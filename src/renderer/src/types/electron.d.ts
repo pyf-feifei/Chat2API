@@ -254,7 +254,7 @@ interface UpdateStatus {
 
 interface AppAPI {
   getVersion: () => Promise<string>
-  checkUpdate: () => Promise<{ hasUpdate: boolean; currentVersion: string; latestVersion: string; releaseUrl?: string; error?: string }>
+  checkUpdate: () => Promise<UpdateStatus>
   downloadUpdate: () => Promise<void>
   installUpdate: () => Promise<void>
   getUpdateStatus: () => Promise<UpdateStatus>
@@ -263,7 +263,7 @@ interface AppAPI {
   onUpdateNotAvailable: (callback: (info: UpdateDownloadedInfo) => void) => () => void
   onUpdateProgress: (callback: (progress: UpdateProgressInfo) => void) => () => void
   onUpdateDownloaded: (callback: (info: UpdateDownloadedInfo) => void) => () => void
-  onUpdateError: (callback: (error: string) => void) => () => void
+  onUpdateError: (callback: (error: { message?: string } | string) => void) => () => void
   minimize: () => Promise<void>
   maximize: () => Promise<void>
   close: () => Promise<void>
