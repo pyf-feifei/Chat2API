@@ -118,6 +118,32 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
   return credentials
 }
 
+async function copyTextToClipboard(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+  } catch (error) {
+    console.warn('Clipboard API copy failed:', error)
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'readonly')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textarea)
+
+  if (!copied) {
+    throw new Error('Copy failed')
+  }
+}
+
 interface AddAccountDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -172,6 +198,7 @@ export function AddAccountDialog({
   const [oauthStatus, setOAuthStatus] = useState<string>('')
   const [browserImportSessionId, setBrowserImportSessionId] = useState<string>('')
   const [browserImportScript, setBrowserImportScript] = useState<string>('')
+  const [browserImportPayload, setBrowserImportPayload] = useState<string>('')
   const [isBrowserImportWaiting, setIsBrowserImportWaiting] = useState(false)
   const [browserImportCopied, setBrowserImportCopied] = useState(false)
 
@@ -208,6 +235,7 @@ export function AddAccountDialog({
     setOAuthStatus('')
     setBrowserImportSessionId('')
     setBrowserImportScript('')
+    setBrowserImportPayload('')
     setIsBrowserImportWaiting(false)
     setBrowserImportCopied(false)
   }
@@ -368,6 +396,7 @@ export function AddAccountDialog({
 
     setIsBrowserImportWaiting(true)
     setBrowserImportCopied(false)
+    setBrowserImportPayload('')
     setOAuthStatus('')
     setValidationResult({})
 
@@ -386,11 +415,59 @@ export function AddAccountDialog({
   const copyBrowserImportScript = async () => {
     if (!browserImportScript) return
     try {
-      await navigator.clipboard.writeText(browserImportScript)
+      await copyTextToClipboard(browserImportScript)
       setBrowserImportCopied(true)
       window.setTimeout(() => setBrowserImportCopied(false), 1500)
     } catch (error) {
       setOAuthStatus(error instanceof Error ? error.message : t('providers.browserImportCopyFailed'))
+    }
+  }
+
+  const handleBrowserImportSessionResult = (session: {
+    id?: string
+    status: 'pending' | 'success' | 'error' | 'expired'
+    credentials?: Record<string, string>
+    error?: string
+  }): boolean => {
+    if (session.status === 'success' && session.credentials) {
+      const mappedCredentials = mapOAuthCredentials(provider?.id, session.credentials)
+      setCredentials(prev => ({
+        ...prev,
+        ...mappedCredentials,
+      }))
+      setValidationResult({ valid: true })
+      setOAuthStatus(t('providers.browserImportSuccess'))
+      setIsBrowserImportWaiting(false)
+      return true
+    }
+
+    if (session.status === 'error' || session.status === 'expired') {
+      setValidationResult({
+        valid: false,
+        error: session.error || t('providers.browserImportFailed'),
+      })
+      setOAuthStatus(session.error || t('providers.browserImportFailed'))
+      setIsBrowserImportWaiting(false)
+      return true
+    }
+
+    return false
+  }
+
+  const applyBrowserImportPayload = async () => {
+    if (!browserImportPayload.trim() || !window.electronAPI?.browserImport) return
+
+    try {
+      const session = await window.electronAPI.browserImport.applyImportPayload(browserImportPayload)
+      setBrowserImportSessionId(session.id)
+      handleBrowserImportSessionResult(session)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('providers.browserImportFailed')
+      setValidationResult({
+        valid: false,
+        error: message,
+      })
+      setOAuthStatus(message)
     }
   }
 
@@ -412,23 +489,7 @@ export function AddAccountDialog({
         const session = await window.electronAPI.browserImport.getSession(browserImportSessionId)
         if (cancelled || !session) return
 
-        if (session.status === 'success' && session.credentials) {
-          const mappedCredentials = mapOAuthCredentials(provider?.id, session.credentials)
-          setCredentials(prev => ({
-            ...prev,
-            ...mappedCredentials,
-          }))
-          setValidationResult({ valid: true })
-          setOAuthStatus(t('providers.browserImportSuccess'))
-          setIsBrowserImportWaiting(false)
-          window.clearInterval(timer)
-        } else if (session.status === 'error' || session.status === 'expired') {
-          setValidationResult({
-            valid: false,
-            error: session.error || t('providers.browserImportFailed'),
-          })
-          setOAuthStatus(session.error || t('providers.browserImportFailed'))
-          setIsBrowserImportWaiting(false)
+        if (handleBrowserImportSessionResult(session)) {
           window.clearInterval(timer)
         }
       } catch (error) {
@@ -449,7 +510,7 @@ export function AddAccountDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-[500px]">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-[560px]">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <User className="h-5 w-5" />
@@ -547,6 +608,29 @@ export function AddAccountDialog({
                             )}
                             {browserImportCopied ? t('common.copied') : t('providers.copyImportScript')}
                           </Button>
+                          <div className="space-y-2 rounded-md border p-3">
+                            <Label>{t('providers.browserImportPayload')}</Label>
+                            <textarea
+                              value={browserImportPayload}
+                              onChange={(event) => setBrowserImportPayload(event.target.value)}
+                              placeholder={t('providers.browserImportPayloadPlaceholder')}
+                              className="h-24 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"
+                            />
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={applyBrowserImportPayload}
+                                disabled={!browserImportPayload.trim()}
+                              >
+                                <CheckCircle2 className="mr-2 h-4 w-4" />
+                                {t('providers.applyImportPayload')}
+                              </Button>
+                              <p className="text-xs text-muted-foreground">
+                                {t('providers.browserImportPayloadHelp')}
+                              </p>
+                            </div>
+                          </div>
                         </div>
                       )}
                       {isBrowserImportWaiting && (

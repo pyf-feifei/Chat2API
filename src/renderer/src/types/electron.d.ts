@@ -209,6 +209,7 @@ interface BrowserImportAPI {
   createSession: (providerId: string) => Promise<BrowserImportSession>
   getSession: (id: string) => Promise<BrowserImportSession | null>
   buildImportScript: (id: string) => Promise<string>
+  applyImportPayload: (input: string) => Promise<BrowserImportSession>
 }
 
 interface LogFilter {

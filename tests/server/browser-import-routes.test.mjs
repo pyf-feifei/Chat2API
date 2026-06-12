@@ -49,3 +49,26 @@ test('browser-assisted import accepts text/plain JSON from provider pages and re
   assert.match(webAdminSource, /throw new Error\(\\`Chat2API browser import failed/)
   assert.match(webAdminSource, /Chat2API browser import sent/)
 })
+
+test('browser-assisted import script falls back to offline payload when direct post is blocked', () => {
+  const webAdminSource = fs.readFileSync('src/renderer/src/web-admin-api.ts', 'utf8')
+
+  assert.match(webAdminSource, /function buildBrowserImportFallbackBlock/)
+  assert.match(webAdminSource, /const payloadText = JSON\.stringify\(payload\)/)
+  assert.match(webAdminSource, /copyPayload/)
+  assert.match(webAdminSource, /navigator\.clipboard\.writeText\(payloadText\)/)
+  assert.match(webAdminSource, /document\.execCommand\('copy'\)/)
+  assert.match(webAdminSource, /Mixed Content/)
+  assert.match(webAdminSource, /Chat2API browser import payload:/)
+  assert.match(webAdminSource, /Paste this payload into the Chat2API admin page/)
+})
+
+test('web admin can apply pasted browser import payload to the active session', () => {
+  const webAdminSource = fs.readFileSync('src/renderer/src/web-admin-api.ts', 'utf8')
+
+  assert.match(webAdminSource, /type BrowserImportPayload/)
+  assert.match(webAdminSource, /function parseBrowserImportPayload/)
+  assert.match(webAdminSource, /function applyBrowserImportPayload/)
+  assert.match(webAdminSource, /setBrowserImportResult\(\s*payload\.importId,\s*payload\.providerId,/)
+  assert.match(webAdminSource, /applyImportPayload:/)
+})

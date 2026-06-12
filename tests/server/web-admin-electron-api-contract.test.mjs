@@ -51,6 +51,7 @@ const expectedContract = {
     'createSession',
     'getSession',
     'buildImportScript',
+    'applyImportPayload',
   ],
   logs: ['get', 'getStats', 'getTrend', 'getAccountTrend', 'clear', 'export', 'getById', 'onNewLog'],
   requestLogs: ['get', 'getById', 'getStats', 'getTrend', 'clear', 'onNewLog'],
@@ -183,14 +184,24 @@ test('web admin provides browser-assisted Qwen AI import instead of docker in-ap
   assert.match(addAccountSource, /browserImport/)
   assert.match(addAccountSource, /isDockerWebAdmin/)
   assert.match(addAccountSource, /browserImportScript/)
+  assert.match(addAccountSource, /browserImportPayload/)
+  assert.match(addAccountSource, /applyBrowserImportPayload/)
+  assert.match(addAccountSource, /copyTextToClipboard/)
+  assert.match(addAccountSource, /document\.execCommand\('copy'\)/)
   assert.match(addAccountSource, /window\.setInterval/)
   assert.match(addAccountSource, /browserImport\.getSession/)
+  assert.match(addAccountSource, /browserImport\.applyImportPayload/)
 
   assert.match(addProviderSource, /browserImport/)
   assert.match(addProviderSource, /isDockerWebAdmin/)
   assert.match(addProviderSource, /browserImportScript/)
+  assert.match(addProviderSource, /browserImportPayload/)
+  assert.match(addProviderSource, /applyBrowserImportPayload/)
+  assert.match(addProviderSource, /copyTextToClipboard/)
+  assert.match(addProviderSource, /document\.execCommand\('copy'\)/)
   assert.match(addProviderSource, /window\.setInterval/)
   assert.match(addProviderSource, /browserImport\.getSession/)
+  assert.match(addProviderSource, /browserImport\.applyImportPayload/)
   assert.match(addProviderSource, /oauthRefreshCredentialFields/)
   assert.match(addProviderSource, /renderCredentialFields\(oauthRefreshCredentialFields\)/)
   assert.match(addProviderSource, /\.\.\.prev,\s*\.\.\.mappedCredentials/)

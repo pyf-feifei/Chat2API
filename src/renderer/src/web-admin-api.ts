@@ -41,6 +41,13 @@ type BrowserImportSession = {
   error?: string
 }
 
+type BrowserImportPayload = {
+  importId: string
+  providerId: string
+  credentials: Record<string, string>
+  error?: string
+}
+
 const browserImportSessions = new Map<string, BrowserImportSession>()
 
 export function getStoredManagementSecret(): string {
@@ -257,6 +264,108 @@ function setBrowserImportResult(
   return next
 }
 
+function parseBrowserImportPayload(input: string): BrowserImportPayload {
+  const trimmed = input.trim()
+  if (!trimmed) {
+    throw new Error('Import payload cannot be empty.')
+  }
+
+  const jsonText = trimmed.startsWith('{')
+    ? trimmed
+    : trimmed.slice(trimmed.indexOf('{'), trimmed.lastIndexOf('}') + 1)
+
+  if (!jsonText || !jsonText.startsWith('{') || !jsonText.endsWith('}')) {
+    throw new Error('Import payload must be a JSON object copied from the provider console.')
+  }
+
+  const payload = JSON.parse(jsonText) as Partial<BrowserImportPayload>
+  if (!payload.importId || typeof payload.importId !== 'string') {
+    throw new Error('Import payload is missing importId.')
+  }
+  if (!payload.providerId || typeof payload.providerId !== 'string') {
+    throw new Error('Import payload is missing providerId.')
+  }
+  if (!payload.credentials || typeof payload.credentials !== 'object') {
+    throw new Error('Import payload is missing credentials.')
+  }
+
+  const credentials = Object.fromEntries(
+    Object.entries(payload.credentials).map(([key, value]) => [key, typeof value === 'string' ? value : String(value ?? '')]),
+  )
+
+  return {
+    importId: payload.importId,
+    providerId: payload.providerId,
+    credentials,
+    error: typeof payload.error === 'string' ? payload.error : '',
+  }
+}
+
+function applyBrowserImportPayload(input: string): BrowserImportSession {
+  const payload = parseBrowserImportPayload(input)
+  return setBrowserImportResult(
+    payload.importId,
+    payload.providerId,
+    payload.credentials,
+    payload.error,
+  )
+}
+
+function buildBrowserImportFallbackBlock(): string {
+  return `  const payloadText = JSON.stringify(payload);
+  const copyPayload = async () => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(payloadText);
+        return true;
+      }
+    } catch (clipboardError) {
+      console.warn('Chat2API browser import payload clipboard copy failed:', clipboardError);
+    }
+
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = payloadText;
+      textarea.setAttribute('readonly', 'readonly');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return copied;
+    } catch (fallbackError) {
+      console.warn('Chat2API browser import payload fallback copy failed:', fallbackError);
+      return false;
+    }
+  };
+  const showOfflinePayload = async (error) => {
+    console.error('Chat2API browser import failed:', error);
+    if (location.protocol === 'https:' && completeUrl.startsWith('http://')) {
+      console.warn('Mixed Content: HTTPS provider pages cannot post credentials to an HTTP Chat2API address.');
+    }
+    console.log('Chat2API browser import payload:', payloadText);
+    const copied = await copyPayload();
+    console.warn(copied
+      ? 'Paste this payload into the Chat2API admin page. It has also been copied if your browser allowed clipboard access.'
+      : 'Paste this payload into the Chat2API admin page. If clipboard copy failed, copy the JSON printed above manually.');
+  };
+  fetch(completeUrl, {
+    method: 'POST',
+    mode: 'cors',
+    headers: { 'Content-Type': 'text/plain' },
+    body: payloadText,
+  })
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(\`Chat2API browser import failed with HTTP \${response.status}. Check that the Docker container is running and regenerate the import script.\`);
+      }
+      console.log('Chat2API browser import sent. Return to the Chat2API admin page.');
+    })
+    .catch(showOfflinePayload);`
+}
+
 function buildQwenAiImportScript(session: BrowserImportSession): string {
   const completeUrl = `${window.location.origin}${MANAGEMENT_BASE}/browser-import/complete`
   return `(() => {
@@ -271,19 +380,7 @@ function buildQwenAiImportScript(session: BrowserImportSession): string {
     credentials: { token, cookies },
     error: token ? '' : 'No token was found in chat.qwen.ai localStorage. Log in first, then run this script again.',
   };
-  fetch(completeUrl, {
-    method: 'POST',
-    mode: 'cors',
-    headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify(payload),
-  })
-    .then((response) => {
-      if (!response.ok) {
-        throw new Error(\`Chat2API browser import failed with HTTP \${response.status}. Check that the Docker container is running and regenerate the import script.\`);
-      }
-      console.log('Chat2API browser import sent. Return to the Chat2API admin page.');
-    })
-    .catch((error) => console.error('Chat2API browser import failed:', error));
+${buildBrowserImportFallbackBlock()}
 })();`
 }
 
@@ -301,19 +398,7 @@ function buildQwenImportScript(session: BrowserImportSession): string {
     credentials: { ticket, tongyi_sso_ticket: ticket },
     error: ticket ? '' : 'No tongyi_sso_ticket cookie was readable. The cookie may be HttpOnly, so use manual credentials for domestic Qwen.',
   };
-  fetch(completeUrl, {
-    method: 'POST',
-    mode: 'cors',
-    headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify(payload),
-  })
-    .then((response) => {
-      if (!response.ok) {
-        throw new Error(\`Chat2API browser import failed with HTTP \${response.status}. Check that the Docker container is running and regenerate the import script.\`);
-      }
-      console.log('Chat2API browser import sent. Return to the Chat2API admin page.');
-    })
-    .catch((error) => console.error('Chat2API browser import failed:', error));
+${buildBrowserImportFallbackBlock()}
 })();`
 }
 
@@ -651,6 +736,9 @@ const browserImport = {
 
   getSession: async (id: string): Promise<BrowserImportSession | null> =>
     syncBrowserImportSession(id),
+
+  applyImportPayload: async (input: string): Promise<BrowserImportSession> =>
+    applyBrowserImportPayload(input),
 
   buildImportScript: async (id: string): Promise<string> => {
     const session = getBrowserImportSession(id)
