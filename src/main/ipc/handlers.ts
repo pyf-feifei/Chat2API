@@ -7,6 +7,7 @@ import { AccountManager } from '../store/accounts'
 import { ProviderChecker } from '../providers/checker'
 import { CustomProviderManager } from '../providers/custom'
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
+import { parseProviderModelsResponse } from '../providers/modelSync'
 import { oauthManager } from '../oauth/manager'
 import { ProxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
@@ -271,9 +272,13 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     type?: 'builtin' | 'custom'
     authType: AuthType
     apiEndpoint: string
+    chatPath?: string
     headers?: Record<string, string>
     description?: string
     supportedModels?: string[]
+    modelMappings?: Record<string, string>
+    modelsApiEndpoint?: string
+    modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]
   }): Promise<Provider> => {
     return CustomProviderManager.create(data)
@@ -434,37 +439,12 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
         }
       }
 
-      const models = response.data.data || response.data
-
-      if (!Array.isArray(models) || models.length === 0) {
-        return {
-          success: false,
-          error: 'No models found in the response',
-        }
-      }
-
-      const supportedModels: string[] = []
-      const modelMappings: Record<string, string> = {}
-
-      models.forEach((model: any) => {
-        if (typeof model === 'string') {
-          supportedModels.push(model)
-          modelMappings[model] = model
-        } else if (model && typeof model === 'object') {
-          const modelId = model.id || model.model_id || model.name
-          const modelName = model.name || model.display_name || modelId
-          
-          if (modelId) {
-            supportedModels.push(modelName || modelId)
-            modelMappings[modelName || modelId] = modelId
-          }
-        }
-      })
+      const { supportedModels, modelMappings } = parseProviderModelsResponse(response.data)
 
       if (supportedModels.length === 0) {
         return {
           success: false,
-          error: 'Failed to parse models from the response',
+          error: 'No models found in the response',
         }
       }
 

@@ -185,6 +185,20 @@
     "clickToOpenOAuth": "Click the button below to open OAuth login window",
     "oauthAutoCapture": "Token will be automatically captured after login",
     "openOAuthLogin": "Open OAuth Login",
+    "browserImportTitle": "Docker Browser-Assisted Import",
+    "browserImportDesc": "Open the provider website and sign in, then copy the script below into that page's console. The script sends readable credentials back to this admin page and fills the form.",
+    "openProviderWebsite": "Open Provider Website",
+    "generateImportScript": "Generate Import Script",
+    "regenerateImportScript": "Regenerate Script",
+    "importScript": "Import Script",
+    "copyImportScript": "Copy Import Script",
+    "waitingBrowserImport": "Waiting for the browser page to send credentials...",
+    "browserImportReady": "Import script generated. Run it on the logged-in provider page and credentials will be filled here.",
+    "browserImportSuccess": "Browser import succeeded and credentials were filled. Validate them before adding the account.",
+    "browserImportFailed": "Browser import failed",
+    "browserImportCreateFailed": "Failed to generate browser import script",
+    "browserImportCopyFailed": "Failed to copy script",
+    "browserImportReadFailed": "Failed to read browser import result",
     "validationSuccess": "Validation Successful",
     "quota": "Quota",
     "validateCredentials": "Validate Credentials",
@@ -310,8 +324,19 @@
     "cookies": "Cookies (Optional)",
     "cookiesPlaceholder": "Optional cookies for enhanced compatibility",
     "cookiesHelp": "Full cookie string from browser DevTools (optional but recommended)",
+    "email": "Login Email (Optional)",
+    "emailPlaceholder": "Qwen login email for automatic token refresh",
+    "emailHelp": "When email and password are provided, Chat2API signs in again before the token expires. This email is shown in the account list.",
+    "password": "Login Password (Optional)",
+    "passwordPlaceholder": "Qwen login password for automatic token refresh",
+    "passwordHelp": "Stored in encrypted credentials when available. Automatic refresh can fail if Qwen requires captcha, MFA, or risk verification.",
     "thinkingMode": "Thinking Mode",
-    "thinkingModeDesc": "Enable thinking mode to get reasoning process before answer"
+    "thinkingModeDesc": "Enable thinking mode to get reasoning process before answer",
+    "models": {
+      "Qwen3.7-Plus": "Qwen3.7-Plus",
+      "Qwen3.7-Max": "Qwen3.7-Max",
+      "Qwen3.6-Plus": "Qwen3.6-Plus"
+    }
   },
   "zai": {
     "name": "Z.ai",
@@ -486,6 +511,10 @@
     "injectionModeNeverDesc": "Disable tool prompt injection",
     "clientDetection": "Client Detection",
     "clientDetectionDesc": "Identify the client source and let backend provider profiles decide the tool calling strategy",
+    "dockerManaged": "Docker Managed",
+    "dockerManagedDesc": "The Docker web admin and proxy run in the same server process. Start, stop, and restart this process from Docker or Docker Compose.",
+    "dockerRestartRequired": "Restart container to apply",
+    "dockerRestartRequiredDesc": "The configuration was saved. Because this is Docker web admin, restart the container for port or bind address changes to take effect.",
     "restartRequired": "Restart Required",
     "restartRequiredDesc": "Port or bind address has changed. The proxy service needs to restart for the changes to take effect. Restart now?",
     "restartNow": "Restart Now",
@@ -804,12 +833,14 @@
     "enabled": "Enabled",
     "disabled": "Disabled",
     "start": "Start Proxy",
-    "stop": "Stop Proxy"
+    "stop": "Stop Proxy",
+    "managedByDocker": "Managed by Docker"
   },
   "quickActions": {
     "title": "Quick Actions",
     "startProxy": "Start Proxy",
     "stopProxy": "Stop Proxy",
+    "proxyManagedExternally": "Docker Managed",
     "addAccount": "Add Account",
     "toolCalling": "Tool Calling",
     "viewLogs": "View Logs"

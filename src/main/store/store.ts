@@ -1,11 +1,10 @@
 /**
  * Credential Storage Module - Core Storage Implementation
- * Uses electron-store for persistent storage
- * Uses Electron's safeStorage API for sensitive data encryption
+ * Uses runtime-specific storage for persistent data
+ * Uses runtime-specific encryption for sensitive data when available
  */
 
-import { app, safeStorage, BrowserWindow } from 'electron'
-import { homedir } from 'os'
+import type { BrowserWindow } from 'electron'
 import { join } from 'path'
 import {
   StoreSchema,
@@ -42,9 +41,9 @@ import { normalizeRequestLogConfig } from '../requestLogs/types'
 import { normalizeToolCallingConfig } from '../../shared/toolCalling'
 import { AppLogManager } from '../appLogs/manager'
 import type { AppLogFilter } from '../appLogs/types'
-
-// Dynamically import electron-store (ESM module)
-let Store: any = null
+import { getRuntime } from '../runtime'
+import { NodeJsonStore } from './storage/nodeJsonStore'
+import { createElectronJsonStore } from './storage/electronJsonStore'
 
 /**
  * Storage Instance Type Definition
@@ -90,21 +89,10 @@ class StoreManager {
       return
     }
 
-    // Dynamically import electron-store (ESM module)
-    if (!Store) {
-      const module = await import('electron-store')
-      Store = module.default
-    }
-
     const storagePath = this.getStoragePath()
 
     try {
-      this.store = new Store({
-        name: 'data',
-        cwd: storagePath,
-        defaults: this.getDefaultData(),
-        encryptionKey: this.getEncryptionKey(),
-      })
+      this.store = await this.createStore(storagePath)
 
       await this.initializeAppLogManager(storagePath)
       await this.initializeRequestLogManager(storagePath)
@@ -119,15 +107,11 @@ class StoreManager {
       // Try to recover by backing up corrupted data and reinitializing
       try {
         await this.recoverFromCorruptedData(storagePath)
-        this.store = new Store({
-          name: 'data',
-          cwd: storagePath,
-          defaults: this.getDefaultData(),
-          encryptionKey: this.getEncryptionKey(),
-        })
+        this.store = await this.createStore(storagePath)
         await this.initializeAppLogManager(storagePath)
         await this.initializeRequestLogManager(storagePath)
         this.initializeDefaultModelMappings()
+        await this.initializeDefaultProviders()
         this.isInitialized = true
         this.initializationError = null
         console.log('[Store] Successfully recovered from corrupted data')
@@ -136,6 +120,22 @@ class StoreManager {
         throw this.initializationError
       }
     }
+  }
+
+  private async createStore(storagePath: string): Promise<StoreType> {
+    const runtime = getRuntime()
+    const options = {
+      name: 'data',
+      cwd: storagePath,
+      defaults: this.getDefaultData() as unknown as Record<string, unknown>,
+      encryptionKey: this.getEncryptionKey(),
+    }
+
+    if (runtime.kind === 'electron') {
+      return createElectronJsonStore(options)
+    }
+
+    return new NodeJsonStore(options)
   }
 
   /**
@@ -166,7 +166,7 @@ class StoreManager {
    * Storage path: ~/.chat2api/
    */
   private getStoragePath(): string {
-    return join(homedir(), '.chat2api')
+    return getRuntime().getDataDir()
   }
 
   /**
@@ -176,16 +176,9 @@ class StoreManager {
    * so it must be stable across app restarts
    */
   private getEncryptionKey(): string | undefined {
-    try {
-      if (safeStorage.isEncryptionAvailable()) {
-        // Use a fixed key - electron-store will use this to encrypt/decrypt data
-        // The key itself is not stored in the data file, only used for encryption
-        return 'chat2api-fixed-encryption-key-v1'
-      }
-    } catch (error) {
-      console.warn('Encryption unavailable, using unencrypted storage:', error)
-    }
-    return undefined
+    return getRuntime().isEncryptionAvailable()
+      ? 'chat2api-fixed-encryption-key-v1'
+      : undefined
   }
 
   /**
@@ -282,7 +275,15 @@ class StoreManager {
    */
   private async initializeDefaultProviders(): Promise<void> {
     const providers = this.store?.get('providers') || []
+    const accounts = this.store?.get('accounts') || []
     const builtinIds = BUILTIN_PROVIDERS.map(p => p.id)
+    const qwenAiAliasIds = providers
+      .filter((provider: Provider) => this.isQwenAiProviderAlias(provider))
+      .map((provider: Provider) => provider.id)
+    const hasQwenAiAliasAccounts = accounts.some((account: Account) => {
+      const providerExists = providers.some((provider: Provider) => account.providerId === provider.id)
+      return qwenAiAliasIds.includes(account.providerId) || (!providerExists && this.isLikelyQwenAiAccount(account))
+    })
     
     const validProviders = providers.filter((p: Provider) => {
       if (p.type === 'builtin') {
@@ -296,7 +297,7 @@ class StoreManager {
     }
     let userModelOverridesChanged = false
     
-    const updatedProviders = validProviders.map((p: Provider) => {
+    let updatedProviders = validProviders.map((p: Provider) => {
       if (p.type === 'builtin') {
         const builtinConfig = BUILTIN_PROVIDERS.find(bp => bp.id === p.id)
         if (builtinConfig) {
@@ -317,16 +318,96 @@ class StoreManager {
             headers: builtinConfig.headers,
             credentialFields: builtinConfig.credentialFields,
             description: builtinConfig.description,
+            modelsApiEndpoint: builtinConfig.modelsApiEndpoint,
+            modelsApiHeaders: builtinConfig.modelsApiHeaders,
           }
         }
       }
       return p
     })
+
+    if (hasQwenAiAliasAccounts && !updatedProviders.some((provider: Provider) => provider.id === 'qwen-ai')) {
+      const qwenAiBuiltin = BUILTIN_PROVIDERS.find(provider => provider.id === 'qwen-ai')
+      if (qwenAiBuiltin) {
+        const now = Date.now()
+        updatedProviders = [
+          ...updatedProviders,
+          {
+            ...qwenAiBuiltin,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ]
+      }
+    }
     
     if (userModelOverridesChanged) {
       this.store?.set('userModelOverrides', userModelOverrides)
     }
     this.store?.set('providers', updatedProviders)
+    this.migrateQwenAiProviderAliases(providers, updatedProviders)
+  }
+
+  private isQwenAiProviderAlias(provider: Provider): boolean {
+    if (provider.type !== 'builtin' || provider.id === 'qwen-ai') {
+      return false
+    }
+
+    const endpoint = provider.apiEndpoint || ''
+    const description = provider.description || ''
+
+    return provider.name === 'Qwen AI (International)'
+      || endpoint.includes('chat.qwen.ai')
+      || description.includes('chat.qwen.ai')
+  }
+
+  private isLikelyQwenAiAccount(account: Account): boolean {
+    const name = (account.name || '').toLowerCase()
+    const credentials = account.credentials || {}
+    const hasBrowserImportCredentials = Boolean(
+      credentials.token && Object.prototype.hasOwnProperty.call(credentials, 'cookies'),
+    )
+
+    return name.includes('qwen ai')
+      || name.includes('qwen-ai')
+      || name.includes('chat.qwen.ai')
+      || (name.includes('qwen') && hasBrowserImportCredentials)
+  }
+
+  private migrateQwenAiProviderAliases(originalProviders: Provider[], currentProviders: Provider[]): void {
+    const accounts = this.store?.get('accounts') || []
+    if (accounts.length === 0) {
+      return
+    }
+
+    const qwenAiAliasIds = new Set(
+      originalProviders
+        .filter((provider: Provider) => this.isQwenAiProviderAlias(provider))
+        .map((provider: Provider) => provider.id),
+    )
+    const now = Date.now()
+    let changed = false
+
+    const migratedAccounts = accounts.map((account: Account) => {
+      const providerExists = currentProviders.some((provider: Provider) => account.providerId === provider.id)
+      const shouldMigrate = account.providerId !== 'qwen-ai'
+        && (qwenAiAliasIds.has(account.providerId) || (!providerExists && this.isLikelyQwenAiAccount(account)))
+
+      if (!shouldMigrate) {
+        return account
+      }
+
+      changed = true
+      return {
+        ...account,
+        providerId: 'qwen-ai',
+        updatedAt: now,
+      }
+    })
+
+    if (changed) {
+      this.store?.set('accounts', migratedAccounts)
+    }
   }
 
   /**
@@ -334,7 +415,7 @@ class StoreManager {
    */
   ensureProviderExists(providerId: string): void {
     this.ensureInitialized()
-    const providers = this.store!.get('providers') || []
+    const providers = this.store!.get('providers') as Provider[] || []
     const exists = providers.some((p: Provider) => p.id === providerId)
     
     if (!exists) {
@@ -355,9 +436,10 @@ class StoreManager {
           description: builtinConfig.description,
           supportedModels: builtinConfig.supportedModels,
           modelMappings: builtinConfig.modelMappings,
+          modelsApiEndpoint: builtinConfig.modelsApiEndpoint,
+          modelsApiHeaders: builtinConfig.modelsApiHeaders,
         }
-        providers.push(newProvider)
-        this.store!.set('providers', providers)
+        this.store!.set('providers', [...providers, newProvider])
         console.log('[Store] Created missing provider:', providerId)
       }
     }
@@ -411,18 +493,9 @@ class StoreManager {
    */
   encryptData(data: string): string {
     try {
-      console.log('[Store] encryptData input length:', data.length, 'content:', data.substring(0, 20) + '...')
-      if (safeStorage.isEncryptionAvailable()) {
-        // Create new Buffer to store encryption result
-        const encrypted = Buffer.from(safeStorage.encryptString(data))
-        const result = encrypted.toString('base64')
-        console.log('[Store] encryptData output length:', result.length, 'content:', result.substring(0, 20) + '...')
-        // Verify encryption is correct
-        const decrypted = safeStorage.decryptString(encrypted)
-        console.log('[Store] encryptData verify decryption:', decrypted.substring(0, 20) + '...', 'match:', decrypted === data)
-        return result
-      } else {
-        console.log('[Store] Encryption unavailable, returning original data')
+      const runtime = getRuntime()
+      if (runtime.isEncryptionAvailable()) {
+        return runtime.encryptString(data)
       }
     } catch (error) {
       console.error('Failed to encrypt data:', error)
@@ -437,9 +510,9 @@ class StoreManager {
    */
   decryptData(encryptedData: string): string {
     try {
-      if (safeStorage.isEncryptionAvailable()) {
-        const buffer = Buffer.from(encryptedData, 'base64')
-        return safeStorage.decryptString(buffer)
+      const runtime = getRuntime()
+      if (runtime.isEncryptionAvailable()) {
+        return runtime.decryptString(encryptedData)
       }
     } catch (error) {
       console.error('Failed to decrypt data:', error)
@@ -502,8 +575,7 @@ class StoreManager {
   addProvider(provider: Provider): void {
     this.ensureInitialized()
     const providers = this.store!.get('providers') as Provider[] || []
-    providers.push(provider)
-    this.store!.set('providers', providers)
+    this.store!.set('providers', [...providers, provider])
   }
 
   /**
@@ -662,13 +734,6 @@ class StoreManager {
       return null
     }
     
-    console.log('[Store] Update account:', {
-      id,
-      updatesCredentials: updates.credentials,
-      oldCredentials: accounts[index].credentials,
-      oldCredentialsDecrypted: this.decryptCredentials(accounts[index].credentials),
-    })
-    
     const updatedAccount: Account = {
       ...accounts[index],
       ...updates,
@@ -677,22 +742,11 @@ class StoreManager {
     
     if (updates.credentials) {
       updatedAccount.credentials = this.encryptCredentials(updates.credentials)
-      console.log('[Store] Encrypted credentials:', updatedAccount.credentials)
-      console.log('[Store] Old credentials:', accounts[index].credentials)
-      console.log('[Store] Credentials match:', JSON.stringify(updatedAccount.credentials) === JSON.stringify(accounts[index].credentials))
     }
     
     accounts[index] = updatedAccount
     this.store!.set('accounts', accounts)
-    
-    // Verify save was successful
-    const savedAccounts = this.store!.get('accounts') as Account[]
-    const savedAccount = savedAccounts.find(a => a.id === id)
-    console.log('[Store] Verify after save:', {
-      id,
-      savedCredentials: savedAccount?.credentials,
-    })
-    
+
     return {
       ...updatedAccount,
       credentials: updates.credentials || this.decryptCredentials(accounts[index].credentials),
@@ -1665,6 +1719,8 @@ class StoreManager {
           headers: builtinConfig.headers,
           credentialFields: builtinConfig.credentialFields,
           description: builtinConfig.description,
+          modelsApiEndpoint: builtinConfig.modelsApiEndpoint,
+          modelsApiHeaders: builtinConfig.modelsApiHeaders,
           updatedAt: Date.now(),
         }
       })

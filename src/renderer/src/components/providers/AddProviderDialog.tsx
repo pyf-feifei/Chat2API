@@ -68,7 +68,6 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     'glm': 'chatglm_refresh_token',
     'deepseek': 'userToken',
     'qwen': 'tongyi_sso_ticket',
-    'qwen-ai': 'tongyi_sso_ticket',
     'zai': 'tongyi_sso_ticket',
     'perplexity': '__Secure-next-auth.session-token',
   }
@@ -77,9 +76,15 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     'glm': 'refresh_token',
     'deepseek': 'token',
     'qwen': 'ticket',
-    'qwen-ai': 'ticket',
     'zai': 'ticket',
     'perplexity': 'sessionToken',
+  }
+
+  if (providerId === 'qwen-ai') {
+    return {
+      token: credentials.token || '',
+      ...(credentials.cookies ? { cookies: credentials.cookies } : {}),
+    }
   }
 
   const oauthKey = credentialKeyMap[providerId]
@@ -178,6 +183,10 @@ export function AddProviderDialog({
   const [oauthStatus, setOAuthStatus] = useState<string>('')
   const [visibleFields, setVisibleFields] = useState<Record<string, boolean>>({})
   const [copiedFields, setCopiedFields] = useState<Record<string, boolean>>({})
+  const [browserImportSessionId, setBrowserImportSessionId] = useState<string>('')
+  const [browserImportScript, setBrowserImportScript] = useState<string>('')
+  const [isBrowserImportWaiting, setIsBrowserImportWaiting] = useState(false)
+  const [browserImportCopied, setBrowserImportCopied] = useState(false)
 
   const toggleFieldVisibility = (fieldName: string) => {
     setVisibleFields(prev => ({
@@ -219,6 +228,8 @@ export function AddProviderDialog({
     : null
 
   const supportsOAuth = selectedProviderData && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(selectedProviderData.id)
+  const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
+  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai'].includes(selectedProviderData.id)
 
   const toggleModelExpansion = (providerId: string) => {
     setExpandedModels(prev => {
@@ -244,6 +255,10 @@ export function AddProviderDialog({
       setOAuthStatus('')
       setVisibleFields({})
       setCopiedFields({})
+      setBrowserImportSessionId('')
+      setBrowserImportScript('')
+      setIsBrowserImportWaiting(false)
+      setBrowserImportCopied(false)
     }
   }, [open])
 
@@ -387,6 +402,86 @@ export function AddProviderDialog({
     }
   }
 
+  const startBrowserImport = async () => {
+    if (!selectedProviderData || !window.electronAPI?.browserImport) return
+
+    setIsBrowserImportWaiting(true)
+    setBrowserImportCopied(false)
+    setOAuthStatus('')
+    setValidationResult({})
+
+    try {
+      const session = await window.electronAPI.browserImport.createSession(selectedProviderData.id)
+      const script = await window.electronAPI.browserImport.buildImportScript(session.id)
+      setBrowserImportSessionId(session.id)
+      setBrowserImportScript(script)
+      setOAuthStatus(t('providers.browserImportReady'))
+    } catch (error) {
+      setIsBrowserImportWaiting(false)
+      setOAuthStatus(error instanceof Error ? error.message : t('providers.browserImportCreateFailed'))
+    }
+  }
+
+  const copyBrowserImportScript = async () => {
+    if (!browserImportScript) return
+
+    try {
+      await navigator.clipboard.writeText(browserImportScript)
+      setBrowserImportCopied(true)
+      window.setTimeout(() => setBrowserImportCopied(false), 1500)
+    } catch (error) {
+      setOAuthStatus(error instanceof Error ? error.message : t('providers.browserImportCopyFailed'))
+    }
+  }
+
+  const openProviderLoginPage = async () => {
+    if (!selectedProviderData) return
+
+    const loginUrls: Record<string, string> = {
+      'qwen-ai': 'https://chat.qwen.ai',
+      qwen: 'https://www.qianwen.com',
+    }
+    await window.electronAPI?.app.openExternal(loginUrls[selectedProviderData.id] || selectedProviderData.apiEndpoint)
+  }
+
+  useEffect(() => {
+    if (!browserImportSessionId || !isBrowserImportWaiting || !window.electronAPI?.browserImport) return
+
+    let cancelled = false
+    const timer = window.setInterval(async () => {
+      try {
+        const session = await window.electronAPI.browserImport.getSession(browserImportSessionId)
+        if (cancelled || !session) return
+
+        if (session.status === 'success' && session.credentials) {
+          const mappedCredentials = mapOAuthCredentials(selectedProviderData?.id, session.credentials)
+          setCredentials(mappedCredentials)
+          setValidationResult({ valid: true })
+          setOAuthStatus(t('providers.browserImportSuccess'))
+          setIsBrowserImportWaiting(false)
+          window.clearInterval(timer)
+        } else if (session.status === 'error' || session.status === 'expired') {
+          setValidationResult({
+            valid: false,
+            error: session.error || t('providers.browserImportFailed'),
+          })
+          setOAuthStatus(session.error || t('providers.browserImportFailed'))
+          setIsBrowserImportWaiting(false)
+          window.clearInterval(timer)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setOAuthStatus(error instanceof Error ? error.message : t('providers.browserImportReadFailed'))
+        }
+      }
+    }, 1500)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [browserImportSessionId, isBrowserImportWaiting, selectedProviderData?.id])
+
   const handleCreateCustom = () => {
     onCreateCustom()
     setSelectedProvider(null)
@@ -405,6 +500,10 @@ export function AddProviderDialog({
     setValidationResult({})
     setActiveTab('manual')
     setOAuthStatus('')
+    setBrowserImportSessionId('')
+    setBrowserImportScript('')
+    setIsBrowserImportWaiting(false)
+    setBrowserImportCopied(false)
   }
 
   const renderCredentialFields = () => {
@@ -467,6 +566,16 @@ export function AddProviderDialog({
                   label: t('qwen-ai.cookies'),
                   placeholder: t('qwen-ai.cookiesPlaceholder'),
                   helpText: t('qwen-ai.cookiesHelp'),
+                },
+                email: {
+                  label: t('qwen-ai.email'),
+                  placeholder: t('qwen-ai.emailPlaceholder'),
+                  helpText: t('qwen-ai.emailHelp'),
+                },
+                password: {
+                  label: t('qwen-ai.password'),
+                  placeholder: t('qwen-ai.passwordPlaceholder'),
+                  helpText: t('qwen-ai.passwordHelp'),
                 },
               },
               zai: {
@@ -779,37 +888,89 @@ export function AddProviderDialog({
             </TabsContent>
 
             <TabsContent value="oauth" className="mt-4">
-              <div className="flex flex-col items-center justify-center py-6 space-y-4">
-                <div className="text-center">
-                  <p className="text-sm text-muted-foreground mb-4">
-                    {t('providers.clickToOpenOAuth')}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {t('providers.oauthAutoCapture')}
-                  </p>
-                </div>
-                <Button 
-                  onClick={handleOpenOAuthBrowser}
-                  disabled={isOAuthLoading}
-                >
-                  {isOAuthLoading ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      {oauthStatus || t('providers.loggingIn')}
-                    </>
-                  ) : (
-                    <>
+              {supportsBrowserImport ? (
+                <div className="space-y-4">
+                  <div className="rounded-lg border bg-muted/30 p-3 text-sm text-muted-foreground">
+                    <p className="font-medium text-foreground">{t('providers.browserImportTitle')}</p>
+                    <p className="mt-1">{t('providers.browserImportDesc')}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="button" variant="outline" onClick={openProviderLoginPage}>
                       <ExternalLink className="mr-2 h-4 w-4" />
-                      {t('providers.openOAuthLogin')}
-                    </>
+                      {t('providers.openProviderWebsite')}
+                    </Button>
+                    <Button type="button" onClick={startBrowserImport} disabled={isBrowserImportWaiting && !!browserImportScript}>
+                      {isBrowserImportWaiting && !browserImportScript ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Copy className="mr-2 h-4 w-4" />
+                      )}
+                      {browserImportScript ? t('providers.regenerateImportScript') : t('providers.generateImportScript')}
+                    </Button>
+                  </div>
+                  {browserImportScript && (
+                    <div className="space-y-2">
+                      <Label>{t('providers.importScript')}</Label>
+                      <textarea
+                        readOnly
+                        value={browserImportScript}
+                        className="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"
+                      />
+                      <Button type="button" variant="outline" onClick={copyBrowserImportScript}>
+                        {browserImportCopied ? (
+                          <Check className="mr-2 h-4 w-4" />
+                        ) : (
+                          <Copy className="mr-2 h-4 w-4" />
+                        )}
+                        {browserImportCopied ? t('common.copied') : t('providers.copyImportScript')}
+                      </Button>
+                    </div>
                   )}
-                </Button>
-                {oauthStatus && !isOAuthLoading && (
-                  <p className={`text-sm ${validationResult.valid ? 'text-green-600' : 'text-red-500'}`}>
-                    {oauthStatus}
-                  </p>
-                )}
-              </div>
+                  {isBrowserImportWaiting && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      <span>{t('providers.waitingBrowserImport')}</span>
+                    </div>
+                  )}
+                  {oauthStatus && (
+                    <p className={`text-sm ${validationResult.valid ? 'text-green-600' : 'text-muted-foreground'}`}>
+                      {oauthStatus}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-6 space-y-4">
+                  <div className="text-center">
+                    <p className="text-sm text-muted-foreground mb-4">
+                      {t('providers.clickToOpenOAuth')}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {t('providers.oauthAutoCapture')}
+                    </p>
+                  </div>
+                  <Button 
+                    onClick={handleOpenOAuthBrowser}
+                    disabled={isOAuthLoading}
+                  >
+                    {isOAuthLoading ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        {oauthStatus || t('providers.loggingIn')}
+                      </>
+                    ) : (
+                      <>
+                        <ExternalLink className="mr-2 h-4 w-4" />
+                        {t('providers.openOAuthLogin')}
+                      </>
+                    )}
+                  </Button>
+                  {oauthStatus && !isOAuthLoading && (
+                    <p className={`text-sm ${validationResult.valid ? 'text-green-600' : 'text-red-500'}`}>
+                      {oauthStatus}
+                    </p>
+                  )}
+                </div>
+              )}
             </TabsContent>
           </Tabs>
         ) : (

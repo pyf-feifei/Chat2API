@@ -66,11 +66,17 @@ const providersAPI = {
   
   add: (data: {
     name: string
+    id?: string
+    type?: 'builtin' | 'custom'
     authType: AuthType
     apiEndpoint: string
+    chatPath?: string
     headers?: Record<string, string>
     description?: string
     supportedModels?: string[]
+    modelMappings?: Record<string, string>
+    modelsApiEndpoint?: string
+    modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]
   }): Promise<Provider> => 
     ipcRenderer.invoke(IpcChannels.PROVIDERS_ADD, data),

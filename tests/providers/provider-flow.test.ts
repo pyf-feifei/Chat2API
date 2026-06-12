@@ -283,18 +283,14 @@ test('domestic Qwen models match the web chat model ids captured from HAR', () =
 
 test('Qwen AI defaults keep only the filtered current web model set', () => {
   const expectedModels = [
+    'Qwen3.7-Plus',
     'Qwen3.7-Max',
     'Qwen3.6-Plus',
-    'Qwen3.6-35B-A3B',
-    'Qwen3.6-27B',
-    'Qwen3-Coder',
   ]
   const expectedMappings = {
+    'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',
     'Qwen3.6-Plus': 'qwen3.6-plus',
-    'Qwen3.6-35B-A3B': 'qwen3.6-35b-a3b',
-    'Qwen3.6-27B': 'qwen3.6-27b',
-    'Qwen3-Coder': 'qwen3-coder-plus',
   }
 
   assert.deepEqual(qwenAiConfig.supportedModels, expectedModels)
@@ -319,8 +315,9 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
   assert.match(qwenAiAdapterSource, /qwen:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /qwen3:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /'qwen3\.7':\s*'qwen3\.7-max'/)
+  assert.match(qwenAiAdapterSource, /'qwen3\.7-plus':\s*'qwen3\.7-plus'/)
   assert.match(qwenAiAdapterSource, /'qwen3\.6':\s*'qwen3\.6-plus'/)
-  assert.match(qwenAiAdapterSource, /'qwen3-coder':\s*'qwen3-coder-plus'/)
+  assert.equal(qwenAiConfig.modelMappings?.['Qwen3-Coder'], undefined)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3\.5':/)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3-vl':/)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3-omni':/)

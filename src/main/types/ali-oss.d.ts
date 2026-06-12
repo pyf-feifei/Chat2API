@@ -4,7 +4,9 @@ declare module 'ali-oss' {
     accessKeySecret: string
     bucket: string
     endpoint: string
+    region?: string
     stsToken?: string
+    authorizationV4?: boolean
   }
 
   interface PutResult {
@@ -15,7 +17,7 @@ declare module 'ali-oss' {
 
   class OSS {
     constructor(options: OSSOptions)
-    put(name: string, data: Buffer | string): Promise<PutResult>
+    put(name: string, data: Buffer | string, options?: any): Promise<PutResult>
   }
 
   export default OSS

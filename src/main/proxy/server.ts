@@ -12,6 +12,7 @@ import managementRoutes from './routes/management'
 import { proxyStatusManager } from './status'
 import { storeManager } from '../store/store'
 import { sessionManager } from './sessionManager'
+import { mountWebAdminAssets } from '../../server/admin/assets'
 
 const SLOW_REQUEST_THRESHOLD_MS = 1500
 
@@ -42,6 +43,7 @@ export class ProxyServer {
       ctx.set('Access-Control-Allow-Origin', '*')
       ctx.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
       ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
+      ctx.set('Access-Control-Allow-Private-Network', 'true')
       ctx.set('Access-Control-Max-Age', '86400')
 
       if (ctx.method === 'OPTIONS') {
@@ -53,6 +55,7 @@ export class ProxyServer {
     })
 
     this.app.use(bodyParser({
+      enableTypes: ['json', 'form', 'text'],
       jsonLimit: '50mb',
       formLimit: '50mb',
       textLimit: '50mb',
@@ -62,7 +65,7 @@ export class ProxyServer {
     this.app.use(async (ctx, next) => {
       // Skip paths that don't require authentication
       const publicPaths = ['/', '/health', '/stats']
-      if (publicPaths.includes(ctx.path)) {
+      if (publicPaths.includes(ctx.path) || ctx.path.startsWith('/admin')) {
         await next()
         return
       }
@@ -154,6 +157,8 @@ export class ProxyServer {
    * Setup routes
    */
   private setupRoutes(): void {
+    mountWebAdminAssets(this.app)
+
     // Register OpenAI API routes
     for (const route of routes) {
       this.router.use(route.routes())

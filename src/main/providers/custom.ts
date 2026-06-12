@@ -8,10 +8,14 @@ export interface CustomProviderData {
   type?: 'builtin' | 'custom'
   authType: AuthType
   apiEndpoint: string
+  chatPath?: string
   headers?: Record<string, string>
   description?: string
   icon?: string
   supportedModels?: string[]
+  modelMappings?: Record<string, string>
+  modelsApiEndpoint?: string
+  modelsApiHeaders?: Record<string, string>
   credentialFields?: CredentialField[]
 }
 
@@ -175,6 +179,7 @@ export class CustomProviderManager {
       type: data.type || 'custom',
       authType: data.authType,
       apiEndpoint: data.apiEndpoint.trim(),
+      chatPath: data.chatPath,
       headers: data.headers || {},
       enabled: true,
       createdAt: now,
@@ -182,6 +187,9 @@ export class CustomProviderManager {
       description: data.description?.trim(),
       icon: data.icon?.trim(),
       supportedModels: data.supportedModels || [],
+      modelMappings: data.modelMappings,
+      modelsApiEndpoint: data.modelsApiEndpoint,
+      modelsApiHeaders: data.modelsApiHeaders,
       credentialFields: data.credentialFields,
     }
     

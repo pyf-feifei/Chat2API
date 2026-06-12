@@ -185,6 +185,20 @@
     "clickToOpenOAuth": "点击下方按钮打开 OAuth 登录窗口",
     "oauthAutoCapture": "登录成功后自动获取 Token",
     "openOAuthLogin": "打开 OAuth 登录",
+    "browserImportTitle": "Docker 浏览器辅助导入",
+    "browserImportDesc": "先打开供应商网页并登录，再复制下方脚本到该网页控制台运行。脚本会把可读取的凭证发送回当前管理页并自动回填。",
+    "openProviderWebsite": "打开供应商网页",
+    "generateImportScript": "生成导入脚本",
+    "regenerateImportScript": "重新生成脚本",
+    "importScript": "导入脚本",
+    "copyImportScript": "复制导入脚本",
+    "waitingBrowserImport": "等待浏览器页面发送凭证...",
+    "browserImportReady": "已生成导入脚本。登录供应商网页后运行脚本，凭证会自动回填到这里。",
+    "browserImportSuccess": "浏览器导入成功，凭证已自动回填。建议点击“验证凭证”确认有效。",
+    "browserImportFailed": "浏览器导入失败",
+    "browserImportCreateFailed": "生成浏览器导入脚本失败",
+    "browserImportCopyFailed": "复制脚本失败",
+    "browserImportReadFailed": "读取浏览器导入结果失败",
     "validationSuccess": "验证成功",
     "quota": "配额",
     "validateCredentials": "验证凭证",
@@ -310,8 +324,19 @@
     "cookies": "Cookies (可选)",
     "cookiesPlaceholder": "可选的 Cookies 用于增强兼容性",
     "cookiesHelp": "从浏览器 DevTools 获取的完整 Cookie 字符串（可选但推荐）",
+    "email": "登录邮箱（可选）",
+    "emailPlaceholder": "用于自动刷新 Token 的 Qwen 登录邮箱",
+    "emailHelp": "填写邮箱和密码后，Token 快过期时会自动重新登录刷新；账户列表会显示该邮箱",
+    "password": "登录密码（可选）",
+    "passwordPlaceholder": "用于自动刷新 Token 的 Qwen 登录密码",
+    "passwordHelp": "密码会按当前存储策略保存到加密凭证中；如果 Qwen 触发验证码、MFA 或风控验证，自动刷新会失败",
     "thinkingMode": "思考模式",
-    "thinkingModeDesc": "启用思考模式，在回答前输出推理过程"
+    "thinkingModeDesc": "启用思考模式，在回答前输出推理过程",
+    "models": {
+      "Qwen3.7-Plus": "Qwen3.7-Plus",
+      "Qwen3.7-Max": "Qwen3.7-Max",
+      "Qwen3.6-Plus": "Qwen3.6-Plus"
+    }
   },
   "zai": {
     "name": "Z.ai",
@@ -486,6 +511,10 @@
     "injectionModeNeverDesc": "禁用工具提示词注入",
     "clientDetection": "客户端检测",
     "clientDetectionDesc": "识别客户端来源并交给后端 provider profile 决定工具调用策略",
+    "dockerManaged": "由 Docker 管理",
+    "dockerManagedDesc": "Docker Web 管理端和代理运行在同一个服务进程中。请通过 Docker 或 Docker Compose 启动、停止、重启该进程。",
+    "dockerRestartRequired": "重启容器后生效",
+    "dockerRestartRequiredDesc": "配置已保存。当前是 Docker Web 管理端，端口或绑定地址变更需要重启容器后生效。",
     "restartRequired": "需要重启",
     "restartRequiredDesc": "端口或绑定地址已更改。代理服务需要重启才能使更改生效。是否立即重启？",
     "restartNow": "立即重启",
@@ -804,12 +833,14 @@
     "enabled": "已启用",
     "disabled": "已禁用",
     "start": "启动代理",
-    "stop": "停止代理"
+    "stop": "停止代理",
+    "managedByDocker": "由 Docker 管理"
   },
   "quickActions": {
     "title": "快捷操作",
     "startProxy": "启动代理",
     "stopProxy": "停止代理",
+    "proxyManagedExternally": "由 Docker 管理",
     "addAccount": "添加账户",
     "toolCalling": "工具调用",
     "viewLogs": "查看日志"

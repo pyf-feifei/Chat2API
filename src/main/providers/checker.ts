@@ -1,5 +1,6 @@
 import axios, { AxiosError } from 'axios'
 import { getBuiltinProvider } from './builtin'
+import { parseProviderModelsResponse } from './modelSync'
 import type { Provider, ProviderCheckResult, Account } from '../../shared/types'
 import type { BuiltinProviderConfig } from '../store/types'
 
@@ -726,16 +727,7 @@ export class ProviderChecker {
         throw new Error(`Failed to fetch models: HTTP ${response.status}`)
       }
 
-      const models = response.data.data || []
-      const supportedModels: string[] = []
-      const modelMappings: Record<string, string> = {}
-
-      for (const model of models) {
-        if (model.name && model.id) {
-          supportedModels.push(model.name)
-          modelMappings[model.name] = model.id
-        }
-      }
+      const { supportedModels, modelMappings } = parseProviderModelsResponse(response.data)
 
       return { supportedModels, modelMappings }
     } catch (error) {

@@ -50,12 +50,24 @@ export type ChatCompletionToolChoice = 'none' | 'auto' | 'required' | {
  * Message Content (supports multimodal)
  */
 export interface ChatMessageContent {
-  type: 'text' | 'image_url'
+  type: 'text' | 'image_url' | 'file' | 'input_audio' | 'video_url'
   text?: string
   image_url?: {
     url: string
     detail?: 'auto' | 'low' | 'high'
   }
+  file_url?: {
+    url: string
+  }
+  input_audio?: {
+    data: string
+    format?: string
+  }
+  video_url?: {
+    url: string
+  }
+  filename?: string
+  mime_type?: string
 }
 
 /**

@@ -89,9 +89,13 @@ interface ProvidersAPI {
     type?: 'builtin' | 'custom'
     authType: AuthType
     apiEndpoint: string
+    chatPath?: string
     headers?: Record<string, string>
     description?: string
     supportedModels?: string[]
+    modelMappings?: Record<string, string>
+    modelsApiEndpoint?: string
+    modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]
   }) => Promise<Provider>
   update: (id: string, updates: Partial<Provider>) => Promise<Provider | null>
@@ -189,6 +193,22 @@ interface OAuthAPI {
     progress?: number
     data?: Record<string, unknown>
   }) => void) => () => void
+}
+
+interface BrowserImportSession {
+  id: string
+  providerId: string
+  createdAt: number
+  expiresAt: number
+  status: 'pending' | 'success' | 'error' | 'expired'
+  credentials?: Record<string, string>
+  error?: string
+}
+
+interface BrowserImportAPI {
+  createSession: (providerId: string) => Promise<BrowserImportSession>
+  getSession: (id: string) => Promise<BrowserImportSession | null>
+  buildImportScript: (id: string) => Promise<string>
 }
 
 interface LogFilter {
@@ -468,6 +488,7 @@ interface ElectronAPI {
   providers: ProvidersAPI
   accounts: AccountsAPI
   oauth: OAuthAPI
+  browserImport: BrowserImportAPI
   logs: LogsAPI
   requestLogs: RequestLogsAPI
   statistics: StatisticsAPI
@@ -487,6 +508,7 @@ interface ElectronAPI {
 declare global {
   interface Window {
     electronAPI: ElectronAPI
+    __CHAT2API_WEB_ADMIN__?: boolean
   }
 }
 

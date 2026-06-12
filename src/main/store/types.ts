@@ -150,6 +150,10 @@ export interface Provider {
   supportedModels?: string[]
   /** Model name mapping */
   modelMappings?: Record<string, string>
+  /** Models list API endpoint for dynamic model fetching */
+  modelsApiEndpoint?: string
+  /** Additional headers for models API request */
+  modelsApiHeaders?: Record<string, string>
   /** Provider status */
   status?: ProviderStatus
   /** Last status check time */

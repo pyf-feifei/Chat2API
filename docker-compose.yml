@@ -1,0 +1,23 @@
+services:
+  chat2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chat2api:server
+    container_name: chat2api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      CHAT2API_HOST: 0.0.0.0
+      CHAT2API_PORT: 8080
+      CHAT2API_DATA_DIR: /data
+      CHAT2API_ENABLE_MANAGEMENT_API: "true"
+      CHAT2API_MANAGEMENT_SECRET: ${CHAT2API_MANAGEMENT_SECRET}
+      CHAT2API_LOG_LEVEL: info
+      CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
+    volumes:
+      - chat2api-data:/data
+
+volumes:
+  chat2api-data:

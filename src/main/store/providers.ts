@@ -62,9 +62,13 @@ export class ProviderManager {
     authType: AuthType
     apiEndpoint: string
     headers?: Record<string, string>
+    chatPath?: string
     description?: string
     icon?: string
     supportedModels?: string[]
+    modelMappings?: Record<string, string>
+    modelsApiEndpoint?: string
+    modelsApiHeaders?: Record<string, string>
     credentialFields?: Array<{
       name: string
       label: string
@@ -115,6 +119,9 @@ export class ProviderManager {
       description: data.description,
       icon: data.icon,
       supportedModels: data.supportedModels,
+      modelMappings: data.modelMappings,
+      modelsApiEndpoint: data.modelsApiEndpoint,
+      modelsApiHeaders: data.modelsApiHeaders,
       credentialFields: data.credentialFields,
     }
     

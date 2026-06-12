@@ -66,6 +66,8 @@ export interface Provider {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  modelsApiEndpoint?: string
+  modelsApiHeaders?: Record<string, string>
   status?: ProviderStatus
   lastStatusCheck?: number
 }
@@ -253,6 +255,8 @@ export interface CreateProviderRequest {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  modelsApiEndpoint?: string
+  modelsApiHeaders?: Record<string, string>
 }
 
 export interface UpdateProviderRequest {
@@ -265,6 +269,8 @@ export interface UpdateProviderRequest {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  modelsApiEndpoint?: string
+  modelsApiHeaders?: Record<string, string>
 }
 
 export interface ProviderStatusRequest {

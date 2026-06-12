@@ -8,7 +8,10 @@ import axios, { AxiosResponse } from 'axios'
 import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import { Account, Provider } from '../../store/types'
+import type { ChatMessage } from '../types'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
+import { QwenAiTokenRefresher } from './qwen-ai-token-refresh'
+import { QwenAiFileUploader, prepareQwenAiMultimodalMessage } from './qwen-ai-files'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 
@@ -36,16 +39,14 @@ const MODEL_ALIASES: Record<string, string> = {
   qwen: 'qwen3.7-max',
   qwen3: 'qwen3.7-max',
   'qwen3.7': 'qwen3.7-max',
+  'qwen3.7-plus': 'qwen3.7-plus',
   'qwen3.6': 'qwen3.6-plus',
   'qwen3.6-35b': 'qwen3.6-35b-a3b',
   'qwen3.6-27b': 'qwen3.6-27b',
   'qwen3-coder': 'qwen3-coder-plus',
 }
 
-interface QwenAiMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string
-}
+type QwenAiMessage = ChatMessage
 
 interface ChatCompletionRequest {
   model: string
@@ -74,6 +75,7 @@ function timestamp(): number {
 export class QwenAiAdapter {
   private provider: Provider
   private account: Account
+  private tokenRefresher = new QwenAiTokenRefresher()
   private axiosInstance = axios.create({
     timeout: 120000,
     maxBodyLength: Infinity,
@@ -83,6 +85,25 @@ export class QwenAiAdapter {
   constructor(provider: Provider, account: Account) {
     this.provider = provider
     this.account = account
+  }
+
+  private async refreshTokenIfNeeded(): Promise<void> {
+    this.account = await this.tokenRefresher.refreshIfNeeded(this.account)
+  }
+
+  private async postWithRefreshRetry(
+    url: string,
+    payload: unknown,
+    createOptions: () => Record<string, any>,
+  ): Promise<AxiosResponse> {
+    let response = await this.axiosInstance.post(url, payload, createOptions())
+
+    if (response.status === 401) {
+      this.account = await this.tokenRefresher.refreshAfterUnauthorized(this.account)
+      response = await this.axiosInstance.post(url, payload, createOptions())
+    }
+
+    return response
   }
 
   private getToken(): string {
@@ -117,6 +138,34 @@ export class QwenAiAdapter {
     return headers
   }
 
+  private sanitizeHeadersForLog(headers: Record<string, string>): Record<string, string> {
+    const sensitiveHeaders = new Set(['authorization', 'cookie', 'bx-ua', 'bx-umidtoken'])
+
+    return Object.fromEntries(
+      Object.entries(headers).map(([key, value]) => [
+        key,
+        sensitiveHeaders.has(key.toLowerCase()) ? '[REDACTED]' : value,
+      ]),
+    )
+  }
+
+  private sanitizePayloadForLog(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map(item => this.sanitizePayloadForLog(item))
+    }
+
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+          key,
+          key === 'url' ? '[REDACTED_URL]' : this.sanitizePayloadForLog(item),
+        ]),
+      )
+    }
+
+    return value
+  }
+
   mapModel(openaiModel: string): string {
     let model = openaiModel
     let forceThinking: boolean | undefined
@@ -149,6 +198,8 @@ export class QwenAiAdapter {
   }
 
   async createChat(modelId: string, title: string = 'New Chat'): Promise<string> {
+    await this.refreshTokenIfNeeded()
+
     const url = `${QWEN_AI_BASE}/api/v2/chats/new`
     const payload = {
       title,
@@ -160,9 +211,10 @@ export class QwenAiAdapter {
     }
 
     try {
-      const response = await this.axiosInstance.post(url, payload, {
+      const response = await this.postWithRefreshRetry(url, payload, () => ({
         headers: this.getHeaders(),
-      })
+        validateStatus: () => true,
+      }))
 
       console.log('[QwenAI] Create chat response:', JSON.stringify(response.data, null, 2))
 
@@ -231,6 +283,8 @@ export class QwenAiAdapter {
     chatId: string
     parentId: string | null
   }> {
+    await this.refreshTokenIfNeeded()
+
     const token = this.getToken()
     if (!token) {
       throw new Error('Qwen AI token not configured, please add token in account settings')
@@ -261,24 +315,13 @@ export class QwenAiAdapter {
     console.log('[QwenAI] Created new chat:', chatId)
 
     const messages = request.messages
-    
-    // Extract system message and user message
-    let systemContent = ''
-    let userContent = ''
-    
-    // Single-turn mode: extract all messages
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        systemContent += (systemContent ? '\n\n' : '') + msg.content
-      } else if (msg.role === 'user') {
-        userContent = msg.content
-      }
-    }
-    
-    // If system prompt exists, prepend it to user content
-    if (systemContent) {
-      userContent = `${systemContent}\n\nUser: ${userContent}`
-    }
+    const uploader = new QwenAiFileUploader(
+      this.axiosInstance,
+      () => this.getHeaders(chatId),
+      this.postWithRefreshRetry.bind(this),
+    )
+    const preparedUserMessage = await prepareQwenAiMultimodalMessage(messages, uploader)
+    const qwenFiles = preparedUserMessage.files
 
     const fid = uuid()
     const childId = uuid()
@@ -320,9 +363,9 @@ export class QwenAiAdapter {
           parentId: null,
           childrenIds: [childId],
           role: 'user',
-          content: userContent,
+          content: preparedUserMessage.content,
           user_action: 'chat',
-          files: [],
+          files: qwenFiles,
           timestamp: ts,
           models: [modelId],
           chat_type: 't2t',
@@ -339,17 +382,18 @@ export class QwenAiAdapter {
 
     console.log('[QwenAI] Sending request to /api/v2/chat/completions...')
     console.log('[QwenAI] Request URL:', url)
-    console.log('[QwenAI] Request payload:', JSON.stringify(payload, null, 2))
-    console.log('[QwenAI] Request headers:', JSON.stringify(this.getHeaders(chatId), null, 2))
+    console.log('[QwenAI] Request payload:', JSON.stringify(this.sanitizePayloadForLog(payload), null, 2))
+    console.log('[QwenAI] Request headers:', JSON.stringify(this.sanitizeHeadersForLog(this.getHeaders(chatId)), null, 2))
 
-    const response = await this.axiosInstance.post(url, payload, {
+    const response = await this.postWithRefreshRetry(url, payload, () => ({
       headers: {
         ...this.getHeaders(chatId),
         'x-accel-buffering': 'no',
       },
       responseType: 'stream',
       timeout: 120000,
-    })
+      validateStatus: () => true,
+    }))
 
     console.log('[QwenAI] Response status:', response.status)
     console.log('[QwenAI] Response headers:', JSON.stringify(response.headers, null, 2))

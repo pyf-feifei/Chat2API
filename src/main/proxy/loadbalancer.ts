@@ -113,7 +113,7 @@ export class LoadBalancer {
       console.log(`[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`)
 
       for (const account of accounts) {
-        console.log(`[LoadBalancer] Account ${account.name} (${account.id}) Token: ${(account.credentials.token || '').substring(0, 20)}...`)
+        console.log(`[LoadBalancer] Account ${account.name} (${account.id}) selected as candidate`)
         candidates.push({
           account,
           provider,
@@ -134,7 +134,7 @@ export class LoadBalancer {
       return true
     }
 
-    const normalizedModel = model.toLowerCase()
+    const normalizedModel = this.normalizeModelForProviderMatch(model).toLowerCase()
     const supported = effectiveModels.some(m => {
       const normalizedSupported = m.displayName.toLowerCase()
       if (normalizedSupported.endsWith('*')) {
@@ -159,7 +159,7 @@ export class LoadBalancer {
       }
       
       const actualModel = globalMapping.actualModel
-      const normalizedActualModel = actualModel.toLowerCase()
+      const normalizedActualModel = this.normalizeModelForProviderMatch(actualModel).toLowerCase()
       const actualSupported = effectiveModels.some(m => {
         const normalizedSupported = m.displayName.toLowerCase()
         if (normalizedSupported.endsWith('*')) {
@@ -173,9 +173,13 @@ export class LoadBalancer {
         return true
       }
     }
-    
+
     console.log(`[LoadBalancer] Provider ${provider.name} does not support model ${model}`)
     return false
+  }
+
+  private normalizeModelForProviderMatch(model: string): string {
+    return model.replace(/-(thinking|fast)$/i, '')
   }
 
   /**
@@ -200,8 +204,9 @@ export class LoadBalancer {
     console.log(`[LoadBalancer] mapModel called with model="${model}", provider="${provider.name}"`)
     
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
+    const normalizedModel = this.normalizeModelForProviderMatch(model).toLowerCase()
     const effectiveModel = effectiveModels.find(m => 
-      m.displayName.toLowerCase() === model.toLowerCase()
+      m.displayName.toLowerCase() === normalizedModel
     )
     
     if (effectiveModel) {

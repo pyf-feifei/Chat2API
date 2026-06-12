@@ -3,6 +3,8 @@ node_modules/
 
 # Build outputs
 out/
+out-server/
+out-admin/
 dist/
 build/entitlements.mac.plist
 
