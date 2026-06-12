@@ -230,6 +230,9 @@ export function AddProviderDialog({
   const supportsOAuth = selectedProviderData && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(selectedProviderData.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
   const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai'].includes(selectedProviderData.id)
+  const oauthRefreshCredentialFields = selectedProviderData?.id === 'qwen-ai'
+    ? selectedProviderData.credentialFields.filter(field => ['email', 'password'].includes(field.name))
+    : []
 
   const toggleModelExpansion = (providerId: string) => {
     setExpandedModels(prev => {
@@ -455,7 +458,10 @@ export function AddProviderDialog({
 
         if (session.status === 'success' && session.credentials) {
           const mappedCredentials = mapOAuthCredentials(selectedProviderData?.id, session.credentials)
-          setCredentials(mappedCredentials)
+          setCredentials(prev => ({
+            ...prev,
+            ...mappedCredentials,
+          }))
           setValidationResult({ valid: true })
           setOAuthStatus(t('providers.browserImportSuccess'))
           setIsBrowserImportWaiting(false)
@@ -506,10 +512,10 @@ export function AddProviderDialog({
     setBrowserImportCopied(false)
   }
 
-  const renderCredentialFields = () => {
+  const renderCredentialFields = (fieldsOverride?: BuiltinProviderConfig['credentialFields']) => {
     if (!selectedProviderData) return null
 
-    const credentialFields = selectedProviderData.credentialFields || []
+    const credentialFields = fieldsOverride || selectedProviderData.credentialFields || []
 
     return (
       <div className="space-y-4">
@@ -894,6 +900,11 @@ export function AddProviderDialog({
                     <p className="font-medium text-foreground">{t('providers.browserImportTitle')}</p>
                     <p className="mt-1">{t('providers.browserImportDesc')}</p>
                   </div>
+                  {oauthRefreshCredentialFields.length > 0 && (
+                    <div className="rounded-lg border p-3">
+                      {renderCredentialFields(oauthRefreshCredentialFields)}
+                    </div>
+                  )}
                   <div className="flex flex-wrap gap-2">
                     <Button type="button" variant="outline" onClick={openProviderLoginPage}>
                       <ExternalLink className="mr-2 h-4 w-4" />
@@ -940,6 +951,11 @@ export function AddProviderDialog({
                 </div>
               ) : (
                 <div className="flex flex-col items-center justify-center py-6 space-y-4">
+                  {oauthRefreshCredentialFields.length > 0 && (
+                    <div className="w-full rounded-lg border p-3">
+                      {renderCredentialFields(oauthRefreshCredentialFields)}
+                    </div>
+                  )}
                   <div className="text-center">
                     <p className="text-sm text-muted-foreground mb-4">
                       {t('providers.clickToOpenOAuth')}

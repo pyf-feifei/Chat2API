@@ -21,7 +21,10 @@ test('web admin browser import session store has bounded ttl', () => {
   assert.match(source, /BROWSER_IMPORT_SESSION_TTL_MS/)
   assert.match(source, /10 \* 60 \* 1000/)
   assert.match(source, /cleanupBrowserImportSessions/)
-  assert.match(source, /crypto\.randomUUID/)
+  assert.match(source, /function createBrowserImportId/)
+  assert.match(source, /globalThis\.crypto\?\.randomUUID/)
+  assert.match(source, /getRandomValues/)
+  assert.doesNotMatch(source, /const id = crypto\.randomUUID\(\)/)
 })
 
 test('browser-assisted import has bounded result storage and local-network cors support', () => {

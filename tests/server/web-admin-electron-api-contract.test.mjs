@@ -191,6 +191,9 @@ test('web admin provides browser-assisted Qwen AI import instead of docker in-ap
   assert.match(addProviderSource, /browserImportScript/)
   assert.match(addProviderSource, /window\.setInterval/)
   assert.match(addProviderSource, /browserImport\.getSession/)
+  assert.match(addProviderSource, /oauthRefreshCredentialFields/)
+  assert.match(addProviderSource, /renderCredentialFields\(oauthRefreshCredentialFields\)/)
+  assert.match(addProviderSource, /\.\.\.prev,\s*\.\.\.mappedCredentials/)
 
   assert.match(electronTypes, /interface BrowserImportAPI/)
   assert.match(electronTypes, /browserImport: BrowserImportAPI/)
