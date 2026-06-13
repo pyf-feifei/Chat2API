@@ -202,6 +202,7 @@
     "browserImportFailed": "Browser import failed",
     "browserImportCreateFailed": "Failed to generate browser import script",
     "browserImportCopyFailed": "Failed to copy script",
+    "browserImportCopyManual": "Import script selected. Press Ctrl+C to copy it manually.",
     "browserImportReadFailed": "Failed to read browser import result",
     "validationSuccess": "Validation Successful",
     "quota": "Quota",

@@ -3,7 +3,7 @@
  * Supports OAuth login and manual input methods
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Dialog,
@@ -118,14 +118,32 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
   return credentials
 }
 
-async function copyTextToClipboard(text: string): Promise<void> {
+function selectVisibleTextArea(textarea: HTMLTextAreaElement | null): boolean {
+  if (!textarea) return false
+
+  textarea.focus()
+  textarea.select()
+  textarea.setSelectionRange(0, textarea.value.length)
+  return true
+}
+
+async function copyTextToClipboard(text: string, visibleTextarea?: HTMLTextAreaElement | null): Promise<boolean> {
   try {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       await navigator.clipboard.writeText(text)
-      return
+      return true
     }
   } catch (error) {
     console.warn('Clipboard API copy failed:', error)
+  }
+
+  if (selectVisibleTextArea(visibleTextarea || null)) {
+    try {
+      return document.execCommand('copy')
+    } catch (error) {
+      console.warn('Visible textarea copy failed:', error)
+      return false
+    }
   }
 
   const textarea = document.createElement('textarea')
@@ -139,9 +157,7 @@ async function copyTextToClipboard(text: string): Promise<void> {
   const copied = document.execCommand('copy')
   document.body.removeChild(textarea)
 
-  if (!copied) {
-    throw new Error('Copy failed')
-  }
+  return copied
 }
 
 interface AddAccountDialogProps {
@@ -201,6 +217,7 @@ export function AddAccountDialog({
   const [browserImportPayload, setBrowserImportPayload] = useState<string>('')
   const [isBrowserImportWaiting, setIsBrowserImportWaiting] = useState(false)
   const [browserImportCopied, setBrowserImportCopied] = useState(false)
+  const browserImportScriptRef = useRef<HTMLTextAreaElement | null>(null)
 
   const isEditing = !!editingAccount
   const builtinProvider = provider as BuiltinProviderConfig | null
@@ -414,12 +431,20 @@ export function AddAccountDialog({
 
   const copyBrowserImportScript = async () => {
     if (!browserImportScript) return
+
     try {
-      await copyTextToClipboard(browserImportScript)
-      setBrowserImportCopied(true)
-      window.setTimeout(() => setBrowserImportCopied(false), 1500)
+      const copied = await copyTextToClipboard(browserImportScript, browserImportScriptRef.current)
+      if (copied) {
+        setBrowserImportCopied(true)
+        window.setTimeout(() => setBrowserImportCopied(false), 1500)
+      } else {
+        selectVisibleTextArea(browserImportScriptRef.current)
+        setOAuthStatus(t('providers.browserImportCopyManual'))
+      }
     } catch (error) {
-      setOAuthStatus(error instanceof Error ? error.message : t('providers.browserImportCopyFailed'))
+      console.warn('Failed to copy browser import script:', error)
+      selectVisibleTextArea(browserImportScriptRef.current)
+      setOAuthStatus(t('providers.browserImportCopyManual'))
     }
   }
 
@@ -596,6 +621,7 @@ export function AddAccountDialog({
                         <div className="space-y-2">
                           <Label>{t('providers.importScript')}</Label>
                           <textarea
+                            ref={browserImportScriptRef}
                             readOnly
                             value={browserImportScript}
                             className="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"

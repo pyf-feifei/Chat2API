@@ -202,6 +202,7 @@
     "browserImportFailed": "浏览器导入失败",
     "browserImportCreateFailed": "生成浏览器导入脚本失败",
     "browserImportCopyFailed": "复制脚本失败",
+    "browserImportCopyManual": "已选中导入脚本，请按 Ctrl+C 手动复制。",
     "browserImportReadFailed": "读取浏览器导入结果失败",
     "validationSuccess": "验证成功",
     "quota": "配额",
