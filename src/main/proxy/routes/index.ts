@@ -6,15 +6,18 @@
 import chatRouter from './chat'
 import modelsRouter from './models'
 import completionsRouter from './completions'
+import geminiRouter from './gemini'
 
 export {
   chatRouter,
   modelsRouter,
   completionsRouter,
+  geminiRouter,
 }
 
 export default [
   chatRouter,
   modelsRouter,
   completionsRouter,
+  geminiRouter,
 ]

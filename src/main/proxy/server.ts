@@ -42,7 +42,7 @@ export class ProxyServer {
     this.app.use(async (ctx, next) => {
       ctx.set('Access-Control-Allow-Origin', '*')
       ctx.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
+      ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-Key, X-Goog-Api-Key, X-Goog-Upload-Protocol, X-Goog-Upload-Command, X-Goog-Upload-Header-Content-Length, X-Goog-Upload-Header-Content-Type, X-Goog-Upload-File-Name, X-Goog-Upload-Offset')
       ctx.set('Access-Control-Allow-Private-Network', 'true')
       ctx.set('Access-Control-Max-Age', '86400')
 
@@ -51,6 +51,26 @@ export class ProxyServer {
         return
       }
 
+      await next()
+    })
+
+    this.app.use(async (ctx, next) => {
+      const shouldReadRawUpload =
+        ctx.method === 'POST' &&
+        ctx.path.startsWith('/upload/v1beta/files/') &&
+        ctx.get('X-Goog-Upload-Command')
+
+      if (!shouldReadRawUpload) {
+        await next()
+        return
+      }
+
+      ;(ctx as Context & { disableBodyParser?: boolean }).disableBodyParser = true
+      const chunks: Buffer[] = []
+      for await (const chunk of ctx.req) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      }
+      ;(ctx.request as any).rawBody = Buffer.concat(chunks)
       await next()
     })
 
@@ -82,7 +102,7 @@ export class ProxyServer {
         const authHeader = ctx.get('Authorization') || ''
         const providedKey = authHeader.startsWith('Bearer ') 
           ? authHeader.slice(7) 
-          : (ctx.query.api_key as string) || ctx.get('X-API-Key')
+          : (ctx.query.api_key as string) || ctx.get('X-API-Key') || ctx.get('X-Goog-Api-Key')
         
         if (!providedKey) {
           ctx.status = 401
@@ -175,6 +195,10 @@ export class ProxyServer {
           'GET /v1/models',
           'GET /v1/models/:model',
           'POST /v1/completions',
+          'GET /v1beta/models',
+          'POST /v1beta/models/:model:generateContent',
+          'POST /v1beta/models/:model:streamGenerateContent',
+          'POST /upload/v1beta/files',
         ],
       }
     })
