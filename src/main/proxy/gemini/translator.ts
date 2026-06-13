@@ -34,9 +34,11 @@ function normalizeRole(role?: string): 'system' | 'user' | 'assistant' {
   return role === 'system' ? 'system' : 'user'
 }
 
-function filePartFromMime(url: string, mimeType: string, filename?: string): ChatMessageContent {
+const CHAT2API_FILE_SCHEME = 'chat2api-file://'
+
+function filePartFromMime(url: string, mimeType: string, filename?: string, localPath?: string): ChatMessageContent {
   if (mimeType.startsWith('image/')) {
-    return { type: 'image_url', image_url: { url }, mime_type: mimeType, filename }
+    return { type: 'image_url', image_url: { url }, mime_type: mimeType, filename, local_path: localPath }
   }
   if (mimeType.startsWith('audio/')) {
     if (url.startsWith('data:')) {
@@ -48,14 +50,15 @@ function filePartFromMime(url: string, mimeType: string, filename?: string): Cha
         },
         mime_type: mimeType,
         filename,
+        local_path: localPath,
       }
     }
-    return { type: 'file', file_url: { url }, mime_type: mimeType, filename }
+    return { type: 'file', file_url: { url }, mime_type: mimeType, filename, local_path: localPath }
   }
   if (mimeType.startsWith('video/')) {
-    return { type: 'video_url', video_url: { url }, mime_type: mimeType, filename }
+    return { type: 'video_url', video_url: { url }, mime_type: mimeType, filename, local_path: localPath }
   }
-  return { type: 'file', file_url: { url }, mime_type: mimeType, filename }
+  return { type: 'file', file_url: { url }, mime_type: mimeType, filename, local_path: localPath }
 }
 
 function convertPart(part: GeminiPart): ChatMessageContent | null {
@@ -80,8 +83,8 @@ function convertPart(part: GeminiPart): ChatMessageContent | null {
     const stored = geminiFileStore.readFile(fileData.fileUri)
     if (stored) {
       const mimeType = fileData.mimeType || stored.file.mimeType
-      const url = `data:${mimeType};base64,${stored.data.toString('base64')}`
-      return filePartFromMime(url, mimeType, stored.file.displayName)
+      const url = `${CHAT2API_FILE_SCHEME}${encodeURIComponent(stored.file.name)}`
+      return filePartFromMime(url, mimeType, stored.file.displayName, stored.file.path)
     }
 
     const mimeType = fileData.mimeType || 'application/octet-stream'

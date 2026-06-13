@@ -1,3 +1,4 @@
+import { readFileSync, statSync } from 'fs'
 import axios, { AxiosInstance, AxiosResponse } from 'axios'
 import OSS from 'ali-oss'
 import mime from 'mime-types'
@@ -63,6 +64,10 @@ function isDataUrl(url: string): boolean {
 
 function isHttpUrl(url: string): boolean {
   return /^https?:\/\//i.test(url)
+}
+
+function isChat2ApiFileUrl(url: string): boolean {
+  return /^chat2api-file:\/\//i.test(url)
 }
 
 function sanitizeFilename(filename: string): string {
@@ -204,6 +209,33 @@ function extractInputAudio(part: ChatMessageContent): NormalizedInputFile {
     mimeType,
     coarseType: 'audio',
     fileClass: 'audio',
+  }
+}
+
+function extractLocalFile(part: ChatMessageContent): NormalizedInputFile {
+  const localPath = part.local_path
+  if (!localPath) {
+    throw new Error('Missing local_path for Chat2API file content part')
+  }
+
+  const stat = statSync(localPath)
+  if (!stat.isFile()) {
+    throw new Error(`Chat2API local file is not a file: ${localPath}`)
+  }
+
+  const explicitMimeType = part.mime_type
+  const filename = ensureExtension(
+    sanitizeFilename(part.filename || path.basename(localPath)),
+    explicitMimeType || mime.lookup(localPath) || 'application/octet-stream',
+  )
+  const mimeType = explicitMimeType || mime.lookup(filename) || 'application/octet-stream'
+  const classification = classifyFile(String(mimeType), part.type)
+
+  return {
+    data: readFileSync(localPath),
+    filename,
+    mimeType: String(mimeType),
+    ...classification,
   }
 }
 
@@ -362,6 +394,10 @@ export class QwenAiFileUploader {
     const url = extractPartUrl(part)
     const explicitFilename = part.filename
     const explicitMimeType = part.mime_type
+
+    if (isChat2ApiFileUrl(url)) {
+      return extractLocalFile(part)
+    }
 
     if (isDataUrl(url)) {
       return extractDataUrl(url, explicitFilename, explicitMimeType, part.type)

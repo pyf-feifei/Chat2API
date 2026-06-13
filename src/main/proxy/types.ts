@@ -68,6 +68,7 @@ export interface ChatMessageContent {
   }
   filename?: string
   mime_type?: string
+  local_path?: string
 }
 
 /**

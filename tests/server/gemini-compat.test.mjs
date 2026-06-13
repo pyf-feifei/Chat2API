@@ -16,15 +16,23 @@ test('Gemini compatibility routes are registered alongside OpenAI routes', () =>
 
 test('Gemini translator maps contents parts to OpenAI-compatible chat messages', () => {
   const source = fs.readFileSync('src/main/proxy/gemini/translator.ts', 'utf8')
+  const qwenFileSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+  const typeSource = fs.readFileSync('src/main/proxy/types.ts', 'utf8')
 
   assert.match(source, /export function geminiToChatCompletionRequest/)
   assert.match(source, /inlineData/)
   assert.match(source, /fileData/)
+  assert.match(source, /chat2api-file:\/\//)
+  assert.doesNotMatch(source, /stored\.data\.toString\('base64'\)/)
   assert.match(source, /video_url/)
   assert.match(source, /image_url/)
   assert.match(source, /input_audio/)
   assert.match(source, /function chatCompletionToGeminiResponse/)
   assert.match(source, /finishReason/)
+  assert.match(qwenFileSource, /isChat2ApiFileUrl/)
+  assert.match(qwenFileSource, /extractLocalFile/)
+  assert.match(qwenFileSource, /readFileSync/)
+  assert.match(typeSource, /local_path\?\: string/)
 })
 
 test('Gemini file store supports official resumable upload flow and 48 hour ttl', () => {
