@@ -61,6 +61,11 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     return {
       token: credentials.token || '',
       ...(credentials.cookies ? { cookies: credentials.cookies } : {}),
+      ...(credentials.baxiaUidToken ? { baxiaUidToken: credentials.baxiaUidToken } : {}),
+      ...(credentials.baxiaUa ? { baxiaUa: credentials.baxiaUa } : {}),
+      ...(credentials.baxiaVersion ? { baxiaVersion: credentials.baxiaVersion } : {}),
+      ...(credentials.x5secdata ? { x5secdata: credentials.x5secdata } : {}),
+      ...(credentials.x5sectag ? { x5sectag: credentials.x5sectag } : {}),
     }
   }
 

@@ -27,11 +27,7 @@ const DEFAULT_HEADERS = {
   'Sec-Fetch-Dest': 'empty',
   'Sec-Fetch-Mode': 'cors',
   'Sec-Fetch-Site': 'same-origin',
-  'bx-v': '2.5.36',
-  'bx-umidtoken': 'T2gAr9z8byN8sNOmfQ3X9j61MNTNmSqDO5L1rs2jMcQCVhOKgZICcBN-UdTuJGig-NM=',
-  'bx-ua': '231!lWD36kmUe5E+joKDK5gBZ48FEl2ZWfPwIPF92lBLek2KxVW/XJ2EwruCiDOX5Px4EXNhmh6EfS9eDwQGRwijIK64A4nPqeLysJcDjUACje/H3J4ZgGZpicG6K8AkiGGaEKC830+QSiSUsLRlL/EyhXTmLcJc/5iDkMuOpUhNz0e0Q/nTqjVJ3ko00Q/oyE+jauHhUHfb1GxGHkE+++3+qCS4+ItkaA6tiItCo+romzElfLFD6RIj7oHt9vffs98nLwpHnaqKjufnLFMejSlAUGiQvTofIiGhIvftAMcoFV4mrUHsqyQ/ncQihmJHkbxXjvM57FCb6b9dEIRZl7jgj0+QLNLRs0NZ4azdZ6rzbGTSO8KA5I3Aq/3gBr87X16Mj0oJtaPKmFGaP2zghfOVhxQht8YjRd50lJa+Ue4PAuPSdu2O69DKLH8VOhrsB+psaBIRxnRi5POUQ6w8s8qlb9vxvExjHNOAKWXV1by1Nz+6FPWdyTeAgcmonjCcV0dCtPj/KyeVDkeSrDkKZjnDzHEqeCdfmJ65kve+Vy3YS0vagzyHfVEnzN0ULUZtkGfJXFNm6+bIa55wmGBhUeXbHL0EdlQXMu1YXxmcwBgTaq7tlQcfv7AefanbfjGE8R1IFnNyg2/jXLbnLg5Z6l1oKqgnxZQg0DE9BJuw6s0XjGwTdSxybWxp+WFD/RsXt76uwvCBk7z+YmSFLtFj2UlTsoq+vl0DTmsVItDKf9SZ94NcuJ7mxJYI02S/2kQBfbbHG0d4hXevDrEC0cb86EvzN2ud+v6bAunNRGNFz/RH0KLusoBVeo+puCFKeeIJWEo0t1UicX5YxJwMAoV7+g0gK93y4W9sMQtso8/wY5wsBzis9dwfLvIwXpaAM1g0MZp/YIRq8T/Qc+U/8x99tam4er0IWizvrkjqhIzCWBKpJ4Y4gj3bOmiS3VCMEaoVfKCwUWENwYKuP3H5VI0n+O2vVVRrekUrwvkm6URRhVhN4eEFTCjB9nSQu++qKyDH8HPpkS3YfwF8/OQtrZo7hQXxvNmP2HcH/K7zcweD00BaoOLiYUtXRItGYbl06sVSbm04soRf1Jqpyo3XiRqBWD9rmJfr4w8NOEGVGUCKXLDLsXy+8JC4Iqf0FsIjWxjMVdraTUtCbwXRbYUownQVm6bt7LYD1SNPoWNPqUJgsLMwP33ugrb1UbHCs24roOch6Go5QHIPA8E15SZE9pkr1SkmqrNs/+KRomFJ9HyFnWUYhZIV9MRLqlOAt6XBBTash3WJnCjhx/PZGhXVvdn2jX4+0Pm55LsiNugA8vaAUJQBxD/8a1u/RvTgbj35+b7I7m8tG0hMhClNZF+tpsOmZZhUGuXH9uVbkJMlMuAmMVCHwn3O31GlLeXXzzep2WS3xN2U+p5J0I7GySnuZUkuGs1ZTVqGUvR2g4q+7ljU55Ak78yPZiQXeUeqS74azszvZvCqWxXn2eePj+gcpliOjrYKpglUP19rQrMt8PqLt8L0ghIqVCmMwl3Hgr/VUcqDpXdpPTR=',
-  Timezone: 'Mon Feb 23 2026 22:06:02 GMT+0800',
-  Version: '0.2.7',
+  Version: '0.2.67',
   Origin: 'https://chat.qwen.ai',
 }
 
@@ -70,6 +66,14 @@ function uuid(): string {
 
 function timestamp(): number {
   return Date.now()
+}
+
+function currentTimezoneHeader(): string {
+  return new Date().toString().replace(/\s*\(.+\)$/, '')
+}
+
+function isObjectValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
 export class QwenAiAdapter {
@@ -113,21 +117,76 @@ export class QwenAiAdapter {
 
   private getCookies(): string {
     const credentials = this.account.credentials
-    return credentials.cookies || credentials.cookie || ''
+    const cookies = credentials.cookies || credentials.cookie || ''
+    if (typeof cookies === 'string') {
+      return cookies
+    }
+    if (isObjectValue(cookies)) {
+      return Object.entries(cookies)
+        .filter(([, value]) => typeof value === 'string' && value)
+        .map(([key, value]) => `${key}=${value}`)
+        .join('; ')
+    }
+    return ''
+  }
+
+  private getCredentialValue(...keys: string[]): string {
+    const credentials = this.account.credentials
+    for (const key of keys) {
+      const value = credentials[key]
+      if (typeof value === 'string' && value.trim()) {
+        return value.trim()
+      }
+    }
+    return ''
   }
 
   private getHeaders(chatId?: string): Record<string, string> {
+    const cookies = this.getCookies()
     const headers: Record<string, string> = {
       ...DEFAULT_HEADERS,
-      Authorization: `Bearer ${this.getToken()}`,
       'X-Request-Id': uuid(),
+      Timezone: currentTimezoneHeader(),
+    }
+
+    const token = this.getToken()
+    // The current Qwen web frontend sets source=web and removes Authorization for
+    // browser sessions. Sending browser cookies together with desktop bearer auth
+    // is more likely to hit upstream risk control.
+    if (token && !cookies) {
+      headers.source = 'desktop'
+      headers.Authorization = `Bearer ${token}`
     }
 
     if (chatId) {
       headers['Referer'] = `https://chat.qwen.ai/c/${chatId}`
     }
 
-    const cookies = this.getCookies()
+    const baxiaUidToken = this.getCredentialValue('baxiaUidToken', 'baxia_uid_token', 'uidToken')
+    if (baxiaUidToken) {
+      headers['bx-umidtoken'] = baxiaUidToken
+    }
+
+    const baxiaUa = this.getCredentialValue('baxiaUa', 'baxia_ua', 'bxUa', 'bx_ua')
+    if (baxiaUa) {
+      headers['bx-ua'] = baxiaUa
+    }
+
+    const baxiaVersion = this.getCredentialValue('baxiaVersion', 'baxia_version', 'bxV', 'bx_v')
+    if (baxiaVersion) {
+      headers['bx-v'] = baxiaVersion
+    }
+
+    const x5secdata = this.getCredentialValue('x5secdata')
+    if (x5secdata) {
+      headers['x5secdata'] = x5secdata
+    }
+
+    const x5sectag = this.getCredentialValue('x5sectag')
+    if (x5sectag) {
+      headers['x5sectag'] = x5sectag
+    }
+
     if (cookies) {
       headers['Cookie'] = cookies
     } else {
@@ -138,8 +197,16 @@ export class QwenAiAdapter {
     return headers
   }
 
-  private sanitizeHeadersForLog(headers: Record<string, string>): Record<string, string> {
-    const sensitiveHeaders = new Set(['authorization', 'cookie', 'bx-ua', 'bx-umidtoken'])
+  private sanitizeHeadersForLog(headers: Record<string, any>): Record<string, unknown> {
+    const sensitiveHeaders = new Set([
+      'authorization',
+      'cookie',
+      'set-cookie',
+      'bx-ua',
+      'bx-umidtoken',
+      'x5secdata',
+      'x5sectag',
+    ])
 
     return Object.fromEntries(
       Object.entries(headers).map(([key, value]) => [
@@ -164,6 +231,126 @@ export class QwenAiAdapter {
     }
 
     return value
+  }
+
+  private async readStreamPreview(stream: any, maxBytes = 4096): Promise<string> {
+    if (!stream) return ''
+    if (typeof stream === 'string') return stream.slice(0, maxBytes)
+    if (Buffer.isBuffer(stream)) return stream.toString('utf8', 0, maxBytes)
+    if (typeof stream !== 'object' || typeof stream.on !== 'function') {
+      try {
+        return JSON.stringify(stream).slice(0, maxBytes)
+      } catch {
+        return String(stream).slice(0, maxBytes)
+      }
+    }
+
+    const chunks: Buffer[] = []
+    let total = 0
+
+    await new Promise<void>((resolve) => {
+      let done = false
+      const finish = () => {
+        if (!done) {
+          done = true
+          resolve()
+        }
+      }
+
+      stream.on('data', (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+        const remaining = maxBytes - total
+        if (remaining > 0) {
+          chunks.push(buffer.subarray(0, remaining))
+          total += Math.min(buffer.length, remaining)
+        }
+        if (total >= maxBytes && typeof stream.destroy === 'function') {
+          stream.destroy()
+        }
+      })
+      stream.once('end', finish)
+      stream.once('close', finish)
+      stream.once('error', finish)
+    })
+
+    return Buffer.concat(chunks).toString('utf8')
+  }
+
+  private extractUpstreamErrorMessage(body: string): string {
+    const trimmed = body.trim()
+    if (!trimmed) return ''
+
+    try {
+      const parsed = JSON.parse(trimmed)
+      const ret = Array.isArray(parsed?.ret)
+        ? parsed.ret.filter((item: unknown) => typeof item === 'string' && item.trim()).join('; ')
+        : ''
+      const message =
+        parsed?.message ||
+        parsed?.msg ||
+        parsed?.error?.message ||
+        parsed?.data?.message ||
+        parsed?.data?.msg ||
+        ret
+      if (typeof message === 'string' && message.trim()) {
+        return message.trim()
+      }
+    } catch {
+      // Fall back to a compact body preview below.
+    }
+
+    return trimmed
+      .replace(/https?:\/\/[^\s"',}]+/gi, '[REDACTED_URL]')
+      .replace(/(x5secdata|x5sectag|cookie|authorization|token)=([^&\s"',}]+)/gi, '$1=[REDACTED]')
+      .replace(/\s+/g, ' ')
+      .slice(0, 500)
+  }
+
+  private hasRiskControlHeaders(headers: Record<string, any>): boolean {
+    const setCookie = headers['set-cookie']
+    const setCookieText = Array.isArray(setCookie) ? setCookie.join('\n') : String(setCookie || '')
+
+    return Boolean(
+      headers.bxpunish ||
+      headers['bxpunish'] ||
+      headers['x5secdata'] ||
+      headers['x5sectag'] ||
+      /x5sec/i.test(setCookieText),
+    )
+  }
+
+  private isRiskControlMessage(message: string): boolean {
+    return /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish|哎哟喂|被挤爆/i.test(message)
+  }
+
+  private async createInvalidStreamError(response: AxiosResponse, reason: string): Promise<Error> {
+    const contentType = String(response.headers?.['content-type'] || 'unknown')
+    const body = await this.readStreamPreview(response.data)
+    const upstreamMessage = this.extractUpstreamErrorMessage(body)
+    const detail = upstreamMessage ? `: ${upstreamMessage}` : ''
+
+    const error = new Error(`Qwen AI upstream ${reason} (HTTP ${response.status}, content-type ${contentType})${detail}`)
+    if (this.isRiskControlMessage(upstreamMessage) || reason.includes('risk-control')) {
+      ;(error as Error & { status?: number; code?: string }).status = 403
+      ;(error as Error & { status?: number; code?: string }).code = 'qwen_ai_risk_control'
+    }
+    return error
+  }
+
+  private async assertChatCompletionStreamResponse(response: AxiosResponse): Promise<void> {
+    const contentType = String(response.headers?.['content-type'] || '').toLowerCase()
+
+    if (response.status >= 400) {
+      throw await this.createInvalidStreamError(response, `returned HTTP ${response.status}`)
+    }
+
+    if (this.hasRiskControlHeaders(response.headers || {})) {
+      throw await this.createInvalidStreamError(response, 'returned a risk-control or challenge response instead of a chat event stream')
+    }
+
+    if (contentType.includes('application/json') || contentType.includes('text/html')) {
+      throw await this.createInvalidStreamError(response, 'returned a non-stream response instead of a chat event stream')
+    }
   }
 
   mapModel(openaiModel: string): string {
@@ -396,7 +583,9 @@ export class QwenAiAdapter {
     }))
 
     console.log('[QwenAI] Response status:', response.status)
-    console.log('[QwenAI] Response headers:', JSON.stringify(response.headers, null, 2))
+    console.log('[QwenAI] Response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers), null, 2))
+
+    await this.assertChatCompletionStreamResponse(response)
 
     return {
       response,
@@ -704,6 +893,7 @@ export class QwenAiStreamHandler {
       let reasoningText = ''
       let summaryText = ''
       let resolved = false
+      let sawAnswerFinish = false
 
       const resolveOnce = (value: any) => {
         if (!resolved) {
@@ -753,6 +943,7 @@ export class QwenAiStreamHandler {
                   data.choices[0].message.content += content
                 }
                 if (status === 'finished') {
+                  sawAnswerFinish = true
                   // Use reasoningText or summaryText for reasoning_content
                   const finalReasoning = reasoningText || summaryText
                   if (finalReasoning) {
@@ -786,6 +977,15 @@ export class QwenAiStreamHandler {
         const finalReasoning = reasoningText || summaryText
         if (finalReasoning) {
           data.choices[0].message.reasoning_content = finalReasoning
+        }
+        const answerText = data.choices[0].message.content || ''
+        const hasAnyOutput = Boolean(answerText.trim() || finalReasoning.trim())
+        if (!hasAnyOutput) {
+          rejectOnce(new Error('Qwen AI returned an empty response stream without answer or reasoning content'))
+          return
+        }
+        if (!sawAnswerFinish) {
+          console.warn('[QwenAI] Non-stream closed before an answer finished event; returning accumulated content.')
         }
         resolveOnce(data)
       })

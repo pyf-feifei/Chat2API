@@ -11,6 +11,8 @@ test('management API exposes browser-assisted import completion route', () => {
   assert.match(source, /importId/)
   assert.match(source, /credentials/)
   assert.match(source, /qwen-ai/)
+  assert.match(source, /baxiaUidToken/)
+  assert.match(source, /x5secdata/)
   assert.match(source, /tongyi_sso_ticket/)
   assert.match(source, /setBrowserImportResult/)
 })
@@ -48,6 +50,9 @@ test('browser-assisted import accepts text/plain JSON from provider pages and re
   assert.match(webAdminSource, /if \(!response\.ok\)/)
   assert.match(webAdminSource, /throw new Error\(\\`Chat2API browser import failed/)
   assert.match(webAdminSource, /Chat2API browser import sent/)
+  assert.match(webAdminSource, /getUidToken/)
+  assert.match(webAdminSource, /baxiaUidToken/)
+  assert.match(webAdminSource, /x5sectag/)
 })
 
 test('browser-assisted import script falls back to offline payload when direct post is blocked', () => {

@@ -13,7 +13,7 @@ import { storeManager } from '../store/store'
 export class LoadBalancer {
   private roundRobinIndex: Map<string, number> = new Map()
   private failedAccounts: Map<string, { count: number; lastFailTime: number }> = new Map()
-  private static readonly FAIL_THRESHOLD = 3
+  private static readonly FAIL_THRESHOLD = 1
   private static readonly RECOVERY_TIME = 60000 // 1 minute
 
   /**
@@ -62,7 +62,11 @@ export class LoadBalancer {
     preferredProviderId?: string,
     preferredAccountId?: string
   ): AccountSelection | null {
-    const candidates = this.getAvailableAccounts(model, preferredProviderId, strategy === 'failover')
+    let candidates = this.getAvailableAccounts(model, preferredProviderId, true)
+
+    if (candidates.length === 0) {
+      candidates = this.getAvailableAccounts(model, preferredProviderId, false)
+    }
 
     if (candidates.length === 0) {
       return null

@@ -145,7 +145,7 @@ export class ProviderChecker {
       case 'qwen':
         return this.checkQwenToken(account.credentials.ticket)
       case 'qwen-ai':
-        return this.checkQwenAiToken(account.credentials.token)
+        return this.checkQwenAiToken(account.credentials)
       case 'perplexity':
         return this.checkPerplexityToken(account.credentials.sessionToken || account.credentials.token)
       case 'mimo':
@@ -538,28 +538,58 @@ export class ProviderChecker {
     }
   }
 
-  private static async checkQwenAiToken(token: string): Promise<TokenCheckResult> {
+  private static getQwenAiCookieHeader(cookies: unknown): string {
+    if (typeof cookies === 'string') {
+      return cookies
+    }
+
+    if (cookies && typeof cookies === 'object' && !Array.isArray(cookies)) {
+      return Object.entries(cookies as Record<string, unknown>)
+        .filter(([, value]) => typeof value === 'string' && value)
+        .map(([key, value]) => `${key}=${value}`)
+        .join('; ')
+    }
+
+    return ''
+  }
+
+  private static async checkQwenAiToken(credentials: Record<string, unknown>): Promise<TokenCheckResult> {
+    const token = typeof credentials.token === 'string' ? credentials.token : ''
+
+    if (!token) {
+      return { valid: false, error: 'Token is required' }
+    }
+
     try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        source: 'web',
+        Version: '0.2.67',
+        Timezone: new Date().toString().replace(/\s*\(.+\)$/, ''),
+      }
+      const cookieHeader = this.getQwenAiCookieHeader(credentials.cookies || credentials.cookie)
+      if (cookieHeader) {
+        headers.Cookie = cookieHeader
+      }
+
       const response = await axios.get(
-        'https://chat.qwen.ai/api/v2/user',
+        'https://chat.qwen.ai/api/v2/users/user/settings',
         {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-            source: 'web',
-          },
+          headers,
           timeout: CHECK_TIMEOUT,
           validateStatus: () => true,
         }
       )
 
-      if (response.status === 200 && response.data?.data) {
+      if (response.status === 200 && response.data?.success !== false && response.data?.data) {
+        const userInfo = response.data.data.user || response.data.data.user_info || response.data.data
         return {
           valid: true,
           userInfo: {
-            name: response.data.data.name || response.data.data.email,
-            email: response.data.data.email,
+            name: userInfo.name || userInfo.email,
+            email: userInfo.email,
           },
         }
       }
@@ -568,7 +598,8 @@ export class ProviderChecker {
         return { valid: false, error: 'Token expired or invalid' }
       }
 
-      return { valid: false, error: `Validation failed: HTTP ${response.status}` }
+      const upstreamError = response.data?.message || response.data?.msg || response.data?.data?.details || response.data?.data?.code
+      return { valid: false, error: `Validation failed: HTTP ${response.status}${upstreamError ? ` ${upstreamError}` : ''}` }
     } catch (error) {
       return {
         valid: false,

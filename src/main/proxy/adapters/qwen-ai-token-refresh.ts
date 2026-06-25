@@ -6,6 +6,8 @@ import { storeManager } from '../../store/store'
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const REFRESH_THRESHOLD_MS = 6 * 60 * 60 * 1000
 
+type SetCookieHeader = string | string[] | undefined
+
 function decodeJwtPayload(token: string): Record<string, any> | null {
   try {
     const parts = token.split('.')
@@ -25,6 +27,64 @@ function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
 }
 
+function currentTimezoneHeader(): string {
+  return new Date().toString().replace(/\s*\(.+\)$/, '')
+}
+
+function normalizeSetCookieHeaders(value: SetCookieHeader): string[] {
+  if (Array.isArray(value)) {
+    return value.filter(header => typeof header === 'string' && header.trim())
+  }
+
+  return typeof value === 'string' && value.trim() ? [value] : []
+}
+
+function parseCookiePair(value: string): [string, string] | null {
+  const pair = value.split(';', 1)[0]?.trim()
+  if (!pair) {
+    return null
+  }
+
+  const separator = pair.indexOf('=')
+  if (separator <= 0) {
+    return null
+  }
+
+  const name = pair.slice(0, separator).trim()
+  const cookieValue = pair.slice(separator + 1)
+  if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
+    return null
+  }
+
+  return [name, cookieValue]
+}
+
+export function mergeCookieHeaders(existingCookieHeader: string, setCookieHeader: SetCookieHeader): string {
+  const cookies = new Map<string, string>()
+
+  for (const existingCookie of String(existingCookieHeader || '').split(';')) {
+    const parsed = parseCookiePair(existingCookie)
+    if (parsed) {
+      cookies.set(parsed[0], parsed[1])
+    }
+  }
+
+  for (const header of normalizeSetCookieHeaders(setCookieHeader)) {
+    const parsed = parseCookiePair(header)
+    if (parsed) {
+      cookies.set(parsed[0], parsed[1])
+    }
+  }
+
+  return Array.from(cookies.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ')
+}
+
+function hasCookie(cookieHeader: string, name: string): boolean {
+  return new RegExp(`(?:^|;\\s*)${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=[^;]+`).test(cookieHeader)
+}
+
 export class QwenAiTokenRefresher {
   isTokenExpiringSoon(token: string, now: number = Date.now()): boolean {
     const payload = decodeJwtPayload(token)
@@ -36,7 +96,10 @@ export class QwenAiTokenRefresher {
   }
 
   async refreshIfNeeded(account: Account): Promise<Account> {
-    if (!this.canRefresh(account) || !this.isTokenExpiringSoon(account.credentials.token || '')) {
+    if (
+      !this.canRefresh(account) ||
+      (!this.isTokenExpiringSoon(account.credentials.token || '') && this.hasWebSessionCookie(account))
+    ) {
       return account
     }
 
@@ -55,6 +118,10 @@ export class QwenAiTokenRefresher {
     return Boolean(account.credentials.email && account.credentials.password)
   }
 
+  private hasWebSessionCookie(account: Account): boolean {
+    return hasCookie(account.credentials.cookies || account.credentials.cookie || '', 'token')
+  }
+
   private async refresh(account: Account): Promise<Account> {
     const response = await axios.post(
       `${QWEN_AI_BASE}/api/v1/auths/signin`,
@@ -66,8 +133,12 @@ export class QwenAiTokenRefresher {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
           Origin: QWEN_AI_BASE,
           Referer: `${QWEN_AI_BASE}/`,
+          source: 'web',
+          Version: '0.2.67',
+          Timezone: currentTimezoneHeader(),
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
         },
         timeout: 15000,
@@ -80,29 +151,30 @@ export class QwenAiTokenRefresher {
       throw new Error(`Qwen AI token refresh failed: HTTP ${response.status}`)
     }
 
+    const cookies = mergeCookieHeaders(
+      account.credentials.cookies || account.credentials.cookie || '',
+      response.headers['set-cookie'],
+    )
+    const credentials = {
+      ...account.credentials,
+      token,
+      ...(cookies ? { cookies } : {}),
+    }
+
     const updated = storeManager.updateAccount(account.id, {
       email: account.credentials.email,
-      credentials: {
-        ...account.credentials,
-        token,
-      },
+      credentials,
       status: 'active',
       errorMessage: undefined,
     })
 
     return updated ? {
       ...updated,
-      credentials: {
-        ...account.credentials,
-        token,
-      },
+      credentials,
     } : {
       ...account,
       email: account.credentials.email,
-      credentials: {
-        ...account.credentials,
-        token,
-      },
+      credentials,
       status: 'active',
       errorMessage: undefined,
       updatedAt: Date.now(),

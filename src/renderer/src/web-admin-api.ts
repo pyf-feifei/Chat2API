@@ -374,10 +374,20 @@ function buildQwenAiImportScript(session: BrowserImportSession): string {
   const completeUrl = ${JSON.stringify(completeUrl)};
   const token = localStorage.getItem('token') || localStorage.getItem('access_token') || '';
   const cookies = document.cookie || '';
+  const getBaxiaUidToken = () => {
+    try {
+      return window.__baxia__?.getFYModule?.getUidToken?.() || '';
+    } catch (error) {
+      return '';
+    }
+  };
+  const baxiaUidToken = getBaxiaUidToken();
+  const x5secdata = cookies.match(/(?:^|;\\s*)x5secdata=([^;]+)/)?.[1] || '';
+  const x5sectag = cookies.match(/(?:^|;\\s*)x5sectag=([^;]+)/)?.[1] || '';
   const payload = {
     importId,
     providerId,
-    credentials: { token, cookies },
+    credentials: { token, cookies, baxiaUidToken, x5secdata, x5sectag },
     error: token ? '' : 'No token was found in chat.qwen.ai localStorage. Log in first, then run this script again.',
   };
 ${buildBrowserImportFallbackBlock()}

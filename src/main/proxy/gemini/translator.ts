@@ -96,7 +96,7 @@ function convertPart(part: GeminiPart): ChatMessageContent | null {
 
 function getTextFromChoice(response: ChatCompletionResponse): string {
   return response.choices
-    .map(choice => choice.message?.content || choice.delta?.content || '')
+    .map(choice => choice.message?.content || choice.delta?.content || choice.message?.reasoning_content || choice.delta?.reasoning_content || '')
     .join('')
 }
 

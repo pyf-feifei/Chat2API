@@ -80,6 +80,11 @@ function normalizeBrowserImportCredentials(
     return {
       token: String(credentials.token || ''),
       cookies: String(credentials.cookies || ''),
+      baxiaUidToken: String(credentials.baxiaUidToken || credentials.baxia_uid_token || credentials.uidToken || ''),
+      baxiaUa: String(credentials.baxiaUa || credentials.baxia_ua || credentials.bxUa || credentials.bx_ua || ''),
+      baxiaVersion: String(credentials.baxiaVersion || credentials.baxia_version || credentials.bxV || credentials.bx_v || ''),
+      x5secdata: String(credentials.x5secdata || ''),
+      x5sectag: String(credentials.x5sectag || ''),
     }
   }
 

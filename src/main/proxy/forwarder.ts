@@ -34,6 +34,20 @@ function shouldDeleteSession(): boolean {
   return sessionManager.shouldDeleteAfterChat()
 }
 
+function statusFromError(error: unknown): number | undefined {
+  const maybeStatus = (error as { status?: unknown; statusCode?: unknown })?.status
+  if (typeof maybeStatus === 'number') {
+    return maybeStatus
+  }
+
+  const maybeStatusCode = (error as { status?: unknown; statusCode?: unknown })?.statusCode
+  if (typeof maybeStatusCode === 'number') {
+    return maybeStatusCode
+  }
+
+  return undefined
+}
+
 type ProviderForwarder = {
   name: string
   matches: (provider: Provider) => boolean
@@ -232,6 +246,7 @@ export class RequestForwarder {
     const maxRetries = config.retryCount
 
     let lastError: string | undefined
+    let lastStatus: number | undefined
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
@@ -297,17 +312,20 @@ export class RequestForwarder {
         }
 
         lastError = result.error
+        lastStatus = result.status
 
         if (result.status && result.status < 500 && result.status !== 429) {
           break
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : 'Unknown error'
+        lastStatus = statusFromError(error)
       }
     }
 
     return {
       success: false,
+      status: lastStatus,
       error: lastError || 'Request failed after retries',
       latency: Date.now() - startTime,
     }
@@ -502,6 +520,7 @@ export class RequestForwarder {
       const latency = Date.now() - startTime
       return {
         success: false,
+        status: statusFromError(error),
         error: error instanceof Error ? error.message : 'Unknown error',
         latency,
       }
@@ -614,6 +633,7 @@ export class RequestForwarder {
       const latency = Date.now() - startTime
       return {
         success: false,
+        status: statusFromError(error),
         error: error instanceof Error ? error.message : 'Unknown error',
         latency,
       }
@@ -888,6 +908,7 @@ export class RequestForwarder {
       const latency = Date.now() - startTime
       return {
         success: false,
+        status: statusFromError(error),
         error: error instanceof Error ? error.message : 'Unknown error',
         latency,
       }

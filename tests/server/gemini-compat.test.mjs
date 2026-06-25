@@ -29,6 +29,7 @@ test('Gemini translator maps contents parts to OpenAI-compatible chat messages',
   assert.match(source, /input_audio/)
   assert.match(source, /function chatCompletionToGeminiResponse/)
   assert.match(source, /finishReason/)
+  assert.match(source, /reasoning_content/)
   assert.match(qwenFileSource, /isChat2ApiFileUrl/)
   assert.match(qwenFileSource, /extractLocalFile/)
   assert.match(qwenFileSource, /readFileSync/)
