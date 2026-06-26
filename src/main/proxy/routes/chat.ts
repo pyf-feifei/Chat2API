@@ -62,6 +62,15 @@ function extractUserInput(messages: Array<{ role: string; content?: string | any
   return undefined
 }
 
+function isQwenAiRiskControl(providerId: string | undefined, status: number | undefined, error: string | undefined): boolean {
+  return Boolean(
+    providerId === 'qwen-ai' &&
+    status === 403 &&
+    error &&
+    /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|x5sec|baxia|punish/i.test(error),
+  )
+}
+
 /**
  * Handle Chat Completions Request
  */
@@ -192,7 +201,9 @@ router.post('/completions', async (ctx: Context) => {
     if (!result.success) {
       proxyStatusManager.recordRequestFailure(latency)
 
-      if (result.status && result.status >= 400 && result.status !== 429) {
+      if (isQwenAiRiskControl(provider.id, result.status, result.error)) {
+        loadBalancer.markQwenAiRiskControl(account.id)
+      } else if (result.status && result.status >= 400 && result.status !== 429) {
         loadBalancer.markAccountFailed(account.id)
       }
 

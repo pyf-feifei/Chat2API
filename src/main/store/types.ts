@@ -84,6 +84,15 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
  */
 export type Theme = 'light' | 'dark' | 'system'
 
+export interface QwenAiGovernorConfig {
+  maxConcurrent: number
+  globalMinIntervalMs: number
+  accountMinIntervalMs: number
+  riskCooldownMs: number
+  maxRiskCooldownMs: number
+  failureCooldownMs: number
+}
+
 /**
  * Account Interface
  * Represents account configuration under a provider
@@ -219,6 +228,8 @@ export interface AppConfig {
   toolCallingConfig: ToolCallingConfig
   /** Legacy migration input from pre-v2 tool prompt settings */
   toolPromptConfig?: LegacyToolPromptConfig
+  /** Qwen AI request governor configuration */
+  qwenAiGovernorConfig: QwenAiGovernorConfig
   /** Management API configuration */
   managementApi: ManagementApiConfig
   /** Context management configuration */
@@ -686,6 +697,15 @@ export const DEFAULT_USER_MODEL_OVERRIDES: UserModelOverrides = {}
 
 export const DEFAULT_TOOL_CALLING_CONFIG_VALUE = DEFAULT_TOOL_CALLING_CONFIG
 
+export const DEFAULT_QWEN_AI_GOVERNOR_CONFIG: QwenAiGovernorConfig = {
+  maxConcurrent: 1,
+  globalMinIntervalMs: 4000,
+  accountMinIntervalMs: 45000,
+  riskCooldownMs: 10 * 60 * 1000,
+  maxRiskCooldownMs: 30 * 60 * 1000,
+  failureCooldownMs: 2 * 60 * 1000,
+}
+
 /**
  * Default Management API Configuration
  */
@@ -817,6 +837,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   sessionConfig: DEFAULT_SESSION_CONFIG,
   toolCallingConfig: DEFAULT_TOOL_CALLING_CONFIG,
   toolPromptConfig: undefined,
+  qwenAiGovernorConfig: DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
   managementApi: DEFAULT_MANAGEMENT_API_CONFIG,
   contextManagement: DEFAULT_CONTEXT_MANAGEMENT_CONFIG,
 }

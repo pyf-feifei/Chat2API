@@ -12,9 +12,10 @@ import { storeManager } from '../store/store'
  */
 export class LoadBalancer {
   private roundRobinIndex: Map<string, number> = new Map()
-  private failedAccounts: Map<string, { count: number; lastFailTime: number }> = new Map()
+  private failedAccounts: Map<string, { count: number; lastFailTime: number; cooldownUntil?: number; reason?: string }> = new Map()
   private static readonly FAIL_THRESHOLD = 1
   private static readonly RECOVERY_TIME = 60000 // 1 minute
+  private static readonly QWEN_AI_RISK_COOLDOWN = 10 * 60 * 1000
 
   /**
    * Mark account as failed
@@ -24,7 +25,24 @@ export class LoadBalancer {
     this.failedAccounts.set(accountId, {
       count: current.count + 1,
       lastFailTime: Date.now(),
+      cooldownUntil: current.cooldownUntil,
+      reason: current.reason,
     })
+  }
+
+  markAccountCooldown(accountId: string, cooldownMs: number, reason: string): void {
+    const current = this.failedAccounts.get(accountId) || { count: 0, lastFailTime: 0 }
+    this.failedAccounts.set(accountId, {
+      count: current.count + 1,
+      lastFailTime: Date.now(),
+      cooldownUntil: Date.now() + cooldownMs,
+      reason,
+    })
+    console.warn(`[LoadBalancer] Account ${accountId} cooled down for ${Math.ceil(cooldownMs / 1000)}s: ${reason}`)
+  }
+
+  markQwenAiRiskControl(accountId: string): void {
+    this.markAccountCooldown(accountId, LoadBalancer.QWEN_AI_RISK_COOLDOWN, 'qwen_ai_risk_control')
   }
 
   /**
@@ -34,6 +52,41 @@ export class LoadBalancer {
     this.failedAccounts.delete(accountId)
   }
 
+  clearAllAccountFailures(): void {
+    this.failedAccounts.clear()
+  }
+
+  getAccountFailureSnapshot(): Record<string, {
+    count: number
+    lastFailTime: number
+    cooldownUntil?: number
+    reason?: string
+  }> {
+    const now = Date.now()
+    const snapshot: Record<string, {
+      count: number
+      lastFailTime: number
+      cooldownUntil?: number
+      reason?: string
+    }> = {}
+
+    for (const [accountId, failure] of this.failedAccounts.entries()) {
+      if (failure.cooldownUntil && failure.cooldownUntil <= now) {
+        this.failedAccounts.delete(accountId)
+        continue
+      }
+
+      if (!failure.cooldownUntil && now - failure.lastFailTime > LoadBalancer.RECOVERY_TIME) {
+        this.failedAccounts.delete(accountId)
+        continue
+      }
+
+      snapshot[accountId] = { ...failure }
+    }
+
+    return snapshot
+  }
+
   /**
    * Check if account is in failure state
    */
@@ -41,12 +94,34 @@ export class LoadBalancer {
     const failure = this.failedAccounts.get(accountId)
     if (!failure) return false
 
-    if (Date.now() - failure.lastFailTime > LoadBalancer.RECOVERY_TIME) {
+    const now = Date.now()
+    if (failure.cooldownUntil && failure.cooldownUntil > now) {
+      return true
+    }
+
+    if (failure.cooldownUntil && failure.cooldownUntil <= now) {
+      this.failedAccounts.delete(accountId)
+      return false
+    }
+
+    if (now - failure.lastFailTime > LoadBalancer.RECOVERY_TIME) {
       this.failedAccounts.delete(accountId)
       return false
     }
 
     return failure.count >= LoadBalancer.FAIL_THRESHOLD
+  }
+
+  private isAccountInHardCooldown(accountId: string): boolean {
+    const failure = this.failedAccounts.get(accountId)
+    if (!failure?.cooldownUntil) return false
+
+    if (failure.cooldownUntil <= Date.now()) {
+      this.failedAccounts.delete(accountId)
+      return false
+    }
+
+    return true
   }
 
   /**
@@ -112,6 +187,7 @@ export class LoadBalancer {
 
       const accounts = storeManager.getAccountsByProviderId(provider.id, true)
         .filter(account => this.isAccountAvailable(account))
+        .filter(account => !this.isAccountInHardCooldown(account.id))
         .filter(account => !excludeFailed || !this.isAccountInFailure(account.id))
 
       console.log(`[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`)

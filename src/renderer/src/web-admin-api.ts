@@ -9,6 +9,8 @@ import type {
   ProviderCheckResult,
   ProviderVendor,
   ProxyStatus,
+  QwenAiGovernorConfig,
+  QwenAiGovernorStatus,
   SystemPrompt,
 } from './types/electron'
 
@@ -947,6 +949,29 @@ const toolCalling = {
   },
 }
 
+const qwenAiGovernor = {
+  getStatus: (): Promise<QwenAiGovernorStatus | null> =>
+    managementFetch<QwenAiGovernorStatus>('/qwen-ai-governor/status'),
+
+  updateConfig: (updates: Partial<QwenAiGovernorConfig>): Promise<QwenAiGovernorConfig> =>
+    managementFetch<QwenAiGovernorConfig>('/qwen-ai-governor/config', {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    }),
+
+  clearAccountCooldown: async (accountId: string): Promise<void> => {
+    await managementFetch(`/qwen-ai-governor/accounts/${encodeURIComponent(accountId)}/cooldown`, {
+      method: 'DELETE',
+    })
+  },
+
+  clearAllCooldowns: async (): Promise<void> => {
+    await managementFetch('/qwen-ai-governor/cooldowns', {
+      method: 'DELETE',
+    })
+  },
+}
+
 const tray = {
   openDashboard: (): void => undefined,
   setHeight: (): void => undefined,
@@ -1013,6 +1038,7 @@ window.electronAPI = {
   managementApi,
   contextManagement,
   toolCalling,
+  qwenAiGovernor,
   tray,
   on,
   send,

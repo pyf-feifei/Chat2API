@@ -30,6 +30,44 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
 
 export type Theme = 'light' | 'dark' | 'system'
 
+export interface QwenAiGovernorConfig {
+  maxConcurrent: number
+  globalMinIntervalMs: number
+  accountMinIntervalMs: number
+  riskCooldownMs: number
+  maxRiskCooldownMs: number
+  failureCooldownMs: number
+}
+
+export interface QwenAiGovernorAccountStatus {
+  accountId: string
+  accountName: string
+  providerId: string
+  providerName: string
+  status: AccountStatus
+  queuedRequests: number
+  activeRequests: number
+  nextAvailableAt?: number
+  nextAvailableInMs: number
+  governorCooldownUntil?: number
+  governorCooldownInMs: number
+  governorCooldownReason?: string
+  governorFailures: number
+  loadBalancerCooldownUntil?: number
+  loadBalancerCooldownInMs: number
+  loadBalancerReason?: string
+  loadBalancerFailures: number
+}
+
+export interface QwenAiGovernorStatus {
+  config: QwenAiGovernorConfig
+  queueSize: number
+  activeRequests: number
+  globalNextAvailableAt?: number
+  globalNextAvailableInMs: number
+  accounts: QwenAiGovernorAccountStatus[]
+}
+
 export type {
   LegacyToolPromptConfig,
   ToolCallingConfig,
@@ -110,6 +148,7 @@ export interface AppConfig {
   sessionConfig: SessionConfig
   toolCallingConfig: ToolCallingConfig
   toolPromptConfig?: LegacyToolPromptConfig
+  qwenAiGovernorConfig: QwenAiGovernorConfig
   managementApi: ManagementApiConfig
   contextManagement?: unknown
   language: 'zh-CN' | 'en-US'
@@ -371,6 +410,7 @@ export interface ConfigUpdateRequest {
   sessionConfig?: SessionConfig
   toolCallingConfig?: Partial<ToolCallingConfig>
   toolPromptConfig?: LegacyToolPromptConfig
+  qwenAiGovernorConfig?: Partial<QwenAiGovernorConfig>
   managementApi?: ManagementApiConfig
 }
 

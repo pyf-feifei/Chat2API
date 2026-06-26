@@ -114,3 +114,90 @@ test('generated call IDs stay stable between emitted chunks and final state', ()
   assert.equal(emittedId, 'call_0')
   assert.deepEqual(parser.flush(baseChunk), [])
 })
+
+test('incomplete internal tool block is dropped on flush instead of leaking protocol text', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  assert.deepEqual(parser.push('<|CHAT2API|tool_calls><|CHAT2API|invoke', baseChunk), [])
+
+  assert.equal(parser.hasPendingToolProtocol(), true)
+  assert.deepEqual(parser.flush(baseChunk), [])
+  assert.equal(parser.hasPendingToolProtocol(), true)
+})
+
+test('partial internal tool block with complete parameter is recovered on flush', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  assert.deepEqual(
+    parser.push('<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter>', baseChunk),
+    [],
+  )
+
+  const chunks = parser.flush(baseChunk)
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments).filePath, '/tmp/a')
+})
+
+test('tool block with missing invoke close is kept until flush and recovered', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  assert.deepEqual(
+    parser.push('<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter></|CHAT2API|tool_calls>', baseChunk),
+    [],
+  )
+
+  const chunks = parser.flush(baseChunk)
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments).filePath, '/tmp/a')
+})
+
+test('tool block with incomplete parameter is dropped without fabricating a tool call', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  assert.deepEqual(
+    parser.push('<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath">"/tmp/a', baseChunk),
+    [],
+  )
+
+  assert.deepEqual(parser.flush(baseChunk), [])
+})
+
+test('accumulated answer content can recover a valid tool call at stream finish', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const content =
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>'
+
+  const chunks = parser.recoverFromContent(content, baseChunk, true)
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.role, 'assistant')
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments).filePath, '/tmp/a')
+  assert.deepEqual(parser.recoverFromContent(content, baseChunk), [])
+})
+
+test('accumulated answer content does not fabricate a call from incomplete arguments', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const content =
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a'
+
+  assert.deepEqual(parser.recoverFromContent(content, baseChunk), [])
+})
+
+test('mixed XML dialect tool block emits a tool call', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const chunks = parser.push(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><parameter name="filePath"><![CDATA[/tmp/a]]></parameter></invoke></tool_calls>',
+    baseChunk,
+  )
+
+  assert.equal(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(JSON.parse(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.arguments).filePath, '/tmp/a')
+})
+
+test('invalid internal tool block is dropped on flush instead of leaking protocol text', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  assert.deepEqual(
+    parser.push('<|CHAT2API|tool_calls><|CHAT2API|invoke name="missing"></|CHAT2API|invoke></|CHAT2API|tool_calls>', baseChunk),
+    [],
+  )
+
+  assert.deepEqual(parser.flush(baseChunk), [])
+})

@@ -137,6 +137,7 @@ test('tool_choice required preserves required policy on the plan', () => {
 
   assert.equal(result.plan.toolChoiceMode, 'required')
   assert.deepEqual([...result.plan.allowedToolNames].sort(), ['default_api:list_dir', 'default_api:read_file'])
+  assert.match(result.messages[0].content as string, /a tool call is required/)
 })
 
 test('forced function choice narrows allowed tool names to the selected function', () => {
@@ -149,6 +150,8 @@ test('forced function choice narrows allowed tool names to the selected function
   assert.equal(result.plan.toolChoiceMode, 'forced')
   assert.equal(result.plan.forcedToolName, 'default_api:list_dir')
   assert.deepEqual(result.plan.tools.map((tool) => tool.name), ['default_api:list_dir'])
+  assert.match(result.messages[0].content as string, /must call `default_api:list_dir`/)
+  assert.doesNotMatch(result.messages[0].content as string, /Tool `default_api:read_file`/)
 })
 
 test('non-stream parsing only accepts the selected provider protocol', () => {
@@ -172,4 +175,77 @@ test('non-stream parsing only accepts the selected provider protocol', () => {
 
   assert.equal(result.choices[0].message.tool_calls, undefined)
   assert.equal(result.choices[0].message.content, '[function_calls][call:default_api:read_file]{"filePath":"/tmp/a"}[/call][/function_calls]')
+})
+
+test('non-stream parsing recovers safely from malformed but complete managed XML', () => {
+  const engine = new ToolCallingEngine()
+  const transformed = engine.transformRequest({
+    request: request({ tool_choice: 'required' }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+  const result: any = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter>',
+      },
+      finish_reason: 'stop',
+    }],
+  }
+
+  engine.applyNonStreamResponse(result, transformed.plan)
+
+  assert.equal(result.choices[0].message.content, null)
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(JSON.parse(result.choices[0].message.tool_calls[0].function.arguments).filePath, '/tmp/a')
+  assert.equal(result.choices[0].finish_reason, 'tool_calls')
+})
+
+test('non-stream required tool call rejects malformed XML without complete parameters', () => {
+  const engine = new ToolCallingEngine()
+  const transformed = engine.transformRequest({
+    request: request({ tool_choice: 'required' }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+  const result: any = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a',
+      },
+      finish_reason: 'stop',
+    }],
+  }
+
+  assert.throws(
+    () => engine.applyNonStreamResponse(result, transformed.plan),
+    /malformed or empty tool call block/,
+  )
+  assert.equal(result.choices[0].message.tool_calls, undefined)
+})
+
+test('non-stream parsing removes malformed managed XML without fabricating optional tool calls', () => {
+  const engine = new ToolCallingEngine()
+  const transformed = engine.transformRequest({
+    request: request(),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+  const result: any = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: 'before <|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a after',
+      },
+      finish_reason: 'stop',
+    }],
+  }
+
+  engine.applyNonStreamResponse(result, transformed.plan)
+
+  assert.equal(result.choices[0].message.tool_calls, undefined)
+  assert.equal(result.choices[0].message.content, 'before')
+  assert.equal(result.choices[0].finish_reason, 'stop')
 })

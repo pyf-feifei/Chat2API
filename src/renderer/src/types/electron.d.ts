@@ -22,6 +22,8 @@ import type {
   ToolCallingConfig,
   LegacyToolPromptConfig,
   EffectiveModel,
+  QwenAiGovernorConfig,
+  QwenAiGovernorStatus,
 } from '../../../shared/types'
 
 export type { 
@@ -48,6 +50,8 @@ export type {
   ToolCallingConfig,
   LegacyToolPromptConfig,
   EffectiveModel,
+  QwenAiGovernorConfig,
+  QwenAiGovernorStatus,
 }
 
 export interface CustomProviderFormData {
@@ -483,6 +487,13 @@ interface ToolCallingAPI {
   runSmoke: (input: { clientAdapterId: string }) => Promise<{ success: boolean; data?: unknown; error?: { message?: string } }>
 }
 
+interface QwenAiGovernorAPI {
+  getStatus: () => Promise<QwenAiGovernorStatus | null>
+  updateConfig: (updates: Partial<QwenAiGovernorConfig>) => Promise<QwenAiGovernorConfig>
+  clearAccountCooldown: (accountId: string) => Promise<void>
+  clearAllCooldowns: () => Promise<void>
+}
+
 interface ElectronAPI {
   proxy: ProxyAPI
   store: StoreAPI
@@ -500,6 +511,7 @@ interface ElectronAPI {
   managementApi: ManagementApiAPI
   contextManagement: ContextManagementAPI
   toolCalling: ToolCallingAPI
+  qwenAiGovernor: QwenAiGovernorAPI
   tray: TrayAPI
   on: (channel: string, callback: (...args: unknown[]) => void) => () => void
   send: (channel: string, ...args: unknown[]) => void

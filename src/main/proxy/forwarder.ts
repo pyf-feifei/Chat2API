@@ -23,6 +23,7 @@ import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
 import { ToolCallingEngine } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
+import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 import { sessionManager } from './sessionManager'
 import {
   createContextManagementService,
@@ -99,7 +100,9 @@ export class RequestForwarder {
       name: 'qwen-ai',
       matches: QwenAiAdapter.isQwenAiProvider,
       forward: (request, account, provider, actualModel, startTime) =>
-        this.forwardQwenAi(request, account, provider, actualModel, startTime),
+        qwenAiRequestGovernor.run(account.id, () =>
+          this.forwardQwenAi(request, account, provider, actualModel, startTime),
+        ),
     },
     {
       name: 'zai',
@@ -861,7 +864,7 @@ export class RequestForwarder {
         }
       }
 
-      const handler = new QwenAiStreamHandler(actualModel)
+      const handler = new QwenAiStreamHandler(actualModel, undefined, transformed.plan)
       handler.setChatId(chatId)
 
       if (request.stream) {

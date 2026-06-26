@@ -52,7 +52,7 @@ export class ToolCallingEngine {
     }
 
     return {
-      messages: injectPrompt(request.messages, renderPrompt(plan.protocol, plan.tools, this.config)),
+      messages: injectPrompt(request.messages, renderPrompt(plan, this.config)),
       tools: undefined,
       plan,
     }
@@ -64,13 +64,24 @@ export class ToolCallingEngine {
     const message = result?.choices?.[0]?.message
     if (!message || typeof message.content !== 'string') return
 
-    const parseResult = parseSelectedProtocol(message.content, plan)
+    const parseResult = parseSelectedProtocol(message.content, plan, { allowPartial: true })
     plan.diagnostics.parserFormat = parseResult.protocol
     plan.diagnostics.parsedToolCallCount = parseResult.toolCalls.length
     plan.diagnostics.invalidToolNames = parseResult.invalidToolNames
     plan.diagnostics.malformedReason = parseResult.malformedReason
 
-    if (parseResult.toolCalls.length === 0) return
+    if (parseResult.toolCalls.length === 0) {
+      if (
+        parseResult.rawMatches.length > 0 &&
+        (plan.toolChoiceMode === 'forced' || plan.toolChoiceMode === 'required')
+      ) {
+        throw new Error('Provider returned a malformed or empty tool call block for a required tool call')
+      }
+      if (parseResult.rawMatches.length > 0) {
+        message.content = parseResult.content || null
+      }
+      return
+    }
 
     message.content = parseResult.content || null
     message.tool_calls = parseResult.toolCalls
@@ -81,11 +92,12 @@ export class ToolCallingEngine {
 }
 
 function renderPrompt(
-  protocol: ToolProtocolId,
-  tools: NormalizedToolDefinition[],
+  plan: ToolCallingPlan,
   config: ToolCallingConfig,
 ): string {
-  const prompt = getToolProtocol(protocol).renderPrompt(tools)
+  const protocolPrompt = getToolProtocol(plan.protocol).renderPrompt(plan.tools)
+  const policyPrompt = renderToolChoicePolicyPrompt(plan)
+  const prompt = policyPrompt ? `${protocolPrompt}\n\n${policyPrompt}` : protocolPrompt
   const customPromptTemplate = config.diagnosticsEnabled
     ? config.advanced.customPromptTemplate
     : undefined
@@ -93,8 +105,28 @@ function renderPrompt(
 
   return customPromptTemplate
     .replace(/\{\{tools\}\}/g, prompt)
-    .replace(/\{\{tool_names\}\}/g, tools.map((tool) => tool.name).join(', '))
-    .replace(/\{\{format\}\}/g, protocol)
+    .replace(/\{\{tool_names\}\}/g, plan.tools.map((tool) => tool.name).join(', '))
+    .replace(/\{\{format\}\}/g, plan.protocol)
+}
+
+function renderToolChoicePolicyPrompt(plan: ToolCallingPlan): string {
+  if (plan.toolChoiceMode === 'required') {
+    return [
+      'Tool choice policy: a tool call is required for this request.',
+      'Respond with one or more tool calls using only the listed tool names and the required protocol block.',
+      'Do not answer in natural language instead of calling a tool.',
+    ].join('\n')
+  }
+
+  if (plan.toolChoiceMode === 'forced' && plan.forcedToolName) {
+    return [
+      `Tool choice policy: you must call \`${plan.forcedToolName}\` for this request.`,
+      'Use only that tool name and the required protocol block.',
+      'Do not answer in natural language instead of calling the tool.',
+    ].join('\n')
+  }
+
+  return ''
 }
 
 function injectPrompt(messages: ChatMessage[], prompt: string): ChatMessage[] {
@@ -106,7 +138,15 @@ function injectPrompt(messages: ChatMessage[], prompt: string): ChatMessage[] {
   return [{ role: 'system', content: prompt }, ...messages]
 }
 
-function parseSelectedProtocol(content: string, plan: ToolCallingPlan) {
+function parseSelectedProtocol(
+  content: string,
+  plan: ToolCallingPlan,
+  options: { allowPartial?: boolean } = {},
+) {
   const selected = getToolProtocol(plan.protocol)
-  return selected.parse(content, { tools: plan.tools, protocol: plan.protocol })
+  return selected.parse(content, {
+    tools: plan.tools,
+    protocol: plan.protocol,
+    allowPartial: options.allowPartial,
+  })
 }

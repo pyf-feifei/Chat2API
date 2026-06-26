@@ -31,6 +31,7 @@ import {
   UserModelOverrides,
   CustomModel,
   DEFAULT_REQUEST_LOG_CONFIG,
+  DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -249,6 +250,10 @@ class StoreManager {
       ),
       toolCallingConfig: normalizeToolCallingConfig(rawToolCallingConfig),
       toolPromptConfig: undefined,
+      qwenAiGovernorConfig: {
+        ...DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
+        ...(rawConfig.qwenAiGovernorConfig || {}),
+      },
     }
   }
 
@@ -850,6 +855,13 @@ class StoreManager {
         ...currentConfig.requestLogConfig,
         ...updates.requestLogConfig,
       })
+    }
+
+    if (updates.qwenAiGovernorConfig) {
+      newConfig.qwenAiGovernorConfig = {
+        ...currentConfig.qwenAiGovernorConfig,
+        ...updates.qwenAiGovernorConfig,
+      }
     }
 
     const normalized = this.normalizeConfig(newConfig)

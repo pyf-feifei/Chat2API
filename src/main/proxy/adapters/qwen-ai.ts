@@ -9,9 +9,12 @@ import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import { Account, Provider } from '../../store/types'
 import type { ChatMessage } from '../types'
-import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
+import { hasToolUse, parseToolUse } from '../promptToolUse'
 import { QwenAiTokenRefresher } from './qwen-ai-token-refresh'
 import { QwenAiFileUploader, prepareQwenAiMultimodalMessage } from './qwen-ai-files'
+import { createBaseChunk } from '../utils/streamToolHandler'
+import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
+import type { ToolCallingPlan } from '../toolCalling/types'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 
@@ -607,19 +610,23 @@ export class QwenAiStreamHandler {
   private responseId: string = ''
   private content: string = ''
   private toolCallsSent: boolean = false
+  private toolStreamParser?: ToolStreamParser
+  private toolCallingPlan?: ToolCallingPlan
 
-  constructor(model: string, onEnd?: (chatId: string) => void) {
+  constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
+    this.toolCallingPlan = toolCallingPlan
+    this.toolStreamParser = toolCallingPlan?.shouldParseResponse ? new ToolStreamParser(toolCallingPlan) : undefined
   }
 
   setChatId(chatId: string) {
     this.chatId = chatId
   }
 
-  private sendToolCalls(transStream: PassThrough): void {
-    if (this.toolCallsSent) return
+  private sendToolCalls(transStream: PassThrough): boolean {
+    if (this.toolCallsSent) return true
     
     const toolCalls = parseToolUse(this.content)
     if (toolCalls && toolCalls.length > 0) {
@@ -668,7 +675,10 @@ export class QwenAiStreamHandler {
       if (this.onEnd && this.chatId) {
         this.onEnd(this.chatId)
       }
+      return true
     }
+
+    return false
   }
 
   async handleStream(stream: any): Promise<PassThrough> {
@@ -680,9 +690,104 @@ export class QwenAiStreamHandler {
     let hasSentReasoning = false
     let summaryText = ''
     let initialChunkSent = false
+    let finalChunkSent = false
+
+    const writeContent = (content: string) => {
+      if (!content || finalChunkSent) return
+
+      this.content += content
+
+      const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
+      const outputChunks = this.toolStreamParser?.push(content, baseChunk, !initialChunkSent) ?? [
+        {
+          ...baseChunk,
+          choices: [{ index: 0, delta: { content }, finish_reason: null }],
+        },
+      ]
+
+      for (const outputChunk of outputChunks) {
+        transStream.write(`data: ${JSON.stringify(outputChunk)}\n\n`)
+      }
+
+      if (outputChunks.length > 0) {
+        initialChunkSent = true
+        console.log('[QwenAI] Content/tool chunk written')
+      }
+    }
+
+    const finishAnswer = (finishReason: string = 'stop') => {
+      if (finalChunkSent) return
+      const hadPendingToolProtocol = this.toolStreamParser?.hasPendingToolProtocol() ?? false
+
+      const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
+      const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+      for (const outputChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outputChunk)}\n\n`)
+      }
+
+      const recoveredToolChunks = this.toolStreamParser?.recoverFromContent(this.content, baseChunk, !initialChunkSent) ?? []
+      for (const outputChunk of recoveredToolChunks) {
+        transStream.write(`data: ${JSON.stringify(outputChunk)}\n\n`)
+      }
+      if (recoveredToolChunks.length > 0) {
+        initialChunkSent = true
+        console.log('[QwenAI] Recovered tool call from accumulated answer content')
+      }
+
+      if (hasToolUse(this.content)) {
+        console.log('[QwenAI] Found legacy tool_use in stream, sending tool_calls')
+        if (this.sendToolCalls(transStream)) {
+          finalChunkSent = true
+          return
+        }
+      }
+
+      if (
+        this.toolCallingPlan?.shouldParseResponse &&
+        !this.toolStreamParser?.hasEmittedToolCall() &&
+        hadPendingToolProtocol &&
+        (this.toolCallingPlan.toolChoiceMode === 'forced' || this.toolCallingPlan.toolChoiceMode === 'required')
+      ) {
+        const errorEvent = {
+          error: {
+            message: 'Provider returned a malformed or empty tool call block for a required tool call',
+            type: 'tool_call_parse_error',
+            param: 'tool_calls',
+            code: 'malformed_tool_call',
+          },
+        }
+        transStream.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+        transStream.write('data: [DONE]\n\n')
+        transStream.end()
+        finalChunkSent = true
+
+        if (this.onEnd && this.chatId) {
+          this.onEnd(this.chatId)
+        }
+        return
+      }
+
+      const resolvedFinishReason = this.toolStreamParser?.hasEmittedToolCall()
+        ? 'tool_calls'
+        : finishReason
+      const finalChunk = {
+        id: this.responseId || this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: resolvedFinishReason }],
+        created: this.created,
+      }
+      transStream.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+      transStream.end('data: [DONE]\n\n')
+      finalChunkSent = true
+
+      if (this.onEnd && this.chatId) {
+        this.onEnd(this.chatId)
+      }
+    }
 
     const sendInitialChunk = () => {
-      if (!initialChunkSent) {
+      if (!initialChunkSent && !this.toolStreamParser) {
         const initialChunk = `data: ${JSON.stringify({
           id: '',
           model: this.model,
@@ -793,61 +898,16 @@ export class QwenAiStreamHandler {
                 sendInitialChunk()
               }
               console.log('[QwenAI] Entering answer branch, content:', content)
-              
-              // Accumulate content for tool call detection
-              this.content += content
-              
-              if (content) {
-                console.log('[QwenAI] Sending content chunk:', content)
-                const chunk = {
-                  id: this.responseId || this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content }, finish_reason: null }],
-                  created: this.created,
-                }
-                transStream.write(`data: ${JSON.stringify(chunk)}\n\n`)
-                console.log('[QwenAI] Content chunk written')
-              }
+              writeContent(content)
             } else if (phase === null && content) {
               if (!initialChunkSent) {
                 sendInitialChunk()
               }
-              // Accumulate content for tool call detection
-              this.content += content
-              
-              const chunk = {
-                id: this.responseId || this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content }, finish_reason: null }],
-                created: this.created,
-              }
-              transStream.write(`data: ${JSON.stringify(chunk)}\n\n`)
+              writeContent(content)
             }
 
             if (status === 'finished' && (phase === 'answer' || phase === null)) {
-              // Check for tool calls before sending stop
-              if (hasToolUse(this.content)) {
-                console.log('[QwenAI] Found tool_use in stream, sending tool_calls')
-                this.sendToolCalls(transStream)
-                return
-              }
-              
-              const finishReason = delta.finish_reason || 'stop'
-              const finalChunk = {
-                id: this.responseId || this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                created: this.created,
-              }
-              transStream.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
-              transStream.end('data: [DONE]\n\n')
-
-              if (this.onEnd && this.chatId) {
-                this.onEnd(this.chatId)
-              }
+              finishAnswer(delta.finish_reason || 'stop')
             }
           }
         } catch (err) {
@@ -863,11 +923,14 @@ export class QwenAiStreamHandler {
     })
     stream.once('error', (err: Error) => {
       console.error('[QwenAI] Stream error:', err)
+      finalChunkSent = true
       transStream.end('data: [DONE]\n\n')
     })
     stream.once('close', () => {
       console.log('[QwenAI] Stream closed')
-      transStream.end('data: [DONE]\n\n')
+      if (!finalChunkSent) {
+        finishAnswer('stop')
+      }
     })
 
     return transStream

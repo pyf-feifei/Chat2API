@@ -78,6 +78,7 @@ export interface ToolCallingTransformResult {
 export interface ToolParseContext {
   tools: NormalizedToolDefinition[]
   protocol: ToolProtocolId
+  allowPartial?: boolean
 }
 
 export interface ToolParseResult {

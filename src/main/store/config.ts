@@ -13,6 +13,28 @@ import {
 } from './types'
 import { normalizeToolCallingConfig } from '../../shared/toolCalling'
 
+function validateNonNegativeInteger(
+  value: unknown,
+  key: string,
+  errors: string[],
+  options: { min?: number; max?: number } = {},
+): void {
+  if (value === undefined) return
+
+  if (!Number.isInteger(value)) {
+    errors.push(`${key} must be an integer`)
+    return
+  }
+
+  const min = options.min ?? 0
+  const max = options.max
+  const numberValue = value as number
+
+  if (numberValue < min || (max !== undefined && numberValue > max)) {
+    errors.push(`${key} must be between ${min}-${max ?? 'unlimited'}`)
+  }
+}
+
 /**
  * Config Manager class
  * Provides all operations related to app configuration
@@ -349,6 +371,53 @@ export class ConfigManager {
         !['standard-openai-tools', 'cherry-studio-mcp'].includes(String(config.toolCallingConfig.clientAdapterId))
       ) {
         errors.push('toolCallingConfig.clientAdapterId must be one of: standard-openai-tools, cherry-studio-mcp')
+      }
+    }
+
+    if (config.qwenAiGovernorConfig) {
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.maxConcurrent,
+        'qwenAiGovernorConfig.maxConcurrent',
+        errors,
+        { min: 1, max: 10 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.globalMinIntervalMs,
+        'qwenAiGovernorConfig.globalMinIntervalMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.accountMinIntervalMs,
+        'qwenAiGovernorConfig.accountMinIntervalMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.riskCooldownMs,
+        'qwenAiGovernorConfig.riskCooldownMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.maxRiskCooldownMs,
+        'qwenAiGovernorConfig.maxRiskCooldownMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.failureCooldownMs,
+        'qwenAiGovernorConfig.failureCooldownMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+
+      if (
+        typeof config.qwenAiGovernorConfig.riskCooldownMs === 'number' &&
+        typeof config.qwenAiGovernorConfig.maxRiskCooldownMs === 'number' &&
+        config.qwenAiGovernorConfig.maxRiskCooldownMs < config.qwenAiGovernorConfig.riskCooldownMs
+      ) {
+        errors.push('qwenAiGovernorConfig.maxRiskCooldownMs must be greater than or equal to riskCooldownMs')
       }
     }
     
