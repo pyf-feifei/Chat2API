@@ -6,6 +6,7 @@ import {
   createParseResult,
   detectMarkers,
   escapeXmlAttribute,
+  getMissingRequiredArguments,
   parseJsonValue,
   renderToolList,
   stripFencedCodeBlocks,
@@ -48,6 +49,13 @@ You can invoke the following developer tools. Tool names are case-sensitive.
 Use only the exact tool names listed below. Do not rename, camelCase, translate, shorten, or invent tool names.
 
 ${renderToolList(tools)}
+
+Tool-use requirements:
+- If the user asks you to inspect files, create or modify files, run commands, install dependencies, execute tests, or verify behavior in the environment, you must call the appropriate tool.
+- Do not claim that files were created, commands were run, tests passed, or behavior was verified unless the corresponding tool result shows it.
+- If a tool argument schema says a field is an array, provide a JSON array for that field, even when there is only one item.
+- Each tool call must include every field listed in that tool schema's required array in the same call; do not send an empty tool call or split required fields across multiple calls.
+- If a tool call fails because the arguments do not match the schema, fix the arguments according to the schema and call the tool again.
 
 When calling tools, respond with only this Chat2API XML block:
 
@@ -218,8 +226,20 @@ function parseInvokes(content: string, options: ParseInvokeOptions): void {
 
     const rawEnd = close ? close.index + close.marker.length : bodyEnd
     const rawText = content.slice(invokeMatch.index, rawEnd)
+    const tool = options.toolDefinitions.get(name)
+    if (getMissingRequiredArguments(parsedArgs.args, tool).length > 0) {
+      continue
+    }
+
     options.toolCalls.push(
-      buildToolCall(`call_${options.toolCalls.length}`, options.toolCalls.length, name, JSON.stringify(parsedArgs.args), rawText),
+      buildToolCall(
+        `call_${options.toolCalls.length}`,
+        options.toolCalls.length,
+        name,
+        JSON.stringify(parsedArgs.args),
+        rawText,
+        tool,
+      ),
     )
   }
 }

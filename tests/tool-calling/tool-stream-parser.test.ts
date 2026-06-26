@@ -221,3 +221,38 @@ test('invalid internal tool block is dropped on flush instead of leaking protoco
 
   assert.deepEqual(parser.flush(baseChunk), [])
 })
+
+test('large streamed context before a tool block still emits the later tool call', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const longContext = 'context line with no tool marker\n'.repeat(60_000)
+
+  const contextChunks = parser.push(longContext, baseChunk)
+  assert.equal(contextChunks.length, 1)
+  assert.equal(contextChunks[0].choices[0].delta.content, longContext)
+
+  const chunks = parser.push(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/large-context.txt]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    baseChunk,
+  )
+
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.deepEqual(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments), {
+    filePath: '/tmp/large-context.txt',
+  })
+})
+
+test('large accumulated content can recover a final tool call without fabricating arguments', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const longContext = 'background token block without a valid marker\n'.repeat(60_000)
+  const content = `${longContext}<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/recovered-large-context.txt]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>`
+
+  const chunks = parser.recoverFromContent(content, baseChunk, true)
+
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.role, 'assistant')
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.deepEqual(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments), {
+    filePath: '/tmp/recovered-large-context.txt',
+  })
+})

@@ -176,19 +176,29 @@ function parseBufferedToolCall(
 function findMarkerStart(buffer: string, plan: ToolCallingPlan): { matched: boolean; partial: boolean; index: number } {
   const protocol = getToolProtocol(plan.protocol)
   const ranges = fencedRanges(buffer)
+  let searchStart = 0
   let partialIndex = -1
 
-  for (let index = 0; index < buffer.length; index += 1) {
-    if (isInsideRange(index, ranges)) continue
+  while (searchStart < buffer.length) {
+    const detection = protocol.detectStart(buffer.slice(searchStart))
+    const markerStart = detection.markerStart
+    if (markerStart === undefined) break
 
-    const suffix = buffer.slice(index)
-    const detection = protocol.detectStart(suffix)
-    if (detection.matched && detection.markerStart === 0) {
+    const index = searchStart + markerStart
+    if (isInsideRange(index, ranges)) {
+      const range = ranges.find((item) => index >= item.start && index < item.end)
+      searchStart = range ? range.end : index + 1
+      continue
+    }
+
+    if (detection.matched) {
       return { matched: true, partial: false, index }
     }
-    if (detection.partial && detection.markerStart === 0 && partialIndex === -1) {
+
+    if (detection.partial) {
       partialIndex = index
     }
+    break
   }
 
   return partialIndex === -1
@@ -197,14 +207,8 @@ function findMarkerStart(buffer: string, plan: ToolCallingPlan): { matched: bool
 }
 
 function hasProtocolMarker(buffer: string, plan: ToolCallingPlan): boolean {
-  const protocol = getToolProtocol(plan.protocol)
-  for (let index = 0; index < buffer.length; index += 1) {
-    const detection = protocol.detectStart(buffer.slice(index))
-    if (detection.matched || detection.partial) {
-      return true
-    }
-  }
-  return false
+  const detection = findMarkerStart(buffer, plan)
+  return detection.matched || detection.partial
 }
 
 function mayBecomeValidToolCall(buffer: string, plan: ToolCallingPlan): boolean {
