@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -18,33 +19,56 @@ import type { QwenAiGovernorConfig, QwenAiGovernorStatus } from '@/types/electro
 import { Gauge, RefreshCw, ShieldAlert, Snowflake, Trash2 } from 'lucide-react'
 
 type FormState = {
+  autoTuneEnabled: boolean
+  autoTuneMaxConcurrent: string
+  autoTuneMinGlobalIntervalSec: string
   maxConcurrent: string
   globalMinIntervalSec: string
   accountMinIntervalSec: string
   riskCooldownMin: string
   maxRiskCooldownMin: string
   failureCooldownMin: string
+  globalRiskCooldownMin: string
+  maxGlobalRiskCooldownMin: string
+  riskWindowMin: string
+  globalRiskThreshold: string
 }
+
+type NumericFormField = Exclude<keyof FormState, 'autoTuneEnabled'>
 
 function toFormState(config: QwenAiGovernorConfig): FormState {
   return {
+    autoTuneEnabled: config.autoTuneEnabled,
+    autoTuneMaxConcurrent: String(config.autoTuneMaxConcurrent),
+    autoTuneMinGlobalIntervalSec: String(Math.round(config.autoTuneMinGlobalIntervalMs / 1000)),
     maxConcurrent: String(config.maxConcurrent),
     globalMinIntervalSec: String(Math.round(config.globalMinIntervalMs / 1000)),
     accountMinIntervalSec: String(Math.round(config.accountMinIntervalMs / 1000)),
     riskCooldownMin: String(Math.round(config.riskCooldownMs / 60000)),
     maxRiskCooldownMin: String(Math.round(config.maxRiskCooldownMs / 60000)),
     failureCooldownMin: String(Math.round(config.failureCooldownMs / 60000)),
+    globalRiskCooldownMin: String(Math.round(config.globalRiskCooldownMs / 60000)),
+    maxGlobalRiskCooldownMin: String(Math.round(config.maxGlobalRiskCooldownMs / 60000)),
+    riskWindowMin: String(Math.round(config.riskWindowMs / 60000)),
+    globalRiskThreshold: String(config.globalRiskThreshold),
   }
 }
 
 function toConfig(form: FormState): QwenAiGovernorConfig {
   return {
+    autoTuneEnabled: form.autoTuneEnabled,
+    autoTuneMaxConcurrent: Number.parseInt(form.autoTuneMaxConcurrent, 10),
+    autoTuneMinGlobalIntervalMs: Number.parseInt(form.autoTuneMinGlobalIntervalSec, 10) * 1000,
     maxConcurrent: Number.parseInt(form.maxConcurrent, 10),
     globalMinIntervalMs: Number.parseInt(form.globalMinIntervalSec, 10) * 1000,
     accountMinIntervalMs: Number.parseInt(form.accountMinIntervalSec, 10) * 1000,
     riskCooldownMs: Number.parseInt(form.riskCooldownMin, 10) * 60000,
     maxRiskCooldownMs: Number.parseInt(form.maxRiskCooldownMin, 10) * 60000,
     failureCooldownMs: Number.parseInt(form.failureCooldownMin, 10) * 60000,
+    globalRiskCooldownMs: Number.parseInt(form.globalRiskCooldownMin, 10) * 60000,
+    maxGlobalRiskCooldownMs: Number.parseInt(form.maxGlobalRiskCooldownMin, 10) * 60000,
+    riskWindowMs: Number.parseInt(form.riskWindowMin, 10) * 60000,
+    globalRiskThreshold: Number.parseInt(form.globalRiskThreshold, 10),
   }
 }
 
@@ -116,17 +140,26 @@ export function QwenAiGovernorPanel() {
     return () => window.clearInterval(interval)
   }, [loadStatus])
 
-  const updateField = (field: keyof FormState, value: string) => {
+  const updateField = (field: NumericFormField, value: string) => {
     if (!/^\d*$/.test(value)) return
     setForm(prev => prev ? { ...prev, [field]: value } : prev)
   }
 
   const validateForm = (): boolean => {
     if (!form) return false
-    const fields = Object.values(form)
+    const fields = Object.entries(form)
+      .filter(([field]) => field !== 'autoTuneEnabled')
+      .map(([, value]) => String(value))
     if (fields.some(value => !isPositiveInteger(value))) return false
     const config = toConfig(form)
-    return config.maxConcurrent >= 1 && config.maxRiskCooldownMs >= config.riskCooldownMs
+    return (
+      config.maxConcurrent >= 1 &&
+      config.autoTuneMaxConcurrent >= 1 &&
+      config.globalRiskThreshold >= 1 &&
+      config.riskWindowMs >= 1000 &&
+      config.maxRiskCooldownMs >= config.riskCooldownMs &&
+      config.maxGlobalRiskCooldownMs >= config.globalRiskCooldownMs
+    )
   }
 
   const handleSave = async () => {
@@ -203,14 +236,71 @@ export function QwenAiGovernorPanel() {
               <p className="mt-1 text-2xl font-semibold">{formatDuration(status?.globalNextAvailableInMs ?? 0)}</p>
             </div>
             <div className="rounded-md border p-4">
+              <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.globalCircuit')}</p>
+              <p className="mt-1 text-2xl font-semibold">{formatDuration(status?.globalCooldownInMs ?? 0)}</p>
+              {status?.globalCooldownReason && (
+                <p className="mt-1 truncate text-xs text-muted-foreground">{status.globalCooldownReason}</p>
+              )}
+            </div>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-4">
+            <div className="rounded-md border p-4">
               <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.cooldownAccounts')}</p>
               <p className="mt-1 text-2xl font-semibold">{cooledAccounts.length}</p>
+            </div>
+            <div className="rounded-md border p-4">
+              <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.recentRiskEvents')}</p>
+              <p className="mt-1 text-2xl font-semibold">{status?.recentRiskEvents ?? 0}</p>
+            </div>
+            <div className="rounded-md border p-4">
+              <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.healthyAccounts')}</p>
+              <p className="mt-1 text-2xl font-semibold">{status?.effectiveConfig.healthyAccountCount ?? 0}</p>
+            </div>
+            <div className="rounded-md border p-4">
+              <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.effectiveLimit')}</p>
+              <p className="mt-1 text-2xl font-semibold">
+                {status?.effectiveConfig.maxConcurrent ?? 0} / {formatDuration(status?.effectiveConfig.globalMinIntervalMs ?? 0)}
+              </p>
+              {status?.effectiveConfig.autoTuneReason && (
+                <p className="mt-1 truncate text-xs text-muted-foreground">{status.effectiveConfig.autoTuneReason}</p>
+              )}
             </div>
           </div>
 
           {form && (
             <div className="space-y-4">
+              <div className="flex items-center justify-between rounded-md border p-4">
+                <div className="space-y-1">
+                  <Label htmlFor="qwen-auto-tune">{t('proxy.qwenGovernor.autoTune')}</Label>
+                  <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.autoTuneDesc')}</p>
+                </div>
+                <Switch
+                  id="qwen-auto-tune"
+                  checked={form.autoTuneEnabled}
+                  onCheckedChange={(checked) => setForm(prev => prev ? { ...prev, autoTuneEnabled: checked } : prev)}
+                />
+              </div>
+
               <div className="grid gap-4 md:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor="qwen-auto-max-concurrent">{t('proxy.qwenGovernor.autoTuneMaxConcurrent')}</Label>
+                  <Input
+                    id="qwen-auto-max-concurrent"
+                    value={form.autoTuneMaxConcurrent}
+                    onChange={(event) => updateField('autoTuneMaxConcurrent', event.target.value)}
+                    inputMode="numeric"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="qwen-auto-min-global-interval">{t('proxy.qwenGovernor.autoTuneMinGlobalInterval')}</Label>
+                  <Input
+                    id="qwen-auto-min-global-interval"
+                    value={form.autoTuneMinGlobalIntervalSec}
+                    onChange={(event) => updateField('autoTuneMinGlobalIntervalSec', event.target.value)}
+                    inputMode="numeric"
+                  />
+                </div>
                 <div className="space-y-2">
                   <Label htmlFor="qwen-max-concurrent">{t('proxy.qwenGovernor.maxConcurrent')}</Label>
                   <Input
@@ -262,6 +352,42 @@ export function QwenAiGovernorPanel() {
                     id="qwen-failure-cooldown"
                     value={form.failureCooldownMin}
                     onChange={(event) => updateField('failureCooldownMin', event.target.value)}
+                    inputMode="numeric"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="qwen-global-risk-cooldown">{t('proxy.qwenGovernor.globalRiskCooldown')}</Label>
+                  <Input
+                    id="qwen-global-risk-cooldown"
+                    value={form.globalRiskCooldownMin}
+                    onChange={(event) => updateField('globalRiskCooldownMin', event.target.value)}
+                    inputMode="numeric"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="qwen-max-global-risk-cooldown">{t('proxy.qwenGovernor.maxGlobalRiskCooldown')}</Label>
+                  <Input
+                    id="qwen-max-global-risk-cooldown"
+                    value={form.maxGlobalRiskCooldownMin}
+                    onChange={(event) => updateField('maxGlobalRiskCooldownMin', event.target.value)}
+                    inputMode="numeric"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="qwen-risk-window">{t('proxy.qwenGovernor.riskWindow')}</Label>
+                  <Input
+                    id="qwen-risk-window"
+                    value={form.riskWindowMin}
+                    onChange={(event) => updateField('riskWindowMin', event.target.value)}
+                    inputMode="numeric"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="qwen-global-risk-threshold">{t('proxy.qwenGovernor.globalRiskThreshold')}</Label>
+                  <Input
+                    id="qwen-global-risk-threshold"
+                    value={form.globalRiskThreshold}
+                    onChange={(event) => updateField('globalRiskThreshold', event.target.value)}
                     inputMode="numeric"
                   />
                 </div>

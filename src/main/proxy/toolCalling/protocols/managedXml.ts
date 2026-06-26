@@ -286,6 +286,12 @@ function addParsedParameter(
   value: unknown,
   tool?: NormalizedToolDefinition,
 ): void {
+  const unwrappedValue = unwrapRedundantNamedArgument(name, value, tool)
+  if (unwrappedValue !== value) {
+    addParameter(args, name, unwrappedValue)
+    return
+  }
+
   if (shouldFlattenWrapperArgument(name, value, tool)) {
     for (const [key, nestedValue] of Object.entries(value as Record<string, unknown>)) {
       addParameter(args, key, nestedValue)
@@ -294,6 +300,22 @@ function addParsedParameter(
   }
 
   addParameter(args, name, value)
+}
+
+function unwrapRedundantNamedArgument(
+  name: string,
+  value: unknown,
+  tool?: NormalizedToolDefinition,
+): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+
+  const entries = Object.entries(value as Record<string, unknown>)
+  if (entries.length !== 1 || entries[0][0] !== name) return value
+
+  const properties = getSchemaProperties(tool)
+  if (!properties.has(name)) return value
+
+  return entries[0][1]
 }
 
 function shouldFlattenWrapperArgument(

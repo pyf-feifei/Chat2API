@@ -96,6 +96,26 @@ test('invalid tool name is not emitted as a tool call', () => {
   assert.equal(chunks.some((chunk) => chunk.choices[0].delta.tool_calls), false)
 })
 
+test('duplicate equivalent XML tool calls are emitted once', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const chunks = parser.push(
+    '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>',
+    baseChunk,
+  )
+
+  const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
+  assert.equal(toolChunks.length, 1)
+  assert.equal(toolChunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+})
+
+test('duplicate equivalent XML tool calls across chunks are emitted once', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const block = '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>'
+
+  assert.equal(parser.push(block, baseChunk).filter((chunk) => chunk.choices[0].delta.tool_calls).length, 1)
+  assert.deepEqual(parser.push(block, baseChunk), [])
+})
+
 test('fenced code block examples are emitted as text and never as tool calls', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   const text = '```xml\n<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">fake</parameter></invoke></tool_calls>\n```'

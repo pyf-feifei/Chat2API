@@ -375,6 +375,24 @@ export class ConfigManager {
     }
 
     if (config.qwenAiGovernorConfig) {
+      if (
+        config.qwenAiGovernorConfig.autoTuneEnabled !== undefined &&
+        typeof config.qwenAiGovernorConfig.autoTuneEnabled !== 'boolean'
+      ) {
+        errors.push('qwenAiGovernorConfig.autoTuneEnabled must be a boolean')
+      }
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.autoTuneMaxConcurrent,
+        'qwenAiGovernorConfig.autoTuneMaxConcurrent',
+        errors,
+        { min: 1, max: 10 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.autoTuneMinGlobalIntervalMs,
+        'qwenAiGovernorConfig.autoTuneMinGlobalIntervalMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
       validateNonNegativeInteger(
         config.qwenAiGovernorConfig.maxConcurrent,
         'qwenAiGovernorConfig.maxConcurrent',
@@ -411,6 +429,30 @@ export class ConfigManager {
         errors,
         { max: 24 * 60 * 60 * 1000 },
       )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.globalRiskCooldownMs,
+        'qwenAiGovernorConfig.globalRiskCooldownMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.maxGlobalRiskCooldownMs,
+        'qwenAiGovernorConfig.maxGlobalRiskCooldownMs',
+        errors,
+        { max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.riskWindowMs,
+        'qwenAiGovernorConfig.riskWindowMs',
+        errors,
+        { min: 1000, max: 24 * 60 * 60 * 1000 },
+      )
+      validateNonNegativeInteger(
+        config.qwenAiGovernorConfig.globalRiskThreshold,
+        'qwenAiGovernorConfig.globalRiskThreshold',
+        errors,
+        { min: 1, max: 100 },
+      )
 
       if (
         typeof config.qwenAiGovernorConfig.riskCooldownMs === 'number' &&
@@ -418,6 +460,14 @@ export class ConfigManager {
         config.qwenAiGovernorConfig.maxRiskCooldownMs < config.qwenAiGovernorConfig.riskCooldownMs
       ) {
         errors.push('qwenAiGovernorConfig.maxRiskCooldownMs must be greater than or equal to riskCooldownMs')
+      }
+
+      if (
+        typeof config.qwenAiGovernorConfig.globalRiskCooldownMs === 'number' &&
+        typeof config.qwenAiGovernorConfig.maxGlobalRiskCooldownMs === 'number' &&
+        config.qwenAiGovernorConfig.maxGlobalRiskCooldownMs < config.qwenAiGovernorConfig.globalRiskCooldownMs
+      ) {
+        errors.push('qwenAiGovernorConfig.maxGlobalRiskCooldownMs must be greater than or equal to globalRiskCooldownMs')
       }
     }
     

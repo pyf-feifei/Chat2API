@@ -32,6 +32,101 @@ test('Qwen AI has a dedicated multimodal upload helper', () => {
   assert.doesNotMatch(source, /console\.log\([^)]*base64/i)
 })
 
+test('Qwen AI document upload waits for parse completion with a bounded timeout', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+
+  assert.match(source, /const PARSE_POLL_TIMEOUT_MS = 120000/)
+  assert.match(source, /while \(Date\.now\(\) < deadline\)/)
+  assert.match(source, /Qwen AI file parse timed out after/)
+  assert.doesNotMatch(source, /const PARSE_POLL_ATTEMPTS = 5/)
+})
+
+test('Qwen AI long text documents add generic evidence excerpts near the user request', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+
+  assert.match(source, /QWEN_AI_DOCUMENT_EVIDENCE_MARKER/)
+  assert.match(source, /createDocumentEvidence\(file,\s*evidenceQueryText\)/)
+  assert.match(source, /renderDocumentEvidence\(evidences\)/)
+  assert.match(source, /TEXT_DOCUMENT_MIME_TYPES/)
+  assert.match(source, /TEXT_DOCUMENT_EXTENSIONS/)
+  assert.match(source, /KEY_VALUE_LINE_PATTERN/)
+  assert.match(source, /KEY_VALUE_CONTEXT_PATTERN/)
+  assert.match(source, /PATH_VALUE_CONTEXT_PATTERN/)
+  assert.match(source, /Use only values that are present in the excerpts or the attached documents/)
+  assert.match(source, /content = documentEvidence\s*\?\s*`\$\{userContent\}\\n\\n\$\{documentEvidence\}`/)
+})
+
+test('Qwen AI document evidence is bounded and configurable instead of hard-coded to one fixture', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+
+  assert.match(source, /QWEN_AI_DOCUMENT_EVIDENCE_MAX_TEXT_BYTES/)
+  assert.match(source, /QWEN_AI_DOCUMENT_EVIDENCE_MAX_TOTAL_CHARS/)
+  assert.match(source, /QWEN_AI_DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS/)
+  assert.match(source, /positiveIntegerFromEnv/)
+  assert.match(source, /selectEvidenceSnippets\(decoded\.text,\s*queryText\)/)
+  assert.doesNotMatch(source, /TARGET_PATH/)
+  assert.doesNotMatch(source, /file-context-extra/)
+  assert.doesNotMatch(source, /long-context-extra/)
+})
+
+test('Qwen AI does not forge or rewrite tool arguments from document evidence', () => {
+  const adapterSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const filesSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+
+  assert.doesNotMatch(adapterSource, /filePath['"]?\s*[:=]/)
+  assert.doesNotMatch(adapterSource, /arguments\s*=\s*.*preparedUserMessage/)
+  assert.doesNotMatch(filesSource, /finish_reason/)
+})
+
+test('Qwen AI multimodal helper preserves full tool-call transcript instead of only the last user message', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+
+  assert.match(source, /function buildQwenAiTranscript\(messages: ChatMessage\[\]\)/)
+  assert.match(source, /getProviderToolProfile\('qwen'\)/)
+  assert.match(source, /msg\.role === 'assistant'/)
+  assert.match(source, /msg\.tool_calls\?\.length/)
+  assert.match(source, /formatAssistantToolCalls\(msg\.tool_calls\.map/)
+  assert.match(source, /msg\.role === 'tool'/)
+  assert.match(source, /formatToolResult\(\{/)
+  assert.match(source, /already executed by the client/)
+  assert.match(source, /Do not repeat the same tool call unless/)
+  assert.match(source, /fileParts\.push\(\.\.\.messageFileParts\)/)
+  assert.match(source, /buildQwenAiTranscript\(messages\)/)
+  assert.doesNotMatch(source, /userContent = textFromContent\(msg\.content\)/)
+  assert.doesNotMatch(source, /fileParts\.splice\(0,\s*fileParts\.length/)
+})
+
+test('Qwen AI stream converts only declared upstream native function calls without fabricated arguments', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const nativeToolsSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai-native-tools.ts', 'utf8')
+
+  assert.match(source, /normalizeNativeFunctionCallDelta/)
+  assert.match(nativeToolsSource, /delta\.function_call/)
+  assert.match(nativeToolsSource, /delta\.tool_calls/)
+  assert.match(source, /toolCallingPlan\.allowedToolNames\.has\(name\)/)
+  assert.match(source, /Ignoring undeclared upstream native tool call/)
+  assert.match(source, /isCompleteJsonText\(state\.arguments\)/)
+  assert.match(source, /mergeNativeToolArguments\(existing\?\.arguments \?\? '', fragment\.arguments\)/)
+  assert.match(source, /arguments:\s*state\.arguments/)
+  assert.match(source, /finish_reason:\s*'tool_calls'/)
+  assert.doesNotMatch(source, /function:\s*\{[\s\S]{0,120}arguments:\s*['"]\{\}['"]/)
+})
+
+test('Qwen AI stream isolates the primary upstream response branch before parsing tool calls', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /ignoredResponseIds = new Set<string>\(\)/)
+  assert.match(source, /responseBranchLocked = false/)
+  assert.match(source, /processedResponseEvent = false/)
+  assert.match(source, /recordResponseCreated\(created: Record<string, any>\)/)
+  assert.match(source, /shouldProcessResponseEvent\(data: Record<string, any>\)/)
+  assert.match(source, /response_index/)
+  assert.match(source, /Ignoring secondary response branch/)
+  assert.match(source, /eventResponseId !== this\.responseId/)
+  assert.match(source, /if \(!this\.shouldProcessResponseEvent\(data\)\)/)
+  assert.match(source, /if \(!this\.shouldProcessResponseEvent\(parsed\)\)/)
+})
+
 test('Qwen AI multimodal helper accepts audio and video inputs', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
 
@@ -68,11 +163,21 @@ test('Qwen AI adapter sends prepared multimodal files instead of a fixed empty l
   assert.doesNotMatch(source, /files:\s*\[\]/)
 })
 
+test('Qwen AI adapter request timeout is configurable for long-context document runs', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS/)
+  assert.match(source, /process\.env\.QWEN_AI_REQUEST_TIMEOUT_MS \|\| 300000/)
+  assert.doesNotMatch(source, /timeout:\s*120000/)
+})
+
 test('Qwen AI adapter redacts sensitive request headers in logs', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
   assert.match(source, /sanitizeHeadersForLog/)
   assert.match(source, /sanitizePayloadForLog/)
+  assert.match(source, /QWEN_AI_DOCUMENT_EVIDENCE_MARKER/)
+  assert.match(source, /REDACTED_DOCUMENT_EVIDENCE/)
   assert.match(source, /JSON\.stringify\(this\.sanitizeHeadersForLog\(this\.getHeaders\(chatId\)\)/)
   assert.match(source, /JSON\.stringify\(this\.sanitizeHeadersForLog\(response\.headers\)/)
   assert.match(source, /JSON\.stringify\(this\.sanitizePayloadForLog\(payload\)/)

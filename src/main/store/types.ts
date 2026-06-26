@@ -85,12 +85,19 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
 export type Theme = 'light' | 'dark' | 'system'
 
 export interface QwenAiGovernorConfig {
+  autoTuneEnabled: boolean
+  autoTuneMaxConcurrent: number
+  autoTuneMinGlobalIntervalMs: number
   maxConcurrent: number
   globalMinIntervalMs: number
   accountMinIntervalMs: number
   riskCooldownMs: number
   maxRiskCooldownMs: number
   failureCooldownMs: number
+  globalRiskCooldownMs: number
+  maxGlobalRiskCooldownMs: number
+  riskWindowMs: number
+  globalRiskThreshold: number
 }
 
 /**
@@ -698,12 +705,19 @@ export const DEFAULT_USER_MODEL_OVERRIDES: UserModelOverrides = {}
 export const DEFAULT_TOOL_CALLING_CONFIG_VALUE = DEFAULT_TOOL_CALLING_CONFIG
 
 export const DEFAULT_QWEN_AI_GOVERNOR_CONFIG: QwenAiGovernorConfig = {
+  autoTuneEnabled: true,
+  autoTuneMaxConcurrent: 2,
+  autoTuneMinGlobalIntervalMs: 8000,
   maxConcurrent: 1,
-  globalMinIntervalMs: 4000,
-  accountMinIntervalMs: 45000,
+  globalMinIntervalMs: 15000,
+  accountMinIntervalMs: 120000,
   riskCooldownMs: 10 * 60 * 1000,
   maxRiskCooldownMs: 30 * 60 * 1000,
   failureCooldownMs: 2 * 60 * 1000,
+  globalRiskCooldownMs: 30 * 60 * 1000,
+  maxGlobalRiskCooldownMs: 2 * 60 * 60 * 1000,
+  riskWindowMs: 5 * 60 * 1000,
+  globalRiskThreshold: 1,
 }
 
 /**

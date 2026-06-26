@@ -11,12 +11,20 @@ import { Account, Provider } from '../../store/types'
 import type { ChatMessage } from '../types'
 import { hasToolUse, parseToolUse } from '../promptToolUse'
 import { QwenAiTokenRefresher } from './qwen-ai-token-refresh'
-import { QwenAiFileUploader, prepareQwenAiMultimodalMessage } from './qwen-ai-files'
+import { QwenAiFileUploader, QWEN_AI_DOCUMENT_EVIDENCE_MARKER, prepareQwenAiMultimodalMessage } from './qwen-ai-files'
 import { createBaseChunk } from '../utils/streamToolHandler'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import type { ToolCall } from '../types'
+import {
+  isCompleteJsonText,
+  mergeNativeToolArguments,
+  normalizeNativeFunctionCallDelta,
+  type NativeToolCallState,
+} from './qwen-ai-native-tools'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
+const QWEN_AI_REQUEST_TIMEOUT_MS = Number(process.env.QWEN_AI_REQUEST_TIMEOUT_MS || 300000)
 
 const DEFAULT_HEADERS = {
   Accept: 'application/json',
@@ -84,7 +92,7 @@ export class QwenAiAdapter {
   private account: Account
   private tokenRefresher = new QwenAiTokenRefresher()
   private axiosInstance = axios.create({
-    timeout: 120000,
+    timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
   })
@@ -222,6 +230,10 @@ export class QwenAiAdapter {
   private sanitizePayloadForLog(value: unknown): unknown {
     if (Array.isArray(value)) {
       return value.map(item => this.sanitizePayloadForLog(item))
+    }
+
+    if (typeof value === 'string' && value.includes(QWEN_AI_DOCUMENT_EVIDENCE_MARKER)) {
+      return `${value.slice(0, value.indexOf(QWEN_AI_DOCUMENT_EVIDENCE_MARKER))}${QWEN_AI_DOCUMENT_EVIDENCE_MARKER}\n[REDACTED_DOCUMENT_EVIDENCE]`
     }
 
     if (value && typeof value === 'object') {
@@ -581,7 +593,7 @@ export class QwenAiAdapter {
         'x-accel-buffering': 'no',
       },
       responseType: 'stream',
-      timeout: 120000,
+      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
       validateStatus: () => true,
     }))
 
@@ -612,6 +624,11 @@ export class QwenAiStreamHandler {
   private toolCallsSent: boolean = false
   private toolStreamParser?: ToolStreamParser
   private toolCallingPlan?: ToolCallingPlan
+  private nativeToolCallStates = new Map<string, NativeToolCallState>()
+  private nativeToolCallIndex = 0
+  private ignoredResponseIds = new Set<string>()
+  private responseBranchLocked = false
+  private processedResponseEvent = false
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
@@ -623,6 +640,123 @@ export class QwenAiStreamHandler {
 
   setChatId(chatId: string) {
     this.chatId = chatId
+  }
+
+  private getResponseIndex(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined
+    return String(value)
+  }
+
+  private getEventResponseId(data: Record<string, any>): string {
+    const responseId = data.response_id ?? data['response.created']?.response_id
+    return typeof responseId === 'string' ? responseId : ''
+  }
+
+  private getEventResponseIndex(data: Record<string, any>): string | undefined {
+    return this.getResponseIndex(data.response_index ?? data['response.created']?.response_index)
+  }
+
+  private hasStartedResponseOutput(): boolean {
+    return Boolean(this.processedResponseEvent || this.content || this.toolCallsSent || this.nativeToolCallStates.size > 0)
+  }
+
+  private setPrimaryResponseBranch(responseId: string, responseIndex?: string): void {
+    this.responseId = responseId
+    this.ignoredResponseIds.delete(responseId)
+
+    if (responseIndex === '0') {
+      this.responseBranchLocked = true
+    }
+
+    console.log('[QwenAI] Got response_id:', this.responseId, 'response_index:', responseIndex ?? 'unknown')
+  }
+
+  private ignoreResponseBranch(responseId: string, responseIndex?: string): void {
+    if (!responseId) return
+
+    const firstIgnoredEvent = !this.ignoredResponseIds.has(responseId)
+    this.ignoredResponseIds.add(responseId)
+
+    if (firstIgnoredEvent) {
+      console.warn('[QwenAI] Ignoring secondary response branch:', {
+        responseId,
+        responseIndex: responseIndex ?? 'unknown',
+        primaryResponseId: this.responseId || 'unselected',
+      })
+    }
+  }
+
+  private recordResponseCreated(created: Record<string, any>): void {
+    const responseId = typeof created.response_id === 'string' ? created.response_id : ''
+    if (!responseId) return
+
+    const responseIndex = this.getResponseIndex(created.response_index)
+
+    if (!this.responseId) {
+      if (responseIndex && responseIndex !== '0') {
+        this.ignoreResponseBranch(responseId, responseIndex)
+        return
+      }
+
+      this.setPrimaryResponseBranch(responseId, responseIndex)
+      return
+    }
+
+    if (responseId === this.responseId) {
+      if (responseIndex === '0') {
+        this.responseBranchLocked = true
+      }
+      return
+    }
+
+    if (responseIndex === '0' && !this.responseBranchLocked && !this.hasStartedResponseOutput()) {
+      this.ignoreResponseBranch(this.responseId, undefined)
+      this.setPrimaryResponseBranch(responseId, responseIndex)
+      return
+    }
+
+    this.ignoreResponseBranch(responseId, responseIndex)
+  }
+
+  private shouldProcessResponseEvent(data: Record<string, any>): boolean {
+    const eventResponseId = this.getEventResponseId(data)
+    const eventResponseIndex = this.getEventResponseIndex(data)
+
+    if (!eventResponseId) {
+      if (eventResponseIndex && eventResponseIndex !== '0') {
+        console.warn('[QwenAI] Ignoring secondary response branch without response_id:', {
+          responseIndex: eventResponseIndex,
+          primaryResponseId: this.responseId || 'unselected',
+        })
+        return false
+      }
+
+      this.processedResponseEvent = true
+      return true
+    }
+
+    if (this.ignoredResponseIds.has(eventResponseId)) {
+      return false
+    }
+
+    if (!this.responseId) {
+      if (eventResponseIndex && eventResponseIndex !== '0') {
+        this.ignoreResponseBranch(eventResponseId, eventResponseIndex)
+        return false
+      }
+
+      this.setPrimaryResponseBranch(eventResponseId, eventResponseIndex)
+      this.processedResponseEvent = true
+      return true
+    }
+
+    if (eventResponseId !== this.responseId) {
+      this.ignoreResponseBranch(eventResponseId, eventResponseIndex)
+      return false
+    }
+
+    this.processedResponseEvent = true
+    return true
   }
 
   private sendToolCalls(transStream: PassThrough): boolean {
@@ -681,6 +815,104 @@ export class QwenAiStreamHandler {
     return false
   }
 
+  private ingestNativeToolCallFragments(delta: Record<string, any>): boolean {
+    if (!this.toolCallingPlan?.shouldParseResponse) return false
+
+    const fragments = normalizeNativeFunctionCallDelta(delta)
+    let sawFragment = false
+
+    for (const fragment of fragments) {
+      sawFragment = true
+      const existing = this.nativeToolCallStates.get(fragment.key)
+      const name = fragment.name || existing?.name || ''
+      const allowed = Boolean(name && this.toolCallingPlan.allowedToolNames.has(name))
+      const nextState: NativeToolCallState = {
+        key: fragment.key,
+        id: fragment.id || existing?.id || `call_${this.nativeToolCallIndex}`,
+        index: fragment.index ?? existing?.index ?? this.nativeToolCallIndex,
+        name,
+        arguments: mergeNativeToolArguments(existing?.arguments ?? '', fragment.arguments),
+        allowed,
+      }
+
+      if (!existing) {
+        this.nativeToolCallIndex += 1
+      }
+
+      this.nativeToolCallStates.set(fragment.key, nextState)
+
+      if (name && !allowed) {
+        console.warn('[QwenAI] Ignoring undeclared upstream native tool call:', name)
+      }
+    }
+
+    return sawFragment
+  }
+
+  private getCompleteNativeToolCalls(force: boolean = false): ToolCall[] {
+    const toolCalls: ToolCall[] = []
+
+    for (const state of this.nativeToolCallStates.values()) {
+      if (!state.allowed || !state.name) continue
+      if (!force && !isCompleteJsonText(state.arguments)) continue
+
+      toolCalls.push({
+        index: state.index,
+        id: state.id,
+        type: 'function',
+        function: {
+          name: state.name,
+          arguments: state.arguments,
+        },
+      })
+    }
+
+    return toolCalls.sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+  }
+
+  private emitNativeToolCalls(transStream: PassThrough, toolCalls: ToolCall[]): boolean {
+    if (this.toolCallsSent || toolCalls.length === 0) return false
+
+    this.toolCallsSent = true
+
+    for (let i = 0; i < toolCalls.length; i += 1) {
+      const toolCall = toolCalls[i]
+      transStream.write(
+        `data: ${JSON.stringify({
+          id: this.responseId || this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{
+            index: 0,
+            delta: {
+              role: i === 0 ? 'assistant' : undefined,
+              tool_calls: [toolCall],
+            },
+            finish_reason: null,
+          }],
+          created: this.created,
+        })}\n\n`,
+      )
+    }
+
+    transStream.write(
+      `data: ${JSON.stringify({
+        id: this.responseId || this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+        created: this.created,
+      })}\n\n`,
+    )
+    transStream.end('data: [DONE]\n\n')
+
+    if (this.onEnd && this.chatId) {
+      this.onEnd(this.chatId)
+    }
+
+    return true
+  }
+
   async handleStream(stream: any): Promise<PassThrough> {
     const transStream = new PassThrough()
 
@@ -717,6 +949,13 @@ export class QwenAiStreamHandler {
 
     const finishAnswer = (finishReason: string = 'stop') => {
       if (finalChunkSent) return
+
+      const completeNativeToolCalls = this.getCompleteNativeToolCalls(true)
+      if (completeNativeToolCalls.length > 0 && this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
+        finalChunkSent = true
+        return
+      }
+
       const hadPendingToolProtocol = this.toolStreamParser?.hasPendingToolProtocol() ?? false
 
       const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
@@ -814,12 +1053,15 @@ export class QwenAiStreamHandler {
           const data = JSON.parse(event.data)
           console.log('[QwenAI] Parsed JSON data keys:', Object.keys(data))
 
-          if (data['response.created']?.response_id) {
-            this.responseId = data['response.created'].response_id
-            console.log('[QwenAI] Got response_id:', this.responseId)
+          if (data['response.created']) {
+            this.recordResponseCreated(data['response.created'])
           }
 
           if (data.choices && data.choices.length > 0) {
+            if (!this.shouldProcessResponseEvent(data)) {
+              return
+            }
+
             const choice = data.choices[0]
             const delta = choice.delta || {}
             const phase = delta.phase
@@ -827,6 +1069,19 @@ export class QwenAiStreamHandler {
             const content = delta.content || ''
 
             console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
+
+            const sawNativeToolCall = this.ingestNativeToolCallFragments(delta)
+            if (sawNativeToolCall) {
+              const completeNativeToolCalls = this.getCompleteNativeToolCalls(status === 'finished')
+              if (completeNativeToolCalls.length > 0 && this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
+                finalChunkSent = true
+                return
+              }
+
+              if (!content) {
+                return
+              }
+            }
 
             if (phase === 'think') {
               if (status !== 'finished') {
@@ -979,12 +1234,21 @@ export class QwenAiStreamHandler {
 
             const parsed = JSON.parse(event.data)
 
-            if (parsed['response.created']?.response_id) {
-              this.responseId = parsed['response.created'].response_id
-              data.id = this.responseId
+            if (parsed['response.created']) {
+              this.recordResponseCreated(parsed['response.created'])
+              if (this.responseId) {
+                data.id = this.responseId
+              }
             }
 
             if (parsed.choices && parsed.choices.length > 0) {
+              if (!this.shouldProcessResponseEvent(parsed)) {
+                return
+              }
+              if (this.responseId) {
+                data.id = this.responseId
+              }
+
               const delta = parsed.choices[0].delta || {}
               const phase = delta.phase
               const status = delta.status

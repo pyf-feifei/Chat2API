@@ -77,6 +77,10 @@ export function normalizeArguments(args: unknown): string {
     try {
       return JSON.stringify(JSON.parse(trimmed))
     } catch {
+      const recovered = recoverJsonValueFromMalformedSnapshots(trimmed)
+      if (recovered !== undefined) {
+        return JSON.stringify(recovered)
+      }
       return trimmed
     }
   }
@@ -91,8 +95,107 @@ export function parseJsonValue(value: string): unknown {
   try {
     return JSON.parse(trimmed)
   } catch {
+    const recovered = recoverJsonValueFromMalformedSnapshots(trimmed)
+    if (recovered !== undefined) {
+      return recovered
+    }
     return decodeXml(trimmed)
   }
+}
+
+function recoverJsonValueFromMalformedSnapshots(value: string): unknown | undefined {
+  const trimmed = decodeXml(unwrapCdata(value)).trim()
+  if (!trimmed || !/^[\[{]/.test(trimmed)) return undefined
+
+  const candidates: Array<{ index: number; value: unknown }> = []
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index]
+    if (char !== '{' && char !== '[') continue
+
+    const jsonText = extractBalancedJson(trimmed, index)
+    if (!jsonText) continue
+
+    try {
+      candidates.push({ index, value: JSON.parse(jsonText) })
+    } catch {
+      // Keep scanning later positions; repeated snapshots may become valid there.
+    }
+  }
+
+  if (candidates.length === 0) return undefined
+  if (candidates.length > 1) return candidates[candidates.length - 1].value
+
+  const [candidate] = candidates
+  if (candidate.index === 0) return undefined
+
+  if (hasRepeatedSnapshotPrefix(trimmed.slice(0, candidate.index), candidate.value)) {
+    return candidate.value
+  }
+
+  return undefined
+}
+
+function extractBalancedJson(value: string, start: number): string | undefined {
+  const opener = value[start]
+  const closer = opener === '{' ? '}' : ']'
+  const stack: string[] = [closer]
+  let inString = false
+  let escaped = false
+
+  for (let index = start + 1; index < value.length; index += 1) {
+    const char = value[index]
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+
+    if (char === '{') {
+      stack.push('}')
+      continue
+    }
+
+    if (char === '[') {
+      stack.push(']')
+      continue
+    }
+
+    if (char === '}' || char === ']') {
+      if (stack.pop() !== char) {
+        return undefined
+      }
+
+      if (stack.length === 0) {
+        return value.slice(start, index + 1)
+      }
+    }
+  }
+
+  return undefined
+}
+
+function hasRepeatedSnapshotPrefix(prefix: string, value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return prefix.trimStart().startsWith('[')
+  }
+
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const keys = Object.keys(value as Record<string, unknown>)
+  return keys.some((key) => prefix.includes(JSON.stringify(key)))
 }
 
 export function unwrapCdata(value: string): string {

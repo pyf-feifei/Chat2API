@@ -208,6 +208,11 @@ router.post('/completions', async (ctx: Context) => {
       }
 
       ctx.status = result.status || 500
+      if (result.headers) {
+        for (const [key, value] of Object.entries(result.headers)) {
+          ctx.set(key, value)
+        }
+      }
       ctx.body = {
         error: {
           message: result.error || 'Request failed',

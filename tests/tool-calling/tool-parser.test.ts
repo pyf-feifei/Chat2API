@@ -86,6 +86,16 @@ test('managed xml flattens wrapper argument objects when schema has no wrapper p
   assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), { filePath: '/tmp/a' })
 })
 
+test('managed xml recovers the last complete JSON value from repeated argument snapshots', () => {
+  const result = managedXmlProtocol.parse(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="argument">{"filePath":"/tmp{"filePath":"/tmp/a"}</|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    { tools, protocol: 'managed_xml' },
+  )
+
+  assert.equal(result.toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), { filePath: '/tmp/a' })
+})
+
 test('managed xml preserves wrapper argument when declared by schema', () => {
   const wrapperTools = [
     {

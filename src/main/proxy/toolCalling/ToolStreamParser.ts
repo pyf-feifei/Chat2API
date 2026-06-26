@@ -8,6 +8,7 @@ export class ToolStreamParser {
   private emittedToolCall = false
   private nextToolCallIndex = 0
   private sawToolProtocolMarker = false
+  private readonly emittedToolCallFingerprints = new Set<string>()
 
   constructor(plan: ToolCallingPlan) {
     this.plan = plan
@@ -46,6 +47,8 @@ export class ToolStreamParser {
     const parsed = parseBufferedToolCall(this.buffer, this.plan)
     if (parsed.toolCalls.length > 0) {
       for (const toolCall of parsed.toolCalls) {
+        if (this.hasSeenToolCall(toolCall)) continue
+
         const indexedToolCall = {
           ...toolCall,
           index: this.nextToolCallIndex,
@@ -54,7 +57,9 @@ export class ToolStreamParser {
         this.nextToolCallIndex += 1
         chunks.push(createToolCallChunk(baseChunk, indexedToolCall, includeRole && !this.emittedToolCall))
       }
-      this.emittedToolCall = true
+      if (chunks.length > 0) {
+        this.emittedToolCall = true
+      }
       this.isBufferingToolCall = false
       this.buffer = ''
       return chunks
@@ -76,7 +81,9 @@ export class ToolStreamParser {
 
     const parsed = parseBufferedToolCall(this.buffer, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length > 0) {
-      const chunks = parsed.toolCalls.map((toolCall) => {
+      const chunks = parsed.toolCalls.flatMap((toolCall) => {
+        if (this.hasSeenToolCall(toolCall)) return []
+
         const indexedToolCall = {
           ...toolCall,
           index: this.nextToolCallIndex,
@@ -84,7 +91,7 @@ export class ToolStreamParser {
         }
         this.nextToolCallIndex += 1
         this.emittedToolCall = true
-        return createToolCallChunk(baseChunk, indexedToolCall, false)
+        return [createToolCallChunk(baseChunk, indexedToolCall, false)]
       })
       this.buffer = ''
       this.isBufferingToolCall = false
@@ -110,17 +117,21 @@ export class ToolStreamParser {
     const parsed = parseBufferedToolCall(content, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length === 0) return []
 
-    const chunks = parsed.toolCalls.map((toolCall, index) => {
+    const chunks = parsed.toolCalls.flatMap((toolCall, index) => {
+      if (this.hasSeenToolCall(toolCall)) return []
+
       const indexedToolCall = {
         ...toolCall,
         index: this.nextToolCallIndex,
         id: toolCall.id || `call_${this.nextToolCallIndex}`,
       }
       this.nextToolCallIndex += 1
-      return createToolCallChunk(baseChunk, indexedToolCall, includeRole && index === 0)
+      return [createToolCallChunk(baseChunk, indexedToolCall, includeRole && index === 0)]
     })
 
-    this.emittedToolCall = true
+    if (chunks.length > 0) {
+      this.emittedToolCall = true
+    }
     this.isBufferingToolCall = false
     this.buffer = ''
     return chunks
@@ -136,6 +147,16 @@ export class ToolStreamParser {
 
   hasPendingToolProtocol(): boolean {
     return this.sawToolProtocolMarker || this.isBufferingToolCall || hasProtocolMarker(this.buffer, this.plan)
+  }
+
+  private hasSeenToolCall(toolCall: any): boolean {
+    const fingerprint = toolCallFingerprint(toolCall)
+    if (this.emittedToolCallFingerprints.has(fingerprint)) {
+      return true
+    }
+
+    this.emittedToolCallFingerprints.add(fingerprint)
+    return false
   }
 }
 
@@ -237,4 +258,37 @@ function createToolCallChunk(baseChunk: any, toolCall: any, includeRole: boolean
       finish_reason: null,
     }],
   }
+}
+
+function toolCallFingerprint(toolCall: any): string {
+  const name = typeof toolCall?.function?.name === 'string' ? toolCall.function.name : ''
+  const args = typeof toolCall?.function?.arguments === 'string' ? toolCall.function.arguments : ''
+  return `${name}\n${canonicalArguments(args)}`
+}
+
+function canonicalArguments(args: string): string {
+  const trimmed = args.trim()
+  if (!trimmed) return '{}'
+
+  try {
+    return JSON.stringify(sortJsonValue(JSON.parse(trimmed)))
+  } catch {
+    return trimmed
+  }
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJsonValue)
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, sortJsonValue(item)]),
+    )
+  }
+
+  return value
 }

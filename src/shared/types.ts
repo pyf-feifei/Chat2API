@@ -31,12 +31,27 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
 export type Theme = 'light' | 'dark' | 'system'
 
 export interface QwenAiGovernorConfig {
+  autoTuneEnabled: boolean
+  autoTuneMaxConcurrent: number
+  autoTuneMinGlobalIntervalMs: number
   maxConcurrent: number
   globalMinIntervalMs: number
   accountMinIntervalMs: number
   riskCooldownMs: number
   maxRiskCooldownMs: number
   failureCooldownMs: number
+  globalRiskCooldownMs: number
+  maxGlobalRiskCooldownMs: number
+  riskWindowMs: number
+  globalRiskThreshold: number
+}
+
+export interface QwenAiGovernorEffectiveConfig extends QwenAiGovernorConfig {
+  configuredMaxConcurrent: number
+  configuredGlobalMinIntervalMs: number
+  healthyAccountCount: number
+  coolingAccountCount: number
+  autoTuneReason: string
 }
 
 export interface QwenAiGovernorAccountStatus {
@@ -61,10 +76,16 @@ export interface QwenAiGovernorAccountStatus {
 
 export interface QwenAiGovernorStatus {
   config: QwenAiGovernorConfig
+  effectiveConfig: QwenAiGovernorEffectiveConfig
   queueSize: number
   activeRequests: number
   globalNextAvailableAt?: number
   globalNextAvailableInMs: number
+  globalCooldownUntil?: number
+  globalCooldownInMs: number
+  globalCooldownReason?: string
+  globalFailures: number
+  recentRiskEvents: number
   accounts: QwenAiGovernorAccountStatus[]
 }
 
