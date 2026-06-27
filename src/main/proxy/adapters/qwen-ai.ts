@@ -984,8 +984,7 @@ export class QwenAiStreamHandler {
       if (
         this.toolCallingPlan?.shouldParseResponse &&
         !this.toolStreamParser?.hasEmittedToolCall() &&
-        hadPendingToolProtocol &&
-        (this.toolCallingPlan.toolChoiceMode === 'forced' || this.toolCallingPlan.toolChoiceMode === 'required')
+        hadPendingToolProtocol
       ) {
         const errorEvent = {
           error: {

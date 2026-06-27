@@ -33,6 +33,46 @@ const tools = [
       parameters: { type: 'object', properties: { path: { type: 'string' } } },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'default_api:write',
+      description: 'Write a file',
+      parameters: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          content: { type: 'string' },
+        },
+        required: ['filePath', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'default_api:todowrite',
+      description: 'Update todos',
+      parameters: {
+        type: 'object',
+        properties: {
+          todos: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                content: { type: 'string' },
+                status: { type: 'string' },
+                priority: { type: 'string' },
+              },
+              required: ['content', 'status', 'priority'],
+            },
+          },
+        },
+        required: ['todos'],
+      },
+    },
+  },
 ]
 
 function request(overrides: Partial<ChatCompletionRequest> = {}): ChatCompletionRequest {
@@ -55,8 +95,16 @@ test('OpenAI tools plus DeepSeek choose managed prompt', () => {
   assert.equal(result.plan.protocol, 'managed_xml')
   assert.equal(result.plan.shouldInjectPrompt, true)
   assert.equal(result.tools, undefined)
-  assert.equal(result.plan.tools.length, 2)
+  assert.equal(result.plan.tools.length, 4)
   assert.match(result.messages[0].content as string, /<\|CHAT2API\|tool_calls>/)
+  assert.match(result.messages[0].content as string, /Every required field must appear as its own/)
+  assert.match(result.messages[0].content as string, /repeat the parameter tag once per argument/)
+  assert.match(result.messages[0].content as string, /Required-parameter XML templates/)
+  assert.match(result.messages[0].content as string, /<\|CHAT2API\|invoke name="default_api:write">/)
+  assert.match(result.messages[0].content as string, /<\|CHAT2API\|parameter name="filePath">/)
+  assert.match(result.messages[0].content as string, /<\|CHAT2API\|parameter name="content">/)
+  assert.match(result.messages[0].content as string, /<\|CHAT2API\|invoke name="default_api:todowrite">/)
+  assert.match(result.messages[0].content as string, /\[\{"content":"\.\.\.content\.\.\.","status":"\.\.\.status\.\.\.","priority":"\.\.\.priority\.\.\."\}\]/)
 })
 
 test('explicit Cherry Studio MCP adapter uses managed prompt and preserves tool names', () => {
@@ -136,7 +184,7 @@ test('tool_choice required preserves required policy on the plan', () => {
   })
 
   assert.equal(result.plan.toolChoiceMode, 'required')
-  assert.deepEqual([...result.plan.allowedToolNames].sort(), ['default_api:list_dir', 'default_api:read_file'])
+  assert.deepEqual([...result.plan.allowedToolNames].sort(), ['default_api:list_dir', 'default_api:read_file', 'default_api:todowrite', 'default_api:write'])
   assert.match(result.messages[0].content as string, /a tool call is required/)
 })
 

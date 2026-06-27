@@ -19,6 +19,8 @@ const XML_START = '<tool_calls>'
 const XML_END = '</tool_calls>'
 const LOOSE_XML_START = '<|tool_calls>'
 const LOOSE_XML_END = '</|tool_calls>'
+const QCML_START = '<\uFF5CQCML\uFF5Ctool_calls>'
+const QCML_END = '</\uFF5CQCML\uFF5Ctool_calls>'
 
 interface XmlSyntax {
   startMarkers: string[]
@@ -31,13 +33,13 @@ interface XmlSyntax {
 }
 
 const MANAGED_XML_SYNTAX: XmlSyntax = {
-  startMarkers: [CHAT2API_START, XML_START, LOOSE_XML_START],
-  endMarkers: [CHAT2API_END, XML_END, LOOSE_XML_END],
-  blockPattern: /(?:<\|CHAT2API\|tool_calls>|<tool_calls>|<\|tool_calls>)([\s\S]*?)(?:<\/\|CHAT2API\|tool_calls>|<\/tool_calls>|<\/\|tool_calls>)/g,
-  invokePattern: /(?:<\|CHAT2API\|invoke\s+name=(["'])(.*?)\1\s*>|<invoke\s+name=(["'])(.*?)\3\s*>|<\|?tool_call\s+name=(["'])(.*?)\5\s*>|<\|?tool_call_id=(["'])(.*?)\7\s*>)/g,
-  parameterOpenPattern: /(?:<\|CHAT2API\|parameter\s+name=(["'])(.*?)\1\s*>|<parameter\s+name=(["'])(.*?)\3\s*>|<\|parameter\s+name=(["'])(.*?)\5\s*>)/g,
-  invokeCloseTags: ['</|CHAT2API|invoke>', '</invoke>', '</tool_call>', '</|tool_call>'],
-  parameterCloseTags: ['</|CHAT2API|parameter>', '</parameter>', '</|parameter>'],
+  startMarkers: [CHAT2API_START, XML_START, LOOSE_XML_START, QCML_START],
+  endMarkers: [CHAT2API_END, XML_END, LOOSE_XML_END, QCML_END],
+  blockPattern: /(?:<\|CHAT2API\|tool_calls>|<\uFF5CQCML\uFF5Ctool_calls>|<tool_calls>|<\|tool_calls>)([\s\S]*?)(?:<\/\|CHAT2API\|tool_calls>|<\/\uFF5CQCML\uFF5Ctool_calls>|<\/tool_calls>|<\/\|tool_calls>)/g,
+  invokePattern: /(?:<\|CHAT2API\|invoke\s+name=["']([^"']+)["']\s*>|<\uFF5CQCML\uFF5Cinvoke\s+name=["']([^"']+)["']\s*>|<invoke\s+name=["']([^"']+)["']\s*>|<\|?tool_call\s+name=["']([^"']+)["']\s*>|<\|?tool_call_id=["']([^"']+)["']\s*>)/g,
+  parameterOpenPattern: /(?:<\|CHAT2API\|parameter\s+name=["']([^"']+)["']\s*>|<\uFF5CQCML\uFF5Cparameter\s+name=["']([^"']+)["']\s*>|<parameter\s+name=["']([^"']+)["']\s*>|<\|parameter\s+name=["']([^"']+)["']\s*>)/g,
+  invokeCloseTags: ['</|CHAT2API|invoke>', '</\uFF5CQCML\uFF5Cinvoke>', '</invoke>', '</tool_call>', '</|tool_call>'],
+  parameterCloseTags: ['</|CHAT2API|parameter>', '</\uFF5CQCML\uFF5Cparameter>', '</parameter>', '</|parameter>'],
 }
 
 export const managedXmlProtocol: ToolProtocolAdapter = {
@@ -49,19 +51,21 @@ You can invoke the following developer tools. Tool names are case-sensitive.
 Use only the exact tool names listed below. Do not rename, camelCase, translate, shorten, or invent tool names.
 
 ${renderToolList(tools)}
+${renderRequiredParameterTemplates(tools)}
 
 Tool-use requirements:
 - If the user asks you to inspect files, create or modify files, run commands, install dependencies, execute tests, or verify behavior in the environment, you must call the appropriate tool.
 - Do not claim that files were created, commands were run, tests passed, or behavior was verified unless the corresponding tool result shows it.
 - If a tool argument schema says a field is an array, provide a JSON array for that field, even when there is only one item.
 - Each tool call must include every field listed in that tool schema's required array in the same call; do not send an empty tool call or split required fields across multiple calls.
+- Every required field must appear as its own <|CHAT2API|parameter name="field_name"> entry inside the same <|CHAT2API|invoke> block. Do not put required values only in ordinary text, explanations, titles, or summaries.
 - If a tool call fails because the arguments do not match the schema, fix the arguments according to the schema and call the tool again.
 
 When calling tools, respond with only this Chat2API XML block:
 
 <|CHAT2API|tool_calls><|CHAT2API|invoke name="exact_tool_name"><|CHAT2API|parameter name="parameter_name"><![CDATA[value]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>
 
-Use exactly the tag names shown in the tool-call block above. Do not use alternative tag names when requesting tools.
+Use exactly the tag names shown in the tool-call block above. Do not use alternative tag names when requesting tools. For tools with multiple required arguments, repeat the parameter tag once per argument inside one invoke block.
 
 Tool results will be provided as Chat2API XML result blocks:
 
@@ -69,7 +73,7 @@ Tool results will be provided as Chat2API XML result blocks:
   },
 
   detectStart(buffer) {
-    return detectMarkers(buffer, [CHAT2API_START, XML_START])
+    return detectMarkers(buffer, [CHAT2API_START, XML_START, LOOSE_XML_START, QCML_START])
   },
 
   parse(content: string, context: ToolParseContext) {
@@ -140,6 +144,76 @@ Tool results will be provided as Chat2API XML result blocks:
   formatToolResult(result) {
     return `<|CHAT2API|tool_result tool_call_id="${escapeXmlAttribute(result.toolCallId)}"><![CDATA[${result.content}]]></|CHAT2API|tool_result>`
   },
+}
+
+function renderRequiredParameterTemplates(tools: NormalizedToolDefinition[]): string {
+  const templates = tools
+    .map((tool) => {
+      const requiredFields = getRequiredFields(tool.parameters)
+      if (requiredFields.length === 0) return undefined
+
+      const parameters = requiredFields
+        .map((field) => `<|CHAT2API|parameter name="${escapeXmlAttribute(field)}"><![CDATA[${renderParameterPlaceholder(tool.parameters, field)}]]></|CHAT2API|parameter>`)
+        .join('')
+      return `Tool \`${tool.name}\`:\n<|CHAT2API|tool_calls><|CHAT2API|invoke name="${escapeXmlAttribute(tool.name)}">${parameters}</|CHAT2API|invoke></|CHAT2API|tool_calls>`
+    })
+    .filter((template): template is string => Boolean(template))
+
+  if (templates.length === 0) return ''
+
+  return `Required-parameter XML templates. When invoking one of these tools, keep every shown parameter tag and replace each placeholder with the actual argument value:\n${templates.join('\n')}\n`
+}
+
+function getRequiredFields(schema: unknown): string[] {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return []
+
+  const required = (schema as Record<string, unknown>).required
+  return Array.isArray(required) ? required.filter((field): field is string => typeof field === 'string') : []
+}
+
+function renderParameterPlaceholder(parameters: unknown, field: string): string {
+  const schema = getSchemaObjectProperties(parameters)?.[field]
+  return renderSchemaPlaceholder(schema, field)
+}
+
+function renderSchemaPlaceholder(schema: unknown, name: string): string {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return `...${name}...`
+
+  const schemaObject = schema as Record<string, unknown>
+  if (schemaTypeIncludes(schemaObject, 'array') || schemaObject.items) {
+    return `[${renderSchemaPlaceholder(schemaObject.items, singularizeName(name))}]`
+  }
+
+  if (schemaTypeIncludes(schemaObject, 'object') || getSchemaObjectProperties(schemaObject)) {
+    const properties = getSchemaObjectProperties(schemaObject) ?? {}
+    const fields = getRequiredFields(schemaObject)
+    const selectedFields = fields.length > 0 ? fields : Object.keys(properties).slice(0, 3)
+    const entries = selectedFields.map((field) => `"${field}":${JSON.stringify(renderSchemaPlaceholder(properties[field], field))}`)
+    return `{${entries.join(',')}}`
+  }
+
+  if (schemaTypeIncludes(schemaObject, 'number') || schemaTypeIncludes(schemaObject, 'integer')) return '0'
+  if (schemaTypeIncludes(schemaObject, 'boolean')) return 'true'
+
+  return `...${name}...`
+}
+
+function getSchemaObjectProperties(schema: unknown): Record<string, unknown> | undefined {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return undefined
+
+  const properties = (schema as Record<string, unknown>).properties
+  return properties && typeof properties === 'object' && !Array.isArray(properties)
+    ? properties as Record<string, unknown>
+    : undefined
+}
+
+function schemaTypeIncludes(schema: Record<string, unknown>, type: string): boolean {
+  const schemaType = schema.type
+  return schemaType === type || (Array.isArray(schemaType) && schemaType.includes(type))
+}
+
+function singularizeName(name: string): string {
+  return name.endsWith('s') && name.length > 1 ? name.slice(0, -1) : name
 }
 
 interface ParseBlockOptions {

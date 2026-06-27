@@ -212,6 +212,19 @@ test('mixed XML dialect tool block emits a tool call', () => {
   assert.equal(JSON.parse(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.arguments).filePath, '/tmp/a')
 })
 
+test('QCML namespace marker split across chunks emits a tool call without leaking text', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  assert.deepEqual(parser.push('<\uFF5CQCML\uFF5Ctool_', baseChunk), [])
+  const chunks = parser.push(
+    'calls><\uFF5CQCML\uFF5Cinvoke name="default_api:read_file"><\uFF5CQCML\uFF5Cparameter name="filePath"><![CDATA[/tmp/qcml]]></\uFF5CQCML\uFF5Cparameter></\uFF5CQCML\uFF5Cinvoke></\uFF5CQCML\uFF5Ctool_calls>',
+    baseChunk,
+  )
+
+  assert.equal(chunks.some((chunk) => chunk.choices[0].delta.content?.includes('QCML')), false)
+  assert.equal(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(JSON.parse(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.arguments).filePath, '/tmp/qcml')
+})
+
 test('invalid internal tool block is dropped on flush instead of leaking protocol text', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   assert.deepEqual(

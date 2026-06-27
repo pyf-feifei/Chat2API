@@ -106,6 +106,23 @@ test('managed xml parses mixed Chat2API and canonical XML tags', () => {
   assert.equal(JSON.parse(result.toolCalls[0].function.arguments).filePath, '/tmp/a')
 })
 
+test('managed xml parses QCML namespace compatibility form without changing required validation', () => {
+  const result = managedXmlProtocol.parse(
+    '<\uFF5CQCML\uFF5Ctool_calls><\uFF5CQCML\uFF5Cinvoke name="default_api:todowrite"><\uFF5CQCML\uFF5Cparameter name="todos">[{"content":"Run tests","status":"pending","priority":"high"}]</\uFF5CQCML\uFF5Cparameter></\uFF5CQCML\uFF5Cinvoke></\uFF5CQCML\uFF5Ctool_calls>',
+    { tools: todoTools, protocol: 'managed_xml' },
+  )
+  const missingRequired = managedXmlProtocol.parse(
+    '<\uFF5CQCML\uFF5Ctool_calls><\uFF5CQCML\uFF5Cinvoke name="default_api:write"><\uFF5CQCML\uFF5Cparameter name="filePath">/tmp/a</\uFF5CQCML\uFF5Cparameter></\uFF5CQCML\uFF5Cinvoke></\uFF5CQCML\uFF5Ctool_calls>',
+    { tools: writeTools, protocol: 'managed_xml' },
+  )
+
+  assert.equal(result.toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), {
+    todos: [{ content: 'Run tests', status: 'pending', priority: 'high' }],
+  })
+  assert.equal(missingRequired.toolCalls.length, 0)
+})
+
 test('managed xml parses loose tool_call XML emitted inside a tool_calls block', () => {
   const result = managedXmlProtocol.parse(
     '<|CHAT2API|tool_calls><|tool_calls><|tool_call_id="default_api:read_file"><parameter name="filePath"><![CDATA[/tmp/a]]></parameter></tool_call></tool_calls>',

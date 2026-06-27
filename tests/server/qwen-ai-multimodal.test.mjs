@@ -112,6 +112,14 @@ test('Qwen AI stream converts only declared upstream native function calls witho
   assert.doesNotMatch(source, /function:\s*\{[\s\S]{0,120}arguments:\s*['"]\{\}['"]/)
 })
 
+test('Qwen AI stream rejects malformed internal tool protocol even when tool choice is auto', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /hadPendingToolProtocol/)
+  assert.match(source, /malformed_tool_call/)
+  assert.doesNotMatch(source, /toolChoiceMode === 'forced' \|\| this\.toolCallingPlan\.toolChoiceMode === 'required'/)
+})
+
 test('Qwen AI stream isolates the primary upstream response branch before parsing tool calls', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
