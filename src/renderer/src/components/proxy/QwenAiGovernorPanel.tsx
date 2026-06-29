@@ -251,7 +251,9 @@ export function QwenAiGovernorPanel() {
             </div>
             <div className="rounded-md border p-4">
               <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.recentRiskEvents')}</p>
-              <p className="mt-1 text-2xl font-semibold">{status?.recentRiskEvents ?? 0}</p>
+              <p className="mt-1 text-2xl font-semibold">
+                {status?.recentRiskAccounts ?? 0} / {status?.recentRiskEvents ?? 0}
+              </p>
             </div>
             <div className="rounded-md border p-4">
               <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.healthyAccounts')}</p>

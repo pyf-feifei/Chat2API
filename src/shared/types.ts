@@ -86,6 +86,7 @@ export interface QwenAiGovernorStatus {
   globalCooldownReason?: string
   globalFailures: number
   recentRiskEvents: number
+  recentRiskAccounts: number
   accounts: QwenAiGovernorAccountStatus[]
 }
 

@@ -21,6 +21,11 @@ type CooldownState = {
   reason: string
 }
 
+type RiskEvent = {
+  accountId: string
+  timestamp: number
+}
+
 const ENV_DEFAULT_CONFIG: QwenAiGovernorConfig = {
   autoTuneEnabled: process.env.CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED !== 'false',
   autoTuneMaxConcurrent: Math.max(1, numberFromEnv('CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT', 2)),
@@ -34,7 +39,7 @@ const ENV_DEFAULT_CONFIG: QwenAiGovernorConfig = {
   globalRiskCooldownMs: numberFromEnv('CHAT2API_QWEN_AI_GLOBAL_RISK_COOLDOWN_MS', 30 * 60 * 1000),
   maxGlobalRiskCooldownMs: numberFromEnv('CHAT2API_QWEN_AI_MAX_GLOBAL_RISK_COOLDOWN_MS', 2 * 60 * 60 * 1000),
   riskWindowMs: numberFromEnv('CHAT2API_QWEN_AI_RISK_WINDOW_MS', 5 * 60 * 1000),
-  globalRiskThreshold: Math.max(1, numberFromEnv('CHAT2API_QWEN_AI_GLOBAL_RISK_THRESHOLD', 1)),
+  globalRiskThreshold: Math.max(1, numberFromEnv('CHAT2API_QWEN_AI_GLOBAL_RISK_THRESHOLD', 3)),
 }
 
 function numberFromEnv(name: string, fallback: number): number {
@@ -80,7 +85,7 @@ export class QwenAiRequestGovernor {
   private accountCooldowns: Map<string, CooldownState> = new Map()
   private activeByAccount: Map<string, number> = new Map()
   private globalCooldown: CooldownState | undefined
-  private riskEvents: number[] = []
+  private riskEvents: RiskEvent[] = []
 
   run(accountId: string, run: () => Promise<ForwardResult>): Promise<ForwardResult> {
     return new Promise((resolve, reject) => {
@@ -195,7 +200,7 @@ export class QwenAiRequestGovernor {
       const failures = (current?.failures || 0) + 1
       const cooldownMs = Math.min(config.riskCooldownMs * (2 ** (failures - 1)), config.maxRiskCooldownMs)
       this.openCooldown(accountId, cooldownMs, 'qwen_ai_risk_control', failures)
-      this.recordGlobalRiskControl(config)
+      this.recordGlobalRiskControl(accountId, config)
       return
     }
 
@@ -218,13 +223,14 @@ export class QwenAiRequestGovernor {
     )
   }
 
-  private recordGlobalRiskControl(config: QwenAiGovernorConfig): void {
+  private recordGlobalRiskControl(accountId: string, config: QwenAiGovernorConfig): void {
     const now = Date.now()
     this.riskEvents = this.riskEvents
-      .filter(timestamp => now - timestamp <= config.riskWindowMs)
-      .concat(now)
+      .filter(event => now - event.timestamp <= config.riskWindowMs)
+      .concat({ accountId, timestamp: now })
 
-    if (this.riskEvents.length < config.globalRiskThreshold) {
+    const distinctRiskAccounts = new Set(this.riskEvents.map(event => event.accountId)).size
+    if (distinctRiskAccounts < config.globalRiskThreshold) {
       return
     }
 
@@ -262,7 +268,7 @@ export class QwenAiRequestGovernor {
   private expireGlobalCooldown(now: number): void {
     if (this.globalCooldown && this.globalCooldown.until <= now) {
       this.globalCooldown = undefined
-      this.riskEvents = this.riskEvents.filter(timestamp => now - timestamp <= this.getConfig().riskWindowMs)
+      this.riskEvents = this.riskEvents.filter(event => now - event.timestamp <= this.getConfig().riskWindowMs)
     }
   }
 
@@ -314,8 +320,16 @@ export class QwenAiRequestGovernor {
 
   private getRecentRiskEventCount(config: QwenAiGovernorConfig, now: number): number {
     return this.riskEvents
-      .filter(timestamp => now - timestamp <= config.riskWindowMs)
+      .filter(event => now - event.timestamp <= config.riskWindowMs)
       .length
+  }
+
+  private getRecentRiskAccountCount(config: QwenAiGovernorConfig, now: number): number {
+    return new Set(
+      this.riskEvents
+        .filter(event => now - event.timestamp <= config.riskWindowMs)
+        .map(event => event.accountId),
+    ).size
   }
 
   private getQwenAiAccountScope(loadBalancerFailures: Record<string, {
@@ -457,6 +471,7 @@ export class QwenAiRequestGovernor {
     )
     const providerById = new Map(providers.map(provider => [provider.id, provider]))
     const recentRiskEvents = this.getRecentRiskEventCount(config, now)
+    const recentRiskAccounts = this.getRecentRiskAccountCount(config, now)
 
     const accountStatuses = accounts.map(account => {
       this.expireCooldown(account.id, now)
@@ -508,6 +523,7 @@ export class QwenAiRequestGovernor {
       globalCooldownReason: this.globalCooldown?.reason,
       globalFailures: this.globalCooldown?.failures || 0,
       recentRiskEvents,
+      recentRiskAccounts,
       accounts: accountStatuses,
     }
   }

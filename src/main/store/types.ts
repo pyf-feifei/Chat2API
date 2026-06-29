@@ -97,6 +97,10 @@ export interface QwenAiGovernorConfig {
   globalRiskCooldownMs: number
   maxGlobalRiskCooldownMs: number
   riskWindowMs: number
+  /**
+   * Number of distinct accounts that must hit Qwen AI risk control inside
+   * riskWindowMs before opening the provider-wide circuit.
+   */
   globalRiskThreshold: number
 }
 
@@ -717,7 +721,7 @@ export const DEFAULT_QWEN_AI_GOVERNOR_CONFIG: QwenAiGovernorConfig = {
   globalRiskCooldownMs: 30 * 60 * 1000,
   maxGlobalRiskCooldownMs: 2 * 60 * 60 * 1000,
   riskWindowMs: 5 * 60 * 1000,
-  globalRiskThreshold: 1,
+  globalRiskThreshold: 3,
 }
 
 /**

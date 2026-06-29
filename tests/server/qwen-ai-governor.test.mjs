@@ -24,7 +24,7 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(governorSource, /attachRelease\(result\.stream, release\)/)
 })
 
-test('Qwen AI risk-control failures open account and global cooldown instead of immediate reuse', () => {
+test('Qwen AI risk-control failures cool the account and require distinct accounts before global circuit', () => {
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
   const loadBalancerSource = fs.readFileSync('src/main/proxy/loadbalancer.ts', 'utf8')
   const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
@@ -43,6 +43,8 @@ test('Qwen AI risk-control failures open account and global cooldown instead of 
   assert.match(governorSource, /qwen_ai_risk_control/)
   assert.match(governorSource, /2 \*\* \(failures - 1\)/)
   assert.match(governorSource, /recordGlobalRiskControl/)
+  assert.match(governorSource, /recordGlobalRiskControl\(accountId, config\)/)
+  assert.match(governorSource, /new Set\(this\.riskEvents\.map\(event => event\.accountId\)\)\.size/)
   assert.match(governorSource, /qwen_ai_global_risk_circuit/)
   assert.match(governorSource, /createGlobalCircuitOpenResult/)
   assert.match(governorSource, /Retry-After/)
@@ -65,9 +67,11 @@ test('Qwen AI governor exposes configurable global risk circuit settings', () =>
 
   assert.match(sharedTypes, /globalCooldownInMs/)
   assert.match(sharedTypes, /recentRiskEvents/)
+  assert.match(sharedTypes, /recentRiskAccounts/)
   assert.match(storeTypes, /globalMinIntervalMs:\s*15000/)
   assert.match(storeTypes, /accountMinIntervalMs:\s*120000/)
   assert.match(storeTypes, /globalRiskCooldownMs:\s*30 \* 60 \* 1000/)
+  assert.match(storeTypes, /globalRiskThreshold:\s*3/)
   assert.match(configSource, /maxGlobalRiskCooldownMs must be greater than or equal to globalRiskCooldownMs/)
   assert.match(zh, /全局风控熔断/)
 })
