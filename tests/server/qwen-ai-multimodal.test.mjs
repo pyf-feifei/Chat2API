@@ -28,8 +28,25 @@ test('Qwen AI has a dedicated multimodal upload helper', () => {
   assert.match(source, /\/api\/v2\/files\/getstsToken/)
   assert.match(source, /\/api\/v2\/files\/parse/)
   assert.match(source, /\/api\/v2\/files\/parse\/status/)
-  assert.match(source, /\.put\(sts\.filePath,\s*file\.data/)
+  assert.match(source, /\.put\(sts\.filePath,\s*file\.data,\s*uploadOptions\)/)
+  assert.match(source, /\.multipartUpload\(sts\.filePath,\s*file\.data/)
   assert.doesNotMatch(source, /console\.log\([^)]*base64/i)
+})
+
+test('Qwen AI OSS uploads use multipart upload for web-sized video files', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+  const types = fs.readFileSync('src/main/types/ali-oss.d.ts', 'utf8')
+
+  assert.match(source, /OSS_SINGLE_PUT_MAX_BYTES/)
+  assert.match(source, /2 \* 1024 \* 1024/)
+  assert.match(source, /QWEN_AI_OSS_UPLOAD_TIMEOUT_MS/)
+  assert.match(source, /QWEN_AI_OSS_UPLOAD_RETRY_MAX/)
+  assert.match(source, /function qwenOssMultipartParams\(fileSize: number\)/)
+  assert.match(source, /fileSize < 100 \* 1024 \* 1024/)
+  assert.match(source, /parallel: 10,\s*partSize: 10 \* 1024 \* 1024/)
+  assert.match(source, /if \(file\.data\.length < OSS_SINGLE_PUT_MAX_BYTES\)/)
+  assert.match(source, /client\.multipartUpload\(sts\.filePath,\s*file\.data,\s*\{[\s\S]*\.\.\.multipartParams/)
+  assert.match(types, /multipartUpload\(name: string,\s*data: Buffer \| string,\s*options\?: any\)/)
 })
 
 test('Qwen AI document upload waits for parse completion with a bounded timeout', () => {

@@ -8,6 +8,9 @@ import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const MAX_FILE_SIZE = 2000 * 1024 * 1024
+const OSS_SINGLE_PUT_MAX_BYTES = positiveIntegerFromEnv('QWEN_AI_OSS_SINGLE_PUT_MAX_BYTES', 2 * 1024 * 1024)
+const OSS_UPLOAD_TIMEOUT_MS = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_TIMEOUT_MS', 5 * 60 * 1000)
+const OSS_UPLOAD_RETRY_MAX = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_RETRY_MAX', 3)
 const PARSE_POLL_INTERVAL_MS = 2000
 const PARSE_POLL_TIMEOUT_MS = 120000
 const DOCUMENT_EVIDENCE_MAX_TEXT_BYTES = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_TEXT_BYTES', 32 * 1024 * 1024)
@@ -171,6 +174,26 @@ interface CandidateInput {
   label: string
   start: number
   end: number
+}
+
+function qwenOssMultipartParams(fileSize: number): { parallel: number; partSize: number } {
+  if (fileSize < 5 * 1024 * 1024) {
+    return { parallel: 2, partSize: 2 * 1024 * 1024 }
+  }
+
+  if (fileSize < 10 * 1024 * 1024) {
+    return { parallel: 4, partSize: 2 * 1024 * 1024 }
+  }
+
+  if (fileSize < 50 * 1024 * 1024) {
+    return { parallel: 6, partSize: 6 * 1024 * 1024 }
+  }
+
+  if (fileSize < 100 * 1024 * 1024) {
+    return { parallel: 8, partSize: 8 * 1024 * 1024 }
+  }
+
+  return { parallel: 10, partSize: 10 * 1024 * 1024 }
 }
 
 function positiveIntegerFromEnv(name: string, fallback: number): number {
@@ -1023,13 +1046,28 @@ export class QwenAiFileUploader {
       region: sts.region,
       endpoint: sts.endpoint,
       authorizationV4: true,
+      timeout: OSS_UPLOAD_TIMEOUT_MS,
+      retryMax: OSS_UPLOAD_RETRY_MAX,
     } as any)
 
-    await client.put(sts.filePath, file.data, {
+    const uploadOptions = {
       headers: {
         'Content-Type': file.mimeType,
       },
-    } as any)
+      timeout: OSS_UPLOAD_TIMEOUT_MS,
+      mime: file.mimeType,
+    } as any
+
+    if (file.data.length < OSS_SINGLE_PUT_MAX_BYTES) {
+      await client.put(sts.filePath, file.data, uploadOptions)
+      return
+    }
+
+    const multipartParams = qwenOssMultipartParams(file.data.length)
+    await client.multipartUpload(sts.filePath, file.data, {
+      ...uploadOptions,
+      ...multipartParams,
+    })
   }
 
   private async parseDocument(fileId: string): Promise<void> {
