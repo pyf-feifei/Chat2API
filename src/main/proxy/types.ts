@@ -237,6 +237,7 @@ export interface ProxyContext {
   startTime: number
   isStream: boolean
   clientIP?: string
+  signal?: AbortSignal
 }
 
 /**

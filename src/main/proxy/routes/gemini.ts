@@ -46,6 +46,18 @@ function selectModel(model: string) {
   return selection
 }
 
+function createClientAbortSignal(ctx: Context): AbortSignal {
+  const controller = new AbortController()
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort()
+    }
+  }
+  ctx.req.once('aborted', abort)
+  ctx.res.once('close', abort)
+  return controller.signal
+}
+
 async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
   const model = ctx.params.model
   const startTime = Date.now()
@@ -77,6 +89,7 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
     startTime,
     isStream: stream,
     clientIP: ctx.ip,
+    signal: createClientAbortSignal(ctx),
   }
 
   proxyStatusManager.recordRequestStart(model, provider.id, account.id)

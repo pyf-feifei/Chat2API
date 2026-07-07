@@ -57,7 +57,8 @@ type ProviderForwarder = {
     account: Account,
     provider: Provider,
     actualModel: string,
-    startTime: number
+    startTime: number,
+    context: ProxyContext
   ) => Promise<ForwardResult>
 }
 
@@ -99,9 +100,10 @@ export class RequestForwarder {
     {
       name: 'qwen-ai',
       matches: QwenAiAdapter.isQwenAiProvider,
-      forward: (request, account, provider, actualModel, startTime) =>
+      forward: (request, account, provider, actualModel, startTime, context) =>
         qwenAiRequestGovernor.run(account.id, () =>
-          this.forwardQwenAi(request, account, provider, actualModel, startTime),
+          this.forwardQwenAi(request, account, provider, actualModel, startTime, context),
+          { signal: context.signal },
         ),
     },
     {
@@ -348,7 +350,7 @@ export class RequestForwarder {
 
     const dedicatedForwarder = this.providerForwarders.find(forwarder => forwarder.matches(provider))
     if (dedicatedForwarder) {
-      return dedicatedForwarder.forward(request, account, provider, actualModel, startTime)
+      return dedicatedForwarder.forward(request, account, provider, actualModel, startTime, context)
     }
 
     try {
@@ -837,7 +839,8 @@ export class RequestForwarder {
     account: Account,
     provider: Provider,
     actualModel: string,
-    startTime: number
+    startTime: number,
+    context?: ProxyContext
   ): Promise<ForwardResult> {
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
@@ -850,6 +853,7 @@ export class RequestForwarder {
         stream: request.stream,
         temperature: request.temperature,
         enable_thinking: !!request.reasoning_effort,
+        signal: context?.signal,
       })
 
       const latency = Date.now() - startTime

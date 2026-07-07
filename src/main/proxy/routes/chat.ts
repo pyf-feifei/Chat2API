@@ -62,6 +62,18 @@ function extractUserInput(messages: Array<{ role: string; content?: string | any
   return undefined
 }
 
+function createClientAbortSignal(ctx: Context): AbortSignal {
+  const controller = new AbortController()
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort()
+    }
+  }
+  ctx.req.once('aborted', abort)
+  ctx.res.once('close', abort)
+  return controller.signal
+}
+
 function isQwenAiRiskControl(providerId: string | undefined, status: number | undefined, error: string | undefined): boolean {
   return Boolean(
     providerId === 'qwen-ai' &&
@@ -183,6 +195,7 @@ router.post('/completions', async (ctx: Context) => {
     startTime,
     isStream: request.stream || false,
     clientIP,
+    signal: createClientAbortSignal(ctx),
   }
 
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)

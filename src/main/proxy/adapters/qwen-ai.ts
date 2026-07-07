@@ -65,6 +65,7 @@ interface ChatCompletionRequest {
   enable_thinking?: boolean
   thinking_budget?: number
   chatId?: string
+  signal?: AbortSignal
 }
 
 function uuid(): string {
@@ -594,6 +595,7 @@ export class QwenAiAdapter {
       },
       responseType: 'stream',
       timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      signal: request.signal,
       validateStatus: () => true,
     }))
 

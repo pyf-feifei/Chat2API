@@ -9,10 +9,15 @@ import type {
 import type { QwenAiGovernorEffectiveConfig, QwenAiGovernorStatus } from '../../shared/types'
 
 type QueueItem = {
+  id: string
   accountId: string
   run: () => Promise<ForwardResult>
   resolve: (value: ForwardResult) => void
   reject: (reason: unknown) => void
+  enqueuedAt: number
+  timeout?: NodeJS.Timeout
+  signal?: AbortSignal
+  cancelled: boolean
 }
 
 type CooldownState = {
@@ -41,6 +46,11 @@ const ENV_DEFAULT_CONFIG: QwenAiGovernorConfig = {
   riskWindowMs: numberFromEnv('CHAT2API_QWEN_AI_RISK_WINDOW_MS', 5 * 60 * 1000),
   globalRiskThreshold: Math.max(1, numberFromEnv('CHAT2API_QWEN_AI_GLOBAL_RISK_THRESHOLD', 3)),
 }
+
+const QWEN_AI_QUEUE_TIMEOUT_MS = Math.max(
+  1000,
+  numberFromEnv('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS', 2 * 60 * 1000),
+)
 
 function numberFromEnv(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -86,8 +96,9 @@ export class QwenAiRequestGovernor {
   private activeByAccount: Map<string, number> = new Map()
   private globalCooldown: CooldownState | undefined
   private riskEvents: RiskEvent[] = []
+  private nextQueueItemId = 1
 
-  run(accountId: string, run: () => Promise<ForwardResult>): Promise<ForwardResult> {
+  run(accountId: string, run: () => Promise<ForwardResult>, options: { signal?: AbortSignal } = {}): Promise<ForwardResult> {
     return new Promise((resolve, reject) => {
       const now = Date.now()
       this.expireGlobalCooldown(now)
@@ -97,9 +108,64 @@ export class QwenAiRequestGovernor {
         return
       }
 
-      this.queue.push({ accountId, run, resolve, reject })
+      if (options.signal?.aborted) {
+        resolve(this.createCancelledResult('Client disconnected before Qwen AI request was queued.'))
+        return
+      }
+
+      const item: QueueItem = {
+        id: String(this.nextQueueItemId++),
+        accountId,
+        run,
+        resolve,
+        reject,
+        enqueuedAt: now,
+        signal: options.signal,
+        cancelled: false,
+      }
+
+      const cancelQueued = (message: string) => {
+        if (item.cancelled) return
+        item.cancelled = true
+        this.removeQueuedItem(item)
+        resolve(this.createCancelledResult(message))
+      }
+
+      item.timeout = setTimeout(() => {
+        cancelQueued(`Qwen AI request waited in queue for more than ${Math.ceil(QWEN_AI_QUEUE_TIMEOUT_MS / 1000)}s.`)
+      }, QWEN_AI_QUEUE_TIMEOUT_MS)
+
+      options.signal?.addEventListener('abort', () => {
+        cancelQueued('Client disconnected while Qwen AI request was queued.')
+      }, { once: true })
+
+      this.queue.push(item)
       this.pump()
     })
+  }
+
+  private createCancelledResult(message: string): ForwardResult {
+    return {
+      success: false,
+      status: 499,
+      error: message,
+    }
+  }
+
+  private clearQueueItemTimeout(item: QueueItem): void {
+    if (item.timeout) {
+      clearTimeout(item.timeout)
+      item.timeout = undefined
+    }
+  }
+
+  private removeQueuedItem(item: QueueItem): void {
+    const index = this.queue.findIndex(candidate => candidate === item || candidate.id === item.id)
+    if (index >= 0) {
+      this.queue.splice(index, 1)
+      this.pump()
+    }
+    this.clearQueueItemTimeout(item)
   }
 
   private pump(): void {
@@ -138,6 +204,12 @@ export class QwenAiRequestGovernor {
       }
 
       const item = this.queue.splice(selectedIndex, 1)[0]
+      this.clearQueueItemTimeout(item)
+      if (item.cancelled || item.signal?.aborted) {
+        item.cancelled = true
+        item.resolve(this.createCancelledResult('Client disconnected before Qwen AI request started.'))
+        continue
+      }
       this.start(item)
     }
   }
@@ -151,6 +223,7 @@ export class QwenAiRequestGovernor {
     this.accountNextAvailableAt.set(item.accountId, startedAt + config.accountMinIntervalMs)
 
     let released = false
+    let settledByAbort = false
     const release = () => {
       if (!released) {
         released = true
@@ -160,17 +233,35 @@ export class QwenAiRequestGovernor {
       }
     }
 
+    const abortActive = () => {
+      if (settledByAbort) return
+      settledByAbort = true
+      release()
+      item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
+    }
+
+    item.signal?.addEventListener('abort', abortActive, { once: true })
+
     item.run()
       .then((result) => {
         this.recordResult(item.accountId, result)
         if (result.success && result.stream) {
-          attachRelease(result.stream, release)
+          const releaseStream = () => {
+            item.signal?.removeEventListener('abort', abortActive)
+            release()
+          }
+          attachRelease(result.stream, releaseStream)
+          if (item.signal?.aborted) {
+            releaseStream()
+          }
         } else {
+          item.signal?.removeEventListener('abort', abortActive)
           release()
         }
         item.resolve(result)
       })
       .catch((error) => {
+        item.signal?.removeEventListener('abort', abortActive)
         this.openCooldown(item.accountId, this.getConfig().failureCooldownMs, 'exception')
         release()
         item.reject(error)
