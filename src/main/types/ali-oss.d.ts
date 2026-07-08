@@ -19,8 +19,8 @@ declare module 'ali-oss' {
 
   class OSS {
     constructor(options: OSSOptions)
-    put(name: string, data: Buffer | string, options?: any): Promise<PutResult>
-    multipartUpload(name: string, data: Buffer | string, options?: any): Promise<any>
+    put(name: string, data: Buffer | string | NodeJS.ReadableStream, options?: any): Promise<PutResult>
+    multipartUpload(name: string, data: Buffer | string | NodeJS.ReadableStream, options?: any): Promise<any>
   }
 
   export default OSS

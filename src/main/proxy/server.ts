@@ -198,6 +198,8 @@ export class ProxyServer {
           'GET /v1beta/models',
           'POST /v1beta/models/:model:generateContent',
           'POST /v1beta/models/:model:streamGenerateContent',
+          'POST /v1beta/chat2api/qwen-ai/direct-upload/start',
+          'POST /v1beta/chat2api/qwen-ai/direct-upload/complete',
           'POST /upload/v1beta/files',
         ],
       }

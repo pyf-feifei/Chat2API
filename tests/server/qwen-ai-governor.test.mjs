@@ -8,7 +8,8 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
 
   assert.match(forwarderSource, /qwenAiRequestGovernor/)
   assert.match(forwarderSource, /qwenAiRequestGovernor\.run\(account\.id/)
-  assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime\)/)
+  assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context\)/)
+  assert.match(forwarderSource, /\{ signal: context\.signal \}/)
 
   assert.match(governorSource, /CHAT2API_QWEN_AI_MAX_CONCURRENT/)
   assert.match(governorSource, /CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS/)
@@ -21,7 +22,7 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(governorSource, /CHAT2API_QWEN_AI_GLOBAL_RISK_THRESHOLD/)
   assert.match(governorSource, /maxConcurrent/)
   assert.match(governorSource, /accountNextAvailableAt/)
-  assert.match(governorSource, /attachRelease\(result\.stream, release\)/)
+  assert.match(governorSource, /attachRelease\(result\.stream, releaseStream\)/)
 })
 
 test('Qwen AI risk-control failures cool the account and require distinct accounts before global circuit', () => {

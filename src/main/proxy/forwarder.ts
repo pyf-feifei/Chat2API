@@ -491,7 +491,9 @@ export class RequestForwarder {
       )
       
       if (request.stream) {
-        const transformedStream = await handler.handleStream(response.data)
+        const transformedStream = await handler.handleStream(response.data, {
+          signal: context?.signal,
+        })
         
         return {
           success: true,
@@ -505,7 +507,9 @@ export class RequestForwarder {
       }
 
       // Non-streaming requests need to collect stream data and convert
-      const result = await handler.handleNonStream(response.data)
+      const result = await handler.handleNonStream(response.data, {
+        signal: context?.signal,
+      })
       
       this.applyToolCallsToResponse(result, transformed)
       

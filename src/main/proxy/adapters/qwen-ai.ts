@@ -11,7 +11,13 @@ import { Account, Provider } from '../../store/types'
 import type { ChatMessage } from '../types'
 import { hasToolUse, parseToolUse } from '../promptToolUse'
 import { QwenAiTokenRefresher } from './qwen-ai-token-refresh'
-import { QwenAiFileUploader, QWEN_AI_DOCUMENT_EVIDENCE_MARKER, prepareQwenAiMultimodalMessage } from './qwen-ai-files'
+import {
+  QwenAiFileUploader,
+  QWEN_AI_DOCUMENT_EVIDENCE_MARKER,
+  prepareQwenAiMultimodalMessage,
+  type QwenAiDirectUploadInput,
+  type QwenAiDirectUploadStartResult,
+} from './qwen-ai-files'
 import { createBaseChunk } from '../utils/streamToolHandler'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
@@ -25,6 +31,8 @@ import {
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = Number(process.env.QWEN_AI_REQUEST_TIMEOUT_MS || 300000)
+const QWEN_AI_RESPONSE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', QWEN_AI_REQUEST_TIMEOUT_MS)
+const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
 
 const DEFAULT_HEADERS = {
   Accept: 'application/json',
@@ -55,6 +63,12 @@ const MODEL_ALIASES: Record<string, string> = {
 
 type QwenAiMessage = ChatMessage
 
+type StreamHandlingOptions = {
+  signal?: AbortSignal
+  responseTimeoutMs?: number
+  idleTimeoutMs?: number
+}
+
 interface ChatCompletionRequest {
   model: string
   /** Original model name before mapping (used for feature detection like thinking mode) */
@@ -66,6 +80,26 @@ interface ChatCompletionRequest {
   thinking_budget?: number
   chatId?: string
   signal?: AbortSignal
+}
+
+function positiveNumberFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+function destroyReadableStream(stream: any, error?: Error): void {
+  if (!stream) return
+
+  if (typeof stream.destroy === 'function') {
+    stream.destroy(error)
+    return
+  }
+
+  if (typeof stream.abort === 'function') {
+    stream.abort()
+  }
 }
 
 function uuid(): string {
@@ -522,6 +556,7 @@ export class QwenAiAdapter {
       this.axiosInstance,
       () => this.getHeaders(chatId),
       this.postWithRefreshRetry.bind(this),
+      { providerId: this.provider.id, accountId: this.account.id },
     )
     const preparedUserMessage = await prepareQwenAiMultimodalMessage(messages, uploader)
     const qwenFiles = preparedUserMessage.files
@@ -609,6 +644,35 @@ export class QwenAiAdapter {
       chatId,
       parentId: null,
     }
+  }
+
+  async startDirectFileUpload(input: QwenAiDirectUploadInput): Promise<QwenAiDirectUploadStartResult> {
+    await this.refreshTokenIfNeeded()
+
+    const token = this.getToken()
+    if (!token && !this.getCookies()) {
+      throw new Error('Qwen AI token/cookies not configured, please add credentials in account settings')
+    }
+
+    const uploader = new QwenAiFileUploader(
+      this.axiosInstance,
+      () => this.getHeaders(),
+      this.postWithRefreshRetry.bind(this),
+      { providerId: this.provider.id, accountId: this.account.id },
+    )
+    return uploader.startDirectUpload(input)
+  }
+
+  async completeDirectFileUpload(sessionId: string): Promise<any> {
+    await this.refreshTokenIfNeeded()
+
+    const uploader = new QwenAiFileUploader(
+      this.axiosInstance,
+      () => this.getHeaders(),
+      this.postWithRefreshRetry.bind(this),
+      { providerId: this.provider.id, accountId: this.account.id },
+    )
+    return uploader.completeDirectUpload(sessionId)
   }
 
   static isQwenAiProvider(provider: Provider): boolean {
@@ -915,7 +979,7 @@ export class QwenAiStreamHandler {
     return true
   }
 
-  async handleStream(stream: any): Promise<PassThrough> {
+  async handleStream(stream: any, options: StreamHandlingOptions = {}): Promise<PassThrough> {
     const transStream = new PassThrough()
 
     console.log('[QwenAI] Starting stream handler...')
@@ -925,6 +989,60 @@ export class QwenAiStreamHandler {
     let summaryText = ''
     let initialChunkSent = false
     let finalChunkSent = false
+    let responseTimer: NodeJS.Timeout | undefined
+    let idleTimer: NodeJS.Timeout | undefined
+
+    const cleanupTimers = () => {
+      if (responseTimer) {
+        clearTimeout(responseTimer)
+        responseTimer = undefined
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+        idleTimer = undefined
+      }
+    }
+
+    const failStream = (error: Error) => {
+      if (finalChunkSent) return
+      console.error('[QwenAI] Stream failed:', error.message)
+      finalChunkSent = true
+      cleanupTimers()
+      destroyReadableStream(stream, error)
+      transStream.write(`event: error\ndata: ${JSON.stringify({
+        error: {
+          message: error.message,
+          type: 'upstream_stream_error',
+          code: 'qwen_ai_stream_error',
+        },
+      })}\n\n`)
+      transStream.end('data: [DONE]\n\n')
+    }
+
+    const refreshIdleTimer = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+      }
+      idleTimer = setTimeout(() => {
+        failStream(new Error(`Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`))
+      }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
+    }
+
+    const onAbort = () => {
+      failStream(new Error('Qwen AI response stream aborted because the client disconnected.'))
+    }
+
+    responseTimer = setTimeout(() => {
+      failStream(new Error(`Qwen AI response stream timed out after ${Math.ceil((options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS) / 1000)}s.`))
+    }, options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS)
+    refreshIdleTimer()
+
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+
+    const cleanup = () => {
+      cleanupTimers()
+      options.signal?.removeEventListener('abort', onAbort)
+    }
 
     const writeContent = (content: string) => {
       if (!content || finalChunkSent) return
@@ -955,6 +1073,7 @@ export class QwenAiStreamHandler {
       const completeNativeToolCalls = this.getCompleteNativeToolCalls(true)
       if (completeNativeToolCalls.length > 0 && this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
         finalChunkSent = true
+        cleanup()
         return
       }
 
@@ -979,6 +1098,7 @@ export class QwenAiStreamHandler {
         console.log('[QwenAI] Found legacy tool_use in stream, sending tool_calls')
         if (this.sendToolCalls(transStream)) {
           finalChunkSent = true
+          cleanup()
           return
         }
       }
@@ -1000,6 +1120,7 @@ export class QwenAiStreamHandler {
         transStream.write('data: [DONE]\n\n')
         transStream.end()
         finalChunkSent = true
+        cleanup()
 
         if (this.onEnd && this.chatId) {
           this.onEnd(this.chatId)
@@ -1020,6 +1141,7 @@ export class QwenAiStreamHandler {
       transStream.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
       transStream.end('data: [DONE]\n\n')
       finalChunkSent = true
+      cleanup()
 
       if (this.onEnd && this.chatId) {
         this.onEnd(this.chatId)
@@ -1173,14 +1295,20 @@ export class QwenAiStreamHandler {
     })
 
     stream.on('data', (buffer: Buffer) => {
+      refreshIdleTimer()
       const text = buffer.toString()
       console.log('[QwenAI] Raw stream data:', text.substring(0, 500))
       parser.feed(text)
     })
     stream.once('error', (err: Error) => {
       console.error('[QwenAI] Stream error:', err)
-      finalChunkSent = true
-      transStream.end('data: [DONE]\n\n')
+      failStream(err)
+    })
+    stream.once('end', () => {
+      console.log('[QwenAI] Stream ended')
+      if (!finalChunkSent) {
+        finishAnswer('stop')
+      }
     })
     stream.once('close', () => {
       console.log('[QwenAI] Stream closed')
@@ -1188,11 +1316,17 @@ export class QwenAiStreamHandler {
         finishAnswer('stop')
       }
     })
+    transStream.once('close', () => {
+      cleanup()
+      if (!finalChunkSent) {
+        destroyReadableStream(stream, new Error('Qwen AI downstream stream closed before upstream completed.'))
+      }
+    })
 
     return transStream
   }
 
-  async handleNonStream(stream: any): Promise<any> {
+  async handleNonStream(stream: any, options: StreamHandlingOptions = {}): Promise<any> {
     return new Promise((resolve, reject) => {
       const data = {
         id: '',
@@ -1213,10 +1347,30 @@ export class QwenAiStreamHandler {
       let summaryText = ''
       let resolved = false
       let sawAnswerFinish = false
+      let responseTimer: NodeJS.Timeout | undefined
+      let idleTimer: NodeJS.Timeout | undefined
+
+      const cleanupTimers = () => {
+        if (responseTimer) {
+          clearTimeout(responseTimer)
+          responseTimer = undefined
+        }
+        if (idleTimer) {
+          clearTimeout(idleTimer)
+          idleTimer = undefined
+        }
+      }
+
+      const cleanup = () => {
+        cleanupTimers()
+        options.signal?.removeEventListener('abort', onAbort)
+      }
 
       const resolveOnce = (value: any) => {
         if (!resolved) {
           resolved = true
+          cleanup()
+          destroyReadableStream(stream)
           resolve(value)
         }
       }
@@ -1224,9 +1378,36 @@ export class QwenAiStreamHandler {
       const rejectOnce = (reason: any) => {
         if (!resolved) {
           resolved = true
+          cleanup()
+          destroyReadableStream(stream, reason instanceof Error ? reason : undefined)
           reject(reason)
         }
       }
+
+      const refreshIdleTimer = () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer)
+        }
+        idleTimer = setTimeout(() => {
+          rejectOnce(new Error(`Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`))
+        }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
+      }
+
+      function onAbort() {
+        rejectOnce(new Error('Qwen AI response stream aborted because the client disconnected.'))
+      }
+
+      if (options.signal?.aborted) {
+        rejectOnce(new Error('Qwen AI response stream aborted before reading started.'))
+        return
+      }
+
+      responseTimer = setTimeout(() => {
+        rejectOnce(new Error(`Qwen AI response stream timed out after ${Math.ceil((options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS) / 1000)}s.`))
+      }, options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS)
+      refreshIdleTimer()
+
+      options.signal?.addEventListener('abort', onAbort, { once: true })
 
       const parser = createParser({
         onEvent: (event: any) => {
@@ -1295,12 +1476,18 @@ export class QwenAiStreamHandler {
         },
       })
 
-      stream.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
+      stream.on('data', (buffer: Buffer) => {
+        refreshIdleTimer()
+        parser.feed(buffer.toString())
+      })
       stream.once('error', (err: Error) => {
-        console.error('[QwenAI] Non-stream error:', err)
+        if (resolved) {
+          return
+        }
+        console.error('[QwenAI] Non-stream error:', err instanceof Error ? `${err.name}: ${err.message}` : err)
         rejectOnce(err)
       })
-      stream.once('close', () => {
+      const finishFromClose = () => {
         // Use reasoningText or summaryText for reasoning_content
         const finalReasoning = reasoningText || summaryText
         if (finalReasoning) {
@@ -1316,7 +1503,9 @@ export class QwenAiStreamHandler {
           console.warn('[QwenAI] Non-stream closed before an answer finished event; returning accumulated content.')
         }
         resolveOnce(data)
-      })
+      }
+      stream.once('end', finishFromClose)
+      stream.once('close', finishFromClose)
     })
   }
 

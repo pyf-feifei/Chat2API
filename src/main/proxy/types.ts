@@ -78,6 +78,10 @@ export interface ChatCompletionRequest {
   model: string
   /** Original model name before mapping (used for feature detection like web search, thinking mode) */
   originalModel?: string
+  /** Internal routing hint used by Gemini-compatible direct upload flows. */
+  preferredProviderId?: string
+  /** Internal routing hint used by Gemini-compatible direct upload flows. */
+  preferredAccountId?: string
   messages: ChatMessage[]
   temperature?: number
   top_p?: number

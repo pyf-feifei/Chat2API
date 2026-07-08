@@ -6,12 +6,17 @@ import { modelMapper } from '../modelMapper'
 import { requestForwarder } from '../forwarder'
 import { proxyStatusManager } from '../status'
 import { storeManager } from '../../store/store'
+import { QwenAiAdapter } from '../adapters/qwen-ai'
 import {
   chatCompletionStreamToGeminiSse,
   chatCompletionToGeminiResponse,
   geminiToChatCompletionRequest,
 } from '../gemini/translator'
 import { geminiFileStore } from '../gemini/fileStore'
+import {
+  getQwenAiDirectUploadSessionScope,
+  type QwenAiDirectUploadInput,
+} from '../adapters/qwen-ai-files'
 import type { ProxyContext } from '../types'
 
 const router = new Router()
@@ -35,13 +40,13 @@ function getModelResource(model: string, ownedBy = 'chat2api'): any {
   }
 }
 
-function selectModel(model: string) {
+function selectModel(model: string, request?: { preferredProviderId?: string; preferredAccountId?: string }) {
   const config = storeManager.getConfig()
   const selection = loadBalancer.selectAccount(
     model,
     config.loadBalanceStrategy,
-    modelMapper.getPreferredProvider(model),
-    modelMapper.getPreferredAccount(model),
+    request?.preferredProviderId || modelMapper.getPreferredProvider(model),
+    request?.preferredAccountId || modelMapper.getPreferredAccount(model),
   )
   return selection
 }
@@ -61,7 +66,24 @@ function createClientAbortSignal(ctx: Context): AbortSignal {
 async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
   const model = ctx.params.model
   const startTime = Date.now()
-  const selection = selectModel(model)
+  let chatRequest
+  try {
+    chatRequest = {
+      ...geminiToChatCompletionRequest(model, ctx.request.body || {}),
+      stream,
+    }
+  } catch (error) {
+    ctx.status = 400
+    ctx.body = {
+      error: {
+        code: 400,
+        message: error instanceof Error ? error.message : 'Invalid Gemini-compatible request',
+        status: 'INVALID_ARGUMENT',
+      },
+    }
+    return
+  }
+  const selection = selectModel(model, chatRequest)
 
   if (!selection) {
     ctx.status = 503
@@ -76,10 +98,8 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
   }
 
   const { account, provider, actualModel } = selection
-  const chatRequest = {
-    ...geminiToChatCompletionRequest(model, ctx.request.body || {}),
-    stream,
-  }
+  const signal = createClientAbortSignal(ctx)
+  chatRequest.stream = stream
   const context: ProxyContext = {
     requestId: requestId(),
     providerId: provider.id,
@@ -89,38 +109,143 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
     startTime,
     isStream: stream,
     clientIP: ctx.ip,
-    signal: createClientAbortSignal(ctx),
+    signal,
   }
 
   proxyStatusManager.recordRequestStart(model, provider.id, account.id)
-  const result = await requestForwarder.forwardChatCompletion(chatRequest, account, provider, actualModel, context)
+  let statisticsRecorded = false
+  const recordSuccess = () => {
+    if (!statisticsRecorded) {
+      statisticsRecorded = true
+      proxyStatusManager.recordRequestSuccess(Date.now() - startTime)
+    }
+  }
+  const recordFailure = () => {
+    if (!statisticsRecorded) {
+      statisticsRecorded = true
+      proxyStatusManager.recordRequestFailure(Date.now() - startTime)
+    }
+  }
 
-  if (!result.success) {
-    proxyStatusManager.recordRequestFailure(Date.now() - startTime)
-    ctx.status = result.status || 500
+  try {
+    const result = await requestForwarder.forwardChatCompletion(chatRequest, account, provider, actualModel, context)
+
+    if (!result.success) {
+      recordFailure()
+      ctx.status = result.status || 500
+      ctx.body = {
+        error: {
+          code: ctx.status,
+          message: result.error || 'Gemini-compatible request failed',
+          status: result.status === 499 ? 'CANCELLED' : 'INTERNAL',
+        },
+      }
+      return
+    }
+
+    recordSuccess()
+
+    if (stream && result.stream) {
+      ctx.set('Content-Type', 'text/event-stream')
+      ctx.set('Cache-Control', 'no-cache')
+      const geminiStream = chatCompletionStreamToGeminiSse(result.stream, actualModel)
+      const abortStream = () => {
+        if (typeof (result.stream as any).destroy === 'function') {
+          ;(result.stream as any).destroy(new Error('Gemini-compatible client disconnected'))
+        }
+        if (typeof (geminiStream as any).destroy === 'function') {
+          ;(geminiStream as any).destroy(new Error('Gemini-compatible client disconnected'))
+        }
+      }
+      signal.addEventListener('abort', abortStream, { once: true })
+      geminiStream.once('close', () => signal.removeEventListener('abort', abortStream))
+      ctx.body = geminiStream
+      return
+    }
+
+    ctx.set('Content-Type', 'application/json')
+    ctx.body = chatCompletionToGeminiResponse(result.body, actualModel)
+  } catch (error) {
+    recordFailure()
+    const status = (error as { status?: number; statusCode?: number })?.status ||
+      (error as { status?: number; statusCode?: number })?.statusCode ||
+      (signal.aborted ? 499 : 500)
+    const message = error instanceof Error ? error.message : 'Gemini-compatible request failed'
+    ctx.status = status
     ctx.body = {
       error: {
-        code: ctx.status,
-        message: result.error || 'Gemini-compatible request failed',
-        status: 'INTERNAL',
+        code: status,
+        message,
+        status: status === 499 ? 'CANCELLED' : 'INTERNAL',
       },
     }
+  }
+}
+
+function directUploadInput(ctx: Context): QwenAiDirectUploadInput {
+  const body = (ctx.request.body || {}) as any
+  return {
+    filename: body.filename || body.displayName || body.display_name,
+    mimeType: body.mimeType || body.mime_type,
+    sizeBytes: body.sizeBytes ?? body.size_bytes,
+    clientFileKey: body.clientFileKey || body.client_file_key,
+  }
+}
+
+async function startQwenAiDirectUpload(ctx: Context): Promise<void> {
+  const model = String(((ctx.request.body || {}) as any).model || ctx.query.model || 'qwen')
+  const selection = selectModel(model)
+  if (!selection) {
+    ctx.status = 503
+    ctx.body = { error: { message: `No available account for model: ${model}` } }
     return
   }
 
-  proxyStatusManager.recordRequestSuccess(Date.now() - startTime)
-
-  if (stream && result.stream) {
-    ctx.set('Content-Type', 'text/event-stream')
-    ctx.set('Cache-Control', 'no-cache')
-    ctx.body = result.skipTransform
-      ? chatCompletionStreamToGeminiSse(result.stream, actualModel)
-      : chatCompletionStreamToGeminiSse(result.stream, actualModel)
+  if (!QwenAiAdapter.isQwenAiProvider(selection.provider)) {
+    ctx.status = 400
+    ctx.body = { error: { message: 'Qwen AI direct upload requires a qwen-ai provider selection' } }
     return
   }
 
-  ctx.set('Content-Type', 'application/json')
-  ctx.body = chatCompletionToGeminiResponse(result.body, actualModel)
+  try {
+    const adapter = new QwenAiAdapter(selection.provider, selection.account)
+    ctx.body = await adapter.startDirectFileUpload(directUploadInput(ctx))
+  } catch (error) {
+    ctx.status = 400
+    ctx.body = { error: { message: error instanceof Error ? error.message : 'Qwen AI direct upload start failed' } }
+  }
+}
+
+async function completeQwenAiDirectUpload(ctx: Context): Promise<void> {
+  const sessionId = String(((ctx.request.body || {}) as any).sessionId || ((ctx.request.body || {}) as any).session_id || '')
+  if (!sessionId) {
+    ctx.status = 400
+    ctx.body = { error: { message: 'Missing sessionId' } }
+    return
+  }
+
+  const scope = getQwenAiDirectUploadSessionScope(sessionId)
+  if (!scope) {
+    ctx.status = 404
+    ctx.body = { error: { message: `Qwen AI direct upload session not found or expired: ${sessionId}` } }
+    return
+  }
+
+  const provider = storeManager.getProviderById(scope.providerId)
+  const account = storeManager.getAccountById(scope.accountId, true)
+  if (!provider || !account || !QwenAiAdapter.isQwenAiProvider(provider)) {
+    ctx.status = 404
+    ctx.body = { error: { message: 'Qwen AI direct upload account not found' } }
+    return
+  }
+
+  try {
+    const adapter = new QwenAiAdapter(provider, account)
+    ctx.body = { file: await adapter.completeDirectFileUpload(sessionId) }
+  } catch (error) {
+    ctx.status = 400
+    ctx.body = { error: { message: error instanceof Error ? error.message : 'Qwen AI direct upload complete failed' } }
+  }
 }
 
 function setCapturedModelParam(ctx: RouterContext): void {
@@ -153,6 +278,10 @@ router.get('/v1beta/models', async (ctx: Context) => {
 router.get('/v1beta/models/:model', async (ctx: Context) => {
   ctx.body = getModelResource(ctx.params.model)
 })
+
+router.post('/v1beta/chat2api/qwen-ai/direct-upload/start', startQwenAiDirectUpload)
+
+router.post('/v1beta/chat2api/qwen-ai/direct-upload/complete', completeQwenAiDirectUpload)
 
 router.post(generateContentRoutePattern, async (ctx: Context) => {
   setCapturedModelParam(ctx)

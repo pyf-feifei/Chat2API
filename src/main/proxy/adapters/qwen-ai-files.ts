@@ -1,16 +1,22 @@
-import { readFileSync, statSync } from 'fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs'
 import axios, { AxiosInstance, AxiosResponse } from 'axios'
 import OSS from 'ali-oss'
 import mime from 'mime-types'
 import path from 'path'
 import type { ChatMessage, ChatMessageContent } from '../types'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
+import { getRuntime } from '../../runtime'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const MAX_FILE_SIZE = 2000 * 1024 * 1024
 const OSS_SINGLE_PUT_MAX_BYTES = positiveIntegerFromEnv('QWEN_AI_OSS_SINGLE_PUT_MAX_BYTES', 2 * 1024 * 1024)
 const OSS_UPLOAD_TIMEOUT_MS = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_TIMEOUT_MS', 5 * 60 * 1000)
 const OSS_UPLOAD_RETRY_MAX = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_RETRY_MAX', 3)
+const QWEN_AI_FILE_CACHE_ENABLED = process.env.QWEN_AI_FILE_CACHE_ENABLED !== 'false'
+const QWEN_AI_FILE_CACHE_TTL_MS = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_TTL_MS', 47 * 60 * 60 * 1000)
+const QWEN_AI_FILE_CACHE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_MAX_ENTRIES', 512)
+const QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS = positiveIntegerFromEnv('QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS', 60 * 60 * 1000)
+const QWEN_AI_DIRECT_FILE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_DIRECT_FILE_MAX_ENTRIES', 512)
 const PARSE_POLL_INTERVAL_MS = 2000
 const PARSE_POLL_TIMEOUT_MS = 120000
 const DOCUMENT_EVIDENCE_MAX_TEXT_BYTES = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_TEXT_BYTES', 32 * 1024 * 1024)
@@ -121,9 +127,13 @@ type QwenPostWithRetry = (
 
 type QwenFileClass = 'vision' | 'document' | 'audio' | 'video'
 type QwenCoarseFileType = 'image' | 'file' | 'audio' | 'video'
+export const QWEN_AI_DIRECT_FILE_SCHEME = 'qwen-ai-direct://'
 
 interface NormalizedInputFile {
-  data: Buffer
+  data?: Buffer
+  localPath?: string
+  localMtimeMs?: number
+  sizeBytes: number
   filename: string
   mimeType: string
   sourceUrl?: string
@@ -161,6 +171,91 @@ interface UploadedQwenAiPart {
   evidence?: QwenAiDocumentEvidence
 }
 
+interface QwenAiFileCacheScope {
+  providerId?: string
+  accountId?: string
+}
+
+interface QwenAiFileCacheRecord {
+  key: string
+  providerId: string
+  accountId: string
+  localPath: string
+  localMtimeMs: number
+  sizeBytes: number
+  filename: string
+  mimeType: string
+  coarseType: QwenCoarseFileType
+  fileClass: QwenFileClass
+  file: any
+  createdAt: number
+  lastUsedAt: number
+}
+
+export interface QwenAiDirectUploadInput {
+  filename?: string
+  mimeType?: string
+  mime_type?: string
+  sizeBytes?: number
+  size_bytes?: number
+  clientFileKey?: string
+  client_file_key?: string
+}
+
+interface QwenAiDirectFileRecord {
+  id: string
+  name: string
+  uri: string
+  providerId: string
+  accountId: string
+  clientFileKey?: string
+  filename: string
+  mimeType: string
+  sizeBytes: number
+  coarseType: QwenCoarseFileType
+  fileClass: QwenFileClass
+  file: any
+  createdAt: number
+  lastUsedAt: number
+}
+
+interface QwenAiDirectUploadPendingSession {
+  sessionId: string
+  providerId: string
+  accountId: string
+  clientFileKey?: string
+  file: NormalizedInputFile
+  sts: QwenStsInfo
+  createdAt: number
+  expiresAt: number
+}
+
+export interface QwenAiDirectUploadStartResult {
+  reused: boolean
+  file: any
+  qwen: {
+    providerId: string
+    accountId: string
+    fileId: string
+  }
+  upload?: {
+    sessionId: string
+    accessKeyId: string
+    accessKeySecret: string
+    securityToken?: string
+    bucket: string
+    region: string
+    endpoint: string
+    fileId: string
+    filePath: string
+    fileUrl: string
+    authVersion: 'v4'
+    partSize: number
+    parallel: number
+    expiresAt: string
+  }
+}
+
 interface DocumentCandidateSnippet {
   priority: number
   position: number
@@ -196,6 +291,18 @@ function qwenOssMultipartParams(fileSize: number): { parallel: number; partSize:
   return { parallel: 10, partSize: 10 * 1024 * 1024 }
 }
 
+function qwenOssDirectMultipartParams(fileSize: number): { parallel: number; partSize: number } {
+  const base = qwenOssMultipartParams(fileSize)
+  if (fileSize < 100 * 1024 * 1024) {
+    return base
+  }
+
+  return {
+    parallel: boundedPositiveIntegerFromEnv('QWEN_AI_DIRECT_UPLOAD_PARALLEL', 12, 1, 16),
+    partSize: boundedPositiveIntegerFromEnv('QWEN_AI_DIRECT_UPLOAD_PART_SIZE_MIB', 16, 5, 32) * 1024 * 1024,
+  }
+}
+
 function positiveIntegerFromEnv(name: string, fallback: number): number {
   const raw = process.env[name]
   if (!raw) {
@@ -204,6 +311,10 @@ function positiveIntegerFromEnv(name: string, fallback: number): number {
 
   const parsed = Number(raw)
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
+}
+
+function boundedPositiveIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, positiveIntegerFromEnv(name, fallback)))
 }
 
 function uuid(): string {
@@ -218,6 +329,423 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function elapsedSeconds(startTime: number): string {
+  return ((Date.now() - startTime) / 1000).toFixed(1)
+}
+
+function safeCacheScope(scope?: QwenAiFileCacheScope): Required<QwenAiFileCacheScope> {
+  return {
+    providerId: scope?.providerId || 'unknown-provider',
+    accountId: scope?.accountId || 'unknown-account',
+  }
+}
+
+function qwenFileCachePath(): string {
+  return path.join(getRuntime().getDataDir(), 'qwen-ai-file-cache.json')
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value))
+}
+
+function cloneCachedQwenFileItem(fileItem: any, file: NormalizedInputFile): any {
+  const cloned = cloneJson(fileItem)
+  const now = Date.now()
+
+  cloned.itemId = uuid()
+  cloned.name = file.filename
+  cloned.size = file.sizeBytes
+  cloned.filetype = file.coarseType
+  cloned.file_type = file.mimeType
+  cloned.showType = file.coarseType
+  cloned.file_class = file.fileClass
+  cloned.type = file.coarseType
+  cloned.meta = {
+    ...(cloned.meta || {}),
+    name: file.filename,
+    size: file.sizeBytes,
+    content_type: file.mimeType,
+  }
+
+  cloned.file = {
+    ...(cloned.file || {}),
+    filename: file.filename,
+    name: file.filename,
+    size: file.sizeBytes,
+    type: file.mimeType,
+    update_at: now,
+    meta: {
+      ...(cloned.file?.meta || {}),
+      name: file.filename,
+      size: file.sizeBytes,
+      content_type: file.mimeType,
+    },
+  }
+
+  return cloned
+}
+
+class QwenAiFileCache {
+  private records: Record<string, QwenAiFileCacheRecord> = {}
+  private directFiles: Record<string, QwenAiDirectFileRecord> = {}
+  private loaded = false
+
+  createKey(scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile): string | null {
+    if (!QWEN_AI_FILE_CACHE_ENABLED || !file.localPath || file.localMtimeMs === undefined) {
+      return null
+    }
+
+    return JSON.stringify([
+      'qwen-ai-file-cache-v1',
+      scope.providerId,
+      scope.accountId,
+      path.resolve(file.localPath),
+      file.localMtimeMs,
+      file.sizeBytes,
+      normalizeMimeType(file.mimeType),
+      file.coarseType,
+      file.fileClass,
+    ])
+  }
+
+  get(key: string, scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile): any | null {
+    this.load()
+
+    const record = this.records[key]
+    if (!record) {
+      return null
+    }
+
+    const expired = Date.now() - record.createdAt > QWEN_AI_FILE_CACHE_TTL_MS
+    const changed =
+      record.providerId !== scope.providerId ||
+      record.accountId !== scope.accountId ||
+      record.localPath !== path.resolve(file.localPath || '') ||
+      record.localMtimeMs !== file.localMtimeMs ||
+      record.sizeBytes !== file.sizeBytes ||
+      normalizeMimeType(record.mimeType) !== normalizeMimeType(file.mimeType) ||
+      record.coarseType !== file.coarseType ||
+      record.fileClass !== file.fileClass
+
+    if (expired || changed) {
+      delete this.records[key]
+      this.persist()
+      return null
+    }
+
+    record.lastUsedAt = Date.now()
+    this.persist()
+    return cloneCachedQwenFileItem(record.file, file)
+  }
+
+  set(key: string, scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile, fileItem: any): void {
+    if (!file.localPath || file.localMtimeMs === undefined) {
+      return
+    }
+
+    this.load()
+
+    const now = Date.now()
+    this.records[key] = {
+      key,
+      providerId: scope.providerId,
+      accountId: scope.accountId,
+      localPath: path.resolve(file.localPath),
+      localMtimeMs: file.localMtimeMs,
+      sizeBytes: file.sizeBytes,
+      filename: file.filename,
+      mimeType: file.mimeType,
+      coarseType: file.coarseType,
+      fileClass: file.fileClass,
+      file: cloneJson(fileItem),
+      createdAt: now,
+      lastUsedAt: now,
+    }
+
+    this.prune()
+    this.persist()
+  }
+
+  createClientFileKey(scope: Required<QwenAiFileCacheScope>, clientFileKey: string): string {
+    return JSON.stringify([
+      'qwen-ai-direct-file-cache-v1',
+      scope.providerId,
+      scope.accountId,
+      clientFileKey,
+    ])
+  }
+
+  getDirectByClientFileKey(clientFileKey: string): QwenAiDirectFileRecord | null {
+    if (!clientFileKey) {
+      return null
+    }
+
+    this.load()
+    const now = Date.now()
+    const match = Object.values(this.directFiles)
+      .filter(record => record.clientFileKey === clientFileKey && now - record.createdAt <= QWEN_AI_FILE_CACHE_TTL_MS)
+      .sort((a, b) => (b.lastUsedAt || b.createdAt || 0) - (a.lastUsedAt || a.createdAt || 0))[0]
+
+    if (!match) {
+      return null
+    }
+
+    match.lastUsedAt = now
+    this.persist()
+    return cloneJson(match)
+  }
+
+  getDirectByUri(uri: string): QwenAiDirectFileRecord | null {
+    this.load()
+    const id = extractDirectFileId(uri)
+    const record = this.directFiles[id]
+    if (!record) {
+      return null
+    }
+
+    if (Date.now() - record.createdAt > QWEN_AI_FILE_CACHE_TTL_MS) {
+      delete this.directFiles[id]
+      this.persist()
+      return null
+    }
+
+    record.lastUsedAt = Date.now()
+    this.persist()
+    return cloneJson(record)
+  }
+
+  setDirect(
+    scope: Required<QwenAiFileCacheScope>,
+    clientFileKey: string | undefined,
+    file: NormalizedInputFile,
+    fileItem: any,
+  ): QwenAiDirectFileRecord {
+    this.load()
+    const now = Date.now()
+    const id = uuid()
+    const record: QwenAiDirectFileRecord = {
+      id,
+      name: `files/${id}`,
+      uri: `${QWEN_AI_DIRECT_FILE_SCHEME}${id}`,
+      providerId: scope.providerId,
+      accountId: scope.accountId,
+      clientFileKey,
+      filename: file.filename,
+      mimeType: file.mimeType,
+      sizeBytes: file.sizeBytes,
+      coarseType: file.coarseType,
+      fileClass: file.fileClass,
+      file: cloneJson(fileItem),
+      createdAt: now,
+      lastUsedAt: now,
+    }
+
+    if (clientFileKey) {
+      for (const [existingId, existingRecord] of Object.entries(this.directFiles)) {
+        if (existingRecord.clientFileKey === clientFileKey && existingRecord.accountId === scope.accountId) {
+          delete this.directFiles[existingId]
+        }
+      }
+    }
+
+    this.directFiles[id] = record
+    this.prune()
+    this.persist()
+    return cloneJson(record)
+  }
+
+  private load(): void {
+    if (this.loaded) {
+      return
+    }
+
+    this.loaded = true
+    const filePath = qwenFileCachePath()
+    if (!existsSync(filePath)) {
+      return
+    }
+
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+      const records = parsed?.records
+      if (records && typeof records === 'object' && !Array.isArray(records)) {
+        this.records = records
+      }
+      const directFiles = parsed?.directFiles
+      if (directFiles && typeof directFiles === 'object' && !Array.isArray(directFiles)) {
+        this.directFiles = directFiles
+      }
+      this.prune()
+    } catch {
+      try {
+        renameSync(filePath, `${filePath}.corrupted.${Date.now()}`)
+      } catch {
+      }
+      this.records = {}
+      this.directFiles = {}
+    }
+  }
+
+  private prune(): void {
+    const now = Date.now()
+    for (const [key, record] of Object.entries(this.records)) {
+      if (!record?.createdAt || now - record.createdAt > QWEN_AI_FILE_CACHE_TTL_MS) {
+        delete this.records[key]
+      }
+    }
+    for (const [key, record] of Object.entries(this.directFiles)) {
+      if (!record?.createdAt || now - record.createdAt > QWEN_AI_FILE_CACHE_TTL_MS) {
+        delete this.directFiles[key]
+      }
+    }
+
+    const entries = Object.entries(this.records)
+    if (entries.length <= QWEN_AI_FILE_CACHE_MAX_ENTRIES) {
+      const directEntries = Object.entries(this.directFiles)
+      if (directEntries.length <= QWEN_AI_DIRECT_FILE_MAX_ENTRIES) {
+        return
+      }
+
+      directEntries
+        .sort(([, a], [, b]) => (a.lastUsedAt || a.createdAt || 0) - (b.lastUsedAt || b.createdAt || 0))
+        .slice(0, directEntries.length - QWEN_AI_DIRECT_FILE_MAX_ENTRIES)
+        .forEach(([key]) => {
+          delete this.directFiles[key]
+        })
+      return
+    }
+
+    entries
+      .sort(([, a], [, b]) => (a.lastUsedAt || a.createdAt || 0) - (b.lastUsedAt || b.createdAt || 0))
+      .slice(0, entries.length - QWEN_AI_FILE_CACHE_MAX_ENTRIES)
+      .forEach(([key]) => {
+        delete this.records[key]
+      })
+
+    const directEntries = Object.entries(this.directFiles)
+    if (directEntries.length > QWEN_AI_DIRECT_FILE_MAX_ENTRIES) {
+      directEntries
+        .sort(([, a], [, b]) => (a.lastUsedAt || a.createdAt || 0) - (b.lastUsedAt || b.createdAt || 0))
+        .slice(0, directEntries.length - QWEN_AI_DIRECT_FILE_MAX_ENTRIES)
+        .forEach(([key]) => {
+          delete this.directFiles[key]
+        })
+    }
+  }
+
+  private persist(): void {
+    const filePath = qwenFileCachePath()
+    const dir = path.dirname(filePath)
+    mkdirSync(dir, { recursive: true })
+    const tmpPath = `${filePath}.tmp`
+    writeFileSync(tmpPath, `${JSON.stringify({ records: this.records, directFiles: this.directFiles }, null, 2)}\n`, 'utf8')
+    renameSync(tmpPath, filePath)
+  }
+}
+
+class QwenAiFileUploadCoordinator {
+  private readonly pending = new Map<string, Promise<any>>()
+
+  async run(key: string, operation: () => Promise<any>): Promise<any> {
+    const existing = this.pending.get(key)
+    if (existing) {
+      console.log('[QwenAI][File] cache wait for in-flight upload')
+      return existing
+    }
+
+    const promise = operation().finally(() => {
+      this.pending.delete(key)
+    })
+    this.pending.set(key, promise)
+    return promise
+  }
+}
+
+const qwenAiFileCache = new QwenAiFileCache()
+const qwenAiFileUploadCoordinator = new QwenAiFileUploadCoordinator()
+const qwenAiDirectUploadSessions = new Map<string, QwenAiDirectUploadPendingSession>()
+
+function qwenAiDirectPublicFile(record: QwenAiDirectFileRecord): any {
+  return {
+    name: record.name,
+    uri: record.uri,
+    mimeType: record.mimeType,
+    mime_type: record.mimeType,
+    displayName: record.filename,
+    display_name: record.filename,
+    sizeBytes: record.sizeBytes,
+    size_bytes: record.sizeBytes,
+    state: 'ACTIVE',
+    createTime: new Date(record.createdAt).toISOString(),
+    expirationTime: new Date(record.createdAt + QWEN_AI_FILE_CACHE_TTL_MS).toISOString(),
+    qwen: {
+      providerId: record.providerId,
+      accountId: record.accountId,
+      fileId: record.file?.id || record.file?.file?.id || '',
+    },
+  }
+}
+
+function pruneQwenAiDirectUploadSessions(): void {
+  const now = Date.now()
+  for (const [sessionId, session] of qwenAiDirectUploadSessions.entries()) {
+    if (session.expiresAt <= now) {
+      qwenAiDirectUploadSessions.delete(sessionId)
+    }
+  }
+}
+
+function normalizeDirectUploadInput(input: QwenAiDirectUploadInput): NormalizedInputFile {
+  const sizeBytes = Number(input.sizeBytes ?? input.size_bytes ?? 0)
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+    throw new Error('Qwen AI direct upload requires positive sizeBytes')
+  }
+
+  const rawFilename = String(input.filename || `upload-${uuid()}`)
+  const rawMimeType = String(input.mimeType || input.mime_type || mime.lookup(rawFilename) || 'application/octet-stream')
+  const mimeType = normalizeMimeType(rawMimeType)
+  const filename = ensureExtension(sanitizeFilename(rawFilename), mimeType)
+  const classification = classifyFile(mimeType, mimeType.startsWith('video/') ? 'video_url' : mimeType.startsWith('image/') ? 'image_url' : 'file')
+
+  return {
+    sizeBytes,
+    filename,
+    mimeType,
+    ...classification,
+  }
+}
+
+function qwenDirectResultFromRecord(record: QwenAiDirectFileRecord): QwenAiDirectUploadStartResult {
+  return {
+    reused: true,
+    file: qwenAiDirectPublicFile(record),
+    qwen: {
+      providerId: record.providerId,
+      accountId: record.accountId,
+      fileId: record.file?.id || record.file?.file?.id || '',
+    },
+  }
+}
+
+export function getQwenAiDirectUploadFile(uri: string): QwenAiDirectFileRecord | null {
+  if (!isQwenAiDirectFileUrl(uri)) {
+    return null
+  }
+  return qwenAiFileCache.getDirectByUri(uri)
+}
+
+export function getQwenAiDirectUploadSessionScope(sessionId: string): Required<QwenAiFileCacheScope> | null {
+  pruneQwenAiDirectUploadSessions()
+  const session = qwenAiDirectUploadSessions.get(sessionId)
+  if (!session) {
+    return null
+  }
+  return {
+    providerId: session.providerId,
+    accountId: session.accountId,
+  }
+}
+
 function isDataUrl(url: string): boolean {
   return /^data:[^;,]+;base64,/i.test(url)
 }
@@ -228,6 +756,14 @@ function isHttpUrl(url: string): boolean {
 
 function isChat2ApiFileUrl(url: string): boolean {
   return /^chat2api-file:\/\//i.test(url)
+}
+
+function isQwenAiDirectFileUrl(url: string): boolean {
+  return url.startsWith(QWEN_AI_DIRECT_FILE_SCHEME)
+}
+
+function extractDirectFileId(uri: string): string {
+  return uri.replace(QWEN_AI_DIRECT_FILE_SCHEME, '').replace(/^\/+/, '')
 }
 
 function sanitizeFilename(filename: string): string {
@@ -344,6 +880,7 @@ function extractDataUrl(
 
   return {
     data,
+    sizeBytes: data.length,
     filename: safeFilename,
     mimeType,
     ...classification,
@@ -365,6 +902,7 @@ function extractInputAudio(part: ChatMessageContent): NormalizedInputFile {
 
   return {
     data: Buffer.from(parsedData.base64, 'base64'),
+    sizeBytes: Buffer.byteLength(parsedData.base64, 'base64'),
     filename,
     mimeType,
     coarseType: 'audio',
@@ -392,7 +930,9 @@ function extractLocalFile(part: ChatMessageContent): NormalizedInputFile {
   const classification = classifyFile(String(mimeType), part.type)
 
   return {
-    data: readFileSync(localPath),
+    localPath,
+    localMtimeMs: stat.mtimeMs,
+    sizeBytes: stat.size,
     filename,
     mimeType: String(mimeType),
     ...classification,
@@ -557,7 +1097,7 @@ function createQwenFileItem(file: NormalizedInputFile, sts: QwenStsInfo): any {
     progress: 100,
     status: 'uploaded',
     greenNet: 'success',
-    size: file.data.length,
+    size: file.sizeBytes,
     error: '',
     filetype: file.coarseType,
     file_type: file.mimeType,
@@ -566,7 +1106,7 @@ function createQwenFileItem(file: NormalizedInputFile, sts: QwenStsInfo): any {
     uploadStatus: 'success',
     meta: {
       name: file.filename,
-      size: file.data.length,
+      size: file.sizeBytes,
       content_type: file.mimeType,
     },
     file: {
@@ -578,12 +1118,12 @@ function createQwenFileItem(file: NormalizedInputFile, sts: QwenStsInfo): any {
       user_id: '',
       meta: {
         name: file.filename,
-        size: file.data.length,
+        size: file.sizeBytes,
         content_type: file.mimeType,
       },
       update_at: now,
       name: file.filename,
-      size: file.data.length,
+      size: file.sizeBytes,
       type: file.mimeType,
       url: fileUrl,
     },
@@ -607,21 +1147,63 @@ function isTextDocument(file: NormalizedInputFile): boolean {
   return TEXT_DOCUMENT_EXTENSIONS.has(path.extname(file.filename).toLowerCase())
 }
 
+function readLocalEvidenceBytes(localPath: string, fileSize: number, byteLimit: number): Buffer {
+  const fd = openSync(localPath, 'r')
+  try {
+    if (fileSize <= byteLimit) {
+      const data = Buffer.alloc(fileSize)
+      readSync(fd, data, 0, fileSize, 0)
+      return data
+    }
+
+    const firstSize = Math.floor(byteLimit / 2)
+    const lastSize = Math.ceil(byteLimit / 2)
+    const first = Buffer.alloc(firstSize)
+    const last = Buffer.alloc(lastSize)
+    readSync(fd, first, 0, firstSize, 0)
+    readSync(fd, last, 0, lastSize, Math.max(0, fileSize - lastSize))
+    return Buffer.concat([
+      first,
+      Buffer.from('\n\n[... middle of document omitted from local evidence extraction ...]\n\n'),
+      last,
+    ])
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function readEvidenceData(file: NormalizedInputFile): { data: Buffer; truncated: boolean } {
+  const byteLimit = Math.min(DOCUMENT_EVIDENCE_MAX_TEXT_BYTES, file.sizeBytes)
+  const truncated = file.sizeBytes > byteLimit
+
+  if (file.data) {
+    const data = truncated
+      ? Buffer.concat([
+          file.data.subarray(0, Math.floor(byteLimit / 2)),
+          Buffer.from('\n\n[... middle of document omitted from local evidence extraction ...]\n\n'),
+          file.data.subarray(file.data.length - Math.ceil(byteLimit / 2)),
+        ])
+      : file.data
+    return { data, truncated }
+  }
+
+  if (file.localPath) {
+    return {
+      data: readLocalEvidenceBytes(file.localPath, file.sizeBytes, byteLimit),
+      truncated,
+    }
+  }
+
+  return { data: Buffer.alloc(0), truncated }
+}
+
 function decodeEvidenceText(file: NormalizedInputFile): { text: string; truncated: boolean } | undefined {
   if (!isTextDocument(file)) {
     return undefined
   }
 
-  const byteLimit = Math.min(DOCUMENT_EVIDENCE_MAX_TEXT_BYTES, file.data.length)
-  const truncated = file.data.length > byteLimit
-  const data = truncated
-    ? Buffer.concat([
-        file.data.subarray(0, Math.floor(byteLimit / 2)),
-        Buffer.from('\n\n[... middle of document omitted from local evidence extraction ...]\n\n'),
-        file.data.subarray(file.data.length - Math.ceil(byteLimit / 2)),
-      ])
-    : file.data
-  const text = data
+  const decoded = readEvidenceData(file)
+  const text = decoded.data
     .toString('utf8')
     .replace(/\u0000/g, '')
     .replace(/\r\n/g, '\n')
@@ -632,7 +1214,7 @@ function decodeEvidenceText(file: NormalizedInputFile): { text: string; truncate
     return undefined
   }
 
-  return { text, truncated }
+  return { text, truncated: decoded.truncated }
 }
 
 function uniqueTerms(values: string[]): string[] {
@@ -892,7 +1474,7 @@ function createDocumentEvidence(file: NormalizedInputFile, queryText: string): Q
   return {
     filename: file.filename,
     mimeType: normalizeMimeType(file.mimeType),
-    textBytes: file.data.length,
+    textBytes: file.sizeBytes,
     truncated: decoded.truncated,
     snippets,
   }
@@ -934,37 +1516,196 @@ export class QwenAiFileUploader {
   private readonly axiosInstance: AxiosInstance
   private readonly getHeaders: HeaderFactory
   private readonly postWithRefreshRetry?: QwenPostWithRetry
+  private readonly cacheScope: Required<QwenAiFileCacheScope>
 
   constructor(
     axiosInstance: AxiosInstance,
     getHeaders: HeaderFactory,
     postWithRefreshRetry?: QwenPostWithRetry,
+    cacheScope?: QwenAiFileCacheScope,
   ) {
     this.axiosInstance = axiosInstance
     this.getHeaders = getHeaders
     this.postWithRefreshRetry = postWithRefreshRetry
+    this.cacheScope = safeCacheScope(cacheScope)
   }
 
   async uploadPart(part: ChatMessageContent, evidenceQueryText = ''): Promise<UploadedQwenAiPart> {
-    const file = await this.resolveFile(part)
+    const startedAt = Date.now()
+    console.log(`[QwenAI][File] resolve start type=${part.type}`)
+    const directUrl = part.type === 'input_audio' ? '' : extractPartUrl(part)
+    if (directUrl && isQwenAiDirectFileUrl(directUrl)) {
+      const directRecord = qwenAiFileCache.getDirectByUri(directUrl)
+      if (!directRecord) {
+        throw new Error(`Qwen AI direct-upload file not found or expired: ${directUrl}`)
+      }
+      if (
+        directRecord.providerId !== this.cacheScope.providerId ||
+        directRecord.accountId !== this.cacheScope.accountId
+      ) {
+        throw new Error(
+          `Qwen AI direct-upload file belongs to account ${directRecord.accountId}, but request used ${this.cacheScope.accountId}`,
+        )
+      }
+      console.log(`[QwenAI][File] direct cache hit filename="${directRecord.filename}" bytes=${directRecord.sizeBytes} account=${this.cacheScope.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+      return { file: cloneJson(directRecord.file) }
+    }
 
-    if (file.data.length > MAX_FILE_SIZE) {
+    const file = await this.resolveFile(part)
+    console.log(`[QwenAI][File] resolve done seconds=${elapsedSeconds(startedAt)} filename="${file.filename}" bytes=${file.sizeBytes} mime=${file.mimeType} local=${file.localPath ? 'yes' : 'no'}`)
+
+    if (file.sizeBytes > MAX_FILE_SIZE) {
       throw new Error(`Qwen AI file upload exceeds ${MAX_FILE_SIZE} bytes: ${file.filename}`)
     }
 
     const evidence = createDocumentEvidence(file, evidenceQueryText)
-
-    const sts = await this.requestSts(file)
-    await this.uploadToOss(file, sts)
-
-    if (file.fileClass === 'document') {
-      await this.parseDocument(sts.fileId)
+    const cacheKey = qwenAiFileCache.createKey(this.cacheScope, file)
+    if (cacheKey) {
+      const cached = qwenAiFileCache.get(cacheKey, this.cacheScope, file)
+      if (cached) {
+        console.log(`[QwenAI][File] cache hit filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+        return { file: cached, evidence }
+      }
+      console.log(`[QwenAI][File] cache miss filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId}`)
+      const uploadedFile = await qwenAiFileUploadCoordinator.run(cacheKey, () => this.uploadResolvedFile(file, startedAt))
+      qwenAiFileCache.set(cacheKey, this.cacheScope, file, uploadedFile)
+      return {
+        file: cloneCachedQwenFileItem(uploadedFile, file),
+        evidence,
+      }
     }
 
     return {
-      file: createQwenFileItem(file, sts),
+      file: await this.uploadResolvedFile(file, startedAt),
       evidence,
     }
+  }
+
+  async startDirectUpload(input: QwenAiDirectUploadInput): Promise<QwenAiDirectUploadStartResult> {
+    pruneQwenAiDirectUploadSessions()
+    const startedAt = Date.now()
+    const file = normalizeDirectUploadInput(input)
+    const clientFileKey = String(input.clientFileKey || input.client_file_key || '').trim() || undefined
+
+    if (file.sizeBytes > MAX_FILE_SIZE) {
+      throw new Error(`Qwen AI file upload exceeds ${MAX_FILE_SIZE} bytes: ${file.filename}`)
+    }
+
+    if (clientFileKey) {
+      const reused = qwenAiFileCache.getDirectByClientFileKey(clientFileKey)
+      if (reused) {
+        console.log(`[QwenAI][File] direct cache hit filename="${reused.filename}" bytes=${reused.sizeBytes} account=${reused.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+        return qwenDirectResultFromRecord(reused)
+      }
+      console.log(`[QwenAI][File] direct cache miss filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId}`)
+    }
+
+    const stsStartedAt = Date.now()
+    console.log(`[QwenAI][File] direct sts start filename="${file.filename}" bytes=${file.sizeBytes} type=${file.coarseType}`)
+    const sts = await this.requestSts(file)
+    console.log(`[QwenAI][File] direct sts done seconds=${elapsedSeconds(stsStartedAt)} fileId=${sts.fileId}`)
+
+    const sessionId = uuid()
+    const expiresAt = Date.now() + QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS
+    qwenAiDirectUploadSessions.set(sessionId, {
+      sessionId,
+      providerId: this.cacheScope.providerId,
+      accountId: this.cacheScope.accountId,
+      clientFileKey,
+      file,
+      sts,
+      createdAt: Date.now(),
+      expiresAt,
+    })
+
+    const multipartParams = qwenOssDirectMultipartParams(file.sizeBytes)
+    return {
+      reused: false,
+      file: {
+        name: `files/${sessionId}`,
+        uri: `${QWEN_AI_DIRECT_FILE_SCHEME}${sessionId}`,
+        mimeType: file.mimeType,
+        mime_type: file.mimeType,
+        displayName: file.filename,
+        display_name: file.filename,
+        sizeBytes: file.sizeBytes,
+        size_bytes: file.sizeBytes,
+        state: 'PROCESSING',
+        createTime: new Date().toISOString(),
+        expirationTime: new Date(expiresAt).toISOString(),
+      },
+      qwen: {
+        providerId: this.cacheScope.providerId,
+        accountId: this.cacheScope.accountId,
+        fileId: sts.fileId,
+      },
+      upload: {
+        sessionId,
+        accessKeyId: sts.accessKeyId,
+        accessKeySecret: sts.accessKeySecret,
+        securityToken: sts.securityToken,
+        bucket: sts.bucket,
+        region: sts.region,
+        endpoint: sts.endpoint,
+        fileId: sts.fileId,
+        filePath: sts.filePath,
+        fileUrl: sts.fileUrl,
+        authVersion: 'v4',
+        partSize: multipartParams.partSize,
+        parallel: multipartParams.parallel,
+        expiresAt: new Date(expiresAt).toISOString(),
+      },
+    }
+  }
+
+  async completeDirectUpload(sessionId: string): Promise<any> {
+    pruneQwenAiDirectUploadSessions()
+    const session = qwenAiDirectUploadSessions.get(sessionId)
+    if (!session) {
+      throw new Error(`Qwen AI direct upload session not found or expired: ${sessionId}`)
+    }
+
+    const startedAt = Date.now()
+    if (session.file.fileClass === 'document') {
+      const parseStartedAt = Date.now()
+      console.log(`[QwenAI][File] direct parse start fileId=${session.sts.fileId}`)
+      await this.parseDocument(session.sts.fileId)
+      console.log(`[QwenAI][File] direct parse done seconds=${elapsedSeconds(parseStartedAt)} fileId=${session.sts.fileId}`)
+    }
+
+    const fileItem = createQwenFileItem(session.file, session.sts)
+    const record = qwenAiFileCache.setDirect(
+      { providerId: session.providerId, accountId: session.accountId },
+      session.clientFileKey,
+      session.file,
+      fileItem,
+    )
+    qwenAiDirectUploadSessions.delete(sessionId)
+    console.log(`[QwenAI][File] direct upload complete totalSeconds=${elapsedSeconds(startedAt)} filename="${session.file.filename}" bytes=${session.file.sizeBytes} fileId=${session.sts.fileId}`)
+    return qwenAiDirectPublicFile(record)
+  }
+
+  private async uploadResolvedFile(file: NormalizedInputFile, startedAt: number): Promise<any> {
+    const stsStartedAt = Date.now()
+    console.log(`[QwenAI][File] sts start filename="${file.filename}" bytes=${file.sizeBytes} type=${file.coarseType}`)
+    const sts = await this.requestSts(file)
+    console.log(`[QwenAI][File] sts done seconds=${elapsedSeconds(stsStartedAt)} fileId=${sts.fileId}`)
+
+    const ossStartedAt = Date.now()
+    console.log(`[QwenAI][File] oss upload start filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
+    await this.uploadToOss(file, sts)
+    console.log(`[QwenAI][File] oss upload done seconds=${elapsedSeconds(ossStartedAt)} filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
+
+    if (file.fileClass === 'document') {
+      const parseStartedAt = Date.now()
+      console.log(`[QwenAI][File] parse start fileId=${sts.fileId}`)
+      await this.parseDocument(sts.fileId)
+      console.log(`[QwenAI][File] parse done seconds=${elapsedSeconds(parseStartedAt)} fileId=${sts.fileId}`)
+    }
+
+    const fileItem = createQwenFileItem(file, sts)
+    console.log(`[QwenAI][File] upload complete totalSeconds=${elapsedSeconds(startedAt)} filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
+    return fileItem
   }
 
   private async resolveFile(part: ChatMessageContent): Promise<NormalizedInputFile> {
@@ -1008,6 +1749,7 @@ export class QwenAiFileUploader {
 
     return {
       data: Buffer.from(response.data),
+      sizeBytes: Buffer.byteLength(response.data),
       filename: safeFilename,
       mimeType: String(mimeType),
       sourceUrl: url,
@@ -1020,7 +1762,7 @@ export class QwenAiFileUploader {
       `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
       {
         filename: file.filename,
-        filesize: String(file.data.length),
+        filesize: String(file.sizeBytes),
         filetype: file.coarseType,
       },
       () => ({
@@ -1058,13 +1800,18 @@ export class QwenAiFileUploader {
       mime: file.mimeType,
     } as any
 
-    if (file.data.length < OSS_SINGLE_PUT_MAX_BYTES) {
-      await client.put(sts.filePath, file.data, uploadOptions)
+    const uploadSource = file.localPath || file.data
+    if (!uploadSource) {
+      throw new Error(`Qwen AI input file has no upload source: ${file.filename}`)
+    }
+
+    if (file.sizeBytes < OSS_SINGLE_PUT_MAX_BYTES) {
+      await client.put(sts.filePath, uploadSource, uploadOptions)
       return
     }
 
-    const multipartParams = qwenOssMultipartParams(file.data.length)
-    await client.multipartUpload(sts.filePath, file.data, {
+    const multipartParams = qwenOssMultipartParams(file.sizeBytes)
+    await client.multipartUpload(sts.filePath, uploadSource, {
       ...uploadOptions,
       ...multipartParams,
     })

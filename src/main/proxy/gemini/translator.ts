@@ -1,6 +1,7 @@
 import { PassThrough } from 'stream'
 import type { ChatCompletionRequest, ChatCompletionResponse, ChatMessageContent } from '../types'
 import { geminiFileStore } from './fileStore'
+import { QWEN_AI_DIRECT_FILE_SCHEME, getQwenAiDirectUploadFile } from '../adapters/qwen-ai-files'
 
 interface GeminiPart {
   text?: string
@@ -35,6 +36,29 @@ function normalizeRole(role?: string): 'system' | 'user' | 'assistant' {
 }
 
 const CHAT2API_FILE_SCHEME = 'chat2api-file://'
+
+function collectQwenDirectUploadHints(contents: GeminiContent[]): { providerId?: string; accountId?: string } {
+  for (const content of contents) {
+    for (const part of content.parts || []) {
+      const fileData = part.fileData || (part.file_data ? {
+        mimeType: part.file_data.mime_type,
+        fileUri: part.file_data.file_uri,
+      } : undefined)
+      const fileUri = fileData?.fileUri || ''
+      if (!fileUri.startsWith(QWEN_AI_DIRECT_FILE_SCHEME)) {
+        continue
+      }
+      const directFile = getQwenAiDirectUploadFile(fileUri)
+      if (directFile) {
+        return {
+          providerId: directFile.providerId,
+          accountId: directFile.accountId,
+        }
+      }
+    }
+  }
+  return {}
+}
 
 function filePartFromMime(url: string, mimeType: string, filename?: string, localPath?: string): ChatMessageContent {
   if (mimeType.startsWith('image/')) {
@@ -80,11 +104,20 @@ function convertPart(part: GeminiPart): ChatMessageContent | null {
     fileUri: part.file_data.file_uri,
   } : undefined)
   if (fileData?.fileUri) {
-    const stored = geminiFileStore.readFile(fileData.fileUri)
-    if (stored) {
-      const mimeType = fileData.mimeType || stored.file.mimeType
-      const url = `${CHAT2API_FILE_SCHEME}${encodeURIComponent(stored.file.name)}`
-      return filePartFromMime(url, mimeType, stored.file.displayName, stored.file.path)
+    if (fileData.fileUri.startsWith(QWEN_AI_DIRECT_FILE_SCHEME)) {
+      const directFile = getQwenAiDirectUploadFile(fileData.fileUri)
+      if (!directFile) {
+        throw new Error(`Qwen AI direct-upload file not found or expired: ${fileData.fileUri}`)
+      }
+      const mimeType = fileData.mimeType || directFile.mimeType
+      return filePartFromMime(fileData.fileUri, mimeType, directFile.filename)
+    }
+
+    const storedFile = geminiFileStore.getFile(fileData.fileUri)
+    if (storedFile) {
+      const mimeType = fileData.mimeType || storedFile.mimeType
+      const url = `${CHAT2API_FILE_SCHEME}${encodeURIComponent(storedFile.name)}`
+      return filePartFromMime(url, mimeType, storedFile.displayName, storedFile.path)
     }
 
     const mimeType = fileData.mimeType || 'application/octet-stream'
@@ -108,7 +141,9 @@ function mapFinishReason(reason?: string | null): string {
 }
 
 export function geminiToChatCompletionRequest(model: string, body: any): ChatCompletionRequest {
-  const messages = (body.contents || []).map((content: GeminiContent) => {
+  const geminiContents = (body.contents || []) as GeminiContent[]
+  const directUploadHints = collectQwenDirectUploadHints(geminiContents)
+  const messages = geminiContents.map((content: GeminiContent) => {
     const parts = (content.parts || [])
       .map(convertPart)
       .filter(Boolean) as ChatMessageContent[]
@@ -129,6 +164,8 @@ export function geminiToChatCompletionRequest(model: string, body: any): ChatCom
   const generationConfig = body.generationConfig || {}
   return {
     model,
+    preferredProviderId: directUploadHints.providerId,
+    preferredAccountId: directUploadHints.accountId,
     messages,
     stream: false,
     temperature: generationConfig.temperature,

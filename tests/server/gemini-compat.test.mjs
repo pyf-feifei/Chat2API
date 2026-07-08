@@ -23,6 +23,8 @@ test('Gemini translator maps contents parts to OpenAI-compatible chat messages',
   assert.match(source, /inlineData/)
   assert.match(source, /fileData/)
   assert.match(source, /chat2api-file:\/\//)
+  assert.match(source, /geminiFileStore\.getFile\(fileData\.fileUri\)/)
+  assert.doesNotMatch(source, /geminiFileStore\.readFile\(fileData\.fileUri\)/)
   assert.doesNotMatch(source, /stored\.data\.toString\('base64'\)/)
   assert.match(source, /video_url/)
   assert.match(source, /image_url/)
@@ -32,7 +34,9 @@ test('Gemini translator maps contents parts to OpenAI-compatible chat messages',
   assert.match(source, /reasoning_content/)
   assert.match(qwenFileSource, /isChat2ApiFileUrl/)
   assert.match(qwenFileSource, /extractLocalFile/)
-  assert.match(qwenFileSource, /readFileSync/)
+  assert.match(qwenFileSource, /localPath\?: string/)
+  assert.match(qwenFileSource, /statSync\(localPath\)/)
+  assert.doesNotMatch(qwenFileSource, /readFileSync\(localPath\)/)
   assert.match(typeSource, /local_path\?\: string/)
 })
 
@@ -64,4 +68,16 @@ test('Gemini route forwards generateContent through existing OpenAI request forw
   assert.match(source, /chatCompletionToGeminiResponse/)
   assert.match(source, /chatCompletionStreamToGeminiSse/)
   assert.match(source, /geminiFileStore/)
+})
+
+test('Gemini route records failures for aborted or timed out forwarding paths', () => {
+  const source = fs.readFileSync('src/main/proxy/routes/gemini.ts', 'utf8')
+
+  assert.match(source, /let statisticsRecorded = false/)
+  assert.match(source, /const recordFailure = \(\) =>/)
+  assert.match(source, /try \{/)
+  assert.match(source, /catch \(error\)/)
+  assert.match(source, /proxyStatusManager\.recordRequestFailure/)
+  assert.match(source, /signal\.aborted \? 499 : 500/)
+  assert.match(source, /Gemini-compatible client disconnected/)
 })

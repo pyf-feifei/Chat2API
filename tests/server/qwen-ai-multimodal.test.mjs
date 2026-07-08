@@ -28,8 +28,8 @@ test('Qwen AI has a dedicated multimodal upload helper', () => {
   assert.match(source, /\/api\/v2\/files\/getstsToken/)
   assert.match(source, /\/api\/v2\/files\/parse/)
   assert.match(source, /\/api\/v2\/files\/parse\/status/)
-  assert.match(source, /\.put\(sts\.filePath,\s*file\.data,\s*uploadOptions\)/)
-  assert.match(source, /\.multipartUpload\(sts\.filePath,\s*file\.data/)
+  assert.match(source, /\.put\(sts\.filePath,\s*uploadSource,\s*uploadOptions\)/)
+  assert.match(source, /\.multipartUpload\(sts\.filePath,\s*uploadSource/)
   assert.doesNotMatch(source, /console\.log\([^)]*base64/i)
 })
 
@@ -44,9 +44,12 @@ test('Qwen AI OSS uploads use multipart upload for web-sized video files', () =>
   assert.match(source, /function qwenOssMultipartParams\(fileSize: number\)/)
   assert.match(source, /fileSize < 100 \* 1024 \* 1024/)
   assert.match(source, /parallel: 10,\s*partSize: 10 \* 1024 \* 1024/)
-  assert.match(source, /if \(file\.data\.length < OSS_SINGLE_PUT_MAX_BYTES\)/)
-  assert.match(source, /client\.multipartUpload\(sts\.filePath,\s*file\.data,\s*\{[\s\S]*\.\.\.multipartParams/)
-  assert.match(types, /multipartUpload\(name: string,\s*data: Buffer \| string,\s*options\?: any\)/)
+  assert.match(source, /function qwenOssDirectMultipartParams\(fileSize: number\)/)
+  assert.match(source, /QWEN_AI_DIRECT_UPLOAD_PARALLEL/)
+  assert.match(source, /QWEN_AI_DIRECT_UPLOAD_PART_SIZE_MIB/)
+  assert.match(source, /if \(file\.sizeBytes < OSS_SINGLE_PUT_MAX_BYTES\)/)
+  assert.match(source, /client\.multipartUpload\(sts\.filePath,\s*uploadSource,\s*\{[\s\S]*\.\.\.multipartParams/)
+  assert.match(types, /multipartUpload\(name: string,\s*data: Buffer \| string \| NodeJS\.ReadableStream,\s*options\?: any\)/)
 })
 
 test('Qwen AI document upload waits for parse completion with a bounded timeout', () => {
@@ -163,6 +166,71 @@ test('Qwen AI multimodal helper accepts audio and video inputs', () => {
   assert.doesNotMatch(source, /audio\/video input is not supported/)
 })
 
+test('Qwen AI local Gemini files upload by path without reading full videos into memory', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+  const translatorSource = fs.readFileSync('src/main/proxy/gemini/translator.ts', 'utf8')
+
+  assert.match(source, /localPath/)
+  assert.match(source, /localMtimeMs:\s*stat\.mtimeMs/)
+  assert.match(source, /sizeBytes:\s*stat\.size/)
+  assert.match(source, /const uploadSource = file\.localPath \|\| file\.data/)
+  assert.doesNotMatch(source, /data:\s*readFileSync\(localPath\)/)
+  assert.match(translatorSource, /geminiFileStore\.getFile\(fileData\.fileUri\)/)
+  assert.doesNotMatch(translatorSource, /geminiFileStore\.readFile\(fileData\.fileUri\)/)
+})
+
+test('Qwen AI local file uploads are cached per account to avoid repeat OSS uploads', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+  const adapterSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /QWEN_AI_FILE_CACHE_ENABLED/)
+  assert.match(source, /QWEN_AI_FILE_CACHE_TTL_MS/)
+  assert.match(source, /QWEN_AI_FILE_CACHE_MAX_ENTRIES/)
+  assert.match(source, /class QwenAiFileCache/)
+  assert.match(source, /qwen-ai-file-cache\.json/)
+  assert.match(source, /providerId:\s*scope\.providerId/)
+  assert.match(source, /accountId:\s*scope\.accountId/)
+  assert.match(source, /path\.resolve\(file\.localPath\)/)
+  assert.match(source, /qwenAiFileUploadCoordinator\.run\(cacheKey/)
+  assert.match(source, /cache hit/)
+  assert.match(source, /cache miss/)
+  assert.match(source, /cloneCachedQwenFileItem/)
+  assert.match(adapterSource, /providerId:\s*this\.provider\.id,\s*accountId:\s*this\.account\.id/)
+})
+
+test('Qwen AI direct upload API avoids proxying large Gemini files through the VPS', () => {
+  const filesSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+  const routeSource = fs.readFileSync('src/main/proxy/routes/gemini.ts', 'utf8')
+  const translatorSource = fs.readFileSync('src/main/proxy/gemini/translator.ts', 'utf8')
+
+  assert.match(filesSource, /QWEN_AI_DIRECT_FILE_SCHEME = 'qwen-ai-direct:\/\//)
+  assert.match(filesSource, /startDirectUpload\(input: QwenAiDirectUploadInput\)/)
+  assert.match(filesSource, /completeDirectUpload\(sessionId: string\)/)
+  assert.match(filesSource, /accessKeyId: sts\.accessKeyId/)
+  assert.match(filesSource, /authVersion: 'v4'/)
+  assert.match(filesSource, /qwenOssDirectMultipartParams\(file\.sizeBytes\)/)
+  assert.match(filesSource, /qwenAiFileCache\.setDirect/)
+  assert.match(routeSource, /\/v1beta\/chat2api\/qwen-ai\/direct-upload\/start/)
+  assert.match(routeSource, /\/v1beta\/chat2api\/qwen-ai\/direct-upload\/complete/)
+  assert.match(translatorSource, /collectQwenDirectUploadHints/)
+  assert.match(translatorSource, /preferredAccountId: directUploadHints\.accountId/)
+})
+
+test('Qwen AI file upload logs each slow stage with elapsed timings', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+
+  assert.match(source, /\[QwenAI\]\[File\] resolve start/)
+  assert.match(source, /\[QwenAI\]\[File\] resolve done/)
+  assert.match(source, /\[QwenAI\]\[File\] sts start/)
+  assert.match(source, /\[QwenAI\]\[File\] sts done/)
+  assert.match(source, /\[QwenAI\]\[File\] oss upload start/)
+  assert.match(source, /\[QwenAI\]\[File\] oss upload done/)
+  assert.match(source, /\[QwenAI\]\[File\] parse start/)
+  assert.match(source, /\[QwenAI\]\[File\] parse done/)
+  assert.match(source, /\[QwenAI\]\[File\] upload complete/)
+  assert.match(source, /elapsedSeconds\(startedAt\)/)
+})
+
 test('Qwen AI Docker upload limit defaults to the web video limit of 2000 MB', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
 
@@ -194,6 +262,17 @@ test('Qwen AI adapter request timeout is configurable for long-context document 
   assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS/)
   assert.match(source, /process\.env\.QWEN_AI_REQUEST_TIMEOUT_MS \|\| 300000/)
   assert.doesNotMatch(source, /timeout:\s*120000/)
+})
+
+test('Qwen AI stream readers enforce response and idle timeouts', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS/)
+  assert.match(source, /QWEN_AI_STREAM_IDLE_TIMEOUT_MS/)
+  assert.match(source, /response stream timed out after/)
+  assert.match(source, /response stream was idle for more than/)
+  assert.match(source, /destroyReadableStream\(stream/)
+  assert.match(source, /options\.signal\?\.addEventListener\('abort', onAbort/)
 })
 
 test('Qwen AI adapter redacts sensitive request headers in logs', () => {
