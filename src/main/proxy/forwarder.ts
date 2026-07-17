@@ -46,7 +46,32 @@ function statusFromError(error: unknown): number | undefined {
     return maybeStatusCode
   }
 
+  const errorLike = error as { name?: unknown; code?: unknown; message?: unknown }
+  const message = typeof errorLike?.message === 'string' ? errorLike.message : ''
+  const name = typeof errorLike?.name === 'string' ? errorLike.name : ''
+  const code = typeof errorLike?.code === 'string' ? errorLike.code : ''
+
+  if (
+    name === 'CanceledError' ||
+    code === 'ERR_CANCELED' ||
+    /client disconnected|aborted|cancelled|canceled/i.test(message)
+  ) {
+    return 499
+  }
+
+  if (/timed out|timeout|idle for more than/i.test(message)) {
+    return 504
+  }
+
   return undefined
+}
+
+function qwenAiRetryCountFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_RETRY_COUNT
+  if (raw === undefined) return 0
+
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 && value <= 10 ? value : 0
 }
 
 type ProviderForwarder = {
@@ -248,7 +273,9 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     const startTime = Date.now()
     const config = storeManager.getConfig()
-    const maxRetries = config.retryCount
+    const maxRetries = QwenAiAdapter.isQwenAiProvider(provider)
+      ? qwenAiRetryCountFromEnv()
+      : config.retryCount
 
     let lastError: string | undefined
     let lastStatus: number | undefined
@@ -318,6 +345,10 @@ export class RequestForwarder {
 
         lastError = result.error
         lastStatus = result.status
+
+        if (result.retryable === false || context.signal?.aborted) {
+          break
+        }
 
         if (result.status && result.status < 500 && result.status !== 429) {
           break
@@ -876,7 +907,9 @@ export class RequestForwarder {
       handler.setChatId(chatId)
 
       if (request.stream) {
-        const transformedStream = await handler.handleStream(response.data)
+        const transformedStream = await handler.handleStream(response.data, {
+          signal: context?.signal,
+        })
 
         if (shouldDeleteSession()) {
           const originalEnd = transformedStream.end.bind(transformedStream)
@@ -899,7 +932,9 @@ export class RequestForwarder {
         }
       }
 
-      const result = await handler.handleNonStream(response.data)
+      const result = await handler.handleNonStream(response.data, {
+        signal: context?.signal,
+      })
 
       this.applyToolCallsToResponse(result, transformed)
 
@@ -917,11 +952,13 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      const status = context?.signal?.aborted ? 499 : statusFromError(error)
       return {
         success: false,
-        status: statusFromError(error),
+        status,
         error: error instanceof Error ? error.message : 'Unknown error',
         latency,
+        retryable: status === 499 || status === 504 ? false : undefined,
       }
     }
   }

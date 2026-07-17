@@ -86,6 +86,17 @@ function attachRelease(stream: NodeJS.ReadableStream, release: () => void): void
   stream.once('error', releaseOnce)
 }
 
+function destroyForwardStream(stream: NodeJS.ReadableStream | undefined): void {
+  if (!stream) return
+
+  const candidate = stream as NodeJS.ReadableStream & {
+    destroy?: (error?: Error) => void
+  }
+  if (typeof candidate.destroy === 'function') {
+    candidate.destroy()
+  }
+}
+
 export class QwenAiRequestGovernor {
   private queue: QueueItem[] = []
   private active = 0
@@ -149,6 +160,7 @@ export class QwenAiRequestGovernor {
       success: false,
       status: 499,
       error: message,
+      retryable: false,
     }
   }
 
@@ -244,6 +256,14 @@ export class QwenAiRequestGovernor {
 
     item.run()
       .then((result) => {
+        if (item.cancelled || item.signal?.aborted) {
+          item.signal?.removeEventListener('abort', abortActive)
+          destroyForwardStream(result.stream)
+          release()
+          item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
+          return
+        }
+
         this.recordResult(item.accountId, result)
         if (result.success && result.stream) {
           const releaseStream = () => {

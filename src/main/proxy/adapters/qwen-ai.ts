@@ -33,6 +33,8 @@ const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = Number(process.env.QWEN_AI_REQUEST_TIMEOUT_MS || 300000)
 const QWEN_AI_RESPONSE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', QWEN_AI_REQUEST_TIMEOUT_MS)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
+const QWEN_AI_DEBUG_PAYLOAD_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_PAYLOADS === 'true'
+const QWEN_AI_DEBUG_STREAM_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_STREAM === 'true'
 
 const DEFAULT_HEADERS = {
   Accept: 'application/json',
@@ -281,6 +283,33 @@ export class QwenAiAdapter {
     }
 
     return value
+  }
+
+  private summarizePayloadForLog(payload: Record<string, any>): Record<string, unknown> {
+    const messages = Array.isArray(payload.messages) ? payload.messages : []
+    const primaryMessage = messages[0] || {}
+    const content = primaryMessage.content
+    const contentChars = typeof content === 'string'
+      ? content.length
+      : (() => {
+          try {
+            return JSON.stringify(content || '').length
+          } catch {
+            return 0
+          }
+        })()
+
+    return {
+      stream: payload.stream,
+      model: payload.model,
+      chat_id: payload.chat_id,
+      chat_mode: payload.chat_mode,
+      messageCount: messages.length,
+      contentChars,
+      fileCount: Array.isArray(primaryMessage.files) ? primaryMessage.files.length : 0,
+      feature_config: primaryMessage.feature_config,
+      timestamp: payload.timestamp,
+    }
   }
 
   private async readStreamPreview(stream: any, maxBytes = 4096): Promise<string> {
@@ -620,7 +649,11 @@ export class QwenAiAdapter {
 
     console.log('[QwenAI] Sending request to /api/v2/chat/completions...')
     console.log('[QwenAI] Request URL:', url)
-    console.log('[QwenAI] Request payload:', JSON.stringify(this.sanitizePayloadForLog(payload), null, 2))
+    if (QWEN_AI_DEBUG_PAYLOAD_LOGS) {
+      console.log('[QwenAI] Request payload:', JSON.stringify(this.sanitizePayloadForLog(payload), null, 2))
+    } else {
+      console.log('[QwenAI] Request payload summary:', JSON.stringify(this.summarizePayloadForLog(payload), null, 2))
+    }
     console.log('[QwenAI] Request headers:', JSON.stringify(this.sanitizeHeadersForLog(this.getHeaders(chatId)), null, 2))
 
     const response = await this.postWithRefreshRetry(url, payload, () => ({
@@ -1032,6 +1065,11 @@ export class QwenAiStreamHandler {
       failStream(new Error('Qwen AI response stream aborted because the client disconnected.'))
     }
 
+    if (options.signal?.aborted) {
+      failStream(new Error('Qwen AI response stream aborted before reading started.'))
+      return transStream
+    }
+
     responseTimer = setTimeout(() => {
       failStream(new Error(`Qwen AI response stream timed out after ${Math.ceil((options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS) / 1000)}s.`))
     }, options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS)
@@ -1166,7 +1204,9 @@ export class QwenAiStreamHandler {
     const parser = createParser({
       onEvent: (event: any) => {
         try {
-          console.log('[QwenAI] Parsed event:', event.event, 'data:', event.data?.substring(0, 200))
+          if (QWEN_AI_DEBUG_STREAM_LOGS) {
+            console.log('[QwenAI] Parsed event:', event.event, 'data:', event.data?.substring(0, 200))
+          }
           
           if (event.data === '[DONE]') {
             console.log('[QwenAI] Received [DONE] signal')
@@ -1174,7 +1214,9 @@ export class QwenAiStreamHandler {
           }
 
           const data = JSON.parse(event.data)
-          console.log('[QwenAI] Parsed JSON data keys:', Object.keys(data))
+          if (QWEN_AI_DEBUG_STREAM_LOGS) {
+            console.log('[QwenAI] Parsed JSON data keys:', Object.keys(data))
+          }
 
           if (data['response.created']) {
             this.recordResponseCreated(data['response.created'])
@@ -1191,7 +1233,9 @@ export class QwenAiStreamHandler {
             const status = delta.status
             const content = delta.content || ''
 
-            console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
+            if (QWEN_AI_DEBUG_STREAM_LOGS) {
+              console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
+            }
 
             const sawNativeToolCall = this.ingestNativeToolCallFragments(delta)
             if (sawNativeToolCall) {
@@ -1238,7 +1282,9 @@ export class QwenAiStreamHandler {
               // When status === 'finished', the think phase is done
             } else if (phase === 'thinking_summary') {
               const extra = delta.extra || {}
-              console.log('[QwenAI] thinking_summary extra:', JSON.stringify(extra).substring(0, 300))
+              if (QWEN_AI_DEBUG_STREAM_LOGS) {
+                console.log('[QwenAI] thinking_summary extra:', JSON.stringify(extra).substring(0, 300))
+              }
               if (extra.summary_thought?.content) {
                 const newSummary = extra.summary_thought.content.join('\n')
                 if (newSummary && newSummary.length > summaryText.length) {
@@ -1275,7 +1321,9 @@ export class QwenAiStreamHandler {
               if (!initialChunkSent) {
                 sendInitialChunk()
               }
-              console.log('[QwenAI] Entering answer branch, content:', content)
+              if (QWEN_AI_DEBUG_STREAM_LOGS) {
+                console.log('[QwenAI] Entering answer branch, content:', content)
+              }
               writeContent(content)
             } else if (phase === null && content) {
               if (!initialChunkSent) {
@@ -1297,7 +1345,9 @@ export class QwenAiStreamHandler {
     stream.on('data', (buffer: Buffer) => {
       refreshIdleTimer()
       const text = buffer.toString()
-      console.log('[QwenAI] Raw stream data:', text.substring(0, 500))
+      if (QWEN_AI_DEBUG_STREAM_LOGS) {
+        console.log('[QwenAI] Raw stream data:', text.substring(0, 500))
+      }
       parser.feed(text)
     })
     stream.once('error', (err: Error) => {

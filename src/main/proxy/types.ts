@@ -256,6 +256,8 @@ export interface ForwardResult {
   skipTransform?: boolean
   error?: string
   latency?: number
+  /** Set false when retrying would duplicate a slow or cancelled upstream request. */
+  retryable?: boolean
   providerSessionId?: string
   parentMessageId?: string
 }

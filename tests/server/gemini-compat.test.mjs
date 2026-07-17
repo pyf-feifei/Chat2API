@@ -81,3 +81,16 @@ test('Gemini route records failures for aborted or timed out forwarding paths', 
   assert.match(source, /signal\.aborted \? 499 : 500/)
   assert.match(source, /Gemini-compatible client disconnected/)
 })
+
+test('Gemini route writes detailed request logs for generateContent calls', () => {
+  const source = fs.readFileSync('src/main/proxy/routes/gemini.ts', 'utf8')
+
+  assert.match(source, /storeManager\.addRequestLog/)
+  assert.match(source, /url: ctx\.path/)
+  assert.match(source, /model,\s*\n\s*actualModel/)
+  assert.match(source, /providerId: provider\.id/)
+  assert.match(source, /accountId: account\.id/)
+  assert.match(source, /extractUserInput\(chatRequest\.messages \|\| \[\]\)/)
+  assert.match(source, /responseStatus: result\.status \|\| 200/)
+  assert.match(source, /isStream: stream/)
+})

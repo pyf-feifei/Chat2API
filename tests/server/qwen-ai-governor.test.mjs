@@ -5,11 +5,20 @@ import test from 'node:test'
 test('Qwen AI requests are routed through a per-provider governor', () => {
   const forwarderSource = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
   const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
+  const qwenAiForwarderSource = forwarderSource.slice(
+    forwarderSource.indexOf('private async forwardQwenAi'),
+    forwarderSource.indexOf('/**\n   * Z.ai Dedicated Forward'),
+  )
 
   assert.match(forwarderSource, /qwenAiRequestGovernor/)
   assert.match(forwarderSource, /qwenAiRequestGovernor\.run\(account\.id/)
   assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context\)/)
   assert.match(forwarderSource, /\{ signal: context\.signal \}/)
+  assert.match(forwarderSource, /CHAT2API_QWEN_AI_RETRY_COUNT/)
+  assert.match(forwarderSource, /QwenAiAdapter\.isQwenAiProvider\(provider\)[\s\S]*qwenAiRetryCountFromEnv\(\)/)
+  assert.match(qwenAiForwarderSource, /retryable: status === 499 \|\| status === 504 \? false : undefined/)
+  assert.match(qwenAiForwarderSource, /handler\.handleStream\(response\.data, \{\s*signal: context\?\.signal,\s*\}\)/)
+  assert.match(qwenAiForwarderSource, /handler\.handleNonStream\(response\.data, \{\s*signal: context\?\.signal,\s*\}\)/)
 
   assert.match(governorSource, /CHAT2API_QWEN_AI_MAX_CONCURRENT/)
   assert.match(governorSource, /CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS/)
@@ -106,4 +115,37 @@ test('Qwen AI governor auto-tunes effective rate limits from healthy accounts an
   assert.match(panelSource, /status\?\.effectiveConfig\.maxConcurrent/)
   assert.match(panelSource, /autoTuneMaxConcurrent/)
   assert.match(en, /Auto tuning/)
+})
+
+test('Qwen AI cancellation and timeout paths are not retried or logged as success', () => {
+  const forwarderSource = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
+  const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
+  const qwenAiSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const proxyTypes = fs.readFileSync('src/main/proxy/types.ts', 'utf8')
+
+  assert.match(proxyTypes, /retryable\?: boolean/)
+  assert.match(forwarderSource, /context\.signal\?\.aborted/)
+  assert.match(forwarderSource, /name === 'CanceledError'/)
+  assert.match(forwarderSource, /code === 'ERR_CANCELED'/)
+  assert.match(forwarderSource, /timed out\|timeout\|idle for more than/)
+  assert.match(governorSource, /destroyForwardStream/)
+  assert.match(governorSource, /candidate\.destroy\(\)/)
+  assert.doesNotMatch(governorSource, /candidate\.destroy\(new Error/)
+  assert.match(governorSource, /item\.cancelled \|\| item\.signal\?\.aborted/)
+  assert.match(governorSource, /Client disconnected while Qwen AI request was active/)
+  assert.match(qwenAiSource, /options\.signal\?\.aborted/)
+  assert.match(qwenAiSource, /Qwen AI response stream aborted before reading started/)
+})
+
+test('Qwen AI production logs avoid dumping full prompts by default', () => {
+  const qwenAiSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(qwenAiSource, /CHAT2API_QWEN_AI_DEBUG_PAYLOADS/)
+  assert.match(qwenAiSource, /CHAT2API_QWEN_AI_DEBUG_STREAM/)
+  assert.match(qwenAiSource, /summarizePayloadForLog/)
+  assert.match(qwenAiSource, /Request payload summary/)
+  assert.match(qwenAiSource, /contentChars/)
+  assert.match(qwenAiSource, /fileCount/)
+  assert.match(qwenAiSource, /if \(QWEN_AI_DEBUG_PAYLOAD_LOGS\)/)
+  assert.match(qwenAiSource, /if \(QWEN_AI_DEBUG_STREAM_LOGS\)/)
 })

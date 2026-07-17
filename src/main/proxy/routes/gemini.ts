@@ -63,6 +63,31 @@ function createClientAbortSignal(ctx: Context): AbortSignal {
   return controller.signal
 }
 
+function extractUserInput(messages: Array<{ role: string; content?: string | any[] | null }>): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== 'user' || !message.content) {
+      continue
+    }
+
+    if (typeof message.content === 'string') {
+      return message.content
+    }
+
+    if (Array.isArray(message.content)) {
+      const text = message.content
+        .filter((part: any) => part?.type === 'text' && part.text)
+        .map((part: any) => part.text)
+        .join(' ')
+      if (text) {
+        return text
+      }
+    }
+  }
+
+  return undefined
+}
+
 async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
   const model = ctx.params.model
   const startTime = Date.now()
@@ -86,14 +111,32 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
   const selection = selectModel(model, chatRequest)
 
   if (!selection) {
+    const latency = Date.now() - startTime
     ctx.status = 503
-    ctx.body = {
+    const responseBody = {
       error: {
         code: 503,
         message: `No available account for model: ${model}`,
         status: 'UNAVAILABLE',
       },
     }
+    ctx.body = responseBody
+    storeManager.addRequestLog({
+      timestamp: startTime,
+      status: 'error',
+      statusCode: 503,
+      method: ctx.method,
+      url: ctx.path,
+      model,
+      actualModel: model,
+      requestBody: JSON.stringify(ctx.request.body || {}),
+      userInput: extractUserInput(chatRequest.messages || []),
+      responseStatus: 503,
+      responseBody: JSON.stringify(responseBody),
+      latency,
+      isStream: stream,
+      errorMessage: responseBody.error.message,
+    })
     return
   }
 
@@ -133,19 +176,58 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
     if (!result.success) {
       recordFailure()
       ctx.status = result.status || 500
-      ctx.body = {
+      const responseBody = {
         error: {
           code: ctx.status,
           message: result.error || 'Gemini-compatible request failed',
           status: result.status === 499 ? 'CANCELLED' : 'INTERNAL',
         },
       }
+      ctx.body = responseBody
+      storeManager.addRequestLog({
+        timestamp: startTime,
+        status: 'error',
+        statusCode: ctx.status,
+        method: ctx.method,
+        url: ctx.path,
+        model,
+        actualModel,
+        providerId: provider.id,
+        providerName: provider.name,
+        accountId: account.id,
+        accountName: account.name,
+        requestBody: JSON.stringify(ctx.request.body || {}),
+        userInput: extractUserInput(chatRequest.messages || []),
+        responseStatus: ctx.status,
+        responseBody: JSON.stringify(responseBody),
+        latency: Date.now() - startTime,
+        isStream: stream,
+        errorMessage: result.error,
+      })
       return
     }
 
     recordSuccess()
 
     if (stream && result.stream) {
+      storeManager.addRequestLog({
+        timestamp: startTime,
+        status: 'success',
+        statusCode: result.status || 200,
+        method: ctx.method,
+        url: ctx.path,
+        model,
+        actualModel,
+        providerId: provider.id,
+        providerName: provider.name,
+        accountId: account.id,
+        accountName: account.name,
+        requestBody: JSON.stringify(ctx.request.body || {}),
+        userInput: extractUserInput(chatRequest.messages || []),
+        responseStatus: result.status || 200,
+        latency: Date.now() - startTime,
+        isStream: true,
+      })
       ctx.set('Content-Type', 'text/event-stream')
       ctx.set('Cache-Control', 'no-cache')
       const geminiStream = chatCompletionStreamToGeminiSse(result.stream, actualModel)
@@ -164,7 +246,27 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
     }
 
     ctx.set('Content-Type', 'application/json')
-    ctx.body = chatCompletionToGeminiResponse(result.body, actualModel)
+    const responseBody = chatCompletionToGeminiResponse(result.body, actualModel)
+    ctx.body = responseBody
+    storeManager.addRequestLog({
+      timestamp: startTime,
+      status: 'success',
+      statusCode: result.status || 200,
+      method: ctx.method,
+      url: ctx.path,
+      model,
+      actualModel,
+      providerId: provider.id,
+      providerName: provider.name,
+      accountId: account.id,
+      accountName: account.name,
+      requestBody: JSON.stringify(ctx.request.body || {}),
+      userInput: extractUserInput(chatRequest.messages || []),
+      responseStatus: result.status || 200,
+      responseBody: JSON.stringify(responseBody),
+      latency: Date.now() - startTime,
+      isStream: false,
+    })
   } catch (error) {
     recordFailure()
     const status = (error as { status?: number; statusCode?: number })?.status ||
@@ -172,13 +274,35 @@ async function forwardGemini(ctx: Context, stream: boolean): Promise<void> {
       (signal.aborted ? 499 : 500)
     const message = error instanceof Error ? error.message : 'Gemini-compatible request failed'
     ctx.status = status
-    ctx.body = {
+    const responseBody = {
       error: {
         code: status,
         message,
         status: status === 499 ? 'CANCELLED' : 'INTERNAL',
       },
     }
+    ctx.body = responseBody
+    storeManager.addRequestLog({
+      timestamp: startTime,
+      status: 'error',
+      statusCode: status,
+      method: ctx.method,
+      url: ctx.path,
+      model,
+      actualModel,
+      providerId: provider.id,
+      providerName: provider.name,
+      accountId: account.id,
+      accountName: account.name,
+      requestBody: JSON.stringify(ctx.request.body || {}),
+      userInput: extractUserInput(chatRequest.messages || []),
+      responseStatus: status,
+      responseBody: JSON.stringify(responseBody),
+      latency: Date.now() - startTime,
+      isStream: stream,
+      errorMessage: message,
+      errorStack: error instanceof Error ? error.stack : undefined,
+    })
   }
 }
 
