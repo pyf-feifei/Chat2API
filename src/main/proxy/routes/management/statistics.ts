@@ -27,8 +27,10 @@ const router = new Router({ prefix: '/v0/management' })
 
 const BROWSER_IMPORT_RESULT_TTL_MS = 10 * 60 * 1000
 const BROWSER_IMPORT_RESULT_LIMIT = 128
+const BROWSER_IMPORT_RATE_WINDOW_MS = 60 * 1000
+const BROWSER_IMPORT_RATE_LIMIT = 32
 
-type BrowserImportProviderId = 'qwen' | 'qwen-ai'
+type BrowserImportProviderId = 'qwen' | 'qwen-ai' | 'kimi'
 
 type BrowserImportResult = {
   importId: string
@@ -41,18 +43,60 @@ type BrowserImportResult = {
 }
 
 const browserImportResults = new Map<string, BrowserImportResult>()
+const browserImportSubmissionRates = new Map<string, { startedAt: number; count: number }>()
+
+class BrowserImportRateLimitError extends Error {
+  constructor() {
+    super('Too many browser import submissions; try again later')
+    this.name = 'BrowserImportRateLimitError'
+  }
+}
+
+function getBrowserImportClientKey(ctx: Context): string {
+  // Do not trust client-controlled forwarding headers here.  The Docker
+  // server does not enable Koa's proxy mode by default, so `ctx.ip` is the
+  // peer address that actually opened the connection.  A reverse proxy can
+  // opt into trusted proxy handling at the application boundary instead of
+  // allowing every browser to bypass this limiter by rotating X-Forwarded-For.
+  return ctx.ip || ctx.req.socket.remoteAddress || 'unknown'
+}
+
+function enforceBrowserImportRateLimit(ctx: Context): void {
+  const now = Date.now()
+  browserImportSubmissionRates.forEach((entry, key) => {
+    if (now - entry.startedAt >= BROWSER_IMPORT_RATE_WINDOW_MS) {
+      browserImportSubmissionRates.delete(key)
+    }
+  })
+
+  const key = getBrowserImportClientKey(ctx)
+  const current = browserImportSubmissionRates.get(key)
+  if (!current || now - current.startedAt >= BROWSER_IMPORT_RATE_WINDOW_MS) {
+    browserImportSubmissionRates.set(key, { startedAt: now, count: 1 })
+    return
+  }
+
+  if (current.count >= BROWSER_IMPORT_RATE_LIMIT) {
+    throw new BrowserImportRateLimitError()
+  }
+
+  browserImportSubmissionRates.set(key, {
+    ...current,
+    count: current.count + 1,
+  })
+}
 
 function cleanupBrowserImportResults(): void {
   const now = Date.now()
-  for (const [id, result] of browserImportResults.entries()) {
+  browserImportResults.forEach((result, id) => {
     if (result.expiresAt <= now) {
       browserImportResults.delete(id)
     }
-  }
+  })
 
   if (browserImportResults.size > BROWSER_IMPORT_RESULT_LIMIT) {
     const overflow = browserImportResults.size - BROWSER_IMPORT_RESULT_LIMIT
-    const oldestIds = [...browserImportResults.entries()]
+    const oldestIds = Array.from(browserImportResults.entries())
       .sort(([, left], [, right]) => left.createdAt - right.createdAt)
       .slice(0, overflow)
       .map(([id]) => id)
@@ -72,10 +116,43 @@ function parseBrowserImportBody(body: unknown): Record<string, unknown> {
   return body && typeof body === 'object' ? body as Record<string, unknown> : {}
 }
 
+const MAX_BROWSER_IMPORT_PAYLOAD_BYTES = 128 * 1024
+
 function normalizeBrowserImportCredentials(
   providerId: BrowserImportProviderId,
   credentials: Record<string, unknown>,
 ): Record<string, string> {
+  if (providerId === 'kimi') {
+    const refreshToken = String(credentials.refreshToken || credentials.refresh_token || '')
+    const token = String(credentials.accessToken || credentials.access_token || credentials.token || credentials.kimiAuth || credentials['kimi-auth'] || refreshToken || '')
+    const tokenField: Record<string, string> = { token: token }
+    const deviceId = String(
+      credentials.deviceId
+      || credentials.device_id
+      || credentials.webId
+      || credentials.web_id
+      || '',
+    )
+    const sessionId = String(credentials.sessionId || credentials.session_id || credentials.ssid || '')
+    const trafficId = String(
+      credentials.trafficId
+      || credentials.traffic_id
+      || credentials.userId
+      || credentials.user_id
+      || credentials.mshUserId
+      || credentials.msh_user_id
+      || '',
+    )
+
+    return {
+      ...tokenField,
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(deviceId ? { deviceId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(trafficId ? { trafficId } : {}),
+    }
+  }
+
   if (providerId === 'qwen-ai') {
     return {
       token: String(credentials.token || ''),
@@ -103,12 +180,16 @@ function setBrowserImportResult(input: {
 }): BrowserImportResult {
   cleanupBrowserImportResults()
 
-  if (!input.importId || input.importId.length < 16) {
-    throw new Error('importId is required')
+  if (!input.importId || input.importId.length < 16 || input.importId.length > 128) {
+    throw new Error('importId must be between 16 and 128 characters')
   }
 
-  if (input.providerId !== 'qwen' && input.providerId !== 'qwen-ai') {
+  if (input.providerId !== 'qwen' && input.providerId !== 'qwen-ai' && input.providerId !== 'kimi') {
     throw new Error('Unsupported browser import provider')
+  }
+
+  if (browserImportResults.has(input.importId)) {
+    throw new Error('importId has already been used')
   }
 
   const credentials = normalizeBrowserImportCredentials(
@@ -134,7 +215,24 @@ function setBrowserImportResult(input: {
 router.post('/browser-import/complete', async (ctx: Context) => {
   const body = parseBrowserImportBody(ctx.request.body)
 
+  // Body-parser runs before this route, but reject oversized parsed payloads
+  // as well so chunked requests cannot smuggle unbounded credential blobs
+  // into the in-memory import result store.
+  const bodySize = Buffer.byteLength(JSON.stringify(body), 'utf8')
+  if (bodySize > MAX_BROWSER_IMPORT_PAYLOAD_BYTES) {
+    ctx.status = 413
+    ctx.body = {
+      success: false,
+      error: {
+        code: 'browser_import_payload_too_large',
+        message: `Browser import payload exceeds ${MAX_BROWSER_IMPORT_PAYLOAD_BYTES} bytes`,
+      },
+    } as ManagementApiResponse
+    return
+  }
+
   try {
+    enforceBrowserImportRateLimit(ctx)
     const result = setBrowserImportResult({
       importId: String(body.importId || ''),
       providerId: String(body.providerId || ''),
@@ -150,7 +248,7 @@ router.post('/browser-import/complete', async (ctx: Context) => {
       },
     } as ManagementApiResponse
   } catch (error) {
-    ctx.status = 400
+    ctx.status = error instanceof BrowserImportRateLimitError ? 429 : 400
     ctx.body = {
       success: false,
       error: {

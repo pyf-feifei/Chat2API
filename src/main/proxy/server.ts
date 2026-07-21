@@ -15,6 +15,8 @@ import { sessionManager } from './sessionManager'
 import { mountWebAdminAssets } from '../../server/admin/assets'
 
 const SLOW_REQUEST_THRESHOLD_MS = 1500
+const BROWSER_IMPORT_MAX_CONTENT_LENGTH = 128 * 1024
+const BROWSER_IMPORT_PATH = '/v0/management/browser-import/complete'
 
 /**
  * Proxy Server Class
@@ -49,6 +51,81 @@ export class ProxyServer {
       if (ctx.method === 'OPTIONS') {
         ctx.status = 204
         return
+      }
+
+      await next()
+    })
+
+    // Browser-assisted imports contain only a few token strings. Parse this
+    // endpoint before the global 50 MB body parser so a chunked request cannot
+    // consume the large upload budget before the route-level size check runs.
+    this.app.use(async (ctx, next) => {
+      const isBrowserImport = ctx.method === 'POST'
+        && ctx.path === BROWSER_IMPORT_PATH
+      if (!isBrowserImport) {
+        await next()
+        return
+      }
+
+      const rejectOversizedPayload = () => {
+        ctx.status = 413
+        ctx.body = {
+          success: false,
+          error: {
+            code: 'browser_import_payload_too_large',
+            message: `Browser import payload exceeds ${BROWSER_IMPORT_MAX_CONTENT_LENGTH} bytes`,
+          },
+        }
+      }
+
+      const contentLength = Number(ctx.get('content-length'))
+      if (Number.isFinite(contentLength) && contentLength > BROWSER_IMPORT_MAX_CONTENT_LENGTH) {
+        rejectOversizedPayload()
+        return
+      }
+
+      const chunks: Buffer[] = []
+      let totalBytes = 0
+      try {
+        for await (const chunk of ctx.req) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          totalBytes += buffer.length
+          if (totalBytes > BROWSER_IMPORT_MAX_CONTENT_LENGTH) {
+            // Drain without retaining the remainder so Koa can still return a
+            // useful 413 response while keeping memory bounded.
+            ctx.req.resume()
+            rejectOversizedPayload()
+            return
+          }
+          chunks.push(buffer)
+        }
+      } catch (error) {
+        ctx.status = 400
+        ctx.body = {
+          success: false,
+          error: {
+            code: 'invalid_browser_import_body',
+            message: error instanceof Error ? error.message : 'Unable to read browser import payload',
+          },
+        }
+        return
+      }
+
+      const rawBody = Buffer.concat(chunks)
+      ;(ctx.request as any).rawBody = rawBody
+      const contentType = ctx.get('content-type').split(';', 1)[0].trim().toLowerCase()
+      if (contentType === 'application/json') {
+        try {
+          ;(ctx.request as any).body = rawBody.length > 0
+            ? JSON.parse(rawBody.toString('utf8'))
+            : {}
+        } catch {
+          ;(ctx.request as any).body = rawBody.toString('utf8')
+        }
+      } else if (contentType === 'text/plain' || contentType === '') {
+        ;(ctx.request as any).body = rawBody.toString('utf8')
+      } else {
+        ;(ctx.request as any).body = {}
       }
 
       await next()

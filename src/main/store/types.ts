@@ -590,6 +590,8 @@ export interface ValidationResult {
   error?: string
   /** Validation time */
   validatedAt: number
+  /** Canonical credentials returned after validation or token rotation */
+  credentials?: Record<string, string>
   /** Account info (returned when validation succeeds) */
   accountInfo?: {
     name?: string

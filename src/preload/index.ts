@@ -167,6 +167,7 @@ const accountsAPI = {
   validateToken: (providerId: string, credentials: Record<string, string>): Promise<{
     valid: boolean
     error?: string
+    credentials?: Record<string, string>
     userInfo?: {
       name?: string
       email?: string
@@ -193,6 +194,7 @@ interface TokenValidationResult {
   valid: boolean
   tokenType?: string
   expiresAt?: number
+  credentials?: Record<string, string>
   accountInfo?: {
     userId?: string
     email?: string

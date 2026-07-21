@@ -69,6 +69,33 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     }
   }
 
+  if (providerId === 'kimi') {
+    const refreshToken = credentials.refreshToken || credentials.refresh_token || ''
+    const token = credentials.accessToken
+      || credentials.access_token
+      || credentials.token
+      || credentials.kimiAuth
+      || credentials['kimi-auth']
+      || refreshToken
+      || ''
+    const trafficId = credentials.trafficId
+      || credentials.traffic_id
+      || credentials.userId
+      || credentials.user_id
+      || credentials.mshUserId
+      || credentials.msh_user_id
+      || ''
+    const deviceId = credentials.deviceId || credentials.device_id || credentials.webId || credentials.web_id || ''
+    const sessionId = credentials.sessionId || credentials.session_id || credentials.ssid || ''
+    return {
+      token,
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(deviceId ? { deviceId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(trafficId ? { trafficId } : {}),
+    }
+  }
+
   const oauthKey = credentialKeyMap[providerId]
   if (oauthKey && credentials[oauthKey]) {
     const fieldName = providerFieldNames[providerId]
@@ -178,6 +205,7 @@ interface AddAccountDialogProps {
   onValidateToken: (providerId: string, credentials: Record<string, string>) => Promise<{
     valid: boolean
     error?: string
+    credentials?: Record<string, string>
     userInfo?: {
       name?: string
       email?: string
@@ -232,7 +260,7 @@ export function AddAccountDialog({
     : []
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
-  const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai'].includes(provider.id)
+  const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi'].includes(provider.id)
 
   useEffect(() => {
     if (open) {
@@ -289,6 +317,12 @@ export function AddAccountDialog({
 
     try {
       const result = await onValidateToken(provider.id, credentials)
+      if (result.valid && result.credentials) {
+        setCredentials(prev => ({
+          ...prev,
+          ...result.credentials,
+        }))
+      }
       setValidationResult(result)
 
       if (result.valid && result.userInfo) {
@@ -506,6 +540,7 @@ export function AddAccountDialog({
     const loginUrls: Record<string, string> = {
       'qwen-ai': 'https://chat.qwen.ai',
       qwen: 'https://www.qianwen.com',
+      kimi: 'https://www.kimi.com',
     }
     await window.electronAPI?.app.openExternal(loginUrls[provider.id] || provider.apiEndpoint)
   }

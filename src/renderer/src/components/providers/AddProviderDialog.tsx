@@ -35,6 +35,7 @@ interface AddProviderDialogProps {
   onValidateToken?: (providerId: string, credentials: Record<string, string>) => Promise<{
     valid: boolean
     error?: string
+    credentials?: Record<string, string>
     userInfo?: {
       name?: string
       email?: string
@@ -57,7 +58,7 @@ const providerIcons: Record<string, string> = {
 }
 
 function mapOAuthCredentials(providerId: string | undefined, credentials: Record<string, string>): Record<string, string> {
-  console.log('[mapOAuthCredentials] Input providerId:', providerId, 'credentials:', JSON.stringify(credentials, null, 2))
+  console.log('[mapOAuthCredentials] Input providerId:', providerId, 'credential keys:', Object.keys(credentials))
   
   if (!providerId) {
     console.log('[mapOAuthCredentials] No providerId, returning as-is')
@@ -89,6 +90,33 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
       ...(credentials.baxiaVersion ? { baxiaVersion: credentials.baxiaVersion } : {}),
       ...(credentials.x5secdata ? { x5secdata: credentials.x5secdata } : {}),
       ...(credentials.x5sectag ? { x5sectag: credentials.x5sectag } : {}),
+    }
+  }
+
+  if (providerId === 'kimi') {
+    const refreshToken = credentials.refreshToken || credentials.refresh_token || ''
+    const token = credentials.accessToken
+      || credentials.access_token
+      || credentials.token
+      || credentials.kimiAuth
+      || credentials['kimi-auth']
+      || refreshToken
+      || ''
+    const trafficId = credentials.trafficId
+      || credentials.traffic_id
+      || credentials.userId
+      || credentials.user_id
+      || credentials.mshUserId
+      || credentials.msh_user_id
+      || ''
+    const deviceId = credentials.deviceId || credentials.device_id || credentials.webId || credentials.web_id || ''
+    const sessionId = credentials.sessionId || credentials.session_id || credentials.ssid || ''
+    return {
+      token,
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(deviceId ? { deviceId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(trafficId ? { trafficId } : {}),
     }
   }
 
@@ -149,7 +177,7 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
       console.log('[mapOAuthCredentials] Using existing ph_token')
     }
     
-    console.log('[mapOAuthCredentials] Mimo result:', JSON.stringify(result, null, 2))
+    console.log('[mapOAuthCredentials] Mimo result keys:', Object.keys(result))
     return result
   }
 
@@ -278,7 +306,7 @@ export function AddProviderDialog({
 
   const supportsOAuth = selectedProviderData && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(selectedProviderData.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
-  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai'].includes(selectedProviderData.id)
+  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai', 'kimi'].includes(selectedProviderData.id)
   const oauthRefreshCredentialFields = selectedProviderData?.id === 'qwen-ai'
     ? selectedProviderData.credentialFields.filter(field => ['email', 'password'].includes(field.name))
     : []
@@ -343,6 +371,12 @@ export function AddProviderDialog({
 
     try {
       const result = await onValidateToken(selectedProviderData.id, credentials)
+      if (result.valid && result.credentials) {
+        setCredentials(prev => ({
+          ...prev,
+          ...result.credentials,
+        }))
+      }
       setValidationResult(result)
     } catch (error) {
       setValidationResult({
@@ -403,13 +437,17 @@ export function AddProviderDialog({
         selectedProviderData.id as ProviderVendor
       )
       
-      console.log('[AddProviderDialog] OAuth result:', JSON.stringify(result, null, 2))
+      console.log('[AddProviderDialog] OAuth result:', {
+        success: result?.success,
+        credentialKeys: result?.credentials ? Object.keys(result.credentials) : [],
+        error: result?.error,
+      })
       
       if (result?.success && result.credentials) {
-        console.log('[AddProviderDialog] OAuth success, credentials:', JSON.stringify(result.credentials, null, 2))
+        console.log('[AddProviderDialog] OAuth success, credential keys:', Object.keys(result.credentials))
         
         const mappedCredentials = mapOAuthCredentials(selectedProviderData?.id, result.credentials)
-        console.log('[AddProviderDialog] Mapped credentials:', JSON.stringify(mappedCredentials, null, 2))
+        console.log('[AddProviderDialog] Mapped credential keys:', Object.keys(mappedCredentials))
         
         const hasAllRequiredFields = selectedProviderData.credentialFields
           .filter(f => f.required)
@@ -549,6 +587,7 @@ export function AddProviderDialog({
     const loginUrls: Record<string, string> = {
       'qwen-ai': 'https://chat.qwen.ai',
       qwen: 'https://www.qianwen.com',
+      kimi: 'https://www.kimi.com',
     }
     await window.electronAPI?.app.openExternal(loginUrls[selectedProviderData.id] || selectedProviderData.apiEndpoint)
   }

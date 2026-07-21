@@ -6,6 +6,7 @@
 import { Account, Provider, LoadBalanceStrategy } from '../store/types'
 import { AccountSelection } from './types'
 import { storeManager } from '../store/store'
+import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
 
 /**
  * Load Balancer
@@ -70,19 +71,19 @@ export class LoadBalancer {
       reason?: string
     }> = {}
 
-    for (const [accountId, failure] of this.failedAccounts.entries()) {
+    this.failedAccounts.forEach((failure, accountId) => {
       if (failure.cooldownUntil && failure.cooldownUntil <= now) {
         this.failedAccounts.delete(accountId)
-        continue
+        return
       }
 
       if (!failure.cooldownUntil && now - failure.lastFailTime > LoadBalancer.RECOVERY_TIME) {
         this.failedAccounts.delete(accountId)
-        continue
+        return
       }
 
       snapshot[accountId] = { ...failure }
-    }
+    })
 
     return snapshot
   }
@@ -216,11 +217,12 @@ export class LoadBalancer {
 
     const normalizedModel = this.normalizeModelForProviderMatch(model).toLowerCase()
     const supported = effectiveModels.some(m => {
-      const normalizedSupported = m.displayName.toLowerCase()
+      const normalizedSupported = this.normalizeModelForProviderMatch(m.displayName).toLowerCase()
+      const normalizedActualModel = this.normalizeModelForProviderMatch(m.actualModelId).toLowerCase()
       if (normalizedSupported.endsWith('*')) {
         return normalizedModel.startsWith(normalizedSupported.slice(0, -1))
       }
-      return normalizedSupported === normalizedModel
+      return normalizedSupported === normalizedModel || normalizedActualModel === normalizedModel
     })
     
     if (supported) {
@@ -241,11 +243,13 @@ export class LoadBalancer {
       const actualModel = globalMapping.actualModel
       const normalizedActualModel = this.normalizeModelForProviderMatch(actualModel).toLowerCase()
       const actualSupported = effectiveModels.some(m => {
-        const normalizedSupported = m.displayName.toLowerCase()
+        const normalizedSupported = this.normalizeModelForProviderMatch(m.displayName).toLowerCase()
+        const normalizedSupportedActual = this.normalizeModelForProviderMatch(m.actualModelId).toLowerCase()
         if (normalizedSupported.endsWith('*')) {
           return normalizedActualModel.startsWith(normalizedSupported.slice(0, -1))
         }
         return normalizedSupported === normalizedActualModel
+          || normalizedSupportedActual === normalizedActualModel
       })
       
       if (actualSupported) {
@@ -259,7 +263,7 @@ export class LoadBalancer {
   }
 
   private normalizeModelForProviderMatch(model: string): string {
-    return model.replace(/-(thinking|fast)$/i, '')
+    return normalizeProviderModelForMatch(model)
   }
 
   /**
@@ -285,8 +289,9 @@ export class LoadBalancer {
     
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
     const normalizedModel = this.normalizeModelForProviderMatch(model).toLowerCase()
-    const effectiveModel = effectiveModels.find(m => 
-      m.displayName.toLowerCase() === normalizedModel
+    const effectiveModel = effectiveModels.find(m =>
+      this.normalizeModelForProviderMatch(m.displayName).toLowerCase() === normalizedModel
+      || this.normalizeModelForProviderMatch(m.actualModelId).toLowerCase() === normalizedModel
     )
     
     if (effectiveModel) {
@@ -301,8 +306,10 @@ export class LoadBalancer {
       const actualModel = mapping.actualModel
       console.log(`[LoadBalancer] Model mapped from "${model}" to "${actualModel}" via global mapping`)
       
-      const actualEffectiveModel = effectiveModels.find(m => 
-        m.displayName.toLowerCase() === actualModel.toLowerCase()
+      const normalizedActualModel = this.normalizeModelForProviderMatch(actualModel).toLowerCase()
+      const actualEffectiveModel = effectiveModels.find(m =>
+        this.normalizeModelForProviderMatch(m.displayName).toLowerCase() === normalizedActualModel
+        || this.normalizeModelForProviderMatch(m.actualModelId).toLowerCase() === normalizedActualModel
       )
       if (actualEffectiveModel) {
         console.log(`[LoadBalancer] Model further mapped from "${actualModel}" to "${actualEffectiveModel.actualModelId}" via effective models`)
@@ -320,7 +327,7 @@ export class LoadBalancer {
    * Round Robin strategy
    */
   private selectRoundRobin(candidates: AccountSelection[]): AccountSelection {
-    const providerIds = [...new Set(candidates.map(c => c.provider.id))]
+    const providerIds = Array.from(new Set(candidates.map(c => c.provider.id)))
     const key = providerIds.join(',')
 
     const currentIndex = this.roundRobinIndex.get(key) || 0
@@ -419,7 +426,7 @@ export class LoadBalancer {
       }
     }
 
-    return [...models]
+    return Array.from(models)
   }
 }
 

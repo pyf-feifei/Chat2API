@@ -93,6 +93,28 @@ export interface ChatCompletionRequest {
   frequency_penalty?: number
   logit_bias?: Record<string, number>
   user?: string
+  /** Abort the upstream request when the client disconnects. */
+  signal?: AbortSignal
+  /** Provider conversation ID used by web-backed adapters such as Kimi. */
+  conversationId?: string
+  /** Snake-case alias for provider conversation ID. */
+  conversation_id?: string
+  /** Direct Kimi chat identifier alias. */
+  chatId?: string
+  /** Snake-case direct Kimi chat identifier alias. */
+  chat_id?: string
+  /** Optional Kimi project identifier. */
+  projectId?: string
+  /** Snake-case Kimi project identifier alias. */
+  project_id?: string
+  /** Provider parent message ID for multi-turn continuation. */
+  parentMessageId?: string
+  /** Snake-case alias for provider parent message ID. */
+  parent_message_id?: string
+  /** Direct Kimi parent message identifier alias. */
+  parentId?: string
+  /** Snake-case direct Kimi parent message identifier alias. */
+  parent_id?: string
   /** Enable web search (OpenAI compatible) */
   web_search?: boolean
   /** Web search options (OpenAI compatible) */

@@ -101,8 +101,8 @@ export class RequestForwarder {
     {
       name: 'deepseek',
       matches: DeepSeekAdapter.isDeepSeekProvider,
-      forward: (request, account, provider, actualModel, startTime) =>
-        this.forwardDeepSeek(request, account, provider, actualModel, startTime),
+      forward: (request, account, provider, actualModel, startTime, context) =>
+        this.forwardDeepSeek(request, account, provider, actualModel, startTime, context),
     },
     {
       name: 'glm',
@@ -113,8 +113,8 @@ export class RequestForwarder {
     {
       name: 'kimi',
       matches: KimiAdapter.isKimiProvider,
-      forward: (request, account, provider, actualModel, startTime) =>
-        this.forwardKimi(request, account, provider, actualModel, startTime),
+      forward: (request, account, provider, actualModel, startTime, context) =>
+        this.forwardKimi(request, account, provider, actualModel, startTime, context),
     },
     {
       name: 'qwen',
@@ -457,7 +457,8 @@ export class RequestForwarder {
     account: Account,
     provider: Provider,
     actualModel: string,
-    startTime: number
+    startTime: number,
+    context: ProxyContext,
   ): Promise<ForwardResult> {
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
@@ -522,9 +523,7 @@ export class RequestForwarder {
       )
       
       if (request.stream) {
-        const transformedStream = await handler.handleStream(response.data, {
-          signal: context?.signal,
-        })
+        const transformedStream = await handler.handleStream(response.data)
         
         return {
           success: true,
@@ -538,9 +537,7 @@ export class RequestForwarder {
       }
 
       // Non-streaming requests need to collect stream data and convert
-      const result = await handler.handleNonStream(response.data, {
-        signal: context?.signal,
-      })
+      const result = await handler.handleNonStream(response.data)
       
       this.applyToolCallsToResponse(result, transformed)
       
@@ -685,20 +682,37 @@ export class RequestForwarder {
     account: Account,
     provider: Provider,
     actualModel: string,
-    startTime: number
+    startTime: number,
+    context: ProxyContext,
   ): Promise<ForwardResult> {
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
+      const reasoningEffort = request.reasoning_effort ?? request.reasoningEffort
+      const enableWebSearch = request.web_search ?? Boolean(request.web_search_options)
+      const conversationId = request.conversationId || request.conversation_id
+        || request.chatId || request.chat_id
+      const parentId = request.parentMessageId || request.parent_message_id
+        || request.parentId || request.parent_id
+      const projectId = request.projectId || request.project_id
       
       const adapter = new KimiAdapter(provider, account)
-      const { response, conversationId } = await adapter.chatCompletion({
+      const {
+        response,
+        conversationId: upstreamConversationId,
+        accessToken: responseAccessToken,
+      } = await adapter.chatCompletion({
         model: actualModel,
-        originalModel: request.model,
+        originalModel: request.originalModel || request.model,
         messages: transformed.messages,
         stream: request.stream,
         temperature: request.temperature,
-        enableThinking: !!request.reasoning_effort,
-        enableWebSearch: !!request.web_search,
+        enableThinking: Boolean(reasoningEffort),
+        enableWebSearch,
+        reasoningEffort,
+        conversationId,
+        parentId,
+        projectId,
+        signal: context.signal,
       })
 
       const latency = Date.now() - startTime
@@ -713,10 +727,18 @@ export class RequestForwarder {
         }
       }
 
-      const handler = new KimiStreamHandler(actualModel, conversationId, !!request.reasoning_effort, transformed.plan)
+      const handler = new KimiStreamHandler(
+        actualModel,
+        upstreamConversationId,
+        Boolean(reasoningEffort),
+        transformed.plan,
+        () => adapter.invalidateAccessToken(responseAccessToken),
+      )
       
       if (request.stream) {
-        const transformedStream = await handler.handleStream(response.data)
+        const transformedStream = await handler.handleStream(response.data, {
+          signal: context.signal,
+        })
         
         // Add delete conversation callback if needed
         if (shouldDeleteSession()) {
@@ -739,11 +761,16 @@ export class RequestForwarder {
           stream: transformedStream,
           skipTransform: true,
           latency,
-          providerSessionId: undefined,
+          providerSessionId: upstreamConversationId || undefined,
+          // The assistant parent id is only known after the upstream stream
+          // emits its message metadata.  It is included in the final SSE
+          // chunk; do not return the request's old parent as a response header.
         }
       }
 
-      const result = await handler.handleNonStream(response.data)
+      const result = await handler.handleNonStream(response.data, {
+        signal: context.signal,
+      })
 
       this.applyToolCallsToResponse(result, transformed)
 
@@ -761,13 +788,17 @@ export class RequestForwarder {
         body: result,
         latency,
         providerSessionId: handler.getConversationId() ?? undefined,
+        parentMessageId: handler.getLastMessageId() ?? undefined,
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      const kimiError = error as { retryable?: boolean }
       return {
         success: false,
+        status: statusFromError(error),
         error: error instanceof Error ? error.message : 'Unknown error',
         latency,
+        retryable: kimiError.retryable,
       }
     }
   }

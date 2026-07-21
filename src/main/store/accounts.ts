@@ -234,6 +234,15 @@ export class AccountManager {
     
     if (result.valid) {
       this.updateStatus(id, 'active')
+
+      if (result.credentials) {
+        storeManager.updateAccount(id, {
+          credentials: {
+            ...account.credentials,
+            ...result.credentials,
+          },
+        })
+      }
       
       if (result.accountInfo?.email) {
         storeManager.updateAccount(id, { email: result.accountInfo.email })

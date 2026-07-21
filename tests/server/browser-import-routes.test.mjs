@@ -65,7 +65,10 @@ test('browser-assisted import script falls back to offline payload when direct p
   assert.match(webAdminSource, /document\.execCommand\('copy'\)/)
   assert.match(webAdminSource, /Mixed Content/)
   assert.match(webAdminSource, /Chat2API browser import payload:/)
-  assert.match(webAdminSource, /Paste this payload into the Chat2API admin page/)
+  assert.match(webAdminSource, /const announcePayload = async \(\) =>/)
+  assert.match(webAdminSource, /void announcePayload\(\)/)
+  assert.match(webAdminSource, /Payload copied\. Paste it into the Chat2API admin page if needed\./)
+  assert.match(webAdminSource, /return payloadText;/)
 })
 
 test('web admin can apply pasted browser import payload to the active session', () => {

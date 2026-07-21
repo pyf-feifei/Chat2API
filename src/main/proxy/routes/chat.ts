@@ -9,6 +9,7 @@ import { PassThrough } from 'stream'
 import { ChatCompletionRequest, ChatCompletionResponse, ProxyContext } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
+import { KimiAdapter } from '../adapters/kimi'
 import { streamHandler } from '../stream'
 import { proxyStatusManager } from '../status'
 import { modelMapper } from '../modelMapper'
@@ -216,7 +217,8 @@ router.post('/completions', async (ctx: Context) => {
 
       if (isQwenAiRiskControl(provider.id, result.status, result.error)) {
         loadBalancer.markQwenAiRiskControl(account.id)
-      } else if (result.status && result.status >= 400 && result.status !== 429) {
+      } else if (result.status && result.status >= 400
+        && result.status !== 429 && result.status !== 499) {
         loadBalancer.markAccountFailed(account.id)
       }
 
@@ -280,17 +282,30 @@ router.post('/completions', async (ctx: Context) => {
       return
     }
 
-    loadBalancer.clearAccountFailure(account.id)
+    const deferKimiStreamOutcome = KimiAdapter.isKimiProvider(provider)
+      && request.stream === true
+      && Boolean(result.stream)
 
-    proxyStatusManager.recordRequestSuccess(latency)
+    if (!deferKimiStreamOutcome) {
+      loadBalancer.clearAccountFailure(account.id)
+    }
 
-    storeManager.updateAccount(account.id, {
-      lastUsed: Date.now(),
-      requestCount: (account.requestCount || 0) + 1,
-      todayUsed: (account.todayUsed || 0) + 1,
-    })
+    if (KimiAdapter.isKimiProvider(provider)) {
+      if (result.providerSessionId) {
+        ctx.set('X-Kimi-Conversation-Id', result.providerSessionId)
+      }
+      if (result.parentMessageId) {
+        ctx.set('X-Kimi-Parent-Id', result.parentMessageId)
+      }
+    }
 
-    storeManager.addLog('debug', `Request succeeded`, {
+    if (!deferKimiStreamOutcome) {
+      proxyStatusManager.recordRequestSuccess(latency)
+
+      storeManager.incrementAccountUsage(account.id)
+    }
+
+    storeManager.addLog('debug', deferKimiStreamOutcome ? `Request stream started` : `Request succeeded`, {
       requestId,
       providerId: provider.id,
       accountId: account.id,
@@ -358,7 +373,9 @@ router.post('/completions', async (ctx: Context) => {
       logEntryId = logEntry.id
     }
 
-    storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
+    if (!deferKimiStreamOutcome) {
+      storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
+    }
 
     if (request.stream === true && result.stream) {
       ctx.set('Content-Type', 'text/event-stream')
@@ -371,28 +388,85 @@ router.post('/completions', async (ctx: Context) => {
 
       // Collect stream content for logging (raw SSE output)
       let collectedContent = ''
+      let streamOutcomeRecorded = !deferKimiStreamOutcome
+
+      const recordKimiStreamOutcome = (success: boolean, error?: Error) => {
+        if (!deferKimiStreamOutcome || streamOutcomeRecorded) return
+        streamOutcomeRecorded = true
+
+        const completionLatency = Date.now() - startTime
+        if (success) {
+          loadBalancer.clearAccountFailure(account.id)
+          proxyStatusManager.recordRequestSuccess(completionLatency)
+          storeManager.incrementAccountUsage(account.id)
+          storeManager.recordRequestInStats(true, completionLatency, request.model, provider.id, account.id)
+          storeManager.addLog('debug', 'Stream response completed', {
+            requestId,
+            providerId: provider.id,
+            accountId: account.id,
+            model: request.model,
+          })
+          if (logEntryId) {
+            storeManager.updateRequestLog(logEntryId, {
+              latency: completionLatency,
+              responseStatus: 200,
+            })
+          }
+          return
+        }
+
+        const errorStatus = (error as (Error & { status?: unknown }) | undefined)?.status
+        const failureStatus = typeof errorStatus === 'number' ? errorStatus : 502
+        proxyStatusManager.recordRequestFailure(completionLatency)
+        if (failureStatus !== 499) {
+          loadBalancer.markAccountFailed(account.id)
+        }
+        storeManager.recordRequestInStats(false, completionLatency, request.model, provider.id, account.id)
+        if (logEntryId) {
+          storeManager.updateRequestLog(logEntryId, {
+            status: 'error',
+            statusCode: failureStatus,
+            responseStatus: failureStatus,
+            latency: completionLatency,
+            errorMessage: error?.message || 'Kimi stream failed',
+            responseBody: collectedContent || undefined,
+          })
+        }
+      }
 
       // Handle stream errors
       result.stream.once('error', (err: Error) => {
         console.error('[Chat] Stream error:', err.message)
+        recordKimiStreamOutcome(false, err)
 
-        // Send error as SSE event
-        const errorEvent = {
-          id: requestId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: actualModel,
-          choices: [{
-            index: 0,
-            delta: {
-              content: `\n\n[Error: ${err.message}]`,
+        // Kimi's Connect handler deliberately withholds [DONE] when an
+        // upstream trailer reports an error. Preserve that signal so clients
+        // do not mistake a permission/auth failure for a successful answer.
+        if (KimiAdapter.isKimiProvider(provider)) {
+          wrapperStream.write(`data: ${JSON.stringify({
+            error: {
+              message: err.message,
+              type: 'api_error',
             },
-            finish_reason: 'stop',
-          }],
-        }
+          })}\n\n`)
+        } else {
+          const errorEvent = {
+            id: requestId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: actualModel,
+            choices: [{
+              index: 0,
+              delta: {
+                content: `\n\n[Error: ${err.message}]`,
+              },
+              finish_reason: 'stop',
+            }],
+          }
 
-        wrapperStream.write(`data: ${JSON.stringify(errorEvent)}\n\n`)
-        wrapperStream.write('data: [DONE]\n\n')
+          wrapperStream.write(`data: ${JSON.stringify(errorEvent)}\n\n`)
+          wrapperStream.write('data: [DONE]\n\n')
+        }
         wrapperStream.end()
 
         storeManager.addLog('error', `Stream error: ${err.message}`, {
@@ -414,9 +488,11 @@ router.post('/completions', async (ctx: Context) => {
 
         // When source stream ends normally, update log and end wrapper
         result.stream.once('end', () => {
+          recordKimiStreamOutcome(true)
           // Update log with collected response
           if (logEntryId) {
             storeManager.updateRequestLog(logEntryId, {
+              latency: Date.now() - startTime,
               responseBody: collectedContent || undefined,
             })
           }

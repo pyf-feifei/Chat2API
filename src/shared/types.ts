@@ -234,6 +234,7 @@ export interface ValidationResult {
   valid: boolean
   error?: string
   validatedAt: number
+  credentials?: Record<string, string>
   accountInfo?: {
     name?: string
     email?: string

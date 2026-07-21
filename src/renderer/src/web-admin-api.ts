@@ -342,18 +342,25 @@ function buildBrowserImportFallbackBlock(): string {
       return false;
     }
   };
+  let payloadAnnounced = false;
+  const announcePayload = async () => {
+    if (payloadAnnounced) return;
+    payloadAnnounced = true;
+    console.log('Chat2API browser import payload:', payloadText);
+    const copied = await copyPayload();
+    console.warn(copied
+      ? 'Payload copied. Paste it into the Chat2API admin page if needed.'
+      : 'Copy failed. Copy the JSON printed above manually.');
+  };
   const showOfflinePayload = async (error) => {
     console.error('Chat2API browser import failed:', error);
     if (location.protocol === 'https:' && completeUrl.startsWith('http://')) {
       console.warn('Mixed Content: HTTPS provider pages cannot post credentials to an HTTP Chat2API address.');
     }
-    console.log('Chat2API browser import payload:', payloadText);
-    const copied = await copyPayload();
-    console.warn(copied
-      ? 'Paste this payload into the Chat2API admin page. It has also been copied if your browser allowed clipboard access.'
-      : 'Paste this payload into the Chat2API admin page. If clipboard copy failed, copy the JSON printed above manually.');
+    await announcePayload();
   };
-  fetch(completeUrl, {
+  void announcePayload();
+  void fetch(completeUrl, {
     method: 'POST',
     mode: 'cors',
     headers: { 'Content-Type': 'text/plain' },
@@ -365,7 +372,8 @@ function buildBrowserImportFallbackBlock(): string {
       }
       console.log('Chat2API browser import sent. Return to the Chat2API admin page.');
     })
-    .catch(showOfflinePayload);`
+    .catch(showOfflinePayload);
+  return payloadText;`
 }
 
 function buildQwenAiImportScript(session: BrowserImportSession): string {
@@ -414,6 +422,74 @@ ${buildBrowserImportFallbackBlock()}
 })();`
 }
 
+function buildKimiImportScript(session: BrowserImportSession): string {
+  const completeUrl = `${window.location.origin}${MANAGEMENT_BASE}/browser-import/complete`
+  return `(() => {
+  const importId = ${JSON.stringify(session.id)};
+  const providerId = 'kimi';
+  const completeUrl = ${JSON.stringify(completeUrl)};
+  const tokenRefreshEndpoint = 'https://www.kimi.com/api/auth/token/refresh';
+  const readStorage = (key) => {
+    try {
+      return localStorage.getItem(key) || '';
+    } catch (error) {
+      return '';
+    }
+  };
+  const readCookie = (name) => {
+    const prefix = name + '=';
+    const entry = (document.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix));
+    if (!entry) return '';
+    const value = entry.slice(prefix.length);
+    try {
+      return decodeURIComponent(value);
+    } catch (error) {
+      return value;
+    }
+  };
+  const readTokenInfo = () => {
+    const raw = readStorage('volcano-token-info');
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+      return {};
+    }
+  };
+  const tokenInfo = readTokenInfo();
+  const accessToken = readStorage('access_token') || readStorage('accessToken')
+    || '';
+  const refreshToken = readStorage('refresh_token') || readStorage('refreshToken')
+    || '';
+  const kimiAuth = readStorage('kimi-auth') || readStorage('kimi_auth')
+    || readStorage('kimiAuth') || readCookie('kimi-auth');
+  const token = accessToken || kimiAuth || refreshToken;
+  const deviceId = readStorage('device_id') || readStorage('deviceId')
+    || tokenInfo.webId || '';
+  const sessionId = readStorage('session_id') || readStorage('sessionId')
+    || tokenInfo.ssid || '';
+  const trafficId = readStorage('traffic_id') || readStorage('trafficId')
+    || readStorage('msh_user_id') || tokenInfo.userId || '';
+  const payload = {
+    importId,
+    providerId,
+    credentials: {
+      token,
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      refreshToken,
+      kimiAuth,
+      deviceId,
+      sessionId,
+      trafficId,
+    },
+    error: token ? '' : 'No Kimi token was found. Check localStorage.access_token/localStorage.refresh_token or the kimi-auth cookie, then run this script again. The web refresh endpoint is ' + tokenRefreshEndpoint,
+  };
+${buildBrowserImportFallbackBlock()}
+})();`
+}
+
 function buildBrowserImportScript(session: BrowserImportSession): string {
   if (session.providerId === 'qwen-ai') {
     return buildQwenAiImportScript(session)
@@ -421,7 +497,10 @@ function buildBrowserImportScript(session: BrowserImportSession): string {
   if (session.providerId === 'qwen') {
     return buildQwenImportScript(session)
   }
-  throw new Error('Browser-assisted import is only available for Qwen providers in Docker.')
+  if (session.providerId === 'kimi') {
+    return buildKimiImportScript(session)
+  }
+  throw new Error('Browser-assisted import is only available for Qwen and Kimi providers in Docker.')
 }
 
 const defaultUpdateStatus = {
@@ -662,6 +741,7 @@ const accounts = {
     managementFetch<{
       valid: boolean
       error?: string
+      credentials?: Record<string, string>
       userInfo?: {
         name?: string
         email?: string
@@ -712,7 +792,20 @@ const oauth = {
     }),
 
   validateToken: (providerId: string, providerType: ProviderVendor, credentials: Record<string, string>) =>
-    managementFetch('/oauth/validate-token', {
+    managementFetch<{
+      valid: boolean
+      tokenType?: string
+      expiresAt?: number
+      credentials?: Record<string, string>
+      accountInfo?: {
+        userId?: string
+        email?: string
+        name?: string
+        quota?: number
+        used?: number
+      }
+      error?: string
+    }>('/oauth/validate-token', {
       method: 'POST',
       body: JSON.stringify({ providerId, providerType, credentials }),
     }),

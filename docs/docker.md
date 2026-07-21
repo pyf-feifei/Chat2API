@@ -71,7 +71,7 @@ Provider account management supports the same manual credential forms used by th
 
 The Docker web admin and proxy run in the same Koa process. Start, stop, restart, and port publishing are therefore managed by Docker or Docker Compose, not by the in-app Stop Proxy button. If you change the listening port or bind address in the UI, restart the container and update your `-p`/Compose port mapping accordingly.
 
-Electron-only automatic in-app login cannot run in Docker because it depends on an Electron `BrowserWindow`. The Docker web admin provides a browser-assisted import flow for Qwen providers so you do not have to manually search DevTools storage fields.
+Electron-only automatic in-app login cannot run in Docker because it depends on an Electron `BrowserWindow`. The Docker web admin provides a browser-assisted import flow for Qwen and Kimi providers so you do not have to manually search DevTools storage fields.
 
 ## Browser-Assisted Qwen AI Import
 
@@ -88,6 +88,18 @@ For `Qwen AI (International)` (`chat.qwen.ai`):
 The script reads `localStorage.token` and readable cookies from the already logged-in `chat.qwen.ai` page, then posts them to the local Docker admin import endpoint using a short-lived random import ID. It does not receive or need the management secret.
 
 For domestic `Qwen` (`www.qianwen.com`), the same flow attempts to read `tongyi_sso_ticket` from `document.cookie`. If the site marks that cookie as `HttpOnly`, browser JavaScript cannot read it and the UI will show a clear failure. In that case, use the manual `SSO Ticket` field.
+
+## Browser-Assisted Kimi Import
+
+For Kimi (`www.kimi.com`):
+
+1. Open `http://localhost:8080/admin/#/providers`.
+2. Open the Kimi account dialog and switch to the OAuth tab.
+3. Click `Open Provider Website` and log in at `https://www.kimi.com`.
+4. Click `Generate Import Script`, copy it, then run it in the logged-in Kimi page's browser console.
+5. Return to Chat2API. The access token is filled automatically; validate it and add the account.
+
+The script reads `localStorage.access_token` and `localStorage.refresh_token`. The `volcano-token-info` object is used only for request identifiers (`webId`, `ssid`, and `userId`), which become the stored `deviceId`, `sessionId`, and `trafficId`; it is not treated as a token container. The script also checks the `kimi-auth` cookie/local-storage value when available. Kimi may mark that cookie as `HttpOnly`, so the local-storage tokens are preferred. If the browser blocks the cross-origin POST, the script prints and copies a one-time payload that can be pasted into the Docker admin page.
 
 ## Add Qwen Accounts
 

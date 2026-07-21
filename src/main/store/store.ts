@@ -759,6 +759,43 @@ class StoreManager {
   }
 
   /**
+   * Atomically record one completed request for an account.
+   *
+   * Account usage is updated from several stream completion callbacks. Keep
+   * the read/increment/write sequence inside this synchronous store method so
+   * concurrent callbacks cannot overwrite one another's counters.
+   */
+  incrementAccountUsage(id: string, now: number = Date.now()): Account | null {
+    this.ensureInitialized()
+    const accounts = this.store!.get('accounts') as Account[] || []
+    const index = accounts.findIndex((account: Account) => account.id === id)
+
+    if (index === -1) {
+      return null
+    }
+
+    const current = accounts[index]
+    const updatedAccount: Account = {
+      ...current,
+      lastUsed: now,
+      requestCount: (current.requestCount || 0) + 1,
+      todayUsed: (current.todayUsed || 0) + 1,
+      updatedAt: now,
+    }
+
+    this.store!.set('accounts', [
+      ...accounts.slice(0, index),
+      updatedAccount,
+      ...accounts.slice(index + 1),
+    ])
+
+    return {
+      ...updatedAccount,
+      credentials: this.decryptCredentials(updatedAccount.credentials),
+    }
+  }
+
+  /**
    * Delete Account
    */
   deleteAccount(id: string): boolean {
