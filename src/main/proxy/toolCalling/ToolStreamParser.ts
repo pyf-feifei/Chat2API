@@ -1,61 +1,71 @@
+import { randomUUID } from 'node:crypto'
 import type { ToolCallingPlan } from './types.ts'
 import { getToolProtocol } from './protocols/index.ts'
 
 export class ToolStreamParser {
   private readonly plan: ToolCallingPlan
+  private readonly callIdPrefix: string
   private buffer = ''
   private isBufferingToolCall = false
   private emittedToolCall = false
   private nextToolCallIndex = 0
   private sawToolProtocolMarker = false
-  private readonly emittedToolCallFingerprints = new Set<string>()
 
-  constructor(plan: ToolCallingPlan) {
+  constructor(plan: ToolCallingPlan, callIdPrefix?: string) {
     this.plan = plan
+    this.callIdPrefix = callIdPrefix ?? `call_${randomUUID().replace(/-/g, '')}`
   }
 
   push(content: string, baseChunk: any, includeRole: boolean = false): any[] {
-    if (!content || !this.plan.shouldParseResponse) return []
+    // A response may replay a completed XML block in a later upstream delta.
+    // Once a complete block was emitted, all calls for this response are known;
+    // keep the first block and avoid executing a replay a second time.
+    if (!content || !this.plan.shouldParseResponse || this.emittedToolCall) return []
 
     this.buffer += content
     const chunks: any[] = []
+    // `includeRole` describes the first output delta, not every delta that
+    // happens to be produced from one input fragment. Keep it pending until
+    // the first content/tool chunk is emitted.
+    let rolePending = includeRole && !this.emittedToolCall
 
     if (!this.isBufferingToolCall) {
       const markerStart = findMarkerStart(this.buffer, this.plan)
       if (markerStart.matched) {
         this.sawToolProtocolMarker = true
         if (markerStart.index > 0) {
-          chunks.push(createContentChunk(baseChunk, this.buffer.slice(0, markerStart.index), includeRole))
+          chunks.push(createContentChunk(baseChunk, this.buffer.slice(0, markerStart.index), rolePending))
+          rolePending = false
         }
         this.buffer = this.buffer.slice(markerStart.index)
         this.isBufferingToolCall = true
       } else if (markerStart.partial) {
         this.sawToolProtocolMarker = true
         if (markerStart.index > 0) {
-          chunks.push(createContentChunk(baseChunk, this.buffer.slice(0, markerStart.index), includeRole))
+          chunks.push(createContentChunk(baseChunk, this.buffer.slice(0, markerStart.index), rolePending))
+          rolePending = false
           this.buffer = this.buffer.slice(markerStart.index)
         }
         this.isBufferingToolCall = true
         return chunks
       } else {
-        chunks.push(createContentChunk(baseChunk, this.buffer, includeRole))
+        chunks.push(createContentChunk(baseChunk, this.buffer, rolePending))
         this.buffer = ''
         return chunks
       }
     }
 
-    const parsed = parseBufferedToolCall(this.buffer, this.plan)
+    const parsed = parseFirstValidToolBlock(this.buffer, this.plan)
     if (parsed.toolCalls.length > 0) {
       for (const toolCall of parsed.toolCalls) {
-        if (this.hasSeenToolCall(toolCall)) continue
-
         const indexedToolCall = {
           ...toolCall,
           index: this.nextToolCallIndex,
-          id: toolCall.id || `call_${this.nextToolCallIndex}`,
+          id: this.scopedToolCallId(toolCall.id, this.nextToolCallIndex),
         }
         this.nextToolCallIndex += 1
-        chunks.push(createToolCallChunk(baseChunk, indexedToolCall, includeRole && !this.emittedToolCall))
+        chunks.push(createToolCallChunk(baseChunk, indexedToolCall, rolePending))
+        rolePending = false
       }
       if (chunks.length > 0) {
         this.emittedToolCall = true
@@ -79,15 +89,13 @@ export class ToolStreamParser {
   flush(baseChunk: any): any[] {
     if (!this.buffer) return []
 
-    const parsed = parseBufferedToolCall(this.buffer, this.plan, { allowPartial: true })
+    const parsed = parseFirstValidToolBlock(this.buffer, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length > 0) {
       const chunks = parsed.toolCalls.flatMap((toolCall) => {
-        if (this.hasSeenToolCall(toolCall)) return []
-
         const indexedToolCall = {
           ...toolCall,
           index: this.nextToolCallIndex,
-          id: toolCall.id || `call_${this.nextToolCallIndex}`,
+          id: this.scopedToolCallId(toolCall.id, this.nextToolCallIndex),
         }
         this.nextToolCallIndex += 1
         this.emittedToolCall = true
@@ -114,19 +122,17 @@ export class ToolStreamParser {
   recoverFromContent(content: string, baseChunk: any, includeRole: boolean = false): any[] {
     if (!content || this.emittedToolCall || !this.plan.shouldParseResponse) return []
 
-    const parsed = parseBufferedToolCall(content, this.plan, { allowPartial: true })
+    const parsed = parseFirstValidToolBlock(content, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length === 0) return []
 
     const chunks = parsed.toolCalls.flatMap((toolCall, index) => {
-      if (this.hasSeenToolCall(toolCall)) return []
-
       const indexedToolCall = {
         ...toolCall,
         index: this.nextToolCallIndex,
-        id: toolCall.id || `call_${this.nextToolCallIndex}`,
+        id: this.scopedToolCallId(toolCall.id, this.nextToolCallIndex),
       }
       this.nextToolCallIndex += 1
-      return [createToolCallChunk(baseChunk, indexedToolCall, includeRole && index === 0)]
+      return [createToolCallChunk(baseChunk, indexedToolCall, includeRole && !this.emittedToolCall && index === 0)]
     })
 
     if (chunks.length > 0) {
@@ -149,14 +155,9 @@ export class ToolStreamParser {
     return this.sawToolProtocolMarker || this.isBufferingToolCall || hasProtocolMarker(this.buffer, this.plan)
   }
 
-  private hasSeenToolCall(toolCall: any): boolean {
-    const fingerprint = toolCallFingerprint(toolCall)
-    if (this.emittedToolCallFingerprints.has(fingerprint)) {
-      return true
-    }
-
-    this.emittedToolCallFingerprints.add(fingerprint)
-    return false
+  private scopedToolCallId(parsedId: string | undefined, index: number): string {
+    void parsedId
+    return `${this.callIdPrefix}_${index}`
   }
 }
 
@@ -171,6 +172,32 @@ function parseBufferedToolCall(
     protocol: plan.protocol,
     allowPartial: options.allowPartial,
   })
+}
+
+/**
+ * A provider can concatenate a retransmitted, complete tool block into one
+ * streamed delta. Parse the first block that contains a valid call and leave
+ * all calls inside that block intact, so legitimate parallel invocations are
+ * not mistaken for replays.
+ */
+function parseFirstValidToolBlock(
+  content: string,
+  plan: ToolCallingPlan,
+  options: { allowPartial?: boolean } = {},
+) {
+  const parsed = parseBufferedToolCall(content, plan, options)
+  if (parsed.toolCalls.length === 0 || parsed.rawMatches.length <= 1) {
+    return parsed
+  }
+
+  for (const rawMatch of parsed.rawMatches) {
+    const candidate = parseBufferedToolCall(rawMatch, plan, options)
+    if (candidate.toolCalls.length > 0) {
+      return candidate
+    }
+  }
+
+  return parsed
 }
 
 function findMarkerStart(buffer: string, plan: ToolCallingPlan): { matched: boolean; partial: boolean; index: number } {
@@ -262,37 +289,4 @@ function createToolCallChunk(baseChunk: any, toolCall: any, includeRole: boolean
       finish_reason: null,
     }],
   }
-}
-
-function toolCallFingerprint(toolCall: any): string {
-  const name = typeof toolCall?.function?.name === 'string' ? toolCall.function.name : ''
-  const args = typeof toolCall?.function?.arguments === 'string' ? toolCall.function.arguments : ''
-  return `${name}\n${canonicalArguments(args)}`
-}
-
-function canonicalArguments(args: string): string {
-  const trimmed = args.trim()
-  if (!trimmed) return '{}'
-
-  try {
-    return JSON.stringify(sortJsonValue(JSON.parse(trimmed)))
-  } catch {
-    return trimmed
-  }
-}
-
-function sortJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortJsonValue)
-  }
-
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, item]) => [key, sortJsonValue(item)]),
-    )
-  }
-
-  return value
 }

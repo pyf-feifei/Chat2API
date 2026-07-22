@@ -16,6 +16,29 @@ services:
       CHAT2API_MANAGEMENT_SECRET: ${CHAT2API_MANAGEMENT_SECRET}
       CHAT2API_LOG_LEVEL: info
       CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
+      # Queue admission is independent from the active response budget.
+      # Keep it configurable so deployments can choose how long clients wait
+      # for a governor slot before receiving a retryable 429.
+      CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS: ${CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000}
+      # Keep managed-tool responses live by default. Enable only when the
+      # deployment explicitly accepts delayed first bytes for validation.
+      CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-false}
+      # Explicit governor values take precedence over settings persisted in
+      # /data. Leave them unset to keep the stored profile.
+      CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}
+      CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT: ${CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT-}
+      CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS: ${CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS-}
+      CHAT2API_QWEN_AI_MAX_CONCURRENT: ${CHAT2API_QWEN_AI_MAX_CONCURRENT-}
+      CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS-}
+      CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
+      # Long-context provider responses are bounded separately from idle stalls.
+      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-600000}
+      QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-600000}
+      QWEN_AI_STREAM_IDLE_TIMEOUT_MS: ${QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000}
+      # ali-oss refreshes temporary upload credentials during long multipart uploads.
+      QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}
+      # Used only when managed stream validation is explicitly enabled.
+      CHAT2API_VALIDATED_SSE_MAX_HOLD_MS: ${CHAT2API_VALIDATED_SSE_MAX_HOLD_MS:-60000}
     volumes:
       - chat2api-data:/data
 

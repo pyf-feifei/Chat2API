@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypt
 import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, resolve } from 'path'
-import type { RuntimeAdapter } from './types'
+import type { RuntimeAdapter } from './types.ts'
 
 const ENCRYPTION_PREFIX = 'c2a:v1:'
 

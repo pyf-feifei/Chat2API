@@ -36,7 +36,7 @@ const MANAGED_XML_SYNTAX: XmlSyntax = {
   startMarkers: [CHAT2API_START, XML_START, LOOSE_XML_START, QCML_START],
   endMarkers: [CHAT2API_END, XML_END, LOOSE_XML_END, QCML_END],
   blockPattern: /(?:<\|CHAT2API\|tool_calls>|<\uFF5CQCML\uFF5Ctool_calls>|<tool_calls>|<\|tool_calls>)([\s\S]*?)(?:<\/\|CHAT2API\|tool_calls>|<\/\uFF5CQCML\uFF5Ctool_calls>|<\/tool_calls>|<\/\|tool_calls>)/g,
-  invokePattern: /(?:<\|CHAT2API\|invoke\s+name=["']([^"']+)["']\s*>|<\uFF5CQCML\uFF5Cinvoke\s+name=["']([^"']+)["']\s*>|<invoke\s+name=["']([^"']+)["']\s*>|<\|?tool_call\s+name=["']([^"']+)["']\s*>|<\|?tool_call_id=["']([^"']+)["']\s*>)/g,
+  invokePattern: /(?:<\|CHAT2API\|invoke\s+name=["']([^"']+)["'](?:\s+tool_call_id=["'][^"']+["'])?\s*>|<\uFF5CQCML\uFF5Cinvoke\s+name=["']([^"']+)["'](?:\s+tool_call_id=["'][^"']+["'])?\s*>|<invoke\s+name=["']([^"']+)["'](?:\s+tool_call_id=["'][^"']+["'])?\s*>|<\|?tool_call\s+name=["']([^"']+)["'](?:\s+tool_call_id=["'][^"']+["'])?\s*>|<\|?tool_call_id=["']([^"']+)["']\s*>)/g,
   parameterOpenPattern: /(?:<\|CHAT2API\|parameter\s+name=["']([^"']+)["']\s*>|<\uFF5CQCML\uFF5Cparameter\s+name=["']([^"']+)["']\s*>|<parameter\s+name=["']([^"']+)["']\s*>|<\|parameter\s+name=["']([^"']+)["']\s*>)/g,
   invokeCloseTags: ['</|CHAT2API|invoke>', '</\uFF5CQCML\uFF5Cinvoke>', '</invoke>', '</tool_call>', '</|tool_call>'],
   parameterCloseTags: ['</|CHAT2API|parameter>', '</\uFF5CQCML\uFF5Cparameter>', '</parameter>', '</|parameter>'],
@@ -136,7 +136,7 @@ Tool results will be provided as Chat2API XML result blocks:
           return `<|CHAT2API|parameter name="${escapeXmlAttribute(name)}"><![CDATA[${text}]]></|CHAT2API|parameter>`
         })
         .join('')
-      return `<|CHAT2API|invoke name="${escapeXmlAttribute(call.name)}">${params}</|CHAT2API|invoke>`
+      return `<|CHAT2API|invoke name="${escapeXmlAttribute(call.name)}" tool_call_id="${escapeXmlAttribute(call.id)}">${params}</|CHAT2API|invoke>`
     })
     return `${CHAT2API_START}${invokes.join('')}${CHAT2API_END}`
   },

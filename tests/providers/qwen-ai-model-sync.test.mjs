@@ -35,6 +35,8 @@ function plain(value) {
 }
 
 test('Qwen AI defaults include the current anonymous international model set', () => {
+  assert.match(qwenAiSource, /'Qwen3\.8-Max-Preview'/)
+  assert.match(qwenAiSource, /'Qwen3\.8-Max-Preview':\s*'qwen3\.8-max-preview'/)
   assert.match(qwenAiSource, /'Qwen3\.7-Plus'/)
   assert.match(qwenAiSource, /'Qwen3\.7-Plus':\s*'qwen3\.7-plus'/)
   assert.match(qwenAiSource, /'Qwen3\.7-Max':\s*'qwen3\.7-max'/)
@@ -80,6 +82,7 @@ test('provider model parser maps live Qwen AI response shapes to display names a
         'Qwen3.7-Plus': 'qwen3.7-plus',
         'Qwen3.7-Max': 'qwen3.7-max',
       },
+      modelCapabilities: {},
     },
   )
 
@@ -97,6 +100,7 @@ test('provider model parser maps live Qwen AI response shapes to display names a
       modelMappings: {
         'Qwen3.6-Plus': 'qwen3.6-plus',
       },
+      modelCapabilities: {},
     },
   )
 
@@ -107,8 +111,67 @@ test('provider model parser maps live Qwen AI response shapes to display names a
       modelMappings: {
         'raw-model-id': 'raw-model-id',
       },
+      modelCapabilities: {},
     },
   )
+})
+
+test('provider model parser preserves thinking capability metadata', () => {
+  const { parseProviderModelsResponse } = loadModelSyncModule()
+
+  assert.deepEqual(
+    plain(parseProviderModelsResponse({
+      data: {
+        data: [{
+          id: 'qwen3.8-max-preview',
+          name: 'Qwen3.8-Max-Preview',
+          info: { meta: { think_skip: { enable: false } } },
+        }, {
+          id: 'qwen3.7-plus',
+          name: 'Qwen3.7-Plus',
+          info: { meta: { think_skip: { enable: true } } },
+        }],
+      },
+    })),
+    {
+      supportedModels: ['Qwen3.8-Max-Preview', 'Qwen3.7-Plus'],
+      modelMappings: {
+        'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
+        'Qwen3.7-Plus': 'qwen3.7-plus',
+      },
+      modelCapabilities: {
+        'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+        'qwen3.8-max-preview': { thinkingSkippable: false },
+        'Qwen3.7-Plus': { thinkingSkippable: true },
+        'qwen3.7-plus': { thinkingSkippable: true },
+      },
+    },
+  )
+})
+
+test('model sync merges capability metadata instead of clearing it on sparse responses', () => {
+  const { mergeProviderModelCapabilities } = loadModelSyncModule()
+  const existing = {
+    'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+    'custom-model': { thinkingSkippable: true },
+  }
+  const reported = {
+    'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+  }
+
+  const merged = plain(mergeProviderModelCapabilities(existing, reported))
+  assert.deepEqual(merged, existing)
+  assert.notEqual(merged, existing)
+  assert.equal(mergeProviderModelCapabilities(existing, undefined)['custom-model'].thinkingSkippable, true)
+  assert.equal(mergeProviderModelCapabilities(undefined, undefined), undefined)
+})
+
+test('all model sync entry points use the shared capability merge helper', () => {
+  assert.match(ipcSource, /mergeProviderModelCapabilities\(/)
+  assert.match(managementProvidersSource, /mergeProviderModelCapabilities\(/)
+  assert.match(storeSource, /mergeProviderModelCapabilities\(/)
+  assert.match(storeSource, /p\.modelCapabilities/)
+  assert.match(storeSource, /provider\.modelCapabilities/)
 })
 
 test('persisted built-in providers keep model sync endpoint metadata for the update button', () => {

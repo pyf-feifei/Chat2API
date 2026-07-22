@@ -31,7 +31,7 @@ import {
   UserModelOverrides,
   CustomModel,
   DEFAULT_REQUEST_LOG_CONFIG,
-  DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
+  normalizeQwenAiGovernorConfig,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -45,6 +45,7 @@ import type { AppLogFilter } from '../appLogs/types'
 import { getRuntime } from '../runtime'
 import { NodeJsonStore } from './storage/nodeJsonStore'
 import { createElectronJsonStore } from './storage/electronJsonStore'
+import { mergeProviderModelCapabilities } from '../providers/modelSync'
 
 /**
  * Storage Instance Type Definition
@@ -240,7 +241,6 @@ class StoreManager {
       ...config,
     }
     const rawToolCallingConfig = rawConfig.toolCallingConfig ?? rawConfig.toolPromptConfig
-
     return {
       ...rawConfig,
       modelMappings: normalizeModelMappingsWithDefaults(rawConfig.modelMappings),
@@ -250,10 +250,7 @@ class StoreManager {
       ),
       toolCallingConfig: normalizeToolCallingConfig(rawToolCallingConfig),
       toolPromptConfig: undefined,
-      qwenAiGovernorConfig: {
-        ...DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
-        ...(rawConfig.qwenAiGovernorConfig || {}),
-      },
+      qwenAiGovernorConfig: normalizeQwenAiGovernorConfig(rawConfig.qwenAiGovernorConfig),
     }
   }
 
@@ -320,6 +317,12 @@ class StoreManager {
             chatPath: builtinConfig.chatPath,
             supportedModels: builtinConfig.supportedModels,
             modelMappings: builtinConfig.modelMappings,
+            // Keep live capability metadata across restarts while retaining
+            // only explicitly configured built-in capability fallbacks.
+            modelCapabilities: mergeProviderModelCapabilities(
+              builtinConfig.modelCapabilities,
+              p.modelCapabilities,
+            ),
             headers: builtinConfig.headers,
             credentialFields: builtinConfig.credentialFields,
             description: builtinConfig.description,
@@ -441,6 +444,11 @@ class StoreManager {
           description: builtinConfig.description,
           supportedModels: builtinConfig.supportedModels,
           modelMappings: builtinConfig.modelMappings,
+          modelCapabilities: mergeProviderModelCapabilities(
+            undefined,
+            builtinConfig.modelCapabilities,
+          ),
+          credentialFields: builtinConfig.credentialFields,
           modelsApiEndpoint: builtinConfig.modelsApiEndpoint,
           modelsApiHeaders: builtinConfig.modelsApiHeaders,
         }
@@ -937,6 +945,7 @@ class StoreManager {
       latency?: number
       isStream?: boolean
       error?: string
+      errorCode?: string
     }
   ): LogEntry {
     this.ensureInitialized()
@@ -1765,6 +1774,12 @@ class StoreManager {
           chatPath: builtinConfig.chatPath,
           supportedModels: builtinConfig.supportedModels,
           modelMappings: builtinConfig.modelMappings,
+          // Resetting the model list must not discard capability metadata
+          // learned from the provider catalogue.
+          modelCapabilities: mergeProviderModelCapabilities(
+            builtinConfig.modelCapabilities,
+            provider.modelCapabilities,
+          ),
           headers: builtinConfig.headers,
           credentialFields: builtinConfig.credentialFields,
           description: builtinConfig.description,

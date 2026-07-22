@@ -1,17 +1,18 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs'
-import axios, { AxiosInstance, AxiosResponse } from 'axios'
+import axios, { type AxiosInstance, type AxiosResponse } from 'axios'
 import OSS from 'ali-oss'
 import mime from 'mime-types'
 import path from 'path'
-import type { ChatMessage, ChatMessageContent } from '../types'
-import { getProviderToolProfile } from '../toolCalling/providerProfiles'
-import { getRuntime } from '../../runtime'
+import type { ChatMessage, ChatMessageContent } from '../types.ts'
+import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import { getRuntime } from '../../runtime/index.ts'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const MAX_FILE_SIZE = 2000 * 1024 * 1024
 const OSS_SINGLE_PUT_MAX_BYTES = positiveIntegerFromEnv('QWEN_AI_OSS_SINGLE_PUT_MAX_BYTES', 2 * 1024 * 1024)
 const OSS_UPLOAD_TIMEOUT_MS = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_TIMEOUT_MS', 5 * 60 * 1000)
 const OSS_UPLOAD_RETRY_MAX = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_RETRY_MAX', 3)
+const OSS_STS_REFRESH_INTERVAL_MS = positiveIntegerFromEnv('QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS', 4 * 60 * 1000)
 const QWEN_AI_FILE_CACHE_ENABLED = process.env.QWEN_AI_FILE_CACHE_ENABLED !== 'false'
 const QWEN_AI_FILE_CACHE_TTL_MS = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_TTL_MS', 47 * 60 * 60 * 1000)
 const QWEN_AI_FILE_CACHE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_MAX_ENTRIES', 512)
@@ -331,6 +332,16 @@ function delay(ms: number): Promise<void> {
 
 function elapsedSeconds(startTime: number): string {
   return ((Date.now() - startTime) / 1000).toFixed(1)
+}
+
+function normalizeOssTargetPart(value: string): string {
+  return value.trim().replace(/\/+$/, '').toLowerCase()
+}
+
+function hasSameOssTarget(left: QwenStsInfo, right: QwenStsInfo): boolean {
+  return normalizeOssTargetPart(left.bucket) === normalizeOssTargetPart(right.bucket)
+    && normalizeOssTargetPart(left.region) === normalizeOssTargetPart(right.region)
+    && normalizeOssTargetPart(left.endpoint) === normalizeOssTargetPart(right.endpoint)
 }
 
 function safeCacheScope(scope?: QwenAiFileCacheScope): Required<QwenAiFileCacheScope> {
@@ -968,10 +979,29 @@ function formatRoleText(role: string, content: string): string {
   return content ? `${role}: ${content}` : `${role}:`
 }
 
+function nextLocalToolCallId(rawId: string, usedIds: Set<string>, fallbackIndex: number): string {
+  const baseId = rawId || `call_history_${fallbackIndex}`
+  if (!usedIds.has(baseId)) {
+    usedIds.add(baseId)
+    return baseId
+  }
+
+  let occurrence = 2
+  while (usedIds.has(`${baseId}__${occurrence}`)) {
+    occurrence += 1
+  }
+  const localId = `${baseId}__${occurrence}`
+  usedIds.add(localId)
+  return localId
+}
+
 function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
   const toolProfile = getProviderToolProfile('qwen')
   const transcriptParts: string[] = []
   const fileParts: ChatMessageContent[] = []
+  const usedLocalToolCallIds = new Set<string>()
+  const pendingLocalIds = new Map<string, string[]>()
+  let fallbackCallIndex = 0
 
   for (const msg of messages) {
     const text = textFromContent(msg.content)
@@ -998,11 +1028,25 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
         assistantParts.push(formatRoleText('Assistant', text))
       }
       if (msg.tool_calls?.length) {
-        assistantParts.push(toolProfile.formatAssistantToolCalls(msg.tool_calls.map((toolCall) => ({
-          id: toolCall.id,
-          name: toolCall.function.name,
-          arguments: toolCall.function.arguments,
-        }))))
+        const transcriptCalls = msg.tool_calls.map((toolCall) => {
+          fallbackCallIndex += 1
+          const rawId = toolCall.id || `call_history_${fallbackCallIndex}`
+          const localId = nextLocalToolCallId(rawId, usedLocalToolCallIds, fallbackCallIndex)
+          const pending = pendingLocalIds.get(rawId) ?? []
+          const transcriptCall = {
+            localId,
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments,
+          }
+
+          pendingLocalIds.set(rawId, [...pending, localId])
+          return {
+            id: localId,
+            name: transcriptCall.name,
+            arguments: transcriptCall.arguments,
+          }
+        })
+        assistantParts.push(toolProfile.formatAssistantToolCalls(transcriptCalls))
       }
       if (assistantParts.length > 0) {
         transcriptParts.push(assistantParts.join('\n'))
@@ -1012,13 +1056,16 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
 
     if (msg.role === 'tool') {
       if (msg.tool_call_id) {
+        const pending = pendingLocalIds.get(msg.tool_call_id) ?? []
+        const localId = pending[0] ?? msg.tool_call_id
+        pendingLocalIds.set(msg.tool_call_id, pending.slice(1))
         transcriptParts.push([
-          `Tool result for ${msg.tool_call_id} (already executed by the client):`,
+          `Tool result for ${localId} (already executed by the client):`,
           toolProfile.formatToolResult({
-            toolCallId: msg.tool_call_id,
+            toolCallId: localId,
             content: text,
           }),
-          'Use this result to continue. Do not repeat the same tool call unless the user request still cannot be satisfied from the result.',
+          'Use this result to decide the next step.',
         ].join('\n'))
       } else if (text) {
         transcriptParts.push(formatRoleText('Tool', text))
@@ -1780,6 +1827,28 @@ export class QwenAiFileUploader {
   }
 
   private async uploadToOss(file: NormalizedInputFile, sts: QwenStsInfo): Promise<void> {
+    const refreshOptions = sts.securityToken
+      ? {
+          refreshSTSToken: async () => {
+            const refreshStartedAt = Date.now()
+            console.log(`[QwenAI][File] sts refresh start filename="${file.filename}"`)
+            const refreshed = await this.requestSts(file)
+            if (!refreshed.securityToken) {
+              throw new Error('Qwen AI refreshed upload STS response is missing its security token')
+            }
+            if (!hasSameOssTarget(sts, refreshed)) {
+              throw new Error('Qwen AI refreshed upload STS target changed during the active upload')
+            }
+            console.log(`[QwenAI][File] sts refresh done seconds=${elapsedSeconds(refreshStartedAt)} filename="${file.filename}"`)
+            return {
+              accessKeyId: refreshed.accessKeyId,
+              accessKeySecret: refreshed.accessKeySecret,
+              stsToken: refreshed.securityToken,
+            }
+          },
+          refreshSTSTokenInterval: OSS_STS_REFRESH_INTERVAL_MS,
+        }
+      : {}
     const client = new OSS({
       accessKeyId: sts.accessKeyId,
       accessKeySecret: sts.accessKeySecret,
@@ -1790,6 +1859,7 @@ export class QwenAiFileUploader {
       authorizationV4: true,
       timeout: OSS_UPLOAD_TIMEOUT_MS,
       retryMax: OSS_UPLOAD_RETRY_MAX,
+      ...refreshOptions,
     } as any)
 
     const uploadOptions = {

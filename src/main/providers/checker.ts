@@ -887,6 +887,7 @@ export class ProviderChecker {
   ): Promise<{
     supportedModels: string[]
     modelMappings: Record<string, string>
+    modelCapabilities: Record<string, { thinkingSkippable?: boolean }>
   }> {
     const builtinConfig = getBuiltinProvider(providerId)
     
@@ -913,9 +914,9 @@ export class ProviderChecker {
         throw new Error(`Failed to fetch models: HTTP ${response.status}`)
       }
 
-      const { supportedModels, modelMappings } = parseProviderModelsResponse(response.data)
+      const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
 
-      return { supportedModels, modelMappings }
+      return { supportedModels, modelMappings, modelCapabilities }
     } catch (error) {
       console.error(`[ProviderChecker] Failed to fetch models for ${providerId}:`, error)
       throw error

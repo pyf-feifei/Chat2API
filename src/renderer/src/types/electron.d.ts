@@ -98,6 +98,7 @@ interface ProvidersAPI {
     description?: string
     supportedModels?: string[]
     modelMappings?: Record<string, string>
+    modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
     modelsApiEndpoint?: string
     modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]

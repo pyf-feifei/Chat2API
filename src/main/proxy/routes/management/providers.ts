@@ -11,7 +11,7 @@ import { BUILTIN_PROVIDERS } from '../../../store/types'
 import { CustomProviderManager } from '../../../providers/custom'
 import { ProviderChecker } from '../../../providers/checker'
 import { getBuiltinProvider } from '../../../providers/builtin'
-import { parseProviderModelsResponse } from '../../../providers/modelSync'
+import { mergeProviderModelCapabilities, parseProviderModelsResponse } from '../../../providers/modelSync'
 import AccountManager from '../../../store/accounts'
 import { storeManager } from '../../../store/store'
 import axios from 'axios'
@@ -184,6 +184,13 @@ router.post('/:id/validate-token', async (ctx: Context) => {
         description: builtinConfig.description,
         supportedModels: builtinConfig.supportedModels || [],
         modelMappings: builtinConfig.modelMappings || {},
+        modelCapabilities: mergeProviderModelCapabilities(
+          undefined,
+          builtinConfig.modelCapabilities,
+        ),
+        credentialFields: builtinConfig.credentialFields,
+        modelsApiEndpoint: builtinConfig.modelsApiEndpoint,
+        modelsApiHeaders: builtinConfig.modelsApiHeaders,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       }
@@ -297,7 +304,7 @@ router.post('/:id/models/update', async (ctx: Context) => {
       return
     }
 
-    const { supportedModels, modelMappings } = parseProviderModelsResponse(response.data)
+    const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
     if (supportedModels.length === 0) {
       ctx.body = createSuccessResponse({
         success: false,
@@ -306,7 +313,15 @@ router.post('/:id/models/update', async (ctx: Context) => {
       return
     }
 
-    ProviderManager.update(providerId, { supportedModels, modelMappings })
+    const mergedModelCapabilities = mergeProviderModelCapabilities(
+      provider.modelCapabilities,
+      modelCapabilities,
+    )
+    ProviderManager.update(providerId, {
+      supportedModels,
+      modelMappings,
+      modelCapabilities: mergedModelCapabilities,
+    })
 
     ctx.set('Content-Type', 'application/json')
     ctx.body = createSuccessResponse({
@@ -401,6 +416,7 @@ router.post('/', async (ctx: Context) => {
       icon: request.icon,
       supportedModels: request.supportedModels,
       modelMappings: request.modelMappings,
+      modelCapabilities: request.modelCapabilities,
       modelsApiEndpoint: request.modelsApiEndpoint,
       modelsApiHeaders: request.modelsApiHeaders,
       credentialFields: request.credentialFields,
@@ -464,6 +480,10 @@ router.put('/:id', async (ctx: Context) => {
 
     if (request.modelMappings !== undefined) {
       updates.modelMappings = request.modelMappings
+    }
+
+    if (request.modelCapabilities !== undefined) {
+      updates.modelCapabilities = request.modelCapabilities
     }
 
     const updatedProvider = ProviderManager.update(id, updates)

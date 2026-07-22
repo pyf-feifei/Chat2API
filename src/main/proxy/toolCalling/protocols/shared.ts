@@ -281,6 +281,9 @@ function normalizeValueForSchema(value: unknown, schema: unknown): unknown {
     return normalizeObjectProperties(value, properties)
   }
 
+  const scalar = normalizeScalarForSchema(value, variants)
+  if (scalar !== value) return scalar
+
   if (Array.isArray(value)) {
     return value.map((item) => normalizeValueForSchema(item, undefined))
   }
@@ -290,6 +293,48 @@ function normalizeValueForSchema(value: unknown, schema: unknown): unknown {
   }
 
   return value
+}
+
+function normalizeScalarForSchema(value: unknown, variants: unknown[]): unknown {
+  if (value === null || typeof value === 'object') return value
+
+  // Preserve a value when it already matches one of the declared scalar types.
+  // This matters for unions such as `string | number`.
+  if (variants.some((variant) => schemaAcceptsScalar(variant, value))) return value
+
+  if (variants.some((variant) => schemaTypeIncludes(variant, 'string'))) {
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+      const numericValue = Number(trimmed)
+      if (Number.isFinite(numericValue) && variants.some((variant) => {
+        if (schemaTypeIncludes(variant, 'integer')) return Number.isInteger(numericValue)
+        return schemaTypeIncludes(variant, 'number')
+      })) {
+        return numericValue
+      }
+    }
+
+    if (trimmed === 'true' || trimmed === 'false') {
+      const booleanValue = trimmed === 'true'
+      if (variants.some((variant) => schemaTypeIncludes(variant, 'boolean'))) return booleanValue
+    }
+  }
+
+  return value
+}
+
+function schemaAcceptsScalar(schema: unknown, value: unknown): boolean {
+  if (typeof value === 'string') return schemaTypeIncludes(schema, 'string')
+  if (typeof value === 'number') {
+    return schemaTypeIncludes(schema, 'number') ||
+      (schemaTypeIncludes(schema, 'integer') && Number.isInteger(value))
+  }
+  if (typeof value === 'boolean') return schemaTypeIncludes(schema, 'boolean')
+  return false
 }
 
 function normalizeObjectProperties(

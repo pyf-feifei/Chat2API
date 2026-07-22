@@ -56,7 +56,7 @@
 | Mimo          | Cookie        | 是     | MiMo-V2.5-Pro, MiMo-V2.5, MiMo-V2-Flash                                                                                                                                                                                                       |
 | Perplexity    | Cookie        | 是     | Auto                                                                                                                                                                                                                                         |
 | Qwen (国内版)    | SSO Ticket    | 是     | Qwen3.6, Qwen3.7-Max, Qwen3.5-Flash, Qwen3-Max, Qwen3-Max-Thinking-Preview, Qwen3-Coder                                                                                                                                                       |
-| Qwen AI (国际版) | JWT Token     | 是     | Qwen3.7-Plus, Qwen3.7-Max, Qwen3.6-Plus                                                                                                                                                                                                    |
+| Qwen AI (国际版) | JWT Token     | 是     | Qwen3.8-Max-Preview, Qwen3.7-Plus, Qwen3.7-Max, Qwen3.6-Plus                                                                                                                                                                                |
 | Z.ai          | JWT Token     | 是     | 受前端验证码风控限制，暂不可用                                                                                                                                                                                                                              |
 
 供应商适配说明和手动添加模型教程见 [docs/providers](docs/providers/README.md)。

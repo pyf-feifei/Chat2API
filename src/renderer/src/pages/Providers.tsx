@@ -302,6 +302,7 @@ export function Providers() {
         description: provider.description,
         supportedModels: provider.supportedModels,
         modelMappings: provider.modelMappings,
+        modelCapabilities: provider.modelCapabilities,
         modelsApiEndpoint: provider.modelsApiEndpoint,
         modelsApiHeaders: provider.modelsApiHeaders,
         credentialFields: provider.credentialFields,

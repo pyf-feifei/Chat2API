@@ -8,6 +8,12 @@ const REFRESH_THRESHOLD_MS = 6 * 60 * 60 * 1000
 
 type SetCookieHeader = string | string[] | undefined
 
+type QwenAiRefreshError = Error & {
+  status?: number
+  code?: string
+  retryable?: boolean
+}
+
 function decodeJwtPayload(token: string): Record<string, any> | null {
   try {
     const parts = token.split('.')
@@ -95,7 +101,7 @@ export class QwenAiTokenRefresher {
     return payload.exp * 1000 - now <= REFRESH_THRESHOLD_MS
   }
 
-  async refreshIfNeeded(account: Account): Promise<Account> {
+  async refreshIfNeeded(account: Account, signal?: AbortSignal): Promise<Account> {
     if (
       !this.canRefresh(account) ||
       (!this.isTokenExpiringSoon(account.credentials.token || '') && this.hasWebSessionCookie(account))
@@ -103,15 +109,15 @@ export class QwenAiTokenRefresher {
       return account
     }
 
-    return this.refresh(account)
+    return this.refresh(account, signal)
   }
 
-  async refreshAfterUnauthorized(account: Account): Promise<Account> {
+  async refreshAfterUnauthorized(account: Account, signal?: AbortSignal): Promise<Account> {
     if (!this.canRefresh(account)) {
       return account
     }
 
-    return this.refresh(account)
+    return this.refresh(account, signal)
   }
 
   private canRefresh(account: Account): boolean {
@@ -122,7 +128,7 @@ export class QwenAiTokenRefresher {
     return hasCookie(account.credentials.cookies || account.credentials.cookie || '', 'token')
   }
 
-  private async refresh(account: Account): Promise<Account> {
+  private async refresh(account: Account, signal?: AbortSignal): Promise<Account> {
     const response = await axios.post(
       `${QWEN_AI_BASE}/api/v1/auths/signin`,
       {
@@ -142,13 +148,28 @@ export class QwenAiTokenRefresher {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
         },
         timeout: 15000,
+        signal,
         validateStatus: () => true,
       },
     )
 
     const token = response.data?.token
     if (response.status !== 200 || !token || typeof token !== 'string') {
-      throw new Error(`Qwen AI token refresh failed: HTTP ${response.status}`)
+      const responseText = (() => {
+        try {
+          return JSON.stringify(response.data || {})
+        } catch {
+          return ''
+        }
+      })()
+      const riskControlled = /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(responseText)
+      const error = new Error(`Qwen AI token refresh failed: HTTP ${response.status}`) as QwenAiRefreshError
+      error.status = riskControlled ? 403 : response.status === 200 ? 401 : response.status
+      error.retryable = false
+      if (riskControlled) {
+        error.code = 'qwen_ai_risk_control'
+      }
+      throw error
     }
 
     const cookies = mergeCookieHeaders(

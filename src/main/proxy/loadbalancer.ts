@@ -7,6 +7,13 @@ import { Account, Provider, LoadBalanceStrategy } from '../store/types'
 import { AccountSelection } from './types'
 import { storeManager } from '../store/store'
 import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
+import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
+
+const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
+
+function debugLoadBalancer(message: string): void {
+  if (LOAD_BALANCER_DEBUG) console.log(message)
+}
 
 /**
  * Load Balancer
@@ -155,6 +162,14 @@ export class LoadBalancer {
       }
     }
 
+    const immediatelyAvailable = candidates.filter(candidate => (
+      !this.isQwenAiProvider(candidate.provider)
+      || qwenAiRequestGovernor.isAccountImmediatelyAvailable(candidate.account.id)
+    ))
+    if (immediatelyAvailable.length > 0) {
+      candidates = immediatelyAvailable
+    }
+
     if (strategy === 'fill-first') {
       return this.selectFillFirst(candidates)
     }
@@ -191,10 +206,10 @@ export class LoadBalancer {
         .filter(account => !this.isAccountInHardCooldown(account.id))
         .filter(account => !excludeFailed || !this.isAccountInFailure(account.id))
 
-      console.log(`[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`)
+      debugLoadBalancer(`[LoadBalancer] Provider ${provider.name} (${provider.id}) has ${accounts.length} available accounts`)
 
       for (const account of accounts) {
-        console.log(`[LoadBalancer] Account ${account.name} (${account.id}) selected as candidate`)
+        debugLoadBalancer(`[LoadBalancer] Account ${account.name} (${account.id}) selected as candidate`)
         candidates.push({
           account,
           provider,
@@ -234,7 +249,7 @@ export class LoadBalancer {
     if (globalMapping) {
       if (globalMapping.preferredProviderId) {
         if (globalMapping.preferredProviderId === provider.id) {
-          console.log(`[LoadBalancer] Model "${model}" matched preferred provider ${provider.name}`)
+          debugLoadBalancer(`[LoadBalancer] Model "${model}" matched preferred provider ${provider.name}`)
           return true
         }
         return false
@@ -253,17 +268,21 @@ export class LoadBalancer {
       })
       
       if (actualSupported) {
-        console.log(`[LoadBalancer] Model "${model}" (actualModel: "${actualModel}") supported by ${provider.name}`)
+      debugLoadBalancer(`[LoadBalancer] Model "${model}" (actualModel: "${actualModel}") supported by ${provider.name}`)
         return true
       }
     }
 
-    console.log(`[LoadBalancer] Provider ${provider.name} does not support model ${model}`)
+    debugLoadBalancer(`[LoadBalancer] Provider ${provider.name} does not support model ${model}`)
     return false
   }
 
   private normalizeModelForProviderMatch(model: string): string {
     return normalizeProviderModelForMatch(model)
+  }
+
+  private isQwenAiProvider(provider: Provider): boolean {
+    return provider.id === 'qwen-ai' || provider.apiEndpoint.includes('chat.qwen.ai')
   }
 
   /**
@@ -285,7 +304,7 @@ export class LoadBalancer {
    * Map model name
    */
   private mapModel(model: string, provider: Provider): string {
-    console.log(`[LoadBalancer] mapModel called with model="${model}", provider="${provider.name}"`)
+    debugLoadBalancer(`[LoadBalancer] mapModel called with model="${model}", provider="${provider.name}"`)
     
     const effectiveModels = storeManager.getEffectiveModels(provider.id)
     const normalizedModel = this.normalizeModelForProviderMatch(model).toLowerCase()
@@ -295,7 +314,7 @@ export class LoadBalancer {
     )
     
     if (effectiveModel) {
-      console.log(`[LoadBalancer] Model mapped from "${model}" to "${effectiveModel.actualModelId}" via effective models`)
+      debugLoadBalancer(`[LoadBalancer] Model mapped from "${model}" to "${effectiveModel.actualModelId}" via effective models`)
       return effectiveModel.actualModelId
     }
 
@@ -304,7 +323,7 @@ export class LoadBalancer {
 
     if (mapping && (!mapping.preferredProviderId || mapping.preferredProviderId === provider.id)) {
       const actualModel = mapping.actualModel
-      console.log(`[LoadBalancer] Model mapped from "${model}" to "${actualModel}" via global mapping`)
+      debugLoadBalancer(`[LoadBalancer] Model mapped from "${model}" to "${actualModel}" via global mapping`)
       
       const normalizedActualModel = this.normalizeModelForProviderMatch(actualModel).toLowerCase()
       const actualEffectiveModel = effectiveModels.find(m =>
@@ -312,14 +331,14 @@ export class LoadBalancer {
         || this.normalizeModelForProviderMatch(m.actualModelId).toLowerCase() === normalizedActualModel
       )
       if (actualEffectiveModel) {
-        console.log(`[LoadBalancer] Model further mapped from "${actualModel}" to "${actualEffectiveModel.actualModelId}" via effective models`)
+        debugLoadBalancer(`[LoadBalancer] Model further mapped from "${actualModel}" to "${actualEffectiveModel.actualModelId}" via effective models`)
         return actualEffectiveModel.actualModelId
       }
       
       return actualModel
     }
 
-    console.log(`[LoadBalancer] No mapping found, returning original model "${model}"`)
+    debugLoadBalancer(`[LoadBalancer] No mapping found, returning original model "${model}"`)
     return model
   }
 

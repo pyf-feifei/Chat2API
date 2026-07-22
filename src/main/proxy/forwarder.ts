@@ -16,7 +16,13 @@ import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
 import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
-import { QwenAiAdapter, QwenAiStreamHandler } from './adapters/qwen-ai'
+import {
+  describeErrorForLog,
+  QWEN_AI_STREAM_FAILURE_EVENT,
+  QwenAiAdapter,
+  QwenAiStreamHandler,
+  type QwenAiOutputStream,
+} from './adapters/qwen-ai'
 import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
@@ -24,6 +30,8 @@ import { PerplexityStreamHandler } from './adapters/perplexity-stream'
 import { ToolCallingEngine } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
+import { BufferedSseError, bufferValidatedSseStream } from './utils/validatedSseStream'
+import { isClientCancellationError, sanitizeForwardedErrorHeaders } from './utils/errors'
 import { sessionManager } from './sessionManager'
 import {
   createContextManagementService,
@@ -36,26 +44,30 @@ function shouldDeleteSession(): boolean {
 }
 
 function statusFromError(error: unknown): number | undefined {
-  const maybeStatus = (error as { status?: unknown; statusCode?: unknown })?.status
+  const errorRecord = error as {
+    status?: unknown
+    statusCode?: unknown
+    response?: { status?: unknown }
+  }
+  const maybeStatus = errorRecord?.status
   if (typeof maybeStatus === 'number') {
     return maybeStatus
   }
 
-  const maybeStatusCode = (error as { status?: unknown; statusCode?: unknown })?.statusCode
+  const maybeStatusCode = errorRecord?.statusCode
   if (typeof maybeStatusCode === 'number') {
     return maybeStatusCode
   }
 
-  const errorLike = error as { name?: unknown; code?: unknown; message?: unknown }
-  const message = typeof errorLike?.message === 'string' ? errorLike.message : ''
-  const name = typeof errorLike?.name === 'string' ? errorLike.name : ''
-  const code = typeof errorLike?.code === 'string' ? errorLike.code : ''
+  const responseStatus = errorRecord?.response?.status
+  if (typeof responseStatus === 'number') {
+    return responseStatus
+  }
 
-  if (
-    name === 'CanceledError' ||
-    code === 'ERR_CANCELED' ||
-    /client disconnected|aborted|cancelled|canceled/i.test(message)
-  ) {
+  const errorLike = error as { message?: unknown }
+  const message = typeof errorLike?.message === 'string' ? errorLike.message : ''
+
+  if (isClientCancellationError(error)) {
     return 499
   }
 
@@ -66,12 +78,150 @@ function statusFromError(error: unknown): number | undefined {
   return undefined
 }
 
-function qwenAiRetryCountFromEnv(): number {
+function headersFromError(error: unknown): Record<string, string> | undefined {
+  const headers = (error as { headers?: unknown })?.headers
+  return sanitizeForwardedErrorHeaders(headers)
+}
+
+function errorCodeFromError(error: unknown): string | undefined {
+  const code = (error as { code?: unknown })?.code
+  return typeof code === 'string' && code.trim() ? code : undefined
+}
+
+function awaitQwenAiStreamPreflight(
+  stream: QwenAiOutputStream,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (stream.qwenAiFailure) {
+    return Promise.reject(stream.qwenAiFailure)
+  }
+
+  const state = stream as QwenAiOutputStream & {
+    readableLength?: number
+    readableEnded?: boolean
+  }
+  if ((state.readableLength || 0) > 0) {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+
+    const cleanup = () => {
+      stream.removeListener('readable', onReadable)
+      stream.removeListener(QWEN_AI_STREAM_FAILURE_EVENT, onFailure)
+      stream.removeListener('error', onError)
+      stream.removeListener('end', onEnd)
+      stream.removeListener('close', onEnd)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const settle = (error?: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onReadable = () => {
+      if (stream.qwenAiFailure) {
+        settle(stream.qwenAiFailure)
+        return
+      }
+      settle()
+    }
+    const onFailure = (error: Error) => settle(error)
+    const onError = (error: Error) => settle(error)
+    const onEnd = () => {
+      if (stream.qwenAiFailure) {
+        settle(stream.qwenAiFailure)
+        return
+      }
+      if ((state.readableLength || 0) > 0) {
+        settle()
+        return
+      }
+      const error = new Error('Qwen AI response stream ended before producing a client-visible event') as Error & {
+        status?: number
+        code?: string
+        retryable?: boolean
+      }
+      error.status = 502
+      error.code = 'qwen_ai_stream_incomplete'
+      error.retryable = false
+      settle(error)
+    }
+    const onAbort = () => {
+      const error = new Error('Qwen AI response stream aborted before producing a client-visible event') as Error & {
+        status?: number
+        retryable?: boolean
+      }
+      error.status = 499
+      error.retryable = false
+      settle(error)
+    }
+
+    stream.once('readable', onReadable)
+    stream.once(QWEN_AI_STREAM_FAILURE_EVENT, onFailure)
+    stream.once('error', onError)
+    stream.once('end', onEnd)
+    stream.once('close', onEnd)
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    if (stream.qwenAiFailure) {
+      settle(stream.qwenAiFailure)
+    } else if ((state.readableLength || 0) > 0) {
+      settle()
+    } else if (signal?.aborted) {
+      onAbort()
+    } else if (state.readableEnded) {
+      onEnd()
+    }
+  })
+}
+
+function isQwenRiskControlText(value: string | undefined): boolean {
+  return Boolean(value && /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(value))
+}
+
+function qwenAiRetryCountFromEnv(recoverManagedToolStream: boolean): number {
   const raw = process.env.CHAT2API_QWEN_AI_RETRY_COUNT
-  if (raw === undefined) return 0
+  if (raw === undefined) return recoverManagedToolStream ? 1 : 0
 
   const value = Number(raw)
   return Number.isInteger(value) && value >= 0 && value <= 10 ? value : 0
+}
+
+function qwenAiValidatedStreamMaxBytesFromEnv(): number {
+  const fallback = 16 * 1024 * 1024
+  const raw = process.env.CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES
+  if (raw === undefined) return fallback
+
+  const value = Number(raw)
+  return Number.isInteger(value) && value > 0 ? value : fallback
+}
+
+function validatedSseMaxHoldMsFromEnv(): number {
+  const fallback = 60_000
+  const raw = process.env.CHAT2API_VALIDATED_SSE_MAX_HOLD_MS
+  if (raw === undefined) return fallback
+
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : fallback
+}
+
+/**
+ * Full managed-tool stream validation is intentionally opt-in. Once an SSE
+ * byte is sent, a later parser failure cannot be retried transparently, so
+ * the normal path must preserve streaming latency and report that failure
+ * in-band instead of withholding the whole response.
+ */
+function qwenAiBufferManagedStreamsFromEnv(): boolean {
+  const raw = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  return raw !== undefined && /^(?:1|true|yes|on)$/i.test(raw.trim())
+}
+
+function requestUsesManagedTools(request: ChatCompletionRequest): boolean {
+  return Boolean(request.tools?.length && request.tool_choice !== 'none')
 }
 
 type ProviderForwarder = {
@@ -83,8 +233,14 @@ type ProviderForwarder = {
     provider: Provider,
     actualModel: string,
     startTime: number,
-    context: ProxyContext
+    context: ProxyContext,
+    options: ForwardAttemptOptions,
   ) => Promise<ForwardResult>
+}
+
+type ForwardAttemptOptions = {
+  qwenAiRecoveryBypassAccountInterval?: boolean
+  attempt?: number
 }
 
 /**
@@ -125,10 +281,15 @@ export class RequestForwarder {
     {
       name: 'qwen-ai',
       matches: QwenAiAdapter.isQwenAiProvider,
-      forward: (request, account, provider, actualModel, startTime, context) =>
+      forward: (request, account, provider, actualModel, startTime, context, options) =>
         qwenAiRequestGovernor.run(account.id, () =>
           this.forwardQwenAi(request, account, provider, actualModel, startTime, context),
-          { signal: context.signal },
+          {
+            signal: context.signal,
+            recoveryBypassAccountInterval: options.qwenAiRecoveryBypassAccountInterval,
+            requestId: context.requestId,
+            attempt: options.attempt ?? 1,
+          },
         ),
     },
     {
@@ -273,16 +434,52 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     const startTime = Date.now()
     const config = storeManager.getConfig()
+    const bufferManagedToolStreams = QwenAiAdapter.isQwenAiProvider(provider)
+      && requestUsesManagedTools(request)
+      && qwenAiBufferManagedStreamsFromEnv()
+    const recoverManagedToolStream = QwenAiAdapter.isQwenAiProvider(provider)
+      && bufferManagedToolStreams
+    const isQwenAiProvider = QwenAiAdapter.isQwenAiProvider(provider)
+    const defaultManagedToolRecoveryOnly = recoverManagedToolStream
     const maxRetries = QwenAiAdapter.isQwenAiProvider(provider)
-      ? qwenAiRetryCountFromEnv()
+      ? recoverManagedToolStream
+        ? qwenAiRetryCountFromEnv(recoverManagedToolStream)
+        : 0
       : config.retryCount
 
     let lastError: string | undefined
     let lastStatus: number | undefined
+    let lastHeaders: Record<string, string> | undefined
+    let lastRetryable: boolean | undefined
+    let lastErrorCode: string | undefined
+    let previousRecoveryHint: ForwardResult['recoveryHint']
+    let recoveryBypassUsed = false
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (context.signal?.aborted) {
+        lastStatus = 499
+        lastHeaders = undefined
+        lastError = 'Client disconnected before the next request attempt.'
+        lastRetryable = false
+        break
+      }
+
+      const useRecoveryBypass = attempt > 0
+        && !recoveryBypassUsed
+        && previousRecoveryHint === 'managed_tool_stream_validation'
+      if (useRecoveryBypass) {
+        recoveryBypassUsed = true
+      }
+
       if (attempt > 0) {
-        await this.delay(5000)
+        const delayCompleted = await this.delay(5000, context.signal)
+        if (!delayCompleted) {
+          lastStatus = 499
+          lastHeaders = undefined
+          lastError = 'Client disconnected during request retry backoff.'
+          lastRetryable = false
+          break
+        }
       }
 
       let modifiedRequest = request
@@ -337,7 +534,17 @@ export class RequestForwarder {
       }
 
       try {
-        const result = await this.doForward(modifiedRequest, account, provider, actualModel, context)
+        const result = await this.doForward(
+          modifiedRequest,
+          account,
+          provider,
+          actualModel,
+          context,
+          {
+            qwenAiRecoveryBypassAccountInterval: useRecoveryBypass,
+            attempt: attempt + 1,
+          },
+        )
 
         if (result.success) {
           return result
@@ -345,8 +552,37 @@ export class RequestForwarder {
 
         lastError = result.error
         lastStatus = result.status
+        lastHeaders = result.headers
+        lastRetryable = result.retryable
+        lastErrorCode = result.errorCode
+        previousRecoveryHint = result.recoveryHint
 
-        if (result.retryable === false || context.signal?.aborted) {
+        if (context.signal?.aborted && result.status !== 499) {
+          lastStatus = 499
+          lastError = 'Client disconnected while the request was in progress.'
+          lastHeaders = undefined
+          lastRetryable = false
+          lastErrorCode = undefined
+        }
+
+        const canRecoverManagedToolStream = recoverManagedToolStream
+          && result.status === 502
+          && result.recoveryHint === 'managed_tool_stream_validation'
+        if (
+          (result.retryable === false && !canRecoverManagedToolStream)
+          || context.signal?.aborted
+          || result.status === 499
+          // Do not blindly retry a provider quota decision from the same
+          // account. The governor records the throttle and applies backoff.
+          || (isQwenAiProvider && result.status === 429)
+        ) {
+          break
+        }
+
+        if (
+          defaultManagedToolRecoveryOnly
+          && result.recoveryHint !== 'managed_tool_stream_validation'
+        ) {
           break
         }
 
@@ -356,14 +592,43 @@ export class RequestForwarder {
       } catch (error) {
         lastError = error instanceof Error ? error.message : 'Unknown error'
         lastStatus = statusFromError(error)
+        lastHeaders = headersFromError(error)
+        lastErrorCode = errorCodeFromError(error)
+        const errorRetryable = (error as { retryable?: unknown })?.retryable
+        lastRetryable = lastStatus === 499
+          || (isQwenAiProvider && (lastStatus === 403 || lastStatus === 429 || lastStatus === 504))
+          || errorCodeFromError(error) === 'qwen_ai_risk_control'
+          ? false
+          : typeof errorRetryable === 'boolean'
+            ? errorRetryable
+            : undefined
+        previousRecoveryHint = undefined
+        if (context.signal?.aborted && lastStatus !== 499) {
+          lastStatus = 499
+          lastError = 'Client disconnected while the request was in progress.'
+          lastHeaders = undefined
+          lastRetryable = false
+          lastErrorCode = undefined
+        }
+        if (
+          lastRetryable === false
+          || context.signal?.aborted
+          || lastStatus === 499
+          || defaultManagedToolRecoveryOnly
+        ) {
+          break
+        }
       }
     }
 
     return {
       success: false,
       status: lastStatus,
+      headers: lastHeaders,
       error: lastError || 'Request failed after retries',
       latency: Date.now() - startTime,
+      retryable: lastRetryable,
+      errorCode: lastErrorCode,
     }
   }
 
@@ -375,13 +640,14 @@ export class RequestForwarder {
     account: Account,
     provider: Provider,
     actualModel: string,
-    context: ProxyContext
+    context: ProxyContext,
+    options: ForwardAttemptOptions = {},
   ): Promise<ForwardResult> {
     const startTime = Date.now()
 
     const dedicatedForwarder = this.providerForwarders.find(forwarder => forwarder.matches(provider))
     if (dedicatedForwarder) {
-      return dedicatedForwarder.forward(request, account, provider, actualModel, startTime, context)
+      return dedicatedForwarder.forward(request, account, provider, actualModel, startTime, context, options)
     }
 
     try {
@@ -667,7 +933,7 @@ export class RequestForwarder {
         providerSessionId: handler.getConversationId() ?? undefined,
       }
     } catch (error) {
-      const latency = Date.now() - startTime
+      let latency = Date.now() - startTime
       return {
         success: false,
         status: statusFromError(error),
@@ -908,28 +1174,55 @@ export class RequestForwarder {
     startTime: number,
     context?: ProxyContext
   ): Promise<ForwardResult> {
+    const adapter = new QwenAiAdapter(provider, account)
+    let activeChatId: string | undefined
+    let cleanedChatId: string | undefined
+
+    const cleanupChat = (chatId: string): void => {
+      if (cleanedChatId === chatId) return
+      cleanedChatId = chatId
+      adapter.deleteChat(chatId).catch(err => {
+        console.error('[QwenAI] Failed to delete chat:', describeErrorForLog(err))
+      })
+    }
+
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
-      
-      const adapter = new QwenAiAdapter(provider, account)
       const { response, chatId, parentId } = await adapter.chatCompletion({
         model: actualModel,
         originalModel: request.model,
         messages: transformed.messages as any,
         stream: request.stream,
         temperature: request.temperature,
-        enable_thinking: !!request.reasoning_effort,
+        enable_thinking: request.enable_thinking !== undefined
+          ? request.enable_thinking
+          : request.reasoning_effort !== undefined
+            ? Boolean(request.reasoning_effort)
+            : undefined,
+        thinking_budget: request.thinking_budget,
         signal: context?.signal,
       })
+      activeChatId = chatId
 
-      const latency = Date.now() - startTime
+      let latency = Date.now() - startTime
 
       if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
+        const errorMessage = this.extractErrorMessage(response)
+        const errorCode = isQwenRiskControlText(errorMessage) ? 'qwen_ai_risk_control' : undefined
+        cleanupChat(chatId)
         return {
           success: false,
           status: response.status,
-          error: errorMessage,
+          headers: sanitizeForwardedErrorHeaders(response.headers),
+          error: errorMessage || `HTTP ${response.status}`,
+          errorCode,
+          retryable: response.status === 403
+            || response.status === 429
+            || response.status === 499
+            || response.status === 504
+            || errorCode === 'qwen_ai_risk_control'
+            ? false
+            : undefined,
           latency,
         }
       }
@@ -938,17 +1231,53 @@ export class RequestForwarder {
       handler.setChatId(chatId)
 
       if (request.stream) {
-        const transformedStream = await handler.handleStream(response.data, {
+        let transformedStream: any = await handler.handleStream(response.data, {
           signal: context?.signal,
+          onFailure: () => cleanupChat(chatId),
         })
 
+        // Keep the HTTP status mutable until Qwen produces the first visible
+        // event. Failures before that point can cross protocol bridges with
+        // their real status; failures after output remain stream-local and are
+        // never replayed automatically.
+        await awaitQwenAiStreamPreflight(transformedStream, context?.signal)
+
+        if (transformed.plan.shouldParseResponse && qwenAiBufferManagedStreamsFromEnv()) {
+          transformedStream = await bufferValidatedSseStream(transformedStream, {
+            maxBytes: qwenAiValidatedStreamMaxBytesFromEnv(),
+            maxHoldMs: validatedSseMaxHoldMsFromEnv(),
+            signal: context?.signal,
+            forwardEvents: [QWEN_AI_STREAM_FAILURE_EVENT],
+            forwardProperties: ['qwenAiFailure'],
+          })
+          latency = Date.now() - startTime
+        }
+
         if (shouldDeleteSession()) {
-          const originalEnd = transformedStream.end.bind(transformedStream)
-          transformedStream.end = function(chunk?: any, encoding?: any, callback?: any) {
-            adapter.deleteChat(chatId).catch(err => {
-              console.error('[QwenAI] Failed to delete chat:', err)
-            })
-            return originalEnd(chunk, encoding, callback)
+          let cleanupRequested = false
+          const cleanupCompletedStream = () => {
+            if (cleanupRequested) return
+            cleanupRequested = true
+            cleanupChat(chatId)
+          }
+          const streamState = transformedStream as {
+            readableEnded?: boolean
+            writableFinished?: boolean
+            destroyed?: boolean
+            closed?: boolean
+          }
+          if (
+            streamState.readableEnded
+            || streamState.writableFinished
+            || streamState.destroyed
+            || streamState.closed
+          ) {
+            cleanupCompletedStream()
+          } else {
+            transformedStream.once('end', cleanupCompletedStream)
+            transformedStream.once('finish', cleanupCompletedStream)
+            transformedStream.once('close', cleanupCompletedStream)
+            transformedStream.once('error', cleanupCompletedStream)
           }
         }
 
@@ -982,14 +1311,38 @@ export class RequestForwarder {
         providerSessionId: chatId,
       }
     } catch (error) {
-      const latency = Date.now() - startTime
+      if (activeChatId) {
+        cleanupChat(activeChatId)
+      }
+      let latency = Date.now() - startTime
       const status = context?.signal?.aborted ? 499 : statusFromError(error)
+      const recoveryHint = error instanceof BufferedSseError && (
+        error.type === 'tool_call_parse_error'
+        || error.code === 'qwen_ai_stream_incomplete'
+        || error.code === 'qwen_ai_empty_stream'
+      )
+        ? 'managed_tool_stream_validation' as const
+        : undefined
+      const errorCode = errorCodeFromError(error)
+      const upstreamRetryable = (error as { retryable?: unknown })?.retryable
+      const retryable = status === 499
+        || status === 403
+        || status === 429
+        || status === 504
+        || errorCode === 'qwen_ai_risk_control'
+        ? false
+        : typeof upstreamRetryable === 'boolean'
+          ? upstreamRetryable
+          : undefined
       return {
         success: false,
         status,
+        headers: headersFromError(error),
         error: error instanceof Error ? error.message : 'Unknown error',
         latency,
-        retryable: status === 499 || status === 504 ? false : undefined,
+        retryable,
+        errorCode,
+        recoveryHint,
       }
     }
   }
@@ -1488,6 +1841,14 @@ export class RequestForwarder {
       body.user = request.user
     }
 
+    if (request.tools !== undefined) {
+      body.tools = request.tools
+    }
+
+    if (request.tool_choice !== undefined) {
+      body.tool_choice = request.tool_choice
+    }
+
     return body
   }
 
@@ -1542,8 +1903,26 @@ export class RequestForwarder {
   /**
    * Delay
    */
-  private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
+  private delay(ms: number, signal?: AbortSignal): Promise<boolean> {
+    return new Promise(resolve => {
+      if (signal?.aborted) {
+        resolve(false)
+        return
+      }
+
+      let timer: NodeJS.Timeout | undefined
+      const onAbort = () => {
+        if (timer) clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        resolve(false)
+      }
+
+      timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve(true)
+      }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 
   /**

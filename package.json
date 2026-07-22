@@ -20,6 +20,7 @@
     "start": "electron-vite preview",
     "start:server": "node out-server/server/index.js",
     "test:server-compat": "npm run build:server && node tests/server/run-server-tests.mjs",
+    "test:litellm": "npm run build:server && node --test tests/litellm/integration.test.mjs",
     "start:sandbox": "electron . --no-sandbox",
     "postinstall": "electron-builder install-app-deps",
     "prebuild:check": "node scripts/prebuild-check.js",

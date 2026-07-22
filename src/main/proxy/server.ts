@@ -236,7 +236,16 @@ export class ProxyServer {
         (ctx.status >= 400 || latency >= SLOW_REQUEST_THRESHOLD_MS)
 
       if (shouldRecordAccessLog) {
-        storeManager.addLog('warn', `${ctx.method} ${ctx.path} ${ctx.status} ${latency}ms`, {
+        // Slow successful generations are expected for long-context models;
+        // reserve warning/error levels for actionable HTTP failures.
+        const accessLogLevel = ctx.status === 499
+          ? 'info'
+          : ctx.status >= 500
+            ? 'error'
+            : ctx.status >= 400
+              ? 'warn'
+              : 'info'
+        storeManager.addLog(accessLogLevel, `${ctx.method} ${ctx.path} ${ctx.status} ${latency}ms`, {
           data: {
             method: ctx.method,
             path: ctx.path,

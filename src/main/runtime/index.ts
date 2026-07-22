@@ -1,5 +1,5 @@
-import type { RuntimeAdapter } from './types'
-import { nodeRuntime } from './nodeRuntime'
+import type { RuntimeAdapter } from './types.ts'
+import { nodeRuntime } from './nodeRuntime.ts'
 
 let runtime: RuntimeAdapter = nodeRuntime
 

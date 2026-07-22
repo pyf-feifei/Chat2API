@@ -41,6 +41,11 @@ test('Qwen AI OSS uploads use multipart upload for web-sized video files', () =>
   assert.match(source, /2 \* 1024 \* 1024/)
   assert.match(source, /QWEN_AI_OSS_UPLOAD_TIMEOUT_MS/)
   assert.match(source, /QWEN_AI_OSS_UPLOAD_RETRY_MAX/)
+  assert.match(source, /QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS/)
+  assert.match(source, /refreshSTSToken:\s*async \(\) =>/)
+  assert.match(source, /const refreshed = await this\.requestSts\(file\)/)
+  assert.match(source, /hasSameOssTarget\(sts, refreshed\)/)
+  assert.match(source, /refreshSTSTokenInterval:\s*OSS_STS_REFRESH_INTERVAL_MS/)
   assert.match(source, /function qwenOssMultipartParams\(fileSize: number\)/)
   assert.match(source, /fileSize < 100 \* 1024 \* 1024/)
   assert.match(source, /parallel: 10,\s*partSize: 10 \* 1024 \* 1024/)
@@ -105,11 +110,15 @@ test('Qwen AI multimodal helper preserves full tool-call transcript instead of o
   assert.match(source, /getProviderToolProfile\('qwen'\)/)
   assert.match(source, /msg\.role === 'assistant'/)
   assert.match(source, /msg\.tool_calls\?\.length/)
-  assert.match(source, /formatAssistantToolCalls\(msg\.tool_calls\.map/)
+  assert.match(source, /formatAssistantToolCalls\(transcriptCalls\)/)
+  assert.match(source, /function nextLocalToolCallId\(rawId: string/)
+  assert.match(source, /usedLocalToolCallIds/)
+  assert.match(source, /`\$\{baseId\}__\$\{occurrence\}`/)
   assert.match(source, /msg\.role === 'tool'/)
   assert.match(source, /formatToolResult\(\{/)
   assert.match(source, /already executed by the client/)
-  assert.match(source, /Do not repeat the same tool call unless/)
+  assert.match(source, /Use this result to decide the next step\./)
+  assert.doesNotMatch(source, /renderCompletedToolState|Authoritative completed tool ledger|Do not repeat an already successful operation/)
   assert.match(source, /fileParts\.push\(\.\.\.messageFileParts\)/)
   assert.match(source, /buildQwenAiTranscript\(messages\)/)
   assert.doesNotMatch(source, /userContent = textFromContent\(msg\.content\)/)
@@ -134,9 +143,11 @@ test('Qwen AI stream converts only declared upstream native function calls witho
 
 test('Qwen AI stream rejects malformed internal tool protocol even when tool choice is auto', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const policySource = fs.readFileSync('src/main/proxy/toolCalling/streamValidationPolicy.ts', 'utf8')
 
   assert.match(source, /hadPendingToolProtocol/)
-  assert.match(source, /malformed_tool_call/)
+  assert.match(source, /getToolStreamValidationFailure/)
+  assert.match(policySource, /malformed_tool_call/)
   assert.doesNotMatch(source, /toolChoiceMode === 'forced' \|\| this\.toolCallingPlan\.toolChoiceMode === 'required'/)
 })
 
@@ -260,8 +271,31 @@ test('Qwen AI adapter request timeout is configurable for long-context document 
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
   assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS/)
-  assert.match(source, /process\.env\.QWEN_AI_REQUEST_TIMEOUT_MS \|\| 300000/)
+  assert.match(source, /positiveNumberFromEnv\('QWEN_AI_REQUEST_TIMEOUT_MS',\s*300000\)/)
+  assert.match(source, /return Number\.isFinite\(value\) && value > 0 \? value : fallback/)
   assert.doesNotMatch(source, /timeout:\s*120000/)
+})
+
+test('Qwen AI credential warnings only fire when both token and cookies are absent', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /if \(cookies\) \{[\s\S]*headers\['Cookie'\] = cookies[\s\S]*\} else if \(!token\)/)
+  assert.match(source, /No token or cookies provided/)
+  assert.doesNotMatch(source, /else \{\s*console\.warn\('\[QwenAI\] Warning: No cookies provided/)
+})
+
+test('Docker Compose exposes Qwen timeout overrides under their runtime names', () => {
+  const source = fs.readFileSync('docker-compose.yml', 'utf8')
+  const dockerfile = fs.readFileSync('Dockerfile', 'utf8')
+  const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
+
+  assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
+  assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{QWEN_AI_REQUEST_TIMEOUT_MS:-600000\}/)
+  assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS:\s*\$\{QWEN_AI_RESPONSE_TIMEOUT_MS:-600000\}/)
+  assert.match(source, /QWEN_AI_STREAM_IDLE_TIMEOUT_MS:\s*\$\{QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000\}/)
+  assert.doesNotMatch(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_REQUEST_TIMEOUT_MS/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
+  assert.match(governorSource, /numberFromEnv\('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS',\s*120 \* 1000\)/)
 })
 
 test('Qwen AI stream readers enforce response and idle timeouts', () => {
@@ -275,11 +309,21 @@ test('Qwen AI stream readers enforce response and idle timeouts', () => {
   assert.match(source, /options\.signal\?\.addEventListener\('abort', onAbort/)
 })
 
+test('Qwen AI stream readers reject transport close before provider completion', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.match(source, /sawUpstreamCompletion/)
+  assert.match(source, /ended before an upstream completion signal/)
+  assert.match(source, /closed before an upstream completion signal/)
+  assert.doesNotMatch(source, /Non-stream closed before an answer finished event; returning accumulated content/)
+})
+
 test('Qwen AI adapter redacts sensitive request headers in logs', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
   assert.match(source, /sanitizeHeadersForLog/)
   assert.match(source, /sanitizePayloadForLog/)
+  assert.match(source, /describeErrorForLog/)
   assert.match(source, /QWEN_AI_DOCUMENT_EVIDENCE_MARKER/)
   assert.match(source, /REDACTED_DOCUMENT_EVIDENCE/)
   assert.match(source, /JSON\.stringify\(this\.sanitizeHeadersForLog\(this\.getHeaders\(chatId\)\)/)
@@ -288,6 +332,10 @@ test('Qwen AI adapter redacts sensitive request headers in logs', () => {
   assert.match(source, /'set-cookie'/)
   assert.doesNotMatch(source, /JSON\.stringify\(this\.getHeaders\(chatId\)/)
   assert.doesNotMatch(source, /JSON\.stringify\(payload,\s*null,\s*2\)/)
+  assert.doesNotMatch(
+    source,
+    /console\.error\('\[QwenAI\][^']*',\s*(?:err|error)\)/,
+  )
 })
 
 test('Qwen AI adapter rejects risk-control and non-stream upstream responses', () => {
@@ -297,12 +345,37 @@ test('Qwen AI adapter rejects risk-control and non-stream upstream responses', (
   assert.match(source, /hasRiskControlHeaders/)
   assert.match(source, /bxpunish/)
   assert.match(source, /x5sec/)
-  assert.match(source, /status\s*=\s*403/)
+  assert.match(source, /response\.status\s*>=\s*400/)
   assert.match(source, /qwen_ai_risk_control/)
   assert.match(source, /REDACTED_URL/)
   assert.match(source, /x5secdata\|x5sectag\|cookie\|authorization\|token/)
   assert.match(source, /returned a risk-control or challenge response instead of a chat event stream/)
   assert.match(source, /returned a non-stream response instead of a chat event stream/)
+})
+
+test('Qwen AI temporary chats are cleaned up once across every failure path', () => {
+  const adapterSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const forwarderSource = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
+  const qwenForwarderSource = forwarderSource.slice(
+    forwarderSource.indexOf('private async forwardQwenAi'),
+    forwarderSource.indexOf('private async forwardZai'),
+  )
+
+  assert.match(adapterSource, /private deleteChatRequests = new Map<string, Promise<boolean>>\(\)/)
+  assert.match(adapterSource, /const existingRequest = this\.deleteChatRequests\.get\(chatId\)/)
+  assert.match(adapterSource, /const request = this\.performDeleteChat\(chatId\)/)
+  assert.match(adapterSource, /catch \(error\) \{\s*await this\.deleteChat\(chatId\)\s*throw error/)
+  assert.match(adapterSource, /onFailure\?: \(error: Error\) => void/)
+  assert.match(adapterSource, /options\.onFailure\?\.\(error\)/)
+  assert.match(qwenForwarderSource, /let activeChatId: string \| undefined/)
+  assert.match(qwenForwarderSource, /onFailure: \(\) => cleanupChat\(chatId\)/)
+  assert.match(qwenForwarderSource, /if \(activeChatId\) \{\s*cleanupChat\(activeChatId\)/)
+  assert.match(qwenForwarderSource, /transformedStream\.once\('end', cleanupCompletedStream\)/)
+  assert.match(qwenForwarderSource, /transformedStream\.once\('finish', cleanupCompletedStream\)/)
+  assert.match(qwenForwarderSource, /transformedStream\.once\('error', cleanupCompletedStream\)/)
+  assert.match(qwenForwarderSource, /transformedStream\.once\('close', cleanupCompletedStream\)/)
+  assert.doesNotMatch(qwenForwarderSource, /shouldDeleteSession\(\) && transformed\.plan\.shouldParseResponse/)
+  assert.doesNotMatch(qwenForwarderSource, /transformedStream\.end = function/)
 })
 
 test('Qwen AI adapter no longer hard-codes stale Baxia challenge headers', () => {
@@ -332,9 +405,10 @@ test('Qwen AI non-stream responses reject empty upstream output instead of retur
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
   assert.match(source, /let sawAnswerFinish = false/)
+  assert.match(source, /let sawUpstreamCompletion = false/)
   assert.match(source, /const hasAnyOutput = Boolean\(answerText\.trim\(\) \|\| finalReasoning\.trim\(\)\)/)
-  assert.match(source, /rejectOnce\(new Error\('Qwen AI returned an empty response stream without answer or reasoning content'\)\)/)
-  assert.match(source, /Non-stream closed before an answer finished event; returning accumulated content/)
+  assert.match(source, /rejectOnce\(createQwenAiStreamFailure\([\s\S]*'Qwen AI returned an empty response stream without answer or reasoning content',[\s\S]*'qwen_ai_empty_stream'/)
+  assert.match(source, /if \(!sawUpstreamCompletion\) \{[\s\S]*rejectOnce\(createQwenAiStreamFailure\('Qwen AI response stream closed before an upstream completion signal'\)\)/)
 })
 
 test('load balancer does not print account tokens', () => {

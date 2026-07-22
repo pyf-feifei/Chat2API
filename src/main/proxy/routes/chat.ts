@@ -9,16 +9,23 @@ import { PassThrough } from 'stream'
 import { ChatCompletionRequest, ChatCompletionResponse, ProxyContext } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
+import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
+import {
+  QwenAiAdapter,
+  QWEN_AI_STREAM_FAILURE_EVENT,
+  type QwenAiOutputStream,
+} from '../adapters/qwen-ai'
 import { streamHandler } from '../stream'
 import { proxyStatusManager } from '../status'
 import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
-import { 
+import {
   isAnthropicToolFormat,
   transformResponseToAnthropic,
   transformChunkToAnthropic
 } from '../utils/toolFormatConverter'
+import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -71,17 +78,56 @@ function createClientAbortSignal(ctx: Context): AbortSignal {
     }
   }
   ctx.req.once('aborted', abort)
-  ctx.res.once('close', abort)
+  ctx.res.once('close', () => {
+    if (!ctx.res.writableEnded) abort()
+  })
   return controller.signal
 }
 
-function isQwenAiRiskControl(providerId: string | undefined, status: number | undefined, error: string | undefined): boolean {
+function isQwenAiRiskControl(
+  providerId: string | undefined,
+  status: number | undefined,
+  error: string | undefined,
+  errorCode?: string,
+  providerIsQwenAi = false,
+): boolean {
   return Boolean(
-    providerId === 'qwen-ai' &&
-    status === 403 &&
-    error &&
-    /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|x5sec|baxia|punish/i.test(error),
+    (providerId === 'qwen-ai' || providerIsQwenAi) &&
+    (errorCode === 'qwen_ai_risk_control' || (
+      (status === 403 || status === 429) &&
+      error &&
+      /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|x5sec|baxia|punish/i.test(error)
+    )),
   )
+}
+
+function streamFailureStatus(
+  error: (Error & { status?: unknown }) | undefined,
+  clientAborted = false,
+): number {
+  if (clientAborted) return 499
+  if (typeof error?.status === 'number') return error.status
+  if (isClientCancellationError(error)) return 499
+
+  const message = error?.message || ''
+  if (/timed out|timeout|idle for more than/i.test(message)) return 504
+  return 502
+}
+
+function streamFailureCode(error: Error | undefined): string | undefined {
+  const code = (error as (Error & { code?: unknown }) | undefined)?.code
+  return typeof code === 'string' && code.trim() ? code : undefined
+}
+
+function streamFailureHeaders(error: Error | undefined): Record<string, string> | undefined {
+  const headers = (error as (Error & { headers?: unknown }) | undefined)?.headers
+  return sanitizeForwardedErrorHeaders(headers)
+}
+
+function requestFailureLogLevel(status: number | undefined): 'debug' | 'warn' | 'error' {
+  if (status === 499) return 'debug'
+  if (status === 429) return 'warn'
+  return 'error'
 }
 
 /**
@@ -215,7 +261,13 @@ router.post('/completions', async (ctx: Context) => {
     if (!result.success) {
       proxyStatusManager.recordRequestFailure(latency)
 
-      if (isQwenAiRiskControl(provider.id, result.status, result.error)) {
+      if (isQwenAiRiskControl(
+        provider.id,
+        result.status,
+        result.error,
+        result.errorCode,
+        QwenAiAdapter.isQwenAiProvider(provider),
+      )) {
         loadBalancer.markQwenAiRiskControl(account.id)
       } else if (result.status && result.status >= 400
         && result.status !== 429 && result.status !== 499) {
@@ -223,8 +275,9 @@ router.post('/completions', async (ctx: Context) => {
       }
 
       ctx.status = result.status || 500
-      if (result.headers) {
-        for (const [key, value] of Object.entries(result.headers)) {
+      const safeErrorHeaders = sanitizeForwardedErrorHeaders(result.headers)
+      if (safeErrorHeaders) {
+        for (const [key, value] of Object.entries(safeErrorHeaders)) {
           ctx.set(key, value)
         }
       }
@@ -233,16 +286,18 @@ router.post('/completions', async (ctx: Context) => {
           message: result.error || 'Request failed',
           type: 'api_error',
           param: null,
-          code: null,
+          code: result.errorCode ?? null,
         },
       }
 
-      storeManager.addLog('error', `Request failed: ${result.error}`, {
+      const failureLogLevel = requestFailureLogLevel(result.status)
+      storeManager.addLog(failureLogLevel, `${result.status === 499 ? 'Request cancelled' : 'Request failed'}: ${result.error}`, {
         requestId,
         providerId: provider.id,
         accountId: account.id,
         model: request.model,
         latency,
+        errorCode: result.errorCode,
       })
 
       const userInput = extractUserInput(request.messages)
@@ -251,7 +306,7 @@ router.post('/completions', async (ctx: Context) => {
           message: result.error || 'Request failed',
           type: 'api_error',
           param: null,
-          code: null,
+          code: result.errorCode ?? null,
         },
       })
       storeManager.addRequestLog({
@@ -275,6 +330,7 @@ router.post('/completions', async (ctx: Context) => {
         latency,
         isStream: request.stream || false,
         errorMessage: result.error,
+        errorCode: result.errorCode,
       })
 
       storeManager.recordRequestInStats(false, latency, request.model, provider.id, account.id)
@@ -282,11 +338,14 @@ router.post('/completions', async (ctx: Context) => {
       return
     }
 
-    const deferKimiStreamOutcome = KimiAdapter.isKimiProvider(provider)
-      && request.stream === true
+    const deferStreamOutcome = request.stream === true
       && Boolean(result.stream)
+      && (
+        KimiAdapter.isKimiProvider(provider)
+        || QwenAiAdapter.isQwenAiProvider(provider)
+      )
 
-    if (!deferKimiStreamOutcome) {
+    if (!deferStreamOutcome) {
       loadBalancer.clearAccountFailure(account.id)
     }
 
@@ -299,13 +358,13 @@ router.post('/completions', async (ctx: Context) => {
       }
     }
 
-    if (!deferKimiStreamOutcome) {
+    if (!deferStreamOutcome) {
       proxyStatusManager.recordRequestSuccess(latency)
 
       storeManager.incrementAccountUsage(account.id)
     }
 
-    storeManager.addLog('debug', deferKimiStreamOutcome ? `Request stream started` : `Request succeeded`, {
+    storeManager.addLog('debug', deferStreamOutcome ? `Request stream started` : `Request succeeded`, {
       requestId,
       providerId: provider.id,
       accountId: account.id,
@@ -373,7 +432,7 @@ router.post('/completions', async (ctx: Context) => {
       logEntryId = logEntry.id
     }
 
-    if (!deferKimiStreamOutcome) {
+    if (!deferStreamOutcome) {
       storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
     }
 
@@ -388,10 +447,10 @@ router.post('/completions', async (ctx: Context) => {
 
       // Collect stream content for logging (raw SSE output)
       let collectedContent = ''
-      let streamOutcomeRecorded = !deferKimiStreamOutcome
+      let streamOutcomeRecorded = !deferStreamOutcome
 
-      const recordKimiStreamOutcome = (success: boolean, error?: Error) => {
-        if (!deferKimiStreamOutcome || streamOutcomeRecorded) return
+      const recordDeferredStreamOutcome = (success: boolean, error?: Error) => {
+        if (!deferStreamOutcome || streamOutcomeRecorded) return
         streamOutcomeRecorded = true
 
         const completionLatency = Date.now() - startTime
@@ -415,29 +474,89 @@ router.post('/completions', async (ctx: Context) => {
           return
         }
 
-        const errorStatus = (error as (Error & { status?: unknown }) | undefined)?.status
-        const failureStatus = typeof errorStatus === 'number' ? errorStatus : 502
+        const failureStatus = streamFailureStatus(
+          error as (Error & { status?: unknown }) | undefined,
+          context.signal?.aborted,
+        )
+        const failureCode = streamFailureCode(error)
+        const qwenAiFailure = QwenAiAdapter.isQwenAiProvider(provider)
+        if (qwenAiFailure) {
+          qwenAiRequestGovernor.reportDeferredFailure(account.id, {
+            success: false,
+            status: failureStatus,
+            headers: streamFailureHeaders(error),
+            error: error?.message || 'Unknown Qwen AI stream error',
+            errorCode: failureCode,
+            retryable: false,
+          })
+        }
         proxyStatusManager.recordRequestFailure(completionLatency)
         if (failureStatus !== 499) {
-          loadBalancer.markAccountFailed(account.id)
+          if (qwenAiFailure && isQwenAiRiskControl(
+            provider.id,
+            failureStatus,
+            error?.message,
+            failureCode,
+            true,
+          )) {
+            loadBalancer.markQwenAiRiskControl(account.id)
+          } else if (failureStatus !== 429) {
+            loadBalancer.markAccountFailed(account.id)
+          }
         }
         storeManager.recordRequestInStats(false, completionLatency, request.model, provider.id, account.id)
+        const failureLogLevel = requestFailureLogLevel(failureStatus)
+        storeManager.addLog(
+          failureLogLevel,
+          `${failureStatus === 499 ? 'Stream response cancelled' : 'Stream response failed'}: ${error?.message || 'Unknown stream error'}`,
+          {
+            requestId,
+            providerId: provider.id,
+            accountId: account.id,
+            model: request.model,
+            status: failureStatus,
+            errorCode: failureCode,
+          },
+        )
         if (logEntryId) {
           storeManager.updateRequestLog(logEntryId, {
             status: 'error',
             statusCode: failureStatus,
             responseStatus: failureStatus,
             latency: completionLatency,
-            errorMessage: error?.message || 'Kimi stream failed',
+            errorMessage: error?.message || 'Stream failed',
+            errorCode: failureCode,
             responseBody: collectedContent || undefined,
           })
         }
       }
 
+      const qwenAiStream = QwenAiAdapter.isQwenAiProvider(provider)
+        ? result.stream as QwenAiOutputStream
+        : undefined
+      if (qwenAiStream) {
+        qwenAiStream.once(QWEN_AI_STREAM_FAILURE_EVENT, (error: Error) => {
+          recordDeferredStreamOutcome(false, error)
+        })
+        if (qwenAiStream.qwenAiFailure) {
+          recordDeferredStreamOutcome(false, qwenAiStream.qwenAiFailure)
+        }
+      }
+
       // Handle stream errors
       result.stream.once('error', (err: Error) => {
-        console.error('[Chat] Stream error:', err.message)
-        recordKimiStreamOutcome(false, err)
+        const clientCancelled = context.signal?.aborted || isClientCancellationError(err)
+        if (clientCancelled) {
+          console.log('[Chat] Stream cancelled:', err.message)
+        } else {
+          console.error('[Chat] Stream error:', err.message)
+        }
+        recordDeferredStreamOutcome(false, err)
+
+        if (clientCancelled) {
+          wrapperStream.end()
+          return
+        }
 
         // Kimi's Connect handler deliberately withholds [DONE] when an
         // upstream trailer reports an error. Preserve that signal so clients
@@ -469,12 +588,14 @@ router.post('/completions', async (ctx: Context) => {
         }
         wrapperStream.end()
 
-        storeManager.addLog('error', `Stream error: ${err.message}`, {
-          requestId,
-          providerId: provider.id,
-          accountId: account.id,
-          model: request.model,
-        })
+        if (!deferStreamOutcome) {
+          storeManager.addLog(requestFailureLogLevel(streamFailureStatus(err)), `Stream error: ${err.message}`, {
+            requestId,
+            providerId: provider.id,
+            accountId: account.id,
+            model: request.model,
+          })
+        }
       })
 
       // Check if stream is already in correct SSE format (from adapters like Kimi, GLM, DeepSeek)
@@ -488,7 +609,8 @@ router.post('/completions', async (ctx: Context) => {
 
         // When source stream ends normally, update log and end wrapper
         result.stream.once('end', () => {
-          recordKimiStreamOutcome(true)
+          const qwenAiFailure = qwenAiStream?.qwenAiFailure
+          recordDeferredStreamOutcome(!qwenAiFailure, qwenAiFailure)
           // Update log with collected response
           if (logEntryId) {
             storeManager.updateRequestLog(logEntryId, {
@@ -567,8 +689,10 @@ router.post('/completions', async (ctx: Context) => {
 
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
     const errorStack = error instanceof Error ? error.stack : undefined
+    const clientCancelled = context.signal?.aborted || isClientCancellationError(error)
+    const errorStatus = clientCancelled ? 499 : 500
 
-    ctx.status = 500
+    ctx.status = errorStatus
     ctx.body = {
       error: {
         message: errorMessage,
@@ -578,7 +702,7 @@ router.post('/completions', async (ctx: Context) => {
       },
     }
 
-    storeManager.addLog('error', `Request exception: ${errorMessage}`, {
+    storeManager.addLog(clientCancelled ? 'debug' : 'error', `${clientCancelled ? 'Request cancelled' : 'Request exception'}: ${errorMessage}`, {
       requestId,
       providerId: provider.id,
       accountId: account.id,
@@ -599,7 +723,7 @@ router.post('/completions', async (ctx: Context) => {
     storeManager.addRequestLog({
       timestamp: startTime,
       status: 'error',
-      statusCode: 500,
+      statusCode: errorStatus,
       method: 'POST',
       url: '/v1/chat/completions',
       model: request.model,
@@ -612,7 +736,7 @@ router.post('/completions', async (ctx: Context) => {
       userInput,
       webSearch: request.web_search,
       reasoningEffort: request.reasoning_effort,
-      responseStatus: 500,
+      responseStatus: errorStatus,
       responseBody: exceptionResponseBody,
       latency,
       isStream: request.stream || false,

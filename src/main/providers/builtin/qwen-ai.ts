@@ -22,14 +22,23 @@ export const qwenAiConfig: BuiltinProviderConfig = {
     Version: '0.2.35',
   },
   supportedModels: [
+    'Qwen3.8-Max-Preview',
     'Qwen3.7-Plus',
     'Qwen3.7-Max',
     'Qwen3.6-Plus',
   ],
   modelMappings: {
+    'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
     'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',
     'Qwen3.6-Plus': 'qwen3.6-plus',
+  },
+  // Qwen3.8-Max-Preview advertises that its reasoning phase cannot be skipped.
+  // Other model capabilities are intentionally learned from the live catalogue
+  // instead of being guessed from a model name.
+  modelCapabilities: {
+    'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+    'qwen3.8-max-preview': { thinkingSkippable: false },
   },
   credentialFields: [
     {

@@ -9,6 +9,12 @@ declare module 'ali-oss' {
     authorizationV4?: boolean
     timeout?: number
     retryMax?: number
+    refreshSTSToken?: () => Promise<{
+      accessKeyId: string
+      accessKeySecret: string
+      stsToken: string
+    }>
+    refreshSTSTokenInterval?: number
   }
 
   interface PutResult {

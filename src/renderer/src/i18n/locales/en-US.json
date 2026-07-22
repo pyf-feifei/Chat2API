@@ -338,6 +338,7 @@
     "thinkingMode": "Thinking Mode",
     "thinkingModeDesc": "Enable thinking mode to get reasoning process before answer",
     "models": {
+      "Qwen3.8-Max-Preview": "Qwen3.8-Max-Preview",
       "Qwen3.7-Plus": "Qwen3.7-Plus",
       "Qwen3.7-Max": "Qwen3.7-Max",
       "Qwen3.6-Plus": "Qwen3.6-Plus"

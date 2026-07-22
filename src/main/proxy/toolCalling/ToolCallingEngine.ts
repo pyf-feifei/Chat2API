@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type { ChatCompletionRequest, ChatMessage } from '../types.ts'
 import type { Provider } from '../../store/types.ts'
 import {
@@ -83,8 +84,12 @@ export class ToolCallingEngine {
       return
     }
 
+    const callIdPrefix = `call_${randomUUID().replace(/-/g, '')}`
     message.content = parseResult.content || null
-    message.tool_calls = parseResult.toolCalls
+    message.tool_calls = parseResult.toolCalls.map((toolCall, index) => ({
+      ...toolCall,
+      id: `${callIdPrefix}_${index}`,
+    }))
 
     const choice = result.choices[0]
     choice.finish_reason = 'tool_calls'

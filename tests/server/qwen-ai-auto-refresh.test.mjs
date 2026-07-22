@@ -45,9 +45,13 @@ test('Qwen AI adapter refreshes expiring web tokens by signing in with saved ema
   assert.match(refresherSource, /Timezone:\s*currentTimezoneHeader\(\)/)
 
   assert.match(adapterSource, /QwenAiTokenRefresher/)
-  assert.match(adapterSource, /await this\.tokenRefresher\.refreshIfNeeded\(this\.account\)/)
-  assert.match(adapterSource, /await this\.tokenRefresher\.refreshAfterUnauthorized\(this\.account\)/)
+  assert.match(adapterSource, /await this\.tokenRefresher\.refreshIfNeeded\(this\.account, signal\)/)
+  assert.match(adapterSource, /await this\.tokenRefresher\.refreshAfterUnauthorized\(this\.account, options\.signal\)/)
   assert.match(adapterSource, /createOptions: \(\) => Record<string, any>/)
+  assert.match(refresherSource, /async refreshIfNeeded\(account: Account, signal\?: AbortSignal\)/)
+  assert.match(refresherSource, /async refreshAfterUnauthorized\(account: Account, signal\?: AbortSignal\)/)
+  assert.match(refresherSource, /timeout:\s*15000,\s*signal,/)
+  assert.match(adapterSource, /createChat\(modelId, 'OpenAI_API_Chat', request\.signal\)/)
 })
 
 test('Qwen AI token refresher persists signin Set-Cookie values for web sessions', () => {

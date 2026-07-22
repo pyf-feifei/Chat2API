@@ -14,6 +14,16 @@ test('load balancer matches Qwen AI thinking and fast suffixes against the base 
   assert.match(source, /const normalizedActualModel = this\.normalizeModelForProviderMatch\(actualModel\)\.toLowerCase\(\)/)
 })
 
+test('Qwen AI derives required thinking from provider model capabilities', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+
+  assert.doesNotMatch(source, /THINKING_REQUIRED_MODEL_IDS/)
+  assert.match(source, /findModelCapability\(this\.provider, modelForThinking, modelId\)/)
+  assert.match(source, /capability\?\.thinkingSkippable === false/)
+  assert.match(source, /resolveQwenThinkingEnabled\(/)
+  assert.match(source, /return requested \?\? forced \?\? false/)
+})
+
 test('load balancer avoids a failed Qwen AI account on the next selection', () => {
   const source = fs.readFileSync('src/main/proxy/loadbalancer.ts', 'utf8')
 

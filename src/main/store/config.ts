@@ -10,6 +10,7 @@ import {
   Theme,
   ModelMapping,
   DEFAULT_CONFIG,
+  MAX_QWEN_AI_CONCURRENCY,
 } from './types'
 import { normalizeToolCallingConfig } from '../../shared/toolCalling'
 
@@ -385,7 +386,7 @@ export class ConfigManager {
         config.qwenAiGovernorConfig.autoTuneMaxConcurrent,
         'qwenAiGovernorConfig.autoTuneMaxConcurrent',
         errors,
-        { min: 1, max: 10 },
+        { min: 1, max: MAX_QWEN_AI_CONCURRENCY },
       )
       validateNonNegativeInteger(
         config.qwenAiGovernorConfig.autoTuneMinGlobalIntervalMs,
@@ -397,7 +398,7 @@ export class ConfigManager {
         config.qwenAiGovernorConfig.maxConcurrent,
         'qwenAiGovernorConfig.maxConcurrent',
         errors,
-        { min: 1, max: 10 },
+        { min: 1, max: MAX_QWEN_AI_CONCURRENCY },
       )
       validateNonNegativeInteger(
         config.qwenAiGovernorConfig.globalMinIntervalMs,

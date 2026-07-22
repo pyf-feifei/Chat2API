@@ -111,6 +111,11 @@ export interface Account {
   todayUsed?: number
 }
 
+export interface ProviderModelCapability {
+  /** Whether the provider permits skipping its reasoning/thinking phase. */
+  thinkingSkippable?: boolean
+}
+
 export interface Provider {
   id: string
   name: string
@@ -126,6 +131,7 @@ export interface Provider {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  modelCapabilities?: Record<string, ProviderModelCapability>
   modelsApiEndpoint?: string
   modelsApiHeaders?: Record<string, string>
   status?: ProviderStatus
@@ -306,8 +312,10 @@ export interface ManagementApiPaginatedResponse<T> {
 }
 
 export interface CreateProviderRequest {
+  /** Optional caller-supplied identifier used by imports and migrations. */
+  id?: string
   name: string
-  type: ProviderType
+  type?: ProviderType
   authType: AuthType
   apiEndpoint: string
   chatPath?: string
@@ -317,8 +325,10 @@ export interface CreateProviderRequest {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  modelCapabilities?: Record<string, ProviderModelCapability>
   modelsApiEndpoint?: string
   modelsApiHeaders?: Record<string, string>
+  credentialFields?: CredentialField[]
 }
 
 export interface UpdateProviderRequest {
@@ -331,6 +341,7 @@ export interface UpdateProviderRequest {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
+  modelCapabilities?: Record<string, ProviderModelCapability>
   modelsApiEndpoint?: string
   modelsApiHeaders?: Record<string, string>
 }

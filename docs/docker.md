@@ -172,9 +172,43 @@ CHAT2API_ENABLE_API_KEY=false
 CHAT2API_LOG_LEVEL=info
 CHAT2API_LOAD_BALANCE_STRATEGY=round-robin
 CHAT2API_STORAGE_ENCRYPTION_KEY=
+CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
+# Optional guarded throughput profile for a larger Qwen AI account pool.
+# These environment values override persisted governor settings.
+CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED=true
+CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT=20
+CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
+CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS=30000
+QWEN_AI_REQUEST_TIMEOUT_MS=600000
+QWEN_AI_RESPONSE_TIMEOUT_MS=600000
+QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
+QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
+CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
+CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 ```
 
 Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
+
+The Qwen AI queue timeout applies only while waiting for a governor slot. The
+request and response limits apply after admission, while the idle timeout is
+refreshed whenever upstream bytes arrive. These values are independent: a long
+active generation can occupy a slot long enough for a later request to receive
+`429`, and a stream with no bytes for 180 seconds still fails before the
+600-second total response limit. An outer client or reverse proxy can impose a
+shorter end-to-end deadline, so its timeout must be configured separately when
+the deployment is expected to tolerate both queueing and a long generation.
+When using the bundled LiteLLM Compose service, its generic outer
+`REQUEST_TIMEOUT` defaults to `900` seconds (via `LITELLM_REQUEST_TIMEOUT`) so
+it does not race the `600`-second Chat2API response limit. This outer value is
+independent from the queue timeout and remains configurable.
+Managed SSE validation is opt-in through
+`CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true`. The normal value (`false`)
+forwards generated SSE immediately, so a long response does not wait for
+validation before sending its first byte. When validation is enabled,
+`CHAT2API_VALIDATED_SSE_MAX_HOLD_MS` bounds how long an active stream may be
+withheld before its buffered prefix is released. This is not a generation
+timeout; after release, later failures are reported in-band and are not
+retried.
 
 ## Upstream Update Flow
 

@@ -1,0 +1,41 @@
+name: chat2api-litellm
+
+services:
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:v1.93.0
+    container_name: chat2api-litellm
+    restart: unless-stopped
+    command:
+      - --config
+      - /app/config.yaml
+      - --host
+      - 0.0.0.0
+      - --port
+      - "4000"
+      - --num_workers
+      - "1"
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    environment:
+      CHAT2API_BASE_URL: "${CHAT2API_BASE_URL:-http://host.docker.internal:8080/v1}"
+      CHAT2API_API_KEY: "${CHAT2API_API_KEY:-sk-chat2api-local}"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-litellm-local}"
+      LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true}"
+      # cancel_on_disconnect is enabled in the mounted LiteLLM configuration.
+      # Keep LiteLLM's outer read/first-byte budget above Chat2API's 600 s
+      # active-response budget. This remains generic and configurable.
+      REQUEST_TIMEOUT: "${LITELLM_REQUEST_TIMEOUT:-900}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./deploy/litellm/config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s

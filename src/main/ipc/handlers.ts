@@ -7,7 +7,7 @@ import { AccountManager } from '../store/accounts'
 import { ProviderChecker } from '../providers/checker'
 import { CustomProviderManager } from '../providers/custom'
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
-import { parseProviderModelsResponse } from '../providers/modelSync'
+import { mergeProviderModelCapabilities, parseProviderModelsResponse } from '../providers/modelSync'
 import { oauthManager } from '../oauth/manager'
 import { ProxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
@@ -277,6 +277,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     description?: string
     supportedModels?: string[]
     modelMappings?: Record<string, string>
+    modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
     modelsApiEndpoint?: string
     modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]
@@ -350,16 +351,22 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     success: boolean
     supportedModels?: string[]
     modelMappings?: Record<string, string>
+    modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
     error?: string
   }> => {
     try {
       const result = await ProviderChecker.fetchProviderModels(providerId)
       
       const provider = ProviderManager.getById(providerId)
+      const mergedModelCapabilities = mergeProviderModelCapabilities(
+        provider?.modelCapabilities,
+        result.modelCapabilities,
+      )
       if (provider) {
         ProviderManager.update(providerId, {
           supportedModels: result.supportedModels,
           modelMappings: result.modelMappings,
+          modelCapabilities: mergedModelCapabilities,
         })
       }
 
@@ -367,6 +374,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
         success: true,
         supportedModels: result.supportedModels,
         modelMappings: result.modelMappings,
+        modelCapabilities: mergedModelCapabilities,
       }
     } catch (error) {
       return {
@@ -439,7 +447,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
         }
       }
 
-      const { supportedModels, modelMappings } = parseProviderModelsResponse(response.data)
+      const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
 
       if (supportedModels.length === 0) {
         return {
@@ -448,9 +456,14 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
         }
       }
 
+      const mergedModelCapabilities = mergeProviderModelCapabilities(
+        provider.modelCapabilities,
+        modelCapabilities,
+      )
       ProviderManager.update(providerId, {
         supportedModels,
         modelMappings,
+        modelCapabilities: mergedModelCapabilities,
       })
 
       return {
@@ -576,6 +589,13 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
           description: builtinConfig.description,
           supportedModels: builtinConfig.supportedModels || [],
           modelMappings: builtinConfig.modelMappings || {},
+          modelCapabilities: mergeProviderModelCapabilities(
+            undefined,
+            builtinConfig.modelCapabilities,
+          ),
+          credentialFields: builtinConfig.credentialFields,
+          modelsApiEndpoint: builtinConfig.modelsApiEndpoint,
+          modelsApiHeaders: builtinConfig.modelsApiHeaders,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         }

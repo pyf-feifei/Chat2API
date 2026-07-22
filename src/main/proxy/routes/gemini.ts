@@ -59,7 +59,9 @@ function createClientAbortSignal(ctx: Context): AbortSignal {
     }
   }
   ctx.req.once('aborted', abort)
-  ctx.res.once('close', abort)
+  ctx.res.once('close', () => {
+    if (!ctx.res.writableEnded) abort()
+  })
   return controller.signal
 }
 

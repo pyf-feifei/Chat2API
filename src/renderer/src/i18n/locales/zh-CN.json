@@ -338,6 +338,7 @@
     "thinkingMode": "思考模式",
     "thinkingModeDesc": "启用思考模式，在回答前输出推理过程",
     "models": {
+      "Qwen3.8-Max-Preview": "Qwen3.8-Max-Preview",
       "Qwen3.7-Plus": "Qwen3.7-Plus",
       "Qwen3.7-Max": "Qwen3.7-Max",
       "Qwen3.6-Plus": "Qwen3.6-Plus"

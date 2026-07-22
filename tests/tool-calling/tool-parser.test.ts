@@ -76,6 +76,48 @@ test('managed xml parses valid Chat2API tool call', () => {
   assert.equal(result.toolCalls[0].function.name, 'default_api:read_file')
 })
 
+test('managed xml coerces scalar arguments according to the declared schema', () => {
+  const scalarTools = [
+    {
+      name: 'default_api:task_update',
+      description: 'Update a task',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string' },
+          completed: { type: 'boolean' },
+          retryCount: { type: 'integer' },
+        },
+        required: ['taskId'],
+      },
+      source: 'openai' as const,
+    },
+  ]
+
+  const result = managedXmlProtocol.parse(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:task_update"><|CHAT2API|parameter name="taskId">1</|CHAT2API|parameter><|CHAT2API|parameter name="completed">false</|CHAT2API|parameter><|CHAT2API|parameter name="retryCount">2</|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    { tools: scalarTools, protocol: 'managed_xml' },
+  )
+
+  assert.equal(result.toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), {
+    taskId: '1',
+    completed: false,
+    retryCount: 2,
+  })
+})
+
+test('managed xml preserves a complete no-argument tool call as an empty object', () => {
+  const result = managedXmlProtocol.parse(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    { tools, protocol: 'managed_xml' },
+  )
+
+  assert.equal(result.toolCalls.length, 1)
+  assert.equal(result.toolCalls[0].function.name, 'default_api:read_file')
+  assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), {})
+})
+
 test('managed xml parses canonical XML compatibility form', () => {
   const result = managedXmlProtocol.parse(
     '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>',

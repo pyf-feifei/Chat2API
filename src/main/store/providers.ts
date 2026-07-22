@@ -4,7 +4,8 @@
  */
 
 import { storeManager } from './store'
-import { Provider, ProviderType, AuthType, BUILTIN_PROVIDERS } from './types'
+import { Provider, ProviderType, AuthType, BUILTIN_PROVIDERS, type CredentialField } from './types'
+import type { ProviderModelCapability } from '../../shared/types'
 
 /**
  * Provider Manager Class
@@ -67,16 +68,10 @@ export class ProviderManager {
     icon?: string
     supportedModels?: string[]
     modelMappings?: Record<string, string>
+    modelCapabilities?: Record<string, ProviderModelCapability>
     modelsApiEndpoint?: string
     modelsApiHeaders?: Record<string, string>
-    credentialFields?: Array<{
-      name: string
-      label: string
-      type: 'text' | 'password' | 'textarea'
-      required: boolean
-      placeholder?: string
-      helpText?: string
-    }>
+    credentialFields?: CredentialField[]
     type?: ProviderType
     id?: string
   }): Provider {
@@ -120,6 +115,7 @@ export class ProviderManager {
       icon: data.icon,
       supportedModels: data.supportedModels,
       modelMappings: data.modelMappings,
+      modelCapabilities: data.modelCapabilities,
       modelsApiEndpoint: data.modelsApiEndpoint,
       modelsApiHeaders: data.modelsApiHeaders,
       credentialFields: data.credentialFields,

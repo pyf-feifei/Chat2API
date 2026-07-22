@@ -133,6 +133,10 @@ export interface ChatCompletionRequest {
   reasoning_effort?: 'low' | 'medium' | 'high'
   /** Reasoning effort level (camelCase, for AI SDK compatibility) */
   reasoningEffort?: 'low' | 'medium' | 'high'
+  /** Explicit provider thinking-mode override. */
+  enable_thinking?: boolean
+  /** Optional provider thinking budget. */
+  thinking_budget?: number
   /** Enable deep research mode (GLM specific) */
   deep_research?: boolean
   /** Tools for function calling */
@@ -280,6 +284,10 @@ export interface ForwardResult {
   latency?: number
   /** Set false when retrying would duplicate a slow or cancelled upstream request. */
   retryable?: boolean
+  /** Stable upstream classification used by provider-specific circuit breakers. */
+  errorCode?: string
+  /** Internal hint for a narrowly scoped retry that may bypass one account interval. */
+  recoveryHint?: 'managed_tool_stream_validation'
   providerSessionId?: string
   parentMessageId?: string
 }

@@ -28,6 +28,7 @@ import {
   resolveDeepSeekChatOptions,
   resolveKimiScenario,
 } from '../../src/main/proxy/adapters/providerModelOptions.ts'
+import { mergeProviderModelCapabilities } from '../../src/main/providers/modelSync.ts'
 
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 
@@ -322,11 +323,13 @@ test('domestic Qwen models match the web chat model ids captured from HAR', () =
 
 test('Qwen AI defaults keep only the filtered current web model set', () => {
   const expectedModels = [
+    'Qwen3.8-Max-Preview',
     'Qwen3.7-Plus',
     'Qwen3.7-Max',
     'Qwen3.6-Plus',
   ]
   const expectedMappings = {
+    'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
     'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',
     'Qwen3.6-Plus': 'qwen3.6-plus',
@@ -334,6 +337,10 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
 
   assert.deepEqual(qwenAiConfig.supportedModels, expectedModels)
   assert.deepEqual(qwenAiConfig.modelMappings, expectedMappings)
+  assert.deepEqual(qwenAiConfig.modelCapabilities, {
+    'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+    'qwen3.8-max-preview': { thinkingSkippable: false },
+  })
 
   for (const removedModel of [
     'Qwen3.7-Max-Preview',
@@ -351,6 +358,7 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
   }
 
   const qwenAiAdapterSource = readFileSync(join(root, 'src/main/proxy/adapters/qwen-ai.ts'), 'utf8')
+  assert.match(qwenAiAdapterSource, /'qwen3\.8':\s*'qwen3\.8-max-preview'/)
   assert.match(qwenAiAdapterSource, /qwen:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /qwen3:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /'qwen3\.7':\s*'qwen3\.7-max'/)
@@ -361,6 +369,22 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3-vl':/)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3-omni':/)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen2\.5':/)
+})
+
+test('model capability metadata merges live values without inventing unknown fallbacks', () => {
+  const existing = {
+    'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+  }
+  const reported = {
+    'Qwen3.8-Max-Preview': { thinkingSkippable: false },
+  }
+
+  const merged = mergeProviderModelCapabilities(existing, reported)
+  assert.deepEqual(merged, reported)
+  assert.notEqual(merged, existing)
+  assert.notEqual(merged?.['Qwen3.8-Max-Preview'], existing['Qwen3.8-Max-Preview'])
+  assert.equal(mergeProviderModelCapabilities(undefined, undefined), undefined)
+  assert.equal(mergeProviderModelCapabilities(undefined, {}), undefined)
 })
 
 test('Z.ai default models match the latest chat.z.ai HAR model ids', () => {

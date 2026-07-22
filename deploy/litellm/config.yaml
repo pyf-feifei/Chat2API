@@ -1,0 +1,31 @@
+model_list:
+  # Preserve every incoming model name. Chat2API's generic model-mapping
+  # table chooses the actual provider/model when an alias is needed.
+  - model_name: "*"
+    litellm_params:
+      model: "openai/*"
+      api_base: os.environ/CHAT2API_BASE_URL
+      api_key: os.environ/CHAT2API_API_KEY
+      # LiteLLM 1.93 requires this deployment value to be an integer. Keep
+      # retries disabled so a queue response or client cancellation is not
+      # submitted a second time by the outer proxy.
+      num_retries: 0
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # LiteLLM 1.93 monitors the downstream connection and cancels an in-flight
+  # upstream call when the client disconnects.
+  cancel_on_disconnect: true
+
+# LiteLLM has a separate router retry budget in addition to each deployment's
+# SDK retry setting. Both must be zero or one downstream request can still be
+# submitted upstream more than once.
+router_settings:
+  num_retries: 0
+
+litellm_settings:
+  drop_params: true
+  strip_anthropic_total_tokens: true
+  # Chat2API exposes the OpenAI Chat Completions contract. LiteLLM's protocol
+  # bridge is configurable so this file does not force a client-specific path.
+  use_chat_completions_url_for_anthropic_messages: os.environ/LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES

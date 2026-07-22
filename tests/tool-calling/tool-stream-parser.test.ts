@@ -73,6 +73,18 @@ test('Chat2API XML marker split across chunks emits a tool call', () => {
   assert.equal(chunks.at(-1)?.choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
 })
 
+test('complete no-argument XML emits a tool call with empty arguments', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const chunks = parser.push(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    baseChunk,
+  )
+  const toolCall = chunks.at(-1)?.choices[0].delta.tool_calls[0]
+
+  assert.equal(toolCall.function.name, 'default_api:read_file')
+  assert.deepEqual(JSON.parse(toolCall.function.arguments), {})
+})
+
 test('partial Chat2API start marker is reported as buffered so stream handlers do not leak it', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   const chunks = parser.push('<|CHAT2API|tool_calls', baseChunk)
@@ -96,7 +108,7 @@ test('invalid tool name is not emitted as a tool call', () => {
   assert.equal(chunks.some((chunk) => chunk.choices[0].delta.tool_calls), false)
 })
 
-test('duplicate equivalent XML tool calls are emitted once', () => {
+test('equivalent XML tool calls in one block remain distinct calls', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   const chunks = parser.push(
     '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>',
@@ -104,16 +116,50 @@ test('duplicate equivalent XML tool calls are emitted once', () => {
   )
 
   const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
-  assert.equal(toolChunks.length, 1)
+  assert.equal(toolChunks.length, 2)
   assert.equal(toolChunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.notEqual(
+    toolChunks[0].choices[0].delta.tool_calls[0].id,
+    toolChunks[1].choices[0].delta.tool_calls[0].id,
+  )
 })
 
-test('duplicate equivalent XML tool calls across chunks are emitted once', () => {
+test('parallel tool calls share the role only on the first emitted chunk', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const chunks = parser.push(
+    'before <tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke><invoke name="default_api:read_file"><parameter name="filePath">/tmp/b</parameter></invoke></tool_calls>',
+    baseChunk,
+    true,
+  )
+
+  assert.equal(chunks[0].choices[0].delta.role, 'assistant')
+  const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
+  assert.equal(toolChunks.length, 2)
+  assert.equal(toolChunks[0].choices[0].delta.role, undefined)
+  assert.equal(toolChunks[1].choices[0].delta.role, undefined)
+})
+
+test('a completed XML block replay in a later delta is ignored', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   const block = '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>'
 
   assert.equal(parser.push(block, baseChunk).filter((chunk) => chunk.choices[0].delta.tool_calls).length, 1)
   assert.deepEqual(parser.push(block, baseChunk), [])
+})
+
+test('concatenated completed XML blocks in one delta emit only the first block', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const first = '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/first</parameter></invoke></tool_calls>'
+  const second = '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/replayed</parameter></invoke></tool_calls>'
+
+  const chunks = parser.push(first + second, baseChunk)
+  const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
+
+  assert.equal(toolChunks.length, 1)
+  assert.deepEqual(
+    JSON.parse(toolChunks[0].choices[0].delta.tool_calls[0].function.arguments),
+    { filePath: '/tmp/first' },
+  )
 })
 
 test('fenced code block examples are emitted as text and never as tool calls', () => {
@@ -131,8 +177,30 @@ test('generated call IDs stay stable between emitted chunks and final state', ()
   const emittedId = chunks.at(-1)?.choices[0].delta.tool_calls[0].id
 
   assert.equal(parser.hasEmittedToolCall(), true)
-  assert.equal(emittedId, 'call_0')
+  assert.match(emittedId, /^call_[a-f0-9]{32}_0$/)
   assert.deepEqual(parser.flush(baseChunk), [])
+})
+
+test('default call ID prefixes are unique across parser instances', () => {
+  const block = '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>'
+  const first = new ToolStreamParser(plan('managed_xml')).push(block, baseChunk)
+  const second = new ToolStreamParser(plan('managed_xml')).push(block, baseChunk)
+  const firstId = first.at(-1)?.choices[0].delta.tool_calls[0].id
+  const secondId = second.at(-1)?.choices[0].delta.tool_calls[0].id
+
+  assert.match(firstId, /^call_[a-f0-9]{32}_0$/)
+  assert.match(secondId, /^call_[a-f0-9]{32}_0$/)
+  assert.notEqual(firstId, secondId)
+})
+
+test('request-scoped call ID prefix prevents cross-turn ID reuse', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'), 'call_requestabc')
+  const chunks = parser.push(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    baseChunk,
+  )
+
+  assert.equal(chunks.at(-1)?.choices[0].delta.tool_calls[0].id, 'call_requestabc_0')
 })
 
 test('incomplete internal tool block is dropped on flush instead of leaking protocol text', () => {

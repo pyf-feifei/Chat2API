@@ -43,7 +43,7 @@ router.get('/status', async (ctx: Context) => {
 router.get('/config', async (ctx: Context) => {
   ctx.body = {
     success: true,
-    data: ConfigManager.get().qwenAiGovernorConfig,
+    data: qwenAiRequestGovernor.getConfiguredConfig(),
   } as ManagementApiResponse<QwenAiGovernorConfig>
 })
 
