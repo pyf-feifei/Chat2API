@@ -7,10 +7,12 @@ Anthropic client -> LiteLLM :4000 -> Chat2API :8080 -> configured provider
 ```
 
 The Compose file builds a small derived image from LiteLLM `1.93.0`. The build
-applies the upstream-compatible Anthropic mid-stream error fix so provider
-failures terminate with a valid `event: error` instead of leaving Anthropic
-clients with an incomplete response. Its wildcard route preserves the incoming
-model name, so a request for `client-model` reaches Chat2API as `client-model`.
+applies the upstream-compatible Anthropic mid-stream error fix and emits
+standard Anthropic `ping` events during quiet upstream periods. Provider
+failures therefore terminate with a valid `event: error`, while a healthy but
+temporarily quiet stream continues producing transport bytes. Its wildcard
+route preserves the incoming model name, so a request for `client-model`
+reaches Chat2API as `client-model`.
 Configure that name in Chat2API's model mappings when the provider uses a
 different model ID.
 
@@ -19,13 +21,11 @@ different model ID.
 Start the Chat2API proxy on `127.0.0.1:8080` first. This can be the desktop application or the headless server:
 
 ```powershell
-# Optional: hold managed-tool SSE until its first complete protocol boundary.
-# Set these before starting Chat2API. This lets Chat2API retry a malformed
-# tool stream before LiteLLM commits a 200 response. It can delay the first
-# byte, so choose the hold budget for the deployment rather than for a
-# particular client or model.
-$env:CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
-$env:CHAT2API_VALIDATED_SSE_MAX_HOLD_MS = '600000'
+# Interactive streams should use the defaults below. Early provider failures
+# retain a short HTTP-status window, then the response switches to live SSE.
+$env:CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
+$env:CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = '15000'
+$env:CHAT2API_SSE_KEEPALIVE_INTERVAL_MS = '15000'
 
 npm run build:server
 npm run start:server
@@ -38,6 +38,8 @@ $env:LITELLM_MASTER_KEY = 'sk-change-this-key'
 # Optional: outer LiteLLM read/first-byte budget in seconds (default 900).
 # Keep this above Chat2API's active response limit and tolerated queue wait.
 $env:LITELLM_REQUEST_TIMEOUT = '900'
+# Standard Anthropic ping interval during downstream silence; 0 disables it.
+$env:LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS = '15000'
 # The bundled deployment pins its model route to num_retries: 0 so a queued
 # request or client cancellation is not submitted a second time.
 
@@ -172,6 +174,12 @@ this as an outer HTTP connect/read budget; it is not a total-generation timer,
 and streaming reads can refresh it. Chat2API independently bounds streams that
 stop making meaningful progress, while active generations have no absolute
 wall-clock cap by default. It does not change Chat2API's queue policy.
+The derived image separately emits an Anthropic `event: ping` after
+`LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS` of upstream silence (15 seconds
+by default). This is protocol-level transport activity, not assistant content,
+and applies to every translated Anthropic stream regardless of client, model,
+provider, or prompt. Set it to `0` when another proxy already guarantees a
+shorter heartbeat interval.
 The bundled config sets both the deployment `num_retries` and
 `router_settings.num_retries` to the integer `0`. LiteLLM 1.93 has separate
 SDK and Router retry budgets; setting only the deployment value still leaves
@@ -193,6 +201,17 @@ can be retried. After bytes are committed, a later failure is reported
 in-band and is never transparently retried. Set
 `CHAT2API_QWEN_AI_RETRY_COUNT=0` to disable the opt-in recovery retry or use an
 integer from `1` to `10` to override its count.
+Do not enable full buffering for an interactive client unless the delayed first
+byte is explicitly acceptable.
+
+Before live forwarding, Chat2API keeps a short preflight window so an immediate
+provider failure can retain its HTTP status. The window defaults to 15 seconds
+and is configurable with
+`CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS`; after it expires, a quiet
+stream is released and the generic SSE keep-alive starts. This avoids an
+unbounded first-byte wait without changing the provider's meaningful-idle
+limit. `CHAT2API_SSE_KEEPALIVE_INTERVAL_MS` controls comment frames on
+Chat2API's OpenAI and Gemini SSE endpoints and accepts `0` to disable them.
 
 The first validated tool-stream recovery may bypass the ordinary per-account
 minimum interval so it cannot collide with the queue timeout. It still obeys

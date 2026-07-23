@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
       args:
         LITELLM_BASE_IMAGE: "${LITELLM_BASE_IMAGE:-docker.litellm.ai/berriai/litellm:v1.93.0}"
-    image: "${LITELLM_IMAGE:-chat2api-litellm:v1.93.0-anthropic-stream-errors}"
+    image: "${LITELLM_IMAGE:-chat2api-litellm:v1.93.0-anthropic-stream-guard}"
     container_name: chat2api-litellm
     restart: unless-stopped
     command:
@@ -30,6 +30,9 @@ services:
       # LiteLLM applies this to outer connect/read waits. Streaming activity
       # refreshes that budget; Chat2API separately enforces meaningful idle.
       REQUEST_TIMEOUT: "${LITELLM_REQUEST_TIMEOUT:-900}"
+      # Anthropic ping events keep downstream byte-idle watchdogs alive while
+      # the translated upstream stream is temporarily quiet. Zero disables it.
+      LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS: "${LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

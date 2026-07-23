@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply LiteLLM PR #33352 to the pinned v1.93.0 package source."""
+"""Apply Anthropic streaming safety fixes to pinned LiteLLM v1.93.0."""
 
 from __future__ import annotations
 
@@ -11,6 +11,16 @@ from pathlib import Path
 
 MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py"
+)
+
+STANDARD_IMPORT_ANCHOR = "import copy\nimport json\nimport traceback\n"
+PATCHED_STANDARD_IMPORTS = (
+    "import asyncio\n"
+    "import contextlib\n"
+    "import copy\n"
+    "import json\n"
+    "import os\n"
+    "import traceback\n"
 )
 
 IMPORT_ANCHOR = "from litellm._uuid import uuid\n"
@@ -28,6 +38,26 @@ class _CombinedChunkSplitter:
 """
 PATCHED_HELPERS = """if TYPE_CHECKING:
     from litellm.types.utils import ModelResponseStream
+
+
+DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS = 15_000
+
+
+def _anthropic_sse_heartbeat_interval_seconds() -> float:
+    raw = os.environ.get("LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS")
+    if raw is None or not raw.strip():
+        return DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS / 1000
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS
+    if value < 0:
+        value = DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS
+    return value / 1000
+
+
+def _anthropic_sse_ping_event() -> bytes:
+    return b'event: ping\\ndata: {"type":"ping"}\\n\\n'
 
 
 def _error_status_and_message(exc: Exception) -> tuple[int, str]:
@@ -72,8 +102,29 @@ PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIte
         Async version of anthropic_sse_wrapper.
         Convert AnthropicStreamWrapper dict chunks to Server-Sent Events format.
         """
+        heartbeat_interval = _anthropic_sse_heartbeat_interval_seconds()
+        pending_chunk: Optional[asyncio.Task[Any]] = None
         try:
-            async for chunk in self:
+            while True:
+                if pending_chunk is None:
+                    pending_chunk = asyncio.create_task(self.__anext__())
+
+                if heartbeat_interval > 0:
+                    done, _ = await asyncio.wait(
+                        {pending_chunk},
+                        timeout=heartbeat_interval,
+                    )
+                    if not done:
+                        yield _anthropic_sse_ping_event()
+                        continue
+
+                try:
+                    chunk = await pending_chunk
+                except StopAsyncIteration:
+                    pending_chunk = None
+                    break
+                pending_chunk = None
+
                 if isinstance(chunk, dict):
                     event_type: str = str(chunk.get("type", "message"))
                     payload = f"event: {event_type}\\ndata: {json.dumps(chunk)}\\n\\n"
@@ -86,6 +137,12 @@ PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIte
                 exc,
             )
             yield _mid_stream_error_sse_event(exc)
+        finally:
+            if pending_chunk is not None:
+                if not pending_chunk.done():
+                    pending_chunk.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending_chunk
 '''
 
 
@@ -106,7 +163,13 @@ def patch_source(source: str) -> str:
             "review the base image before removing this build patch."
         )
 
-    patched = replace_exact(source, IMPORT_ANCHOR, PATCHED_IMPORTS, "import anchor")
+    patched = replace_exact(
+        source,
+        STANDARD_IMPORT_ANCHOR,
+        PATCHED_STANDARD_IMPORTS,
+        "standard import anchor",
+    )
+    patched = replace_exact(patched, IMPORT_ANCHOR, PATCHED_IMPORTS, "import anchor")
     patched = replace_exact(patched, HELPER_ANCHOR, PATCHED_HELPERS, "helper anchor")
     patched = replace_exact(patched, ORIGINAL_WRAPPER, PATCHED_WRAPPER, "async SSE wrapper")
     compile(patched, str(MODULE_PATH), "exec")
@@ -135,7 +198,7 @@ def main() -> None:
     patched = patch_source(source)
     target.write_text(patched, encoding="utf-8")
     py_compile.compile(str(target), doraise=True)
-    print(f"Applied Anthropic mid-stream error patch to {target}")
+    print(f"Applied Anthropic stream safety patch to {target}")
 
 
 if __name__ == "__main__":

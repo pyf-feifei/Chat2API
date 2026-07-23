@@ -91,6 +91,7 @@ function errorCodeFromError(error: unknown): string | undefined {
 function awaitQwenAiStreamPreflight(
   stream: QwenAiOutputStream,
   signal?: AbortSignal,
+  maxHoldMs: number = qwenAiStreamPreflightMaxHoldMsFromEnv(),
 ): Promise<void> {
   if (stream.qwenAiFailure) {
     return Promise.reject(stream.qwenAiFailure)
@@ -99,13 +100,21 @@ function awaitQwenAiStreamPreflight(
   const state = stream as QwenAiOutputStream & {
     readableLength?: number
     readableEnded?: boolean
+    writableEnded?: boolean
+    writableFinished?: boolean
+    destroyed?: boolean
+    closed?: boolean
   }
   if ((state.readableLength || 0) > 0) {
+    return Promise.resolve()
+  }
+  if (maxHoldMs <= 0) {
     return Promise.resolve()
   }
 
   return new Promise((resolve, reject) => {
     let settled = false
+    let holdTimer: NodeJS.Timeout | undefined
 
     const cleanup = () => {
       stream.removeListener('readable', onReadable)
@@ -114,6 +123,10 @@ function awaitQwenAiStreamPreflight(
       stream.removeListener('end', onEnd)
       stream.removeListener('close', onEnd)
       signal?.removeEventListener('abort', onAbort)
+      if (holdTimer) {
+        clearTimeout(holdTimer)
+        holdTimer = undefined
+      }
     }
     const settle = (error?: Error) => {
       if (settled) return
@@ -127,7 +140,27 @@ function awaitQwenAiStreamPreflight(
         settle(stream.qwenAiFailure)
         return
       }
-      settle()
+      if ((state.readableLength || 0) > 0) {
+        settle()
+        return
+      }
+      // Some Node readable implementations emit `readable` once when an
+      // empty stream is closed. Do not treat that notification as a visible
+      // provider event; let the end/close handlers classify the empty stream.
+      if (state.readableLength === 0) {
+        // Nudge PassThrough/readable streams so an already-ended empty stream
+        // emits `end` instead of waiting for a consumer to call read().
+        stream.read(0)
+      }
+      if (
+        state.readableEnded
+        || state.writableEnded
+        || state.writableFinished
+        || state.destroyed
+        || state.closed
+      ) {
+        onEnd()
+      }
     }
     const onFailure = (error: Error) => settle(error)
     const onError = (error: Error) => settle(error)
@@ -160,12 +193,36 @@ function awaitQwenAiStreamPreflight(
       settle(error)
     }
 
-    stream.once('readable', onReadable)
+    stream.on('readable', onReadable)
     stream.once(QWEN_AI_STREAM_FAILURE_EVENT, onFailure)
     stream.once('error', onError)
     stream.once('end', onEnd)
     stream.once('close', onEnd)
     signal?.addEventListener('abort', onAbort, { once: true })
+    holdTimer = setTimeout(() => {
+      if (stream.qwenAiFailure) {
+        settle(stream.qwenAiFailure)
+        return
+      }
+      if (
+        (state.readableLength || 0) === 0
+        && (
+          state.readableEnded
+          || state.writableEnded
+          || state.writableFinished
+          || state.destroyed
+          || state.closed
+        )
+      ) {
+        onEnd()
+        return
+      }
+      // The upstream is still open but has not produced a visible event.
+      // Release the live response so downstream clients can observe later
+      // in-band errors instead of waiting indefinitely for HTTP headers.
+      settle()
+    }, maxHoldMs)
+    holdTimer.unref?.()
 
     if (stream.qwenAiFailure) {
       settle(stream.qwenAiFailure)
@@ -198,6 +255,15 @@ function qwenAiValidatedStreamMaxBytesFromEnv(): number {
 
   const value = Number(raw)
   return Number.isInteger(value) && value > 0 ? value : fallback
+}
+
+function qwenAiStreamPreflightMaxHoldMsFromEnv(): number {
+  const fallback = 15_000
+  const raw = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  if (raw === undefined) return fallback
+
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : fallback
 }
 
 function validatedSseMaxHoldMsFromEnv(): number {

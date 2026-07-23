@@ -46,11 +46,13 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.doesNotMatch(compose, /Qwen3\.8-Max-Preview/)
   assert.match(compose, /LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:\s*"\$\{LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true\}"/)
   assert.match(compose, /REQUEST_TIMEOUT:\s*"\$\{LITELLM_REQUEST_TIMEOUT:-900\}"/)
+  assert.match(compose, /LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:\s*"\$\{LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000\}"/)
   assert.match(compose, /LITELLM_BASE_IMAGE:\s*"\$\{LITELLM_BASE_IMAGE:-docker\.litellm\.ai\/berriai\/litellm:v1\.93\.0\}"/)
-  assert.match(compose, /image:\s*"\$\{LITELLM_IMAGE:-chat2api-litellm:v1\.93\.0-anthropic-stream-errors\}"/)
+  assert.match(compose, /image:\s*"\$\{LITELLM_IMAGE:-chat2api-litellm:v1\.93\.0-anthropic-stream-guard\}"/)
   assert.match(dockerfile, /apply-anthropic-midstream-error-patch\.py/)
   assert.match(patcher, /Expected exactly one .*Refusing to apply a potentially unsafe patch/s)
   assert.match(patcher, /event: error\\\\ndata:/)
+  assert.match(patcher, /event: ping\\\\ndata: \{\"type\":\"ping\"\}/)
 })
 
 function captureOutput(child, maxLength = 64 * 1024) {
@@ -262,6 +264,36 @@ function writeOpenAiStream(response, model) {
   response.end('data: [DONE]\n\n')
 }
 
+function writeOpenAiDelayedStream(response, model, delayMs = 450) {
+  const base = {
+    id: 'chatcmpl-offline-delayed-stream-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+  }
+  const writeChunk = (delta, finishReason = null) => {
+    response.write(`data: ${JSON.stringify({
+      ...base,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    })}\n\n`)
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'close',
+  })
+  writeChunk({ role: 'assistant' })
+  writeChunk({ content: 'before pause ' })
+
+  setTimeout(() => {
+    if (response.destroyed) return
+    writeChunk({ content: 'after pause' })
+    writeChunk({}, 'stop')
+    response.end('data: [DONE]\n\n')
+  }, delayMs).unref()
+}
+
 function writeOpenAiMidstreamError(response, model) {
   const base = {
     id: 'chatcmpl-offline-midstream-error',
@@ -348,6 +380,11 @@ async function startMockUpstream() {
 
     if (body.stream && text.includes('MIDSTREAM_ERROR')) {
       writeOpenAiMidstreamError(response, body.model || MIDSTREAM_ERROR_MODEL)
+      return
+    }
+
+    if (body.stream && text.includes('HEARTBEAT_CASE')) {
+      writeOpenAiDelayedStream(response, body.model || MOCK_UPSTREAM_MODEL)
       return
     }
 
@@ -606,6 +643,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     '--add-host', 'host.docker.internal:host-gateway',
     '-p', `127.0.0.1:${liteLlmPort}:4000`,
     '-v', `${liteLlmConfigPath}:/app/config.yaml:ro`,
+    '-e', 'LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS=100',
     LITELLM_IMAGE,
     '--config', '/app/config.yaml',
     '--host', '0.0.0.0',
@@ -740,6 +778,36 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       .map((event) => event.data?.delta?.text || '')
       .join('')
     assert.equal(streamedText, 'offline stream reply')
+  })
+
+  await t.test('emits Anthropic ping events while an upstream stream is quiet', async () => {
+    const response = await fetch(`${liteLlmBaseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify(anthropicRequest({
+        stream: true,
+        messages: [{ role: 'user', content: 'HEARTBEAT_CASE' }],
+      })),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const text = await response.text()
+    assert.equal(response.status, 200, text)
+
+    const events = parseSse(text)
+    const pingEvents = events.filter((event) => event.event === 'ping')
+    assert.ok(pingEvents.length >= 1, text)
+    assert.ok(pingEvents.every((event) => event.data?.type === 'ping'), text)
+
+    const streamedText = events
+      .filter((event) => (event.event || event.data?.type) === 'content_block_delta')
+      .map((event) => event.data?.delta?.text || '')
+      .join('')
+    assert.equal(streamedText, 'before pause after pause')
+    assert.ok(
+      events.findIndex((event) => event.event === 'ping')
+        < events.findIndex((event) => (event.event || event.data?.type) === 'message_stop'),
+      text,
+    )
   })
 
   await t.test('terminates mid-stream provider failures with an Anthropic error event', async () => {

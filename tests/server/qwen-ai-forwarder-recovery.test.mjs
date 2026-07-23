@@ -442,6 +442,110 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
   assert.deepEqual(deleteCalls, ['temporary-chat-1'])
 })
 
+test('Qwen AI preflight releases a quiet stream after the configured hold', async () => {
+  const previous = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = '10'
+  const output = new PassThrough()
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-preflight',
+        parentId: null,
+      }
+    }
+
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    async handleStream() { return output }
+  }
+
+  try {
+    const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+    const forwarder = new RequestForwarder()
+    forwarder.transformRequestForPromptToolUse = request => ({
+      messages: request.messages,
+      plan: { shouldParseResponse: false },
+    })
+
+    const startedAt = Date.now()
+    const result = await forwarder.forwardQwenAi(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      Date.now(),
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true)
+    assert.equal(result.stream, output)
+    assert.ok(Date.now() - startedAt < 500, 'quiet preflight should be bounded')
+    output.end('data: [DONE]\n\n')
+  } finally {
+    output.destroy()
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+    else process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = previous
+  }
+})
+
+test('Qwen AI preflight does not treat an empty readable event as output', async () => {
+  const output = new PassThrough()
+  const deleteCalls = []
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-empty',
+        parentId: null,
+      }
+    }
+
+    async deleteChat(chatId) {
+      deleteCalls.push(chatId)
+      return true
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: false },
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+  setImmediate(() => output.end())
+
+  const result = await resultPromise
+  assert.equal(result.success, false)
+  assert.equal(result.status, 502)
+  assert.equal(result.errorCode, 'qwen_ai_stream_incomplete')
+  assert.deepEqual(deleteCalls, ['temporary-chat-empty'])
+  output.destroy()
+})
+
 test('Qwen AI forwarding returns a structured failure before the first visible stream event', async () => {
   const output = new PassThrough()
   const deleteCalls = []

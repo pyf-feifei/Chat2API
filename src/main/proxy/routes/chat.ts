@@ -5,7 +5,6 @@
 
 import Router from '@koa/router'
 import type { Context } from 'koa'
-import { PassThrough } from 'stream'
 import { ChatCompletionRequest, ChatCompletionResponse, ProxyContext } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
@@ -26,6 +25,7 @@ import {
   transformChunkToAnthropic
 } from '../utils/toolFormatConverter'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
+import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -450,7 +450,7 @@ router.post('/completions', async (ctx: Context) => {
       ctx.set('X-Accel-Buffering', 'no')
 
       // Create a wrapper stream to handle errors and collect content
-      const wrapperStream = new PassThrough()
+      const wrapperStream = new SseKeepAliveStream()
 
       // Collect stream content for logging (raw SSE output)
       let collectedContent = ''

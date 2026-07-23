@@ -23,6 +23,8 @@ services:
       # Keep managed-tool responses live by default. Enable only when the
       # deployment explicitly accepts delayed first bytes for validation.
       CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-false}
+      # Preserve early HTTP errors briefly, then release a live SSE response.
+      CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS: ${CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS:-15000}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}
@@ -37,6 +39,9 @@ services:
       # still bounded by QWEN_AI_STREAM_IDLE_TIMEOUT_MS.
       QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-0}
       QWEN_AI_STREAM_IDLE_TIMEOUT_MS: ${QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000}
+      # Emit protocol-neutral SSE comments while a downstream stream is quiet.
+      # Zero disables keep-alives for deployments that manage them elsewhere.
+      CHAT2API_SSE_KEEPALIVE_INTERVAL_MS: ${CHAT2API_SSE_KEEPALIVE_INTERVAL_MS:-15000}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}
       # Used only when managed stream validation is explicitly enabled.

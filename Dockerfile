@@ -22,7 +22,9 @@ ENV CHAT2API_DATA_DIR=/data
 ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
 # Managed-tool validation buffering is opt-in; the default preserves live SSE.
 ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
+ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
 ENV CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
+ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 ENV QWEN_AI_REQUEST_TIMEOUT_MS=600000
 # Active streams are bounded by meaningful inactivity, not total wall time.
 # Set a positive value at deployment time only when an absolute cap is needed.

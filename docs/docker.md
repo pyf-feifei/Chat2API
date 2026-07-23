@@ -184,7 +184,9 @@ QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
+CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
+CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 ```
 
 Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
@@ -205,6 +207,14 @@ When using the bundled LiteLLM Compose service, its generic outer
 Streaming activity refreshes LiteLLM's outer connect/read budget. This value is
 independent from Chat2API's queue and meaningful-idle limits and remains
 configurable.
+Chat2API emits legal SSE comment frames after
+`CHAT2API_SSE_KEEPALIVE_INTERVAL_MS` of downstream silence. These comments do
+not become model output and do not reset the Qwen meaningful-progress timer;
+set the value to `0` only when another layer owns transport keep-alives.
+Qwen's early-error preflight is bounded by
+`CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS`. Once that window expires, the
+HTTP response switches to live SSE and later provider failures are reported
+in-band instead of withholding the response indefinitely.
 Managed SSE validation is opt-in through
 `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true`. The normal value (`false`)
 forwards generated SSE immediately, so a long response does not wait for

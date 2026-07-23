@@ -6,4 +6,4 @@ COPY apply-anthropic-midstream-error-patch.py /tmp/apply-anthropic-midstream-err
 RUN /app/.venv/bin/python /tmp/apply-anthropic-midstream-error-patch.py \
     && rm /tmp/apply-anthropic-midstream-error-patch.py
 
-LABEL org.opencontainers.image.description="LiteLLM with spec-compliant Anthropic mid-stream error events"
+LABEL org.opencontainers.image.description="LiteLLM with Anthropic stream heartbeats and spec-compliant errors"

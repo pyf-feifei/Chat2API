@@ -1,7 +1,7 @@
-import { PassThrough } from 'stream'
 import type { ChatCompletionRequest, ChatCompletionResponse, ChatMessageContent } from '../types'
 import { geminiFileStore } from './fileStore'
 import { QWEN_AI_DIRECT_FILE_SCHEME, getQwenAiDirectUploadFile } from '../adapters/qwen-ai-files'
+import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 
 interface GeminiPart {
   text?: string
@@ -198,7 +198,7 @@ export function chatCompletionToGeminiResponse(response: ChatCompletionResponse,
 }
 
 export function chatCompletionStreamToGeminiSse(stream: NodeJS.ReadableStream, model: string): NodeJS.ReadableStream {
-  const output = new PassThrough()
+  const output = new SseKeepAliveStream()
   let buffer = ''
 
   stream.on('data', (chunk: Buffer) => {
