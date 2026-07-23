@@ -38,7 +38,7 @@ import {
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 300000)
-const QWEN_AI_RESPONSE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', QWEN_AI_REQUEST_TIMEOUT_MS)
+const QWEN_AI_RESPONSE_TIMEOUT_MS = nonNegativeNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', 0)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
 const QWEN_AI_DEBUG_PAYLOAD_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_PAYLOADS === 'true'
 const QWEN_AI_DEBUG_STREAM_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_STREAM === 'true'
@@ -106,6 +106,13 @@ function positiveNumberFromEnv(name: string, fallback: number): number {
   if (!raw) return fallback
   const value = Number(raw)
   return Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+function nonNegativeNumberFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : fallback
 }
 
 /**
@@ -1642,6 +1649,7 @@ export class QwenAiStreamHandler {
     let sawUpstreamCompletion = false
     let responseTimer: NodeJS.Timeout | undefined
     let idleTimer: NodeJS.Timeout | undefined
+    const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
 
     const cleanupTimers = () => {
       if (responseTimer) {
@@ -1727,9 +1735,11 @@ export class QwenAiStreamHandler {
       return transStream
     }
 
-    responseTimer = setTimeout(() => {
-      failStream(new Error(`Qwen AI response stream timed out after ${Math.ceil((options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS) / 1000)}s.`))
-    }, options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS)
+    if (responseTimeoutMs > 0) {
+      responseTimer = setTimeout(() => {
+        failStream(new Error(`Qwen AI response stream timed out after ${Math.ceil(responseTimeoutMs / 1000)}s.`))
+      }, responseTimeoutMs)
+    }
     refreshIdleTimer()
 
     options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -2127,6 +2137,7 @@ export class QwenAiStreamHandler {
       let sawUpstreamCompletion = false
       let responseTimer: NodeJS.Timeout | undefined
       let idleTimer: NodeJS.Timeout | undefined
+      const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
 
       const cleanupTimers = () => {
         if (responseTimer) {
@@ -2255,9 +2266,11 @@ export class QwenAiStreamHandler {
         return
       }
 
-      responseTimer = setTimeout(() => {
-        rejectOnce(new Error(`Qwen AI response stream timed out after ${Math.ceil((options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS) / 1000)}s.`))
-      }, options.responseTimeoutMs || QWEN_AI_RESPONSE_TIMEOUT_MS)
+      if (responseTimeoutMs > 0) {
+        responseTimer = setTimeout(() => {
+          rejectOnce(new Error(`Qwen AI response stream timed out after ${Math.ceil(responseTimeoutMs / 1000)}s.`))
+        }, responseTimeoutMs)
+      }
       refreshIdleTimer()
 
       options.signal?.addEventListener('abort', onAbort, { once: true })

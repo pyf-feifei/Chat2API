@@ -22,8 +22,8 @@ services:
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-litellm-local}"
       LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true}"
       # cancel_on_disconnect is enabled in the mounted LiteLLM configuration.
-      # Keep LiteLLM's outer read/first-byte budget above Chat2API's 600 s
-      # active-response budget. This remains generic and configurable.
+      # LiteLLM applies this to outer connect/read waits. Streaming activity
+      # refreshes that budget; Chat2API separately enforces meaningful idle.
       REQUEST_TIMEOUT: "${LITELLM_REQUEST_TIMEOUT:-900}"
     extra_hosts:
       - "host.docker.internal:host-gateway"

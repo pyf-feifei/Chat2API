@@ -293,17 +293,19 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
 
   assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
   assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{QWEN_AI_REQUEST_TIMEOUT_MS:-600000\}/)
-  assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS:\s*\$\{QWEN_AI_RESPONSE_TIMEOUT_MS:-600000\}/)
+  assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS:\s*\$\{QWEN_AI_RESPONSE_TIMEOUT_MS:-0\}/)
   assert.match(source, /QWEN_AI_STREAM_IDLE_TIMEOUT_MS:\s*\$\{QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000\}/)
   assert.doesNotMatch(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_REQUEST_TIMEOUT_MS/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
+  assert.match(dockerfile, /ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0/)
   assert.match(governorSource, /numberFromEnv\('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS',\s*120 \* 1000\)/)
 })
 
-test('Qwen AI stream readers enforce response and idle timeouts', () => {
+test('Qwen AI stream readers support an optional absolute timeout and enforce idle timeouts', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
-  assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS/)
+  assert.match(source, /nonNegativeNumberFromEnv\('QWEN_AI_RESPONSE_TIMEOUT_MS',\s*0\)/)
+  assert.match(source, /if \(responseTimeoutMs > 0\)/)
   assert.match(source, /QWEN_AI_STREAM_IDLE_TIMEOUT_MS/)
   assert.match(source, /response stream timed out after/)
   assert.match(source, /response stream was idle for more than/)

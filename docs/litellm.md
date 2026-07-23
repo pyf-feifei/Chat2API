@@ -158,9 +158,9 @@ by the selected OpenAI-compatible provider.
 The Compose service also sets LiteLLM's generic `REQUEST_TIMEOUT` to `900`
 seconds by default (override it with `LITELLM_REQUEST_TIMEOUT`). LiteLLM uses
 this as an outer HTTP connect/read budget; it is not a total-generation timer,
-and streaming reads can refresh it. Keeping it above Chat2API's `600` second
-active-response limit avoids a same-boundary race and leaves room for the
-independent queue admission wait. It does not change Chat2API's queue policy.
+and streaming reads can refresh it. Chat2API independently bounds streams that
+stop making meaningful progress, while active generations have no absolute
+wall-clock cap by default. It does not change Chat2API's queue policy.
 The bundled config sets both the deployment `num_retries` and
 `router_settings.num_retries` to the integer `0`. LiteLLM 1.93 has separate
 SDK and Router retry budgets; setting only the deployment value still leaves
@@ -202,18 +202,19 @@ willing to keep clients waiting longer. Pacing and cooldown settings remain
 available through the generic Qwen AI governor panel or management API; no
 Claude-specific model or request path is required.
 
-Long-context Qwen responses use separate generic transport and response limits:
-`QWEN_AI_REQUEST_TIMEOUT_MS` and `QWEN_AI_RESPONSE_TIMEOUT_MS` default to
-`600000` ms in the Docker image and Compose example, while
-`QWEN_AI_STREAM_IDLE_TIMEOUT_MS` defaults to `180000` ms. The longer total
-limit allows slow but active generations to finish; the idle limit still fails
-an upstream stream that stops producing data. These timers start at different
-stages: the queue timer applies only before a governor slot is acquired, and
-the response/idle timers apply after the upstream request has started. A long
-generation therefore does not consume the queue timer, but it can keep a slot
-busy long enough for later requests to receive `429`. Do not raise the queue
-timeout solely because a single generation is slow; raise it only when the
-client and deployment are intended to tolerate a longer admission wait.
+Long-context Qwen responses use separate generic transport and response limits.
+`QWEN_AI_REQUEST_TIMEOUT_MS` defaults to `600000` ms in the Docker image and
+Compose example, while `QWEN_AI_STREAM_IDLE_TIMEOUT_MS` defaults to `180000`
+ms. `QWEN_AI_RESPONSE_TIMEOUT_MS=0` disables the optional absolute response
+deadline, so meaningful thinking or answer progress is not killed solely by
+elapsed wall time. Set it to a positive millisecond value only when an absolute
+deployment cap is required. The queue timer applies only before a governor slot
+is acquired, and the response/idle timers apply after the upstream request has
+started. A long generation therefore does not consume the queue timer, but it
+can keep a slot busy long enough for later requests to receive `429`. Do not
+raise the queue timeout solely because a single generation is slow; raise it
+only when the client and deployment are intended to tolerate a longer
+admission wait.
 The queue limit is applied per governor admission attempt; a logical request
 that opts into a provider recovery retry can have more than one attempt and a
 longer total wall-clock duration. A client abort during a later attempt is

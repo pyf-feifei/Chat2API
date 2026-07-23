@@ -33,7 +33,9 @@ services:
       CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
       # Long-context provider responses are bounded separately from idle stalls.
       QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-600000}
-      QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-600000}
+      # Zero disables the absolute wall-clock cap; meaningful inactivity is
+      # still bounded by QWEN_AI_STREAM_IDLE_TIMEOUT_MS.
+      QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-0}
       QWEN_AI_STREAM_IDLE_TIMEOUT_MS: ${QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}

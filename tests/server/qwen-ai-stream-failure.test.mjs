@@ -188,6 +188,78 @@ test('Qwen AI stream does not treat SSE heartbeats as generation progress', asyn
   upstream.destroy()
 })
 
+test('Qwen AI response timeout zero disables the absolute deadline for stream and non-stream parsing', async () => {
+  const previousResponseTimeout = process.env.QWEN_AI_RESPONSE_TIMEOUT_MS
+  const previousRequestTimeout = process.env.QWEN_AI_REQUEST_TIMEOUT_MS
+  process.env.QWEN_AI_RESPONSE_TIMEOUT_MS = '0'
+  // The old parser rejected zero and fell back to this positive request limit.
+  process.env.QWEN_AI_REQUEST_TIMEOUT_MS = '20'
+  let loaded
+  try {
+    loaded = loadQwenAiStreamHandler()
+  } finally {
+    if (previousResponseTimeout === undefined) delete process.env.QWEN_AI_RESPONSE_TIMEOUT_MS
+    else process.env.QWEN_AI_RESPONSE_TIMEOUT_MS = previousResponseTimeout
+    if (previousRequestTimeout === undefined) delete process.env.QWEN_AI_REQUEST_TIMEOUT_MS
+    else process.env.QWEN_AI_REQUEST_TIMEOUT_MS = previousRequestTimeout
+  }
+
+  const {
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loaded
+  const streamingUpstream = new PassThrough()
+  streamingUpstream.on('error', () => {})
+  const streamingHandler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await streamingHandler.handleStream(streamingUpstream, {
+    idleTimeoutMs: 1_000,
+  })
+  const chunks = []
+  let streamFailure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => {
+    streamFailure = error
+  })
+  const ended = once(output, 'end')
+
+  streamingUpstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'thinking_summary',
+    status: 'typing',
+    extra: { summary_thought: { content: ['still working'] } },
+  } }] })}\n\n`)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.equal(streamFailure, undefined)
+
+  streamingUpstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    content: 'stream complete',
+  } }] })}\n\n`)
+  await ended
+  assert.match(Buffer.concat(chunks).toString(), /stream complete/)
+
+  const nonStreamingUpstream = new PassThrough()
+  nonStreamingUpstream.on('error', () => {})
+  const nonStreamingHandler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const resultPromise = nonStreamingHandler.handleNonStream(nonStreamingUpstream, {
+    idleTimeoutMs: 1_000,
+  })
+  nonStreamingUpstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'thinking_summary',
+    status: 'typing',
+    extra: { summary_thought: { content: ['still working'] } },
+  } }] })}\n\n`)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  nonStreamingUpstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    content: 'non-stream complete',
+  } }] })}\n\n`)
+
+  const result = await resultPromise
+  assert.equal(result.choices[0].message.content, 'non-stream complete')
+})
+
 test('Qwen AI stream waits for terminal output before rejecting an undeclared native tool call', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
