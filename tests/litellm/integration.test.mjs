@@ -12,7 +12,9 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const LITELLM_IMAGE = 'docker.litellm.ai/berriai/litellm:v1.93.0'
+const LITELLM_BASE_IMAGE = process.env.LITELLM_TEST_BASE_IMAGE
+  || 'docker.litellm.ai/berriai/litellm:v1.93.0'
+const LITELLM_IMAGE = 'chat2api-litellm:integration-test'
 const LITELLM_MASTER_KEY = 'sk-litellm-offline-integration-test'
 const MANAGEMENT_SECRET = 'mgmt_litellm_offline_integration_test'
 const SYNTHETIC_CLIENT_MODEL = 'client-connectivity-probe'
@@ -20,10 +22,16 @@ const MOCK_PROVIDER_ID = 'litellm-offline-openai-mock'
 const MOCK_MODEL_ALIAS = 'chat2api-mock'
 const MOCK_UPSTREAM_MODEL = 'mock-model'
 const MOCK_UPSTREAM_KEY = 'sk-mock-upstream-not-real'
+const MIDSTREAM_ERROR_MODEL = 'litellm-midstream-error-mock'
 
 test('bundled LiteLLM configuration keeps client probe and protocol bridge configurable', () => {
   const config = fs.readFileSync('deploy/litellm/config.yaml', 'utf8')
   const compose = fs.readFileSync('docker-compose.litellm.yml', 'utf8')
+  const dockerfile = fs.readFileSync('deploy/litellm/Dockerfile', 'utf8')
+  const patcher = fs.readFileSync(
+    'deploy/litellm/apply-anthropic-midstream-error-patch.py',
+    'utf8',
+  )
 
   assert.match(config, /router_settings:\s*\r?\n\s+num_retries:\s*0\b/)
   assert.match(config, /litellm_params:[\s\S]*?num_retries:\s*0\b/)
@@ -38,6 +46,11 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.doesNotMatch(compose, /Qwen3\.8-Max-Preview/)
   assert.match(compose, /LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:\s*"\$\{LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true\}"/)
   assert.match(compose, /REQUEST_TIMEOUT:\s*"\$\{LITELLM_REQUEST_TIMEOUT:-900\}"/)
+  assert.match(compose, /LITELLM_BASE_IMAGE:\s*"\$\{LITELLM_BASE_IMAGE:-docker\.litellm\.ai\/berriai\/litellm:v1\.93\.0\}"/)
+  assert.match(compose, /image:\s*"\$\{LITELLM_IMAGE:-chat2api-litellm:v1\.93\.0-anthropic-stream-errors\}"/)
+  assert.match(dockerfile, /apply-anthropic-midstream-error-patch\.py/)
+  assert.match(patcher, /Expected exactly one .*Refusing to apply a potentially unsafe patch/s)
+  assert.match(patcher, /event: error\\\\ndata:/)
 })
 
 function captureOutput(child, maxLength = 64 * 1024) {
@@ -249,6 +262,49 @@ function writeOpenAiStream(response, model) {
   response.end('data: [DONE]\n\n')
 }
 
+function writeOpenAiMidstreamError(response, model) {
+  const base = {
+    id: 'chatcmpl-offline-midstream-error',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+  }
+  const chunks = [
+    {
+      ...base,
+      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+    },
+    {
+      ...base,
+      choices: [{ index: 0, delta: { content: 'partial reply' }, finish_reason: null }],
+    },
+  ]
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'close',
+  })
+  for (const chunk of chunks) {
+    response.write(`data: ${JSON.stringify(chunk)}\n\n`)
+  }
+  response.end([
+    'event: error',
+    `data: ${JSON.stringify({
+      error: {
+        message: 'synthetic upstream ECONNRESET aborted',
+        type: 'upstream_stream_error',
+        code: 'ECONNRESET',
+        status: 502,
+      },
+    })}`,
+    '',
+    'data: [DONE]',
+    '',
+    '',
+  ].join('\n'))
+}
+
 async function startMockUpstream() {
   const calls = []
   const server = http.createServer(async (request, response) => {
@@ -287,6 +343,11 @@ async function startMockUpstream() {
           code: 'rate_limit',
         },
       }))
+      return
+    }
+
+    if (body.stream && text.includes('MIDSTREAM_ERROR')) {
+      writeOpenAiMidstreamError(response, body.model || MIDSTREAM_ERROR_MODEL)
       return
     }
 
@@ -335,9 +396,15 @@ function parseSse(text) {
     })
 }
 
-function createLiteLlmConfig(chat2ApiPort, chat2ApiKey) {
+function createLiteLlmConfig(chat2ApiPort, chat2ApiKey, mockPort) {
   return [
     'model_list:',
+    `  - model_name: ${JSON.stringify(MIDSTREAM_ERROR_MODEL)}`,
+    '    litellm_params:',
+    `      model: ${JSON.stringify(`openai/${MIDSTREAM_ERROR_MODEL}`)}`,
+    `      api_base: ${JSON.stringify(`http://host.docker.internal:${mockPort}/v1`)}`,
+    `      api_key: ${JSON.stringify(MOCK_UPSTREAM_KEY)}`,
+    '      num_retries: 0',
     '  - model_name: "*"',
     '    litellm_params:',
     '      model: "openai/*"',
@@ -360,8 +427,8 @@ function createLiteLlmConfig(chat2ApiPort, chat2ApiKey) {
   ].join('\n')
 }
 
-test('LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completely offline', {
-  timeout: 180_000,
+test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completely offline', {
+  timeout: 240_000,
 }, async (t) => {
   const repoRoot = process.cwd()
   const serverEntry = path.join(repoRoot, 'out-server/server/index.js')
@@ -371,16 +438,29 @@ test('LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completely offlin
   )
 
   try {
-    await execFileAsync('docker', ['image', 'inspect', LITELLM_IMAGE], {
+    await execFileAsync('docker', ['image', 'inspect', LITELLM_BASE_IMAGE], {
       windowsHide: true,
       timeout: 15_000,
     })
   } catch (error) {
     throw new Error(
-      `The exact offline image is required. Run: docker pull ${LITELLM_IMAGE}`,
+      `The exact offline image is required. Run: docker pull ${LITELLM_BASE_IMAGE}`,
       { cause: error },
     )
   }
+
+  await execFileAsync('docker', [
+    'build',
+    '--pull=false',
+    '--build-arg', `LITELLM_BASE_IMAGE=${LITELLM_BASE_IMAGE}`,
+    '--file', 'deploy/litellm/Dockerfile',
+    '--tag', LITELLM_IMAGE,
+    'deploy/litellm',
+  ], {
+    cwd: repoRoot,
+    windowsHide: true,
+    timeout: 120_000,
+  })
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'chat2api-litellm-integration-'))
   const chat2ApiDataDir = path.join(tempRoot, 'chat2api-data')
@@ -514,7 +594,7 @@ test('LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completely offlin
 
   fs.writeFileSync(
     liteLlmConfigPath,
-    createLiteLlmConfig(chat2ApiPort, chat2ApiKey),
+    createLiteLlmConfig(chat2ApiPort, chat2ApiKey, mock.port),
     'utf8',
   )
 
@@ -660,6 +740,36 @@ test('LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completely offlin
       .map((event) => event.data?.delta?.text || '')
       .join('')
     assert.equal(streamedText, 'offline stream reply')
+  })
+
+  await t.test('terminates mid-stream provider failures with an Anthropic error event', async () => {
+    const response = await fetch(`${liteLlmBaseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify(anthropicRequest({
+        model: MIDSTREAM_ERROR_MODEL,
+        stream: true,
+        messages: [{ role: 'user', content: 'MIDSTREAM_ERROR' }],
+      })),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const text = await response.text()
+    assert.equal(response.status, 200, text)
+
+    const events = parseSse(text)
+    const errorEvents = events.filter((event) => event.event === 'error')
+    assert.equal(errorEvents.length, 1, text)
+    assert.equal(events.at(-1)?.event, 'error', text)
+    assert.equal(errorEvents[0].data?.type, 'error', text)
+    assert.equal(errorEvents[0].data?.error?.type, 'api_error', text)
+    assert.match(errorEvents[0].data?.error?.message || '', /ECONNRESET|aborted/i)
+    assert.ok(
+      events.some((event) => (
+        event.event === 'content_block_delta'
+        && event.data?.delta?.text === 'partial reply'
+      )),
+      text,
+    )
   })
 
   await t.test('maps tools and a forced tool_choice to Anthropic tool_use', async () => {

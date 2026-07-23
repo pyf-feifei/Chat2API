@@ -6,7 +6,13 @@ Chat2API exposes OpenAI-compatible endpoints. LiteLLM provides the Anthropic-com
 Anthropic client -> LiteLLM :4000 -> Chat2API :8080 -> configured provider
 ```
 
-The Compose file pins LiteLLM `1.93.0`. Its wildcard route preserves the incoming model name, so a request for `client-model` reaches Chat2API as `client-model`. Configure that name in Chat2API's model mappings when the provider uses a different model ID.
+The Compose file builds a small derived image from LiteLLM `1.93.0`. The build
+applies the upstream-compatible Anthropic mid-stream error fix so provider
+failures terminate with a valid `event: error` instead of leaving Anthropic
+clients with an incomplete response. Its wildcard route preserves the incoming
+model name, so a request for `client-model` reaches Chat2API as `client-model`.
+Configure that name in Chat2API's model mappings when the provider uses a
+different model ID.
 
 ## Start
 
@@ -38,9 +44,14 @@ $env:LITELLM_REQUEST_TIMEOUT = '900'
 # Set this only when Chat2API API-key authentication is enabled.
 $env:CHAT2API_API_KEY = 'your-chat2api-key'
 
-docker compose -f docker-compose.litellm.yml up -d
+docker compose -f docker-compose.litellm.yml up -d --build
 docker compose -f docker-compose.litellm.yml ps
 ```
+
+`LITELLM_BASE_IMAGE` can select another compatible base image and
+`LITELLM_IMAGE` can change the local derived-image tag. The patch build verifies
+the expected LiteLLM source anchors and fails instead of applying a partial
+patch when the base source no longer matches.
 
 The Anthropic-compatible base URL is `http://127.0.0.1:4000`. The Compose service listens only on loopback by default.
 
@@ -222,12 +233,16 @@ still a genuine `499`, not a queue timeout.
 Override these environment values for deployments with different latency
 budgets.
 
-LiteLLM 1.93.0 has two error-response differences in this database-free setup:
+LiteLLM 1.93.0 has two non-streaming error-response differences in this database-free setup:
 
 - A missing client key returns `401`, but an unknown key returns `400` with `error.type=no_db_connection` because LiteLLM attempts a virtual-key database lookup.
-- Upstream failures preserve the HTTP status but use an OpenAI-style `{ "error": ... }` body instead of Anthropic's outer `{ "type": "error", "error": ... }` body.
+- Non-streaming upstream failures preserve the HTTP status but use an OpenAI-style `{ "error": ... }` body instead of Anthropic's outer `{ "type": "error", "error": ... }` body.
 
-Both cases deny the request correctly, but clients that require the exact Anthropic error envelope need an additional response-normalization layer or a future LiteLLM release that changes this behavior.
+Both cases deny the request correctly, but clients that require the exact
+Anthropic non-streaming error envelope need an additional response-normalization
+layer or a future LiteLLM release that changes this behavior. Mid-stream errors
+are normalized by the derived image because a malformed event would otherwise
+leave the client with a pending turn.
 
 ## Offline Integration Test
 
@@ -238,7 +253,7 @@ docker pull docker.litellm.ai/berriai/litellm:v1.93.0
 npm run test:litellm
 ```
 
-It verifies the complete `Anthropic client -> LiteLLM -> Chat2API -> mock upstream` chain, including non-streaming text, streaming SSE, tool calls and results, token counting, authentication, and upstream errors.
+It verifies the complete `Anthropic client -> LiteLLM -> Chat2API -> mock upstream` chain, including non-streaming text, streaming SSE, tool calls and results, token counting, authentication, and upstream errors. A separate direct mock stream verifies that partial content followed by an upstream transport error ends with a spec-compliant Anthropic `error` event.
 
 ## References
 
@@ -246,6 +261,7 @@ It verifies the complete `Anthropic client -> LiteLLM -> Chat2API -> mock upstre
 - [LiteLLM 1.93.0 wildcard configuration](https://github.com/BerriAI/litellm/blob/v1.93.0/litellm/proxy/wildcard_config.yaml)
 - [LiteLLM 1.93.0 Anthropic endpoint implementation](https://github.com/BerriAI/litellm/blob/v1.93.0/litellm/proxy/anthropic_endpoints/endpoints.py)
 - [LiteLLM 1.93.0 compatibility flag source](https://github.com/BerriAI/litellm/blob/v1.93.0/litellm/__init__.py)
+- [LiteLLM PR #33352: surface mid-stream provider errors as Anthropic error events](https://github.com/BerriAI/litellm/pull/33352)
 
 ## Stop
 

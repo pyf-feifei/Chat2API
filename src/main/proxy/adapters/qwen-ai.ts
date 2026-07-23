@@ -1675,7 +1675,6 @@ export class QwenAiStreamHandler {
       transStream.qwenAiFailure = error
       transStream.emit(QWEN_AI_STREAM_FAILURE_EVENT, error)
       options.onFailure?.(error)
-      destroyReadableStream(stream, error)
       return true
     }
 
@@ -1714,6 +1713,11 @@ export class QwenAiStreamHandler {
         },
       })}\n\n`)
       transStream.end('data: [DONE]\n\n')
+
+      // Queue the failure frame before destroying the source. Destroying an
+      // Axios response with the same error first can race a downstream SSE
+      // bridge and turn a recoverable stream error into a bare ECONNRESET.
+      destroyReadableStream(stream, upstreamError)
     }
 
     const refreshIdleTimer = () => {
@@ -2106,7 +2110,9 @@ export class QwenAiStreamHandler {
       cleanup()
       if (!finalChunkSent) {
         const error = new Error('Qwen AI downstream stream closed before upstream completed.')
-        recordStreamFailure(normalizeQwenAiStreamFailure(error))
+        const normalized = normalizeQwenAiStreamFailure(error)
+        recordStreamFailure(normalized)
+        destroyReadableStream(stream, normalized)
       }
     })
 

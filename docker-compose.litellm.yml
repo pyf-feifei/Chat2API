@@ -2,7 +2,12 @@ name: chat2api-litellm
 
 services:
   litellm:
-    image: docker.litellm.ai/berriai/litellm:v1.93.0
+    build:
+      context: ./deploy/litellm
+      dockerfile: Dockerfile
+      args:
+        LITELLM_BASE_IMAGE: "${LITELLM_BASE_IMAGE:-docker.litellm.ai/berriai/litellm:v1.93.0}"
+    image: "${LITELLM_IMAGE:-chat2api-litellm:v1.93.0-anthropic-stream-errors}"
     container_name: chat2api-litellm
     restart: unless-stopped
     command:
