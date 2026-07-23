@@ -23,6 +23,7 @@ import { createBaseChunk } from '../utils/streamToolHandler'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import { normalizeArguments } from '../toolCalling/protocols/shared'
 import {
   getToolStreamValidationFailure,
   type ToolStreamValidationFailure,
@@ -107,6 +108,57 @@ function positiveNumberFromEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback
 }
 
+/**
+ * Decide whether a parsed SSE message represents provider progress.
+ *
+ * Qwen can keep an HTTP response open with SSE comments or empty/heartbeat
+ * events. Those bytes prove that the socket is alive, but they do not prove
+ * that generation is making progress. The idle budget must therefore be
+ * refreshed after parsing a meaningful event, rather than for every raw
+ * network buffer.
+ */
+function isMeaningfulQwenAiEvent(event: { data?: unknown }): boolean {
+  const raw = typeof event.data === 'string' ? event.data.trim() : ''
+  if (!raw) return false
+  if (raw === '[DONE]') return true
+
+  let data: unknown
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    // A non-JSON event is handled as an upstream error by the parser. Count
+    // it as activity so the resulting error is reported immediately.
+    return true
+  }
+
+  if (!isObjectValue(data)) return true
+  if (data.error || data.errors || data.ret || data['response.created']) return true
+
+  const choices = data.choices
+  if (!Array.isArray(choices)) {
+    return Boolean(data.response_id || data.id)
+  }
+
+  return choices.some((choice) => {
+    if (!isObjectValue(choice)) return false
+    const delta = isObjectValue(choice.delta) ? choice.delta : undefined
+    if (!delta) return typeof choice.finish_reason === 'string' && Boolean(choice.finish_reason)
+
+    const content = delta.content
+    const reasoning = delta.reasoning_content
+    const summary = isObjectValue(delta.extra)
+      && isObjectValue(delta.extra.summary_thought)
+      && Array.isArray(delta.extra.summary_thought.content)
+      && delta.extra.summary_thought.content.some((part: unknown) => typeof part === 'string' && part.length > 0)
+
+    return (typeof content === 'string' && content.length > 0)
+      || (typeof reasoning === 'string' && reasoning.length > 0)
+      || (delta.phase === 'thinking_summary' && summary)
+      || delta.status === 'finished'
+      || (typeof choice.finish_reason === 'string' && Boolean(choice.finish_reason))
+  })
+}
+
 function destroyReadableStream(stream: any, error?: Error): void {
   if (!stream) return
 
@@ -169,6 +221,7 @@ type QwenAiUpstreamError = Error & {
   code?: string
   headers?: Record<string, string>
   retryable?: boolean
+  accountFault?: boolean
 }
 
 type QwenAiErrorEnvelopeMetadata = {
@@ -202,7 +255,32 @@ function createQwenAiToolValidationError(
   error.param = failure.param
   error.code = failure.code
   error.retryable = false
+  error.accountFault = false
   return error
+}
+
+function createQwenAiUndeclaredNativeToolError(names: string[]): QwenAiUpstreamError {
+  const uniqueNames = [...new Set(names.filter(Boolean))]
+  const error = new Error(
+    `Provider returned undeclared native tool call${uniqueNames.length === 1 ? '' : 's'}: ${uniqueNames.join(', ')}`,
+  ) as QwenAiUpstreamError
+  error.status = 502
+  error.type = 'upstream_tool_error'
+  error.param = 'tool_calls'
+  error.code = 'undeclared_native_tool_call'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiIncompleteNativeToolError(names: string[]): QwenAiUpstreamError {
+  const uniqueNames = [...new Set(names.filter(Boolean))]
+  return createQwenAiToolValidationError({
+    message: `Provider returned declared native tool call${uniqueNames.length === 1 ? '' : 's'} with incomplete JSON arguments: ${uniqueNames.join(', ')}`,
+    type: 'tool_call_parse_error',
+    param: 'tool_calls',
+    code: 'malformed_tool_call',
+  })
 }
 
 function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
@@ -241,6 +319,7 @@ function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
   if (typeof sourceRecord.type === 'string') normalized.type = sourceRecord.type
   if (typeof sourceRecord.param === 'string') normalized.param = sourceRecord.param
   if (typeof sourceRecord.code === 'string') normalized.code = sourceRecord.code
+  if (typeof sourceRecord.accountFault === 'boolean') normalized.accountFault = sourceRecord.accountFault
   normalized.headers = sanitizeForwardedErrorHeaders(sourceRecord.headers)
   return normalized
 }
@@ -1215,6 +1294,7 @@ export class QwenAiStreamHandler {
   private toolCallingPlan?: ToolCallingPlan
   private nativeToolCallStates = new Map<string, NativeToolCallState>()
   private nativeToolCallIndex = 0
+  private warnedUndeclaredNativeToolNames = new Set<string>()
   private ignoredResponseIds = new Set<string>()
   private responseBranchLocked = false
   private processedResponseEvent = false
@@ -1279,36 +1359,37 @@ export class QwenAiStreamHandler {
     }
   }
 
-  private recordResponseCreated(created: Record<string, any>): void {
+  private recordResponseCreated(created: Record<string, any>): boolean {
     const responseId = typeof created.response_id === 'string' ? created.response_id : ''
-    if (!responseId) return
+    if (!responseId) return false
 
     const responseIndex = this.getResponseIndex(created.response_index)
 
     if (!this.responseId) {
       if (responseIndex && responseIndex !== '0') {
         this.ignoreResponseBranch(responseId, responseIndex)
-        return
+        return false
       }
 
       this.setPrimaryResponseBranch(responseId, responseIndex)
-      return
+      return true
     }
 
     if (responseId === this.responseId) {
       if (responseIndex === '0') {
         this.responseBranchLocked = true
       }
-      return
+      return true
     }
 
     if (responseIndex === '0' && !this.responseBranchLocked && !this.hasStartedResponseOutput()) {
       this.ignoreResponseBranch(this.responseId, undefined)
       this.setPrimaryResponseBranch(responseId, responseIndex)
-      return
+      return true
     }
 
     this.ignoreResponseBranch(responseId, responseIndex)
+    return false
   }
 
   private shouldProcessResponseEvent(data: Record<string, any>): boolean {
@@ -1362,6 +1443,7 @@ export class QwenAiStreamHandler {
       // Send tool_calls delta
       for (let i = 0; i < toolCalls.length; i++) {
         const tc = toolCalls[i]
+        const tool = this.toolCallingPlan?.tools?.find(item => item.name === tc.function.name)
         transStream.write(
           `data: ${JSON.stringify({
             id: this.responseId || this.chatId,
@@ -1376,7 +1458,7 @@ export class QwenAiStreamHandler {
                   type: 'function',
                   function: {
                     name: tc.function.name,
-                    arguments: tc.function.arguments,
+                    arguments: normalizeArguments(tc.function.arguments, tool),
                   },
                 }],
               },
@@ -1408,23 +1490,30 @@ export class QwenAiStreamHandler {
     return false
   }
 
-  private ingestNativeToolCallFragments(delta: Record<string, any>): boolean {
-    if (!this.toolCallingPlan?.shouldParseResponse) return false
+  private ingestNativeToolCallFragments(delta: Record<string, any>): {
+    sawFragment: boolean
+    declaredProgress: boolean
+  } {
+    if (!this.toolCallingPlan?.shouldParseResponse) {
+      return { sawFragment: false, declaredProgress: false }
+    }
 
     const fragments = normalizeNativeFunctionCallDelta(delta)
     let sawFragment = false
+    let declaredProgress = false
 
     for (const fragment of fragments) {
       sawFragment = true
       const existing = this.nativeToolCallStates.get(fragment.key)
       const name = fragment.name || existing?.name || ''
       const allowed = Boolean(name && this.toolCallingPlan.allowedToolNames.has(name))
+      const argumentsText = mergeNativeToolArguments(existing?.arguments ?? '', fragment.arguments)
       const nextState: NativeToolCallState = {
         key: fragment.key,
         id: existing?.id || `${this.toolCallIdPrefix}_${this.nativeToolCallIndex}`,
         index: fragment.index ?? existing?.index ?? this.nativeToolCallIndex,
         name,
-        arguments: mergeNativeToolArguments(existing?.arguments ?? '', fragment.arguments),
+        arguments: argumentsText,
         allowed,
       }
 
@@ -1433,13 +1522,40 @@ export class QwenAiStreamHandler {
       }
 
       this.nativeToolCallStates.set(fragment.key, nextState)
+      if (allowed && (
+        !existing
+        || existing.name !== nextState.name
+        || existing.arguments !== nextState.arguments
+        || !existing.allowed
+      )) {
+        declaredProgress = true
+      }
 
-      if (name && !allowed) {
+      if (name && !allowed && !this.warnedUndeclaredNativeToolNames.has(name)) {
+        this.warnedUndeclaredNativeToolNames.add(name)
         console.warn('[QwenAI] Ignoring undeclared upstream native tool call:', name)
       }
     }
 
-    return sawFragment
+    return { sawFragment, declaredProgress }
+  }
+
+  private getUndeclaredNativeToolNames(): string[] {
+    const names = new Set<string>()
+    for (const state of this.nativeToolCallStates.values()) {
+      if (state.name && !state.allowed) names.add(state.name)
+    }
+    return [...names]
+  }
+
+  private getIncompleteDeclaredNativeToolNames(): string[] {
+    const names = new Set<string>()
+    for (const state of this.nativeToolCallStates.values()) {
+      if (state.allowed && state.name && !isCompleteJsonText(state.arguments)) {
+        names.add(state.name)
+      }
+    }
+    return [...names]
   }
 
   private getCompleteNativeToolCalls(force: boolean = false): ToolCall[] {
@@ -1449,13 +1565,18 @@ export class QwenAiStreamHandler {
       if (!state.allowed || !state.name) continue
       if (!force && !isCompleteJsonText(state.arguments)) continue
 
+      // Native provider calls bypass ToolCallingEngine's managed-protocol
+      // parser. Normalize their complete arguments against the declared
+      // client schema before exposing them to the downstream tool validator.
+      const tool = this.toolCallingPlan?.tools?.find(item => item.name === state.name)
+
       toolCalls.push({
         index: state.index,
         id: state.id,
         type: 'function',
         function: {
           name: state.name,
-          arguments: state.arguments,
+          arguments: normalizeArguments(state.arguments, tool),
         },
       })
     }
@@ -1564,6 +1685,9 @@ export class QwenAiStreamHandler {
       const errorRetryable = typeof upstreamError.retryable === 'boolean'
         ? upstreamError.retryable
         : undefined
+      const errorAccountFault = typeof upstreamError.accountFault === 'boolean'
+        ? upstreamError.accountFault
+        : undefined
       const errorType = typeof upstreamError.type === 'string'
         ? upstreamError.type
         : 'upstream_stream_error'
@@ -1578,6 +1702,7 @@ export class QwenAiStreamHandler {
           ...(errorParam === undefined ? {} : { param: errorParam }),
           ...(errorStatus === undefined ? {} : { status: errorStatus }),
           ...(errorRetryable === undefined ? {} : { retryable: errorRetryable }),
+          ...(errorAccountFault === undefined ? {} : { accountFault: errorAccountFault }),
         },
       })}\n\n`)
       transStream.end('data: [DONE]\n\n')
@@ -1588,7 +1713,8 @@ export class QwenAiStreamHandler {
         clearTimeout(idleTimer)
       }
       idleTimer = setTimeout(() => {
-        failStream(new Error(`Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`))
+        const idleMessage = `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`
+        failStream(new Error(idleMessage))
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
     }
 
@@ -1611,6 +1737,12 @@ export class QwenAiStreamHandler {
     const cleanup = () => {
       cleanupTimers()
       options.signal?.removeEventListener('abort', onAbort)
+    }
+
+    const completeStream = () => {
+      finalChunkSent = true
+      cleanup()
+      destroyReadableStream(stream)
     }
 
     const writeContent = (content: string) => {
@@ -1641,10 +1773,15 @@ export class QwenAiStreamHandler {
     const finishAnswer = (finishReason: string = 'stop') => {
       if (finalChunkSent) return
 
-      const completeNativeToolCalls = this.getCompleteNativeToolCalls(true)
+      const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
+      if (incompleteDeclaredNativeToolNames.length > 0) {
+        failStream(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
+        return
+      }
+
+      const completeNativeToolCalls = this.getCompleteNativeToolCalls()
       if (completeNativeToolCalls.length > 0 && this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
-        finalChunkSent = true
-        cleanup()
+        completeStream()
         return
       }
 
@@ -1668,8 +1805,7 @@ export class QwenAiStreamHandler {
       if (hasToolUse(this.content)) {
         console.log('[QwenAI] Found legacy tool_use in stream, sending tool_calls')
         if (this.sendToolCalls(transStream)) {
-          finalChunkSent = true
-          cleanup()
+          completeStream()
           return
         }
       }
@@ -1685,12 +1821,14 @@ export class QwenAiStreamHandler {
         return
       }
 
-      const hasUsableOutput = Boolean(
-        this.content.trim()
-        || reasoningText.trim()
-        || summaryText.trim()
-        || emittedToolCall
-      )
+      const hasAnswerOrTool = Boolean(this.content.trim() || emittedToolCall)
+      const undeclaredNativeToolNames = this.getUndeclaredNativeToolNames()
+      if (undeclaredNativeToolNames.length > 0 && !hasAnswerOrTool) {
+        failStream(createQwenAiUndeclaredNativeToolError(undeclaredNativeToolNames))
+        return
+      }
+
+      const hasUsableOutput = Boolean(hasAnswerOrTool || reasoningText.trim() || summaryText.trim())
       if (!hasUsableOutput) {
         failStream(createQwenAiStreamFailure(
           'Qwen AI returned an empty response stream without answer, reasoning, or tool calls',
@@ -1711,8 +1849,7 @@ export class QwenAiStreamHandler {
       }
       transStream.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
       transStream.end('data: [DONE]\n\n')
-      finalChunkSent = true
-      cleanup()
+      completeStream()
 
       if (this.onEnd && this.chatId) {
         this.onEnd(this.chatId)
@@ -1739,12 +1876,21 @@ export class QwenAiStreamHandler {
     const parser = createParser({
       onEvent: (event: any) => {
         try {
+          if (finalChunkSent) {
+            return
+          }
+
+          if (typeof event.data !== 'string' || event.data.trim() === '') {
+            return
+          }
+
           if (QWEN_AI_DEBUG_STREAM_LOGS) {
             console.log('[QwenAI] Parsed event:', event.event, 'data:', event.data?.substring(0, 200))
           }
           
           if (event.data === '[DONE]') {
             console.log('[QwenAI] Received [DONE] signal')
+            refreshIdleTimer()
             sawUpstreamCompletion = true
             finishAnswer('stop')
             return
@@ -1771,7 +1917,9 @@ export class QwenAiStreamHandler {
           }
 
           if (data['response.created']) {
-            this.recordResponseCreated(data['response.created'])
+            if (this.recordResponseCreated(data['response.created'])) {
+              refreshIdleTimer()
+            }
           }
 
           if (data.choices && data.choices.length > 0) {
@@ -1789,15 +1937,24 @@ export class QwenAiStreamHandler {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
             }
 
-            const sawNativeToolCall = this.ingestNativeToolCallFragments(delta)
-            if (sawNativeToolCall) {
-              const completeNativeToolCalls = this.getCompleteNativeToolCalls(status === 'finished')
-              if (completeNativeToolCalls.length > 0 && this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
-                finalChunkSent = true
+            const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
+            if (isMeaningfulQwenAiEvent(event) || nativeToolProgress.declaredProgress) {
+              refreshIdleTimer()
+            }
+
+            if (nativeToolProgress.sawFragment) {
+              const completeNativeToolCalls = this.getCompleteNativeToolCalls()
+              const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
+              if (
+                incompleteDeclaredNativeToolNames.length === 0
+                && completeNativeToolCalls.length > 0
+                && this.emitNativeToolCalls(transStream, completeNativeToolCalls)
+              ) {
+                completeStream()
                 return
               }
 
-              if (!content) {
+              if (!content && status !== 'finished') {
                 return
               }
             }
@@ -1893,7 +2050,6 @@ export class QwenAiStreamHandler {
     })
 
     stream.on('data', (buffer: Buffer) => {
-      refreshIdleTimer()
       const text = buffer.toString()
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
         console.log('[QwenAI] Raw stream data:', text.substring(0, 500))
@@ -1997,6 +2153,32 @@ export class QwenAiStreamHandler {
         }
       }
 
+      const finishNativeToolCalls = (): boolean => {
+        const toolCalls = this.getCompleteNativeToolCalls()
+        if (toolCalls.length === 0) return false
+
+        const choice = data.choices[0]
+        const response = {
+          ...data,
+          choices: [{
+            ...choice,
+            message: {
+              ...choice.message,
+              content: null,
+              tool_calls: toolCalls,
+            },
+            finish_reason: 'tool_calls',
+          }],
+        }
+        sawAnswerFinish = true
+        sawUpstreamCompletion = true
+        if (this.onEnd && this.chatId) {
+          this.onEnd(this.chatId)
+        }
+        resolveOnce(response)
+        return true
+      }
+
       const rejectOnce = (reason: any) => {
         if (!resolved) {
           resolved = true
@@ -2007,12 +2189,60 @@ export class QwenAiStreamHandler {
         }
       }
 
+      const finishNonStream = () => {
+        if (resolved) return
+
+        const choice = data.choices[0]
+        const answerText = choice.message.content || ''
+        const finalReasoning = reasoningText || summaryText
+        const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
+        if (incompleteDeclaredNativeToolNames.length > 0) {
+          rejectOnce(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
+          return
+        }
+
+        if (finishNativeToolCalls()) return
+
+        const undeclaredNativeToolNames = this.getUndeclaredNativeToolNames()
+        if (undeclaredNativeToolNames.length > 0 && !answerText.trim()) {
+          rejectOnce(createQwenAiUndeclaredNativeToolError(undeclaredNativeToolNames))
+          return
+        }
+
+        if (!answerText.trim() && !finalReasoning.trim()) {
+          rejectOnce(createQwenAiStreamFailure(
+            'Qwen AI returned an empty response stream without answer or reasoning content',
+            'qwen_ai_empty_stream',
+          ))
+          return
+        }
+
+        const response = {
+          ...data,
+          choices: [{
+            ...choice,
+            message: {
+              ...choice.message,
+              ...(finalReasoning ? { reasoning_content: finalReasoning } : {}),
+            },
+          }],
+        }
+        if (!sawAnswerFinish) {
+          console.log('[QwenAI] Non-stream completed with an upstream DONE signal.')
+        }
+        if (this.onEnd && this.chatId) {
+          this.onEnd(this.chatId)
+        }
+        resolveOnce(response)
+      }
+
       const refreshIdleTimer = () => {
         if (idleTimer) {
           clearTimeout(idleTimer)
         }
         idleTimer = setTimeout(() => {
-          rejectOnce(new Error(`Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`))
+          const idleMessage = `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`
+          rejectOnce(new Error(idleMessage))
         }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
       }
 
@@ -2035,8 +2265,18 @@ export class QwenAiStreamHandler {
       const parser = createParser({
         onEvent: (event: any) => {
           try {
+            if (resolved) {
+              return
+            }
+
+            if (typeof event.data !== 'string' || event.data.trim() === '') {
+              return
+            }
+
             if (event.data === '[DONE]') {
+              refreshIdleTimer()
               sawUpstreamCompletion = true
+              finishNonStream()
               return
             }
 
@@ -2058,7 +2298,9 @@ export class QwenAiStreamHandler {
             }
 
             if (parsed['response.created']) {
-              this.recordResponseCreated(parsed['response.created'])
+              if (this.recordResponseCreated(parsed['response.created'])) {
+                refreshIdleTimer()
+              }
               if (this.responseId) {
                 data.id = this.responseId
               }
@@ -2076,6 +2318,11 @@ export class QwenAiStreamHandler {
               const phase = delta.phase
               const status = delta.status
               const content = delta.content || ''
+
+              const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
+              if (isMeaningfulQwenAiEvent(event) || nativeToolProgress.declaredProgress) {
+                refreshIdleTimer()
+              }
 
               if (phase === 'think' && status !== 'finished') {
                 reasoningText += content
@@ -2095,17 +2342,7 @@ export class QwenAiStreamHandler {
                 if (status === 'finished') {
                   sawAnswerFinish = true
                   sawUpstreamCompletion = true
-                  // Use reasoningText or summaryText for reasoning_content
-                  const finalReasoning = reasoningText || summaryText
-                  if (finalReasoning) {
-                    data.choices[0].message.reasoning_content = finalReasoning
-                  }
-
-                  if (this.onEnd && this.chatId) {
-                    this.onEnd(this.chatId)
-                  }
-
-                  resolveOnce(data)
+                  finishNonStream()
                 }
               } else if (phase === null) {
                 if (content) {
@@ -2114,11 +2351,7 @@ export class QwenAiStreamHandler {
                 if (status === 'finished') {
                   sawAnswerFinish = true
                   sawUpstreamCompletion = true
-                  const finalReasoning = reasoningText || summaryText
-                  if (finalReasoning) {
-                    data.choices[0].message.reasoning_content = finalReasoning
-                  }
-                  resolveOnce(data)
+                  finishNonStream()
                 }
               }
             }
@@ -2130,7 +2363,6 @@ export class QwenAiStreamHandler {
       })
 
       stream.on('data', (buffer: Buffer) => {
-        refreshIdleTimer()
         parser.feed(buffer.toString())
       })
       stream.once('error', (err: Error) => {
@@ -2151,24 +2383,7 @@ export class QwenAiStreamHandler {
           rejectOnce(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
           return
         }
-        // Use reasoningText or summaryText for reasoning_content
-        const finalReasoning = reasoningText || summaryText
-        if (finalReasoning) {
-          data.choices[0].message.reasoning_content = finalReasoning
-        }
-        const answerText = data.choices[0].message.content || ''
-        const hasAnyOutput = Boolean(answerText.trim() || finalReasoning.trim())
-        if (!hasAnyOutput) {
-          rejectOnce(createQwenAiStreamFailure(
-            'Qwen AI returned an empty response stream without answer or reasoning content',
-            'qwen_ai_empty_stream',
-          ))
-          return
-        }
-        if (!sawAnswerFinish) {
-          console.log('[QwenAI] Non-stream completed with an upstream DONE signal.')
-        }
-        resolveOnce(data)
+        finishNonStream()
       }
       stream.once('end', finishFromClose)
       stream.once('close', finishFromClose)

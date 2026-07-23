@@ -191,10 +191,12 @@ Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encrypt
 
 The Qwen AI queue timeout applies only while waiting for a governor slot. The
 request and response limits apply after admission, while the idle timeout is
-refreshed whenever upstream bytes arrive. These values are independent: a long
-active generation can occupy a slot long enough for a later request to receive
-`429`, and a stream with no bytes for 180 seconds still fails before the
-600-second total response limit. An outer client or reverse proxy can impose a
+refreshed only by parsed SSE events that represent generation progress. Empty
+events and transport heartbeats keep the connection alive without resetting the
+idle budget. These values are independent: a long active generation can occupy
+a slot long enough for a later request to receive `429`, and a stream with no
+meaningful progress for 180 seconds still fails before the 600-second total
+response limit. An outer client or reverse proxy can impose a
 shorter end-to-end deadline, so its timeout must be configured separately when
 the deployment is expected to tolerate both queueing and a long generation.
 When using the bundled LiteLLM Compose service, its generic outer

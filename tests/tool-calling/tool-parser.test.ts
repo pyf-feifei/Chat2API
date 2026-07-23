@@ -107,6 +107,19 @@ test('managed xml coerces scalar arguments according to the declared schema', ()
   })
 })
 
+test('managed xml serializes structured values for fields declared as strings', () => {
+  const result = managedXmlProtocol.parse(
+    '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:write"><|CHAT2API|parameter name="filePath">/tmp/config.json</|CHAT2API|parameter><|CHAT2API|parameter name="content">{"enabled":true,"items":[1,2]}</|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+    { tools: writeTools, protocol: 'managed_xml' },
+  )
+
+  assert.equal(result.toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), {
+    filePath: '/tmp/config.json',
+    content: '{"enabled":true,"items":[1,2]}',
+  })
+})
+
 test('managed xml preserves a complete no-argument tool call as an empty object', () => {
   const result = managedXmlProtocol.parse(
     '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"></|CHAT2API|invoke></|CHAT2API|tool_calls>',

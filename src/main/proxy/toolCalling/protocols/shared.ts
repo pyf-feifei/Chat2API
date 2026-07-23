@@ -296,7 +296,23 @@ function normalizeValueForSchema(value: unknown, schema: unknown): unknown {
 }
 
 function normalizeScalarForSchema(value: unknown, variants: unknown[]): unknown {
-  if (value === null || typeof value === 'object') return value
+  if (value === null) return value
+
+  // Models sometimes emit a structured JSON value for a field declared as a
+  // string (for example, a file body). Preserve the value losslessly as JSON
+  // so downstream tool validators receive the declared primitive type. Keep
+  // object/array schemas ahead of this function so unions that explicitly
+  // accept structured values retain their native shape.
+  if (typeof value === 'object') {
+    if (variants.some((variant) => schemaTypeIncludes(variant, 'string'))) {
+      try {
+        return JSON.stringify(value)
+      } catch {
+        return value
+      }
+    }
+    return value
+  }
 
   // Preserve a value when it already matches one of the declared scalar types.
   // This matters for unions such as `string | number`.

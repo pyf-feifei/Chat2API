@@ -21,8 +21,8 @@ function loadQwenAiStreamHandler(overrides = {}) {
   const localModules = {
     '../../store/types': {},
     '../promptToolUse': {
-      hasToolUse: () => false,
-      parseToolUse: () => [],
+      hasToolUse: overrides.hasToolUse || (() => false),
+      parseToolUse: overrides.parseToolUse || (() => []),
     },
     './qwen-ai-token-refresh': {
       QwenAiTokenRefresher: class {},
@@ -57,10 +57,29 @@ function loadQwenAiStreamHandler(overrides = {}) {
     '../toolCalling/streamValidationPolicy': {
       getToolStreamValidationFailure: overrides.getToolStreamValidationFailure || (() => undefined),
     },
+    '../toolCalling/protocols/shared': {
+      normalizeArguments: overrides.normalizeArguments || ((value, tool) => {
+        const parsed = typeof value === 'string' ? JSON.parse(value) : value
+        const properties = tool?.parameters?.properties || {}
+        const normalized = Object.fromEntries(Object.entries(parsed || {}).map(([key, item]) => [
+          key,
+          properties[key]?.type === 'string' && (
+            (item !== null && typeof item === 'object')
+            || typeof item === 'number'
+            || typeof item === 'boolean'
+          )
+            ? (typeof item === 'object' ? JSON.stringify(item) : String(item))
+            : properties[key]?.type === 'array' && item !== null && !Array.isArray(item)
+              ? [item]
+              : item,
+        ]))
+        return JSON.stringify(normalized)
+      }),
+    },
     './qwen-ai-native-tools': {
-      isCompleteJsonText: () => true,
-      mergeNativeToolArguments: (_current, next) => next,
-      normalizeNativeFunctionCallDelta: () => [],
+      isCompleteJsonText: overrides.isCompleteJsonText || (() => true),
+      mergeNativeToolArguments: overrides.mergeNativeToolArguments || ((_current, next) => next),
+      normalizeNativeFunctionCallDelta: overrides.normalizeNativeFunctionCallDelta || (() => []),
     },
   }
   const testRequire = specifier => {
@@ -75,6 +94,36 @@ function loadQwenAiStreamHandler(overrides = {}) {
 
   new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
   return module.exports
+}
+
+class PassthroughToolStreamParser {
+  push(content, baseChunk, includeRole) {
+    return [{
+      ...baseChunk,
+      choices: [{
+        index: 0,
+        delta: {
+          ...(includeRole ? { role: 'assistant' } : {}),
+          content,
+        },
+        finish_reason: null,
+      }],
+    }]
+  }
+
+  flush() { return [] }
+  recoverFromContent() { return [] }
+  hasPendingToolProtocol() { return false }
+  hasEmittedToolCall() { return false }
+}
+
+function isCompleteJsonText(value) {
+  try {
+    JSON.parse(value)
+    return true
+  } catch {
+    return false
+  }
 }
 
 test('Qwen AI stream exposes an idle failure to the proxy route', async () => {
@@ -104,6 +153,858 @@ test('Qwen AI stream exposes an idle failure to the proxy route', async () => {
   assert.equal(output.qwenAiFailure, failure)
   await ended
   upstream.destroy()
+})
+
+test('Qwen AI stream does not treat SSE heartbeats as generation progress', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 100,
+    idleTimeoutMs: 20,
+  })
+  const ended = once(output, 'end')
+  output.resume()
+
+  const failurePromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('heartbeat stream did not fail')), 300)
+    output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => {
+      clearTimeout(timer)
+      resolve(error)
+    })
+  })
+  const heartbeat = setInterval(() => {
+    upstream.write(': keep-alive\n\ndata:\n\n')
+  }, 5)
+
+  const failure = await failurePromise
+  clearInterval(heartbeat)
+  await ended
+
+  assert.match(failure.message, /idle for more than/)
+  assert.equal(failure.status, 504)
+  upstream.destroy()
+})
+
+test('Qwen AI stream waits for terminal output before rejecting an undeclared native tool call', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+
+  upstream.write(`data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'answer',
+        status: 'typing',
+        function_call: {
+          name: 'provider_internal_tool',
+          arguments: '{}',
+        },
+      },
+    }],
+  })}\n\n`)
+
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(output.qwenAiFailure, undefined)
+
+  upstream.write(`data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: {
+          name: 'provider_internal_tool',
+          arguments: '{}',
+        },
+      },
+    }],
+  })}\n\n`)
+
+  const [failure] = await failurePromise
+  await ended
+
+  assert.equal(failure.status, 502)
+  assert.equal(failure.type, 'upstream_tool_error')
+  assert.equal(failure.param, 'tool_calls')
+  assert.equal(failure.code, 'undeclared_native_tool_call')
+  assert.equal(failure.retryable, false)
+  assert.equal(failure.accountFault, false)
+  assert.match(failure.message, /undeclared native tool call: provider_internal_tool/)
+  assert.match(Buffer.concat(chunks).toString(), /"accountFault":false/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream does not let undeclared native tool events reset the idle timer', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 300,
+    idleTimeoutMs: 25,
+  })
+  const ended = once(output, 'end')
+  output.resume()
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const event = `data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'answer',
+        status: 'typing',
+        function_call: { name: 'provider_internal_tool', arguments: '{}' },
+      },
+    }],
+  })}\n\n`
+  const interval = setInterval(() => upstream.write(event), 5)
+
+  const [failure] = await failurePromise
+  clearInterval(interval)
+  await ended
+
+  assert.equal(failure.status, 504)
+  assert.match(failure.message, /idle for more than/)
+  assert.equal(failure.accountFault, undefined)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream allows usable answer text after an undeclared native tool event', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.on(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  upstream.write([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'provider_internal_tool', arguments: '{}' },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'usable answer',
+    } }] })}\n\n`,
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure, undefined)
+  assert.match(body, /usable answer/)
+  assert.match(body, /\[DONE\]/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream allows a declared native tool after an undeclared fragment on the same call', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.on(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  upstream.write([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'provider_internal_tool', arguments: '{}' },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'declared_tool', arguments: '{"value":1}' },
+    } }] })}\n\n`,
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure, undefined)
+  assert.match(body, /declared_tool/)
+  assert.match(body, /tool_calls/)
+  assert.match(body, /\[DONE\]/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream normalizes complete native arguments against the declared schema', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['Write']),
+    toolChoiceMode: 'auto',
+    tools: [{
+      name: 'Write',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          content: { type: 'string' },
+          todos: { type: 'array', items: { type: 'object' } },
+        },
+      },
+      source: 'openai',
+    }],
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+
+  upstream.end(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    function_call: {
+      name: 'Write',
+      arguments: JSON.stringify({
+        file_path: 'src/example.ts',
+        content: { enabled: true },
+        todos: { subject: 'verify', status: 'pending' },
+      }),
+    },
+  } }] })}\n\n`)
+
+  await ended
+  const events = Buffer.concat(chunks).toString().split('\n\n')
+    .filter(block => block.startsWith('data: ') && !block.includes('[DONE]'))
+    .map(block => JSON.parse(block.slice('data: '.length)))
+  const toolCall = events.flatMap(event => event.choices?.[0]?.delta?.tool_calls || [])[0]
+  assert.ok(toolCall)
+  assert.deepEqual(JSON.parse(toolCall.function.arguments), {
+    file_path: 'src/example.ts',
+    content: '{"enabled":true}',
+    todos: [{ subject: 'verify', status: 'pending' }],
+  })
+  assert.match(Buffer.concat(chunks).toString(), /\[DONE\]/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream normalizes legacy tool_use arguments against the declared schema', async () => {
+  const legacyArguments = JSON.stringify({
+    taskId: 1,
+    content: { enabled: true },
+  })
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    hasToolUse: content => content.includes('<tool_use>'),
+    parseToolUse: () => [{
+      id: 'legacy-call',
+      type: 'function',
+      function: {
+        name: 'Write',
+        arguments: legacyArguments,
+      },
+    }],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['Write']),
+    toolChoiceMode: 'auto',
+    tools: [{
+      name: 'Write',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string' },
+          content: { type: 'string' },
+        },
+      },
+      source: 'openai',
+    }],
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+
+  upstream.end(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    content: `<tool_use><name>Write</name><arguments>${legacyArguments}</arguments></tool_use>`,
+  } }] })}\n\n`)
+
+  await ended
+  const events = Buffer.concat(chunks).toString().split('\n\n')
+    .filter(block => block.startsWith('data: ') && !block.includes('[DONE]'))
+    .map(block => JSON.parse(block.slice('data: '.length)))
+  const toolCall = events.flatMap(event => event.choices?.[0]?.delta?.tool_calls || [])[0]
+  assert.ok(toolCall)
+  assert.deepEqual(JSON.parse(toolCall.function.arguments), {
+    taskId: '1',
+    content: '{"enabled":true}',
+  })
+})
+
+test('Qwen AI stream applies each declared schema to parallel native tool calls', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.tool_calls?.map((toolCall, index) => ({
+      key: toolCall.id || String(index),
+      id: toolCall.id,
+      index,
+      name: toolCall.function?.name,
+      arguments: toolCall.function?.arguments,
+    })) || [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['Write', 'TodoWrite']),
+    toolChoiceMode: 'auto',
+    tools: [
+      {
+        name: 'Write',
+        parameters: {
+          type: 'object',
+          properties: { content: { type: 'string' } },
+        },
+        source: 'openai',
+      },
+      {
+        name: 'TodoWrite',
+        parameters: {
+          type: 'object',
+          properties: { todos: { type: 'array', items: { type: 'object' } } },
+        },
+        source: 'openai',
+      },
+    ],
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'typing',
+    tool_calls: [
+      {
+        id: 'write-call',
+        function: {
+          name: 'Write',
+          arguments: JSON.stringify({ content: { enabled: true } }),
+        },
+      },
+      {
+        id: 'todo-call',
+        function: {
+          name: 'TodoWrite',
+          arguments: JSON.stringify({ todos: { content: 'verify', status: 'pending' } }),
+        },
+      },
+    ],
+  } }] })}\n\n`)
+
+  await ended
+  const events = Buffer.concat(chunks).toString().split('\n\n')
+    .filter(block => block.startsWith('data: ') && !block.includes('[DONE]'))
+    .map(block => JSON.parse(block.slice('data: '.length)))
+  const toolCalls = events.flatMap(event => event.choices?.[0]?.delta?.tool_calls || [])
+  assert.equal(toolCalls.length, 2)
+  assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), {
+    content: '{"enabled":true}',
+  })
+  assert.deepEqual(JSON.parse(toolCalls[1].function.arguments), {
+    todos: [{ content: 'verify', status: 'pending' }],
+  })
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream rejects incomplete declared native tool arguments only at terminal output', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+  const chunks = []
+  let observedFailure
+  output.on('data', chunk => chunks.push(chunk))
+  output.on(QWEN_AI_STREAM_FAILURE_EVENT, error => { observedFailure = error })
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const ended = once(output, 'end')
+
+  upstream.write([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'think',
+      status: 'typing',
+      content: 'planning',
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'declared_tool', arguments: '{"value":' },
+    } }] })}\n\n`,
+  ].join(''))
+
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(observedFailure, undefined)
+  assert.equal(upstream.destroyed, false)
+
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    function_call: { name: 'declared_tool', arguments: '{"value":' },
+  } }] })}\n\n`)
+
+  const [failure] = await failurePromise
+  await ended
+  assert.equal(failure.status, 502)
+  assert.equal(failure.type, 'tool_call_parse_error')
+  assert.equal(failure.param, 'tool_calls')
+  assert.equal(failure.code, 'malformed_tool_call')
+  assert.equal(failure.retryable, false)
+  assert.equal(failure.accountFault, false)
+  assert.match(failure.message, /incomplete JSON arguments: declared_tool/)
+  assert.doesNotMatch(Buffer.concat(chunks).toString(), /"finish_reason":"tool_calls"/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream rejects an empty declared native tool argument block', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-empty',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const ended = once(output, 'end')
+
+  upstream.end(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    function_call: { name: 'declared_tool', arguments: '' },
+  } }] })}\n\n`)
+
+  const [failure] = await failurePromise
+  await ended
+  assert.equal(failure.status, 502)
+  assert.equal(failure.type, 'tool_call_parse_error')
+  assert.equal(failure.code, 'malformed_tool_call')
+  assert.equal(failure.accountFault, false)
+  assert.match(failure.message, /incomplete JSON arguments: declared_tool/)
+  assert.doesNotMatch(Buffer.concat(chunks).toString(), /"finish_reason":"tool_calls"/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream rejects an incomplete declared call before complete calls or answer text can finish', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: delta => delta.tool_calls?.map((toolCall, index) => ({
+      key: toolCall.id || String(index),
+      id: toolCall.id,
+      index,
+      name: toolCall.function?.name,
+      arguments: toolCall.function?.arguments,
+    })) || [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['complete_tool', 'incomplete_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const ended = once(output, 'end')
+
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    content: 'I will use the available tools.',
+    tool_calls: [{
+      id: 'native-complete',
+      function: { name: 'complete_tool', arguments: '{"value":1}' },
+    }, {
+      id: 'native-incomplete',
+      function: { name: 'incomplete_tool', arguments: '{"value":' },
+    }],
+  } }] })}\n\n`)
+
+  const [failure] = await failurePromise
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure.status, 502)
+  assert.equal(failure.code, 'malformed_tool_call')
+  assert.equal(failure.retryable, false)
+  assert.equal(failure.accountFault, false)
+  assert.match(failure.message, /incomplete JSON arguments: incomplete_tool/)
+  assert.match(body, /I will use the available tools/)
+  assert.doesNotMatch(body, /"finish_reason":"tool_calls"/)
+  assert.doesNotMatch(body, /"finish_reason":"stop"/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI non-stream parsing rejects an undeclared native tool only at terminal output', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.tool_calls?.map((toolCall, index) => ({
+      key: toolCall.id || String(index),
+      id: toolCall.id,
+      index,
+      name: toolCall.function?.name,
+      arguments: toolCall.function?.arguments,
+    })) || [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const result = handler.handleNonStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+
+  upstream.write(`data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'answer',
+        status: 'typing',
+        tool_calls: [{
+          id: 'native-call-1',
+          function: {
+            name: 'another_provider_tool',
+            arguments: '{}',
+          },
+        }],
+      },
+    }],
+  })}\n\n`)
+
+  upstream.write(`data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'answer',
+        status: 'finished',
+        tool_calls: [{
+          id: 'native-call-1',
+          function: {
+            name: 'another_provider_tool',
+            arguments: '{}',
+          },
+        }],
+      },
+    }],
+  })}\n\n`)
+
+  await assert.rejects(result, error => (
+    error.status === 502
+    && error.type === 'upstream_tool_error'
+    && error.param === 'tool_calls'
+    && error.code === 'undeclared_native_tool_call'
+    && error.retryable === false
+    && error.accountFault === false
+    && /another_provider_tool/.test(error.message)
+  ))
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI non-stream parsing allows answer text after an undeclared native tool event', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const result = handler.handleNonStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+
+  upstream.write([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'provider_internal_tool', arguments: '{}' },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'usable answer',
+    } }] })}\n\n`,
+  ].join(''))
+
+  const response = await result
+  assert.equal(response.choices[0].message.content, 'usable answer')
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI non-stream parsing rejects terminal incomplete declared native tool arguments', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const result = handler.handleNonStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+
+  upstream.write([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'think',
+      status: 'typing',
+      content: 'planning',
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      function_call: { name: 'declared_tool', arguments: '{"value":' },
+    } }] })}\n\n`,
+  ].join(''))
+
+  await assert.rejects(result, error => (
+    error.status === 502
+    && error.type === 'tool_call_parse_error'
+    && error.param === 'tool_calls'
+    && error.code === 'malformed_tool_call'
+    && error.retryable === false
+    && error.accountFault === false
+    && /incomplete JSON arguments: declared_tool/.test(error.message)
+  ))
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI non-stream rejects an incomplete declared call before complete calls or answer text can finish', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: delta => delta.tool_calls?.map((toolCall, index) => ({
+      key: toolCall.id || String(index),
+      id: toolCall.id,
+      index,
+      name: toolCall.function?.name,
+      arguments: toolCall.function?.arguments,
+    })) || [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['complete_tool', 'incomplete_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const result = handler.handleNonStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'finished',
+    content: 'I will use the available tools.',
+    tool_calls: [{
+      id: 'native-complete',
+      function: { name: 'complete_tool', arguments: '{"value":1}' },
+    }, {
+      id: 'native-incomplete',
+      function: { name: 'incomplete_tool', arguments: '{"value":' },
+    }],
+  } }] })}\n\n`)
+
+  await assert.rejects(result, error => (
+    error.status === 502
+    && error.type === 'tool_call_parse_error'
+    && error.code === 'malformed_tool_call'
+    && error.retryable === false
+    && error.accountFault === false
+    && /incomplete JSON arguments: incomplete_tool/.test(error.message)
+  ))
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI non-stream parsing does not accept a native tool after truncated upstream output', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.tool_calls?.map((toolCall, index) => ({
+      key: toolCall.id || String(index),
+      id: toolCall.id,
+      index,
+      name: toolCall.function?.name,
+      arguments: toolCall.function?.arguments,
+    })) || [],
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const result = handler.handleNonStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 100,
+  })
+
+  upstream.end(`data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'answer',
+        status: 'typing',
+        tool_calls: [{
+          id: 'native-call-1',
+          function: {
+            name: 'declared_tool',
+            arguments: '{"value":',
+          },
+        }],
+      },
+    }],
+  })}\n\n`)
+
+  await assert.rejects(result, error => (
+    error.status === 502
+    && error.code === 'qwen_ai_stream_incomplete'
+    && error.retryable === false
+  ))
+  assert.equal(upstream.destroyed, true)
 })
 
 test('Qwen AI stream classifies an in-band captcha envelope as risk control', async () => {
@@ -496,6 +1397,8 @@ test('Qwen AI stream ignores a transport cancellation after terminal output', as
     })}\n\n`)
     await ended
 
+    assert.equal(upstream.destroyed, true)
+
     const cancellation = Object.assign(new Error('canceled'), {
       name: 'CanceledError',
       code: 'ERR_CANCELED',
@@ -513,6 +1416,44 @@ test('Qwen AI stream ignores a transport cancellation after terminal output', as
     console.error = originalConsoleError
     upstream.destroy()
   }
+})
+
+test('Qwen AI stream destroys upstream and ignores events after terminal output', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream)
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+
+  upstream.write([
+    `data: ${JSON.stringify({
+      choices: [{
+        delta: {
+          phase: 'answer',
+          status: 'finished',
+          content: 'done',
+          finish_reason: 'stop',
+        },
+      }],
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      choices: [{
+        delta: {
+          phase: 'answer',
+          status: 'typing',
+          content: 'late content',
+        },
+      }],
+    })}\n\n`,
+  ].join(''))
+
+  await ended
+
+  assert.equal(upstream.destroyed, true)
+  assert.match(Buffer.concat(chunks).toString(), /done/)
+  assert.doesNotMatch(Buffer.concat(chunks).toString(), /late content/)
 })
 
 test('Qwen AI stream exposes a downstream close before upstream completion', async () => {
@@ -619,12 +1560,14 @@ test('Qwen AI stream reports a managed tool validation failure through its failu
   assert.equal(failure.type, validationFailure.type)
   assert.equal(failure.code, validationFailure.code)
   assert.equal(failure.retryable, false)
+  assert.equal(failure.accountFault, false)
   assert.equal(output.qwenAiFailure, failure)
 
   const serialized = Buffer.concat(chunks).toString()
   assert.match(serialized, /"type":"tool_call_parse_error"/)
   assert.match(serialized, /"param":"tool_calls"/)
   assert.match(serialized, /"code":"malformed_tool_call"/)
+  assert.match(serialized, /"accountFault":false/)
   assert.match(serialized, /"status":502/)
   assert.match(serialized, /"retryable":false/)
 })

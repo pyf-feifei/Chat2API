@@ -18,7 +18,7 @@ test('forwarder does not retry cancellations or completed response timeouts', ()
   assert.match(source, /isQwenAiProvider && \(lastStatus === 403 \|\| lastStatus === 429 \|\| lastStatus === 504\)/)
   assert.match(source, /status === 499[\s\S]*status === 403[\s\S]*status === 429[\s\S]*status === 504[\s\S]*\? false/)
   assert.match(source, /lastRetryable === false[\s\S]*lastStatus === 499/)
-  assert.match(source, /context\.signal\?\.aborted && result\.status !== 499[\s\S]*lastStatus = 499/)
+  assert.match(source, /if \(context\.signal\?\.aborted\) \{[\s\S]*lastAccountFault = undefined[\s\S]*if \(result\.status !== 499\) \{[\s\S]*lastStatus = 499/)
 })
 
 test('forwarder returns a provider 429 to the caller instead of internally requeueing it', () => {

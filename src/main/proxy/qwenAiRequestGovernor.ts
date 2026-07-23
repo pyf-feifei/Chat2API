@@ -494,7 +494,10 @@ export class QwenAiRequestGovernor {
           item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
           return
         }
-        this.openCooldown(item.accountId, this.getConfig().failureCooldownMs, 'exception')
+        const accountFault = (error as { accountFault?: unknown } | undefined)?.accountFault
+        if (accountFault !== false) {
+          this.openCooldown(item.accountId, this.getConfig().failureCooldownMs, 'exception')
+        }
         release()
         item.reject(error)
       })
@@ -542,6 +545,10 @@ export class QwenAiRequestGovernor {
     // recovery attempt, so opening the normal 5xx cooldown here would make
     // that retry sit behind the queue timeout.
     if (result.recoveryHint === 'managed_tool_stream_validation') {
+      return result
+    }
+
+    if (result.accountFault === false) {
       return result
     }
 

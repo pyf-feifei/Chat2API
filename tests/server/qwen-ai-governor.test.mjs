@@ -506,6 +506,69 @@ test('Qwen AI governor adds Retry-After from its configured cooldown when upstre
   assert.equal(result.retryable, false)
 })
 
+test('Qwen AI governor does not cool an account for an account-neutral protocol failure', async () => {
+  const Governor = loadGovernorForRuntimeTest(3_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    failureCooldownMs: 45_000,
+  })
+  const governor = new Governor()
+
+  await governor.run('account-1', async () => ({
+    success: false,
+    status: 502,
+    error: 'Provider returned an unsupported response protocol',
+    errorCode: 'synthetic_protocol_error',
+    retryable: false,
+    accountFault: false,
+  }))
+
+  const status = governor.getStatus(
+    [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+    [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+  )
+  assert.equal(status.accounts[0].governorCooldownInMs, 0)
+  assert.equal(status.accounts[0].governorCooldownReason, undefined)
+})
+
+test('Qwen AI governor does not cool an account when an account-neutral request rejects', async () => {
+  const Governor = loadGovernorForRuntimeTest(3_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    failureCooldownMs: 45_000,
+  })
+  const governor = new Governor()
+  const error = Object.assign(new Error('local protocol rejection'), { accountFault: false })
+
+  await assert.rejects(
+    governor.run('account-1', async () => {
+      throw error
+    }),
+    rejected => rejected === error,
+  )
+
+  const status = governor.getStatus(
+    [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+    [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+  )
+  assert.equal(status.accounts[0].governorCooldownInMs, 0)
+  assert.equal(status.accounts[0].governorCooldownReason, undefined)
+})
+
+test('Qwen AI account-neutral failures bypass load-balancer penalties on immediate and deferred paths', () => {
+  const proxyTypes = fs.readFileSync('src/main/proxy/types.ts', 'utf8')
+  const forwarderSource = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
+  const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
+
+  assert.match(proxyTypes, /accountFault\?: boolean/)
+  assert.match(forwarderSource, /accountFault: typeof upstreamAccountFault === 'boolean'/)
+  assert.match(chatRouteSource, /result\.accountFault !== false/)
+  assert.match(chatRouteSource, /streamFailureAccountFault\(error\) !== false/)
+  assert.match(chatRouteSource, /accountFault: streamFailureAccountFault\(error\)/)
+})
+
 test('Qwen AI risk-control failures cool the account and require distinct accounts before global circuit', () => {
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
   const loadBalancerSource = fs.readFileSync('src/main/proxy/loadbalancer.ts', 'utf8')

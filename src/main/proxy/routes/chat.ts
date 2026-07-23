@@ -119,6 +119,11 @@ function streamFailureCode(error: Error | undefined): string | undefined {
   return typeof code === 'string' && code.trim() ? code : undefined
 }
 
+function streamFailureAccountFault(error: Error | undefined): boolean | undefined {
+  const accountFault = (error as (Error & { accountFault?: unknown }) | undefined)?.accountFault
+  return typeof accountFault === 'boolean' ? accountFault : undefined
+}
+
 function streamFailureHeaders(error: Error | undefined): Record<string, string> | undefined {
   const headers = (error as (Error & { headers?: unknown }) | undefined)?.headers
   return sanitizeForwardedErrorHeaders(headers)
@@ -261,17 +266,19 @@ router.post('/completions', async (ctx: Context) => {
     if (!result.success) {
       proxyStatusManager.recordRequestFailure(latency)
 
-      if (isQwenAiRiskControl(
-        provider.id,
-        result.status,
-        result.error,
-        result.errorCode,
-        QwenAiAdapter.isQwenAiProvider(provider),
-      )) {
-        loadBalancer.markQwenAiRiskControl(account.id)
-      } else if (result.status && result.status >= 400
-        && result.status !== 429 && result.status !== 499) {
-        loadBalancer.markAccountFailed(account.id)
+      if (result.accountFault !== false) {
+        if (isQwenAiRiskControl(
+          provider.id,
+          result.status,
+          result.error,
+          result.errorCode,
+          QwenAiAdapter.isQwenAiProvider(provider),
+        )) {
+          loadBalancer.markQwenAiRiskControl(account.id)
+        } else if (result.status && result.status >= 400
+          && result.status !== 429 && result.status !== 499) {
+          loadBalancer.markAccountFailed(account.id)
+        }
       }
 
       ctx.status = result.status || 500
@@ -488,10 +495,11 @@ router.post('/completions', async (ctx: Context) => {
             error: error?.message || 'Unknown Qwen AI stream error',
             errorCode: failureCode,
             retryable: false,
+            accountFault: streamFailureAccountFault(error),
           })
         }
         proxyStatusManager.recordRequestFailure(completionLatency)
-        if (failureStatus !== 499) {
+        if (failureStatus !== 499 && streamFailureAccountFault(error) !== false) {
           if (qwenAiFailure && isQwenAiRiskControl(
             provider.id,
             failureStatus,

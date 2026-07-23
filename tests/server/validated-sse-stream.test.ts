@@ -31,7 +31,7 @@ test('validated SSE buffering rejects an upstream error before replay', async ()
   const input = [
     'data: {"choices":[{"delta":{"reasoning_content":"partial"}}]}\n\n',
     'event: error\n',
-    'data: {"error":{"message":"malformed tool block","type":"tool_call_parse_error","code":"malformed_tool_call"}}\n\n',
+    'data: {"error":{"message":"malformed tool block","type":"tool_call_parse_error","code":"malformed_tool_call","accountFault":false}}\n\n',
     'data: [DONE]\n\n',
   ].join('')
 
@@ -43,6 +43,7 @@ test('validated SSE buffering rejects an upstream error before replay', async ()
       assert.equal(error.type, 'tool_call_parse_error')
       assert.equal(error.code, 'malformed_tool_call')
       assert.equal(error.status, 502)
+      assert.equal(error.accountFault, false)
       return true
     },
   )

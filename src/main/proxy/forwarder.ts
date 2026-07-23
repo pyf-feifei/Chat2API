@@ -452,6 +452,7 @@ export class RequestForwarder {
     let lastHeaders: Record<string, string> | undefined
     let lastRetryable: boolean | undefined
     let lastErrorCode: string | undefined
+    let lastAccountFault: boolean | undefined
     let previousRecoveryHint: ForwardResult['recoveryHint']
     let recoveryBypassUsed = false
 
@@ -461,6 +462,7 @@ export class RequestForwarder {
         lastHeaders = undefined
         lastError = 'Client disconnected before the next request attempt.'
         lastRetryable = false
+        lastAccountFault = undefined
         break
       }
 
@@ -478,6 +480,7 @@ export class RequestForwarder {
           lastHeaders = undefined
           lastError = 'Client disconnected during request retry backoff.'
           lastRetryable = false
+          lastAccountFault = undefined
           break
         }
       }
@@ -555,14 +558,18 @@ export class RequestForwarder {
         lastHeaders = result.headers
         lastRetryable = result.retryable
         lastErrorCode = result.errorCode
+        lastAccountFault = result.accountFault
         previousRecoveryHint = result.recoveryHint
 
-        if (context.signal?.aborted && result.status !== 499) {
-          lastStatus = 499
-          lastError = 'Client disconnected while the request was in progress.'
-          lastHeaders = undefined
-          lastRetryable = false
-          lastErrorCode = undefined
+        if (context.signal?.aborted) {
+          lastAccountFault = undefined
+          if (result.status !== 499) {
+            lastStatus = 499
+            lastError = 'Client disconnected while the request was in progress.'
+            lastHeaders = undefined
+            lastRetryable = false
+            lastErrorCode = undefined
+          }
         }
 
         const canRecoverManagedToolStream = recoverManagedToolStream
@@ -594,6 +601,8 @@ export class RequestForwarder {
         lastStatus = statusFromError(error)
         lastHeaders = headersFromError(error)
         lastErrorCode = errorCodeFromError(error)
+        const errorAccountFault = (error as { accountFault?: unknown })?.accountFault
+        lastAccountFault = typeof errorAccountFault === 'boolean' ? errorAccountFault : undefined
         const errorRetryable = (error as { retryable?: unknown })?.retryable
         lastRetryable = lastStatus === 499
           || (isQwenAiProvider && (lastStatus === 403 || lastStatus === 429 || lastStatus === 504))
@@ -603,12 +612,15 @@ export class RequestForwarder {
             ? errorRetryable
             : undefined
         previousRecoveryHint = undefined
-        if (context.signal?.aborted && lastStatus !== 499) {
-          lastStatus = 499
-          lastError = 'Client disconnected while the request was in progress.'
-          lastHeaders = undefined
-          lastRetryable = false
-          lastErrorCode = undefined
+        if (context.signal?.aborted) {
+          lastAccountFault = undefined
+          if (lastStatus !== 499) {
+            lastStatus = 499
+            lastError = 'Client disconnected while the request was in progress.'
+            lastHeaders = undefined
+            lastRetryable = false
+            lastErrorCode = undefined
+          }
         }
         if (
           lastRetryable === false
@@ -629,6 +641,7 @@ export class RequestForwarder {
       latency: Date.now() - startTime,
       retryable: lastRetryable,
       errorCode: lastErrorCode,
+      accountFault: lastAccountFault,
     }
   }
 
@@ -1325,6 +1338,7 @@ export class RequestForwarder {
         : undefined
       const errorCode = errorCodeFromError(error)
       const upstreamRetryable = (error as { retryable?: unknown })?.retryable
+      const upstreamAccountFault = (error as { accountFault?: unknown })?.accountFault
       const retryable = status === 499
         || status === 403
         || status === 429
@@ -1342,6 +1356,7 @@ export class RequestForwarder {
         latency,
         retryable,
         errorCode,
+        accountFault: typeof upstreamAccountFault === 'boolean' ? upstreamAccountFault : undefined,
         recoveryHint,
       }
     }

@@ -286,6 +286,8 @@ export interface ForwardResult {
   retryable?: boolean
   /** Stable upstream classification used by provider-specific circuit breakers. */
   errorCode?: string
+  /** False when a protocol-level response failure should not penalize the selected account. */
+  accountFault?: boolean
   /** Internal hint for a narrowly scoped retry that may bypass one account interval. */
   recoveryHint?: 'managed_tool_stream_validation'
   providerSessionId?: string

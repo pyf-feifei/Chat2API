@@ -116,7 +116,9 @@ function createHarness(results) {
   forwarder.delay = async () => true
   forwarder.doForward = async (...args) => {
     attempts.push(args.at(-1))
-    return results[attempts.length - 1]
+    const result = results[attempts.length - 1]
+    if (result instanceof Error) throw result
+    return result
   }
 
   const execute = request => forwarder.forwardChatCompletion(
@@ -253,6 +255,68 @@ test('ordinary streams and unrelated failures do not use managed-tool recovery',
     const result = await execute(request)
     assert.equal(result.success, false)
     assert.equal(attempts.length, 1)
+  }
+})
+
+test('outer Qwen forwarding preserves account-neutral failures from results and thrown errors', async () => {
+  const failures = [
+    {
+      success: false,
+      status: 502,
+      error: 'account-neutral result',
+      retryable: false,
+      accountFault: false,
+    },
+    Object.assign(new Error('account-neutral exception'), {
+      status: 502,
+      retryable: false,
+      accountFault: false,
+    }),
+  ]
+
+  for (const failure of failures) {
+    const { attempts, execute } = createHarness([failure])
+    const result = await execute({
+      model: 'model-1',
+      messages: [],
+      stream: true,
+    })
+
+    assert.equal(result.success, false)
+    assert.equal(result.status, 502)
+    assert.equal(result.accountFault, false)
+    assert.equal(attempts.length, 1)
+  }
+})
+
+test('outer Qwen forwarding clears account classification when the client aborts', async () => {
+  for (const upstreamStatus of [502, 499]) {
+    const RequestForwarder = loadRequestForwarder()
+    const forwarder = new RequestForwarder()
+    const controller = new AbortController()
+
+    forwarder.doForward = async () => {
+      controller.abort()
+      return {
+        success: false,
+        status: upstreamStatus,
+        error: 'protocol failure overtaken by client cancellation',
+        retryable: false,
+        accountFault: false,
+      }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'provider-1', apiEndpoint: 'https://provider.invalid' },
+      'model-1',
+      { signal: controller.signal },
+    )
+
+    assert.equal(result.success, false)
+    assert.equal(result.status, 499)
+    assert.equal(result.accountFault, undefined)
   }
 })
 

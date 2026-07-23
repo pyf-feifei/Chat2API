@@ -13,6 +13,14 @@ The Compose file pins LiteLLM `1.93.0`. Its wildcard route preserves the incomin
 Start the Chat2API proxy on `127.0.0.1:8080` first. This can be the desktop application or the headless server:
 
 ```powershell
+# Optional: hold managed-tool SSE until its first complete protocol boundary.
+# Set these before starting Chat2API. This lets Chat2API retry a malformed
+# tool stream before LiteLLM commits a 200 response. It can delay the first
+# byte, so choose the hold budget for the deployment rather than for a
+# particular client or model.
+$env:CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
+$env:CHAT2API_VALIDATED_SSE_MAX_HOLD_MS = '600000'
+
 npm run build:server
 npm run start:server
 ```

@@ -18,6 +18,7 @@ type SseErrorDetails = {
   code?: string
   status?: BufferedSseStatus
   retryable?: boolean
+  accountFault?: boolean
 }
 
 function inferBufferedSseStatus(details: SseErrorDetails): BufferedSseStatus {
@@ -62,6 +63,7 @@ export class BufferedSseError extends Error {
   readonly code?: string
   readonly status: BufferedSseStatus
   readonly retryable?: boolean
+  readonly accountFault?: boolean
 
   constructor(details: SseErrorDetails) {
     super(details.message)
@@ -70,6 +72,7 @@ export class BufferedSseError extends Error {
     this.code = details.code
     this.status = inferBufferedSseStatus(details)
     this.retryable = details.retryable
+    this.accountFault = details.accountFault
   }
 }
 
@@ -307,6 +310,7 @@ function findSseError(payload: string): SseErrorDetails | undefined {
         code: typeof error?.code === 'string' ? error.code : undefined,
         status: toBufferedSseStatus(error?.status),
         retryable: typeof error?.retryable === 'boolean' ? error.retryable : undefined,
+        accountFault: typeof error?.accountFault === 'boolean' ? error.accountFault : undefined,
       }
     } catch {
       return {
