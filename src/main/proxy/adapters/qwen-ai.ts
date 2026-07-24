@@ -1991,15 +1991,13 @@ export class QwenAiStreamHandler {
 
   private ingestNativeToolCallFragments(delta: Record<string, any>): {
     sawFragment: boolean
-    declaredProgress: boolean
   } {
     if (!this.toolCallingPlan?.shouldParseResponse) {
-      return { sawFragment: false, declaredProgress: false }
+      return { sawFragment: false }
     }
 
     const fragments = normalizeNativeFunctionCallDelta(delta)
     let sawFragment = false
-    let declaredProgress = false
 
     for (const fragment of fragments) {
       sawFragment = true
@@ -2021,22 +2019,13 @@ export class QwenAiStreamHandler {
       }
 
       this.nativeToolCallStates.set(fragment.key, nextState)
-      if (allowed && (
-        !existing
-        || existing.name !== nextState.name
-        || existing.arguments !== nextState.arguments
-        || !existing.allowed
-      )) {
-        declaredProgress = true
-      }
-
       if (name && !allowed && !this.warnedUndeclaredNativeToolNames.has(name)) {
         this.warnedUndeclaredNativeToolNames.add(name)
         console.warn('[QwenAI] Ignoring undeclared upstream native tool call:', name)
       }
     }
 
-    return { sawFragment, declaredProgress }
+    return { sawFragment }
   }
 
   private getUndeclaredNativeToolNames(): string[] {
@@ -2251,6 +2240,16 @@ export class QwenAiStreamHandler {
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
     }
 
+    const writeVisibleSse = (frame: string): boolean => {
+      if (finalChunkSent) return false
+      transStream.write(frame)
+      // Upstream events, parser buffering, and protocol fragments are not
+      // client-visible progress. Refresh only after a frame reached the
+      // downstream stream.
+      if (!finalChunkSent) refreshIdleTimer()
+      return true
+    }
+
     const onAbort = () => {
       failStream(new Error('Qwen AI response stream aborted because the client disconnected.'))
     }
@@ -2294,8 +2293,16 @@ export class QwenAiStreamHandler {
         },
       ]
 
+      let emittedManagedToolCall = false
       for (const outputChunk of outputChunks) {
-        transStream.write(`data: ${JSON.stringify(outputChunk)}\n\n`)
+        const choices = Array.isArray(outputChunk?.choices) ? outputChunk.choices : []
+        if (choices.some((choice: any) => {
+          const toolCalls = choice?.delta?.tool_calls
+          return Array.isArray(toolCalls) && toolCalls.length > 0
+        })) {
+          emittedManagedToolCall = true
+        }
+        writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
       }
 
       if (outputChunks.length > 0) {
@@ -2303,6 +2310,14 @@ export class QwenAiStreamHandler {
         if (QWEN_AI_DEBUG_STREAM_LOGS) {
           console.log('[QwenAI] Content/tool chunk written')
         }
+      }
+
+      // A managed tool protocol block is terminal once the parser has emitted
+      // a complete tool call. Some upstream responses never send a follow-up
+      // `finished`/`[DONE]` event, so waiting for it leaves the downstream
+      // client hanging after it already received an actionable tool call.
+      if (emittedManagedToolCall && !finalChunkSent) {
+        finishAnswer('tool_calls')
       }
     }
 
@@ -2326,12 +2341,12 @@ export class QwenAiStreamHandler {
       const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
       const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
       for (const outputChunk of flushChunks) {
-        transStream.write(`data: ${JSON.stringify(outputChunk)}\n\n`)
+        writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
       }
 
       const recoveredToolChunks = this.toolStreamParser?.recoverFromContent(this.content, baseChunk, !initialChunkSent) ?? []
       for (const outputChunk of recoveredToolChunks) {
-        transStream.write(`data: ${JSON.stringify(outputChunk)}\n\n`)
+        writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
       }
       if (recoveredToolChunks.length > 0) {
         initialChunkSent = true
@@ -2401,8 +2416,9 @@ export class QwenAiStreamHandler {
           choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
           created: this.created,
         })}\n\n`
-        transStream.write(initialChunk)
-        initialChunkSent = true
+        if (writeVisibleSse(initialChunk)) {
+          initialChunkSent = true
+        }
         if (QWEN_AI_DEBUG_STREAM_LOGS) {
           console.log('[QwenAI] Initial chunk written')
         }
@@ -2426,7 +2442,6 @@ export class QwenAiStreamHandler {
           
           if (event.data === '[DONE]') {
             console.log('[QwenAI] Received [DONE] signal')
-            refreshIdleTimer()
             sawUpstreamCompletion = true
             finishAnswer('stop')
             return
@@ -2471,11 +2486,7 @@ export class QwenAiStreamHandler {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
             }
 
-            const previousSummaryLength = summaryText.length
             const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
-            if (isMeaningfulQwenAiEvent(event, previousSummaryLength) || nativeToolProgress.declaredProgress) {
-              refreshIdleTimer()
-            }
 
             if (nativeToolProgress.sawFragment) {
               const completeNativeToolCalls = this.getCompleteNativeToolCalls()
@@ -2499,7 +2510,7 @@ export class QwenAiStreamHandler {
                 // Stream thinking content as reasoning_content in real-time
                 reasoningText += content
                 if (!hasSentReasoning) {
-                  transStream.write(
+                  writeVisibleSse(
                     `data: ${JSON.stringify({
                       id: this.responseId || this.chatId,
                       model: this.model,
@@ -2511,7 +2522,7 @@ export class QwenAiStreamHandler {
                   hasSentReasoning = true
                   console.log('[QwenAI] Sent reasoning role chunk')
                 }
-                transStream.write(
+                writeVisibleSse(
                   `data: ${JSON.stringify({
                     id: this.responseId || this.chatId,
                     model: this.model,
@@ -2534,7 +2545,7 @@ export class QwenAiStreamHandler {
                   const diff = newSummary.substring(summaryText.length)
                   if (diff) {
                     if (!hasSentReasoning) {
-                      transStream.write(
+                      writeVisibleSse(
                         `data: ${JSON.stringify({
                           id: this.responseId || this.chatId,
                           model: this.model,
@@ -2545,7 +2556,7 @@ export class QwenAiStreamHandler {
                       )
                       hasSentReasoning = true
                     }
-                    transStream.write(
+                    writeVisibleSse(
                       `data: ${JSON.stringify({
                         id: this.responseId || this.chatId,
                         model: this.model,
@@ -2885,9 +2896,8 @@ export class QwenAiStreamHandler {
               const status = delta.status
               const content = delta.content || ''
 
-              const previousSummaryLength = summaryText.length
-              const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
-              if (isMeaningfulQwenAiEvent(event, previousSummaryLength) || nativeToolProgress.declaredProgress) {
+              this.ingestNativeToolCallFragments(delta)
+              if (isMeaningfulQwenAiEvent(event, summaryText.length)) {
                 refreshIdleTimer()
               }
 

@@ -396,6 +396,106 @@ test('Qwen AI stream resumes the same response after duplicate summaries exhaust
   assert.equal(content, 'done')
 })
 
+test('Qwen AI stream resumes when incomplete declared native fragments are the only upstream activity', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({
+    isCompleteJsonText: value => value === '{"value":1}',
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'declared-native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 30,
+    recoverFromIdle: error => bridge.recoverFromIdle(error),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  const created = `data: ${JSON.stringify({
+    'response.created': { response_id: 'response-native-idle', response_index: 0 },
+  })}\n\n`
+  const incompleteEvent = argumentsText => `data: ${JSON.stringify({
+    response_id: 'response-native-idle',
+    choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'declared_tool', arguments: argumentsText },
+    } }],
+  })}\n\n`
+  initial.write(created)
+  initial.write(incompleteEvent('{"value": '))
+  let fragmentSequence = 0
+  const repeatedFragments = setInterval(() => {
+    const padding = ' '.repeat((fragmentSequence++ % 4) + 1)
+    initial.write(incompleteEvent(`{"value":${padding}`))
+  }, 5)
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      clearInterval(poll)
+      reject(new Error('incomplete native fragments did not trigger response-id continuation'))
+    }, 500)
+    const poll = setInterval(() => {
+      if (resumeCalls.length === 0) return
+      clearInterval(poll)
+      clearTimeout(timeout)
+      resolve()
+    }, 5)
+  })
+  clearInterval(repeatedFragments)
+
+  resumed.write(`data: ${JSON.stringify({
+    response_id: 'response-native-idle',
+    choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'declared_tool', arguments: '{"value":1}' },
+    } }],
+  })}\n\n`)
+  await ended
+
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(resumeCalls, ['response-native-idle'])
+  assert.equal(failure, undefined)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.match(body, /\[DONE\]/)
+})
+
 test('Qwen AI non-stream parsing resumes on semantic idle without resubmitting the prompt', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
   const initial = new PassThrough()
@@ -811,6 +911,78 @@ test('Qwen AI stream normalizes complete native arguments against the declared s
     todos: [{ subject: 'verify', status: 'pending' }],
   })
   assert.match(Buffer.concat(chunks).toString(), /\[DONE\]/)
+  assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI stream completes a managed tool call without waiting for upstream DONE', async () => {
+  class CompletedManagedToolStreamParser {
+    constructor() {
+      this.emitted = false
+    }
+
+    push(content, baseChunk, includeRole) {
+      if (!content || this.emitted) return []
+      this.emitted = true
+      return [{
+        ...baseChunk,
+        choices: [{
+          index: 0,
+          delta: {
+            ...(includeRole ? { role: 'assistant' } : {}),
+            tool_calls: [{
+              index: 0,
+              id: 'call-managed-0',
+              type: 'function',
+              function: { name: 'Write', arguments: '{}' },
+            }],
+          },
+          finish_reason: null,
+        }],
+      }]
+    }
+
+    flush() { return [] }
+    recoverFromContent() { return [] }
+    hasPendingToolProtocol() { return false }
+    hasEmittedToolCall() { return this.emitted }
+  }
+
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: CompletedManagedToolStreamParser,
+  })
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['Write']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 2_000,
+    idleTimeoutMs: 1_000,
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'typing',
+    content: 'complete managed tool call',
+  } }] })}\n\n`)
+
+  await Promise.race([
+    ended,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('managed tool call did not finish without upstream DONE')), 500)),
+  ])
+
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure, undefined)
+  assert.match(body, /"name":"Write"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.match(body, /\[DONE\]/)
   assert.equal(upstream.destroyed, true)
 })
 
