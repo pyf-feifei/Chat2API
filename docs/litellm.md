@@ -168,6 +168,18 @@ a client-specific model or request path. It also strips the non-Anthropic
 `usage.total_tokens` extension and drops parameters that cannot be represented
 by the selected OpenAI-compatible provider.
 
+Anthropic `count_tokens` requests use the local LiteLLM tokenizer by default:
+
+```text
+LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY=true
+```
+
+This avoids probing the OpenAI Responses token-counting endpoint when the
+Chat2API target only exposes Chat Completions. The bundled image patch counts
+Anthropic `system`, `tools`, and `image`/`source` content in the same local
+path. Set the value to `false` only when the configured target provides a
+compatible `/responses/input_tokens` endpoint.
+
 The Compose service also sets LiteLLM's generic `REQUEST_TIMEOUT` to `900`
 seconds by default (override it with `LITELLM_REQUEST_TIMEOUT`). LiteLLM uses
 this as an outer HTTP connect/read budget; it is not a total-generation timer,

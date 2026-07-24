@@ -25,6 +25,7 @@ const MOCK_MODEL_ALIAS = 'chat2api-mock'
 const MOCK_UPSTREAM_MODEL = 'mock-model'
 const MOCK_UPSTREAM_KEY = 'sk-mock-upstream-not-real'
 const MIDSTREAM_ERROR_MODEL = 'litellm-midstream-error-mock'
+const ONE_PIXEL_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
 
 test('bundled LiteLLM configuration keeps client probe and protocol bridge configurable', () => {
   const config = fs.readFileSync('deploy/litellm/config.yaml', 'utf8')
@@ -50,6 +51,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(compose, /LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:\s*"\$\{LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true\}"/)
   assert.match(compose, /REQUEST_TIMEOUT:\s*"\$\{LITELLM_REQUEST_TIMEOUT:-900\}"/)
   assert.match(compose, /LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:\s*"\$\{LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000\}"/)
+  assert.match(compose, /LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:\s*"\$\{LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:-true\}"/)
   assert.match(compose, /LITELLM_BASE_IMAGE:\s*"\$\{LITELLM_BASE_IMAGE:-docker\.litellm\.ai\/berriai\/litellm:v1\.93\.0\}"/)
   assert.match(compose, /image:\s*"\$\{LITELLM_IMAGE:-chat2api-litellm:v1\.93\.0-anthropic-stream-guard\}"/)
   const serverCompose = fs.readFileSync('docker-compose.yml', 'utf8')
@@ -65,6 +67,11 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /RESPONSES_MODULE_PATH/)
   assert.match(patcher, /responses_adapters/)
   assert.match(patcher, /RESPONSES_PATCHED_WRAPPER/)
+  assert.match(patcher, /TOKEN_COUNTER_MODULE_PATH/)
+  assert.match(patcher, /PROXY_SERVER_MODULE_PATH/)
+  assert.match(patcher, /ANTHROPIC_ENDPOINTS_MODULE_PATH/)
+  assert.match(patcher, /_chat2api_anthropic_image_url/)
+  assert.match(patcher, /LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY/)
 })
 
 function captureOutput(child, maxLength = 64 * 1024) {
@@ -762,6 +769,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     '-p', `127.0.0.1:${liteLlmPort}:4000`,
     '-v', `${liteLlmConfigPath}:/app/config.yaml:ro`,
     '-e', 'LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS=100',
+    '-e', 'LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY=true',
     LITELLM_IMAGE,
     '--config', '/app/config.yaml',
     '--host', '0.0.0.0',
@@ -1099,7 +1107,17 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(toolMessage.content, 'Sunny, 25 C')
   })
 
-  await t.test('counts Anthropic input tokens locally', async () => {
+  await t.test('counts Anthropic text, system, and tools locally without an upstream probe', async () => {
+    const callsBefore = mock.calls.length
+    const baseline = await requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify({
+        model: MOCK_MODEL_ALIAS,
+        messages: [{ role: 'user', content: 'Count these tokens without an upstream call.' }],
+      }),
+    })
+
     const result = await requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
       method: 'POST',
       headers: anthropicHeaders(),
@@ -1118,9 +1136,39 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       }),
     })
 
+    assert.equal(baseline.response.status, 200, baseline.text)
+    assert.equal(result.response.status, 200, result.text)
+    assert.equal(Number.isInteger(baseline.body?.input_tokens), true, baseline.text)
+    assert.equal(Number.isInteger(result.body?.input_tokens), true, result.text)
+    assert.ok(result.body.input_tokens > baseline.body.input_tokens, result.text)
+    assert.equal(mock.calls.length, callsBefore)
+  })
+
+  await t.test('counts Anthropic base64 images locally', async () => {
+    const callsBefore = mock.calls.length
+    const result = await requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify({
+        model: MOCK_MODEL_ALIAS,
+        messages: [{
+          role: 'user',
+          content: [{
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: ONE_PIXEL_PNG_BASE64,
+            },
+          }],
+        }],
+      }),
+    })
+
     assert.equal(result.response.status, 200, result.text)
     assert.equal(Number.isInteger(result.body?.input_tokens), true, result.text)
     assert.ok(result.body.input_tokens > 0, result.text)
+    assert.equal(mock.calls.length, callsBefore)
   })
 
   await t.test('records the LiteLLM v1.93.0 upstream error envelope', async () => {

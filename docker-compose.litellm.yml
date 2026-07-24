@@ -33,6 +33,9 @@ services:
       # Anthropic ping events keep downstream byte-idle watchdogs alive while
       # the translated upstream stream is temporarily quiet. Zero disables it.
       LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS: "${LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000}"
+      # Count-token requests stay local by default because the generic Chat2API
+      # target does not expose OpenAI's /responses/input_tokens endpoint.
+      LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY: "${LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:-true}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
