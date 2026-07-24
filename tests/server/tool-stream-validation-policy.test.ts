@@ -28,20 +28,33 @@ function plan(toolChoiceMode: ToolCallingPlan['toolChoiceMode']): ToolCallingPla
   }
 }
 
-test('attempted optional tool call with a pending protocol block is malformed', () => {
-  assert.deepEqual(
+test('optional tool calls tolerate a pending managed protocol block', () => {
+  assert.equal(
     getToolStreamValidationFailure({
       plan: plan('auto'),
       emittedToolCall: false,
       pendingToolProtocol: true,
     }),
-    {
-      message: 'Provider returned a malformed or empty tool call block for an attempted tool call',
-      type: 'tool_call_parse_error',
-      param: 'tool_calls',
-      code: 'malformed_tool_call',
-    },
+    undefined,
   )
+})
+
+test('required and forced tool calls reject a pending managed protocol block', () => {
+  for (const toolChoiceMode of ['required', 'forced'] as const) {
+    assert.deepEqual(
+      getToolStreamValidationFailure({
+        plan: plan(toolChoiceMode),
+        emittedToolCall: false,
+        pendingToolProtocol: true,
+      }),
+      {
+        message: 'Provider returned a malformed or empty tool call block for an enforced tool call',
+        type: 'tool_call_parse_error',
+        param: 'tool_calls',
+        code: 'malformed_tool_call',
+      },
+    )
+  }
 })
 
 test('required tool choice without a protocol block is missing', () => {
