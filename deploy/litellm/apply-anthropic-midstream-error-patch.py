@@ -12,6 +12,9 @@ from pathlib import Path
 MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py"
 )
+RESPONSES_MODULE_PATH = Path(
+    "litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py"
+)
 
 STANDARD_IMPORT_ANCHOR = "import copy\nimport json\nimport traceback\n"
 PATCHED_STANDARD_IMPORTS = (
@@ -145,6 +148,107 @@ PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIte
                     await pending_chunk
 '''
 
+RESPONSES_IMPORT_ANCHOR = '''import json
+import traceback
+from collections import deque
+from typing import Any, AsyncIterator, Dict
+
+from litellm import verbose_logger
+from litellm._uuid import uuid
+'''
+
+RESPONSES_PATCHED_IMPORTS = '''import asyncio
+import contextlib
+import json
+import os
+import traceback
+from collections import deque
+from typing import Any, AsyncIterator, Dict
+
+from litellm import verbose_logger
+from litellm._uuid import uuid
+'''
+
+RESPONSES_HELPER_ANCHOR = '''from litellm._uuid import uuid
+
+
+class AnthropicResponsesStreamWrapper:'''
+
+RESPONSES_PATCHED_HELPERS = '''from litellm._uuid import uuid
+
+
+DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS = 15_000
+
+
+def _anthropic_sse_heartbeat_interval_seconds() -> float:
+    raw = os.environ.get("LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS")
+    if raw is None or not raw.strip():
+        return DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS / 1000
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS
+    if value < 0:
+        value = DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS
+    return value / 1000
+
+
+def _anthropic_sse_ping_event() -> bytes:
+    return b'event: ping\\ndata: {"type":"ping"}\\n\\n'
+
+
+class AnthropicResponsesStreamWrapper:'''
+
+RESPONSES_ORIGINAL_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
+        """Yield SSE-encoded bytes for each Anthropic event chunk."""
+        async for chunk in self:
+            if isinstance(chunk, dict):
+                event_type: str = str(chunk.get("type", "message"))
+                payload = f"event: {event_type}\\ndata: {json.dumps(chunk)}\\n\\n"
+                yield payload.encode()
+            else:
+                yield chunk
+'''
+
+RESPONSES_PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
+        """Yield SSE events and keep quiet Responses streams observable."""
+        heartbeat_interval = _anthropic_sse_heartbeat_interval_seconds()
+        pending_chunk = None
+        try:
+            while True:
+                if pending_chunk is None:
+                    pending_chunk = asyncio.create_task(self.__anext__())
+
+                if heartbeat_interval > 0:
+                    done, _ = await asyncio.wait(
+                        {pending_chunk},
+                        timeout=heartbeat_interval,
+                    )
+                    if not done:
+                        yield _anthropic_sse_ping_event()
+                        continue
+
+                try:
+                    chunk = await pending_chunk
+                except StopAsyncIteration:
+                    pending_chunk = None
+                    break
+                pending_chunk = None
+
+                if isinstance(chunk, dict):
+                    event_type: str = str(chunk.get("type", "message"))
+                    payload = f"event: {event_type}\\ndata: {json.dumps(chunk)}\\n\\n"
+                    yield payload.encode()
+                else:
+                    yield chunk
+        finally:
+            if pending_chunk is not None:
+                if not pending_chunk.done():
+                    pending_chunk.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending_chunk
+'''
+
 
 def replace_exact(source: str, old: str, new: str, description: str) -> str:
     occurrences = source.count(old)
@@ -176,13 +280,37 @@ def patch_source(source: str) -> str:
     return patched
 
 
-def resolve_target() -> Path:
-    if len(sys.argv) > 2:
-        raise RuntimeError("Usage: apply-anthropic-midstream-error-patch.py [target.py]")
-    if len(sys.argv) == 2:
-        return Path(sys.argv[1]).resolve()
+def patch_responses_source(source: str) -> str:
+    if "def _anthropic_sse_heartbeat_interval_seconds(" in source:
+        raise RuntimeError(
+            "LiteLLM Responses Anthropic heartbeat patch is already present; "
+            "review the base image before removing this build patch."
+        )
 
-    candidates = [Path(root) / MODULE_PATH for root in site.getsitepackages()]
+    patched = replace_exact(
+        source,
+        RESPONSES_IMPORT_ANCHOR,
+        RESPONSES_PATCHED_IMPORTS,
+        "Responses import anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_HELPER_ANCHOR,
+        RESPONSES_PATCHED_HELPERS,
+        "Responses helper anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_ORIGINAL_WRAPPER,
+        RESPONSES_PATCHED_WRAPPER,
+        "Responses async SSE wrapper",
+    )
+    compile(patched, str(RESPONSES_MODULE_PATH), "exec")
+    return patched
+
+
+def resolve_installed_target(relative_path: Path) -> Path:
+    candidates = [Path(root) / relative_path for root in site.getsitepackages()]
     existing = [candidate for candidate in candidates if candidate.is_file()]
     if len(existing) != 1:
         rendered = ", ".join(str(candidate) for candidate in candidates)
@@ -192,13 +320,28 @@ def resolve_target() -> Path:
     return existing[0]
 
 
+def resolve_targets() -> list[Path]:
+    if len(sys.argv) > 2:
+        raise RuntimeError("Usage: apply-anthropic-midstream-error-patch.py [target.py]")
+    if len(sys.argv) == 2:
+        return [Path(sys.argv[1]).resolve()]
+
+    return [
+        resolve_installed_target(MODULE_PATH),
+        resolve_installed_target(RESPONSES_MODULE_PATH),
+    ]
+
+
 def main() -> None:
-    target = resolve_target()
-    source = target.read_text(encoding="utf-8")
-    patched = patch_source(source)
-    target.write_text(patched, encoding="utf-8")
-    py_compile.compile(str(target), doraise=True)
-    print(f"Applied Anthropic stream safety patch to {target}")
+    for target in resolve_targets():
+        source = target.read_text(encoding="utf-8")
+        if "responses_adapters" in target.as_posix():
+            patched = patch_responses_source(source)
+        else:
+            patched = patch_source(source)
+        target.write_text(patched, encoding="utf-8")
+        py_compile.compile(str(target), doraise=True)
+        print(f"Applied Anthropic stream safety patch to {target}")
 
 
 if __name__ == "__main__":

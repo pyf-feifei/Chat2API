@@ -155,6 +155,87 @@ test('Qwen AI stream exposes an idle failure to the proxy route', async () => {
   upstream.destroy()
 })
 
+test('Qwen AI resumable bridge continues after a transport reset', async () => {
+  const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const resumeCalls = []
+  const output = createQwenAiResumableStream(initial, {
+    getResponseId: () => 'response-1',
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  output.on('error', () => {})
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+
+  initial.write('data: partial answer\n\n')
+  initial.destroy(Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }))
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.deepEqual(resumeCalls, ['response-1'])
+
+  resumed.end('data: resumed answer\n\ndata: [DONE]\n\n')
+  await ended
+  const serialized = Buffer.concat(chunks).toString()
+  assert.match(serialized, /partial answer/)
+  assert.match(serialized, /resumed answer/)
+})
+
+test('Qwen AI resumable bridge does not resume a completed stream', async () => {
+  const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+  const resumeCalls = []
+  const output = createQwenAiResumableStream(initial, {
+    getResponseId: () => 'response-complete',
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      return new PassThrough()
+    },
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  output.on('error', () => {})
+  output.resume()
+  const ended = once(output, 'end')
+
+  initial.end('data: [DONE]\n\n')
+  await ended
+  assert.deepEqual(resumeCalls, [])
+})
+
+test('Qwen AI resumable bridge stops without retrying after client abort', async () => {
+  const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
+  const controller = new AbortController()
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+  const resumeCalls = []
+  const output = createQwenAiResumableStream(initial, {
+    signal: controller.signal,
+    getResponseId: () => 'response-aborted',
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      return new PassThrough()
+    },
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  output.on('error', () => {})
+  const closed = new Promise(resolve => output.once('close', resolve))
+
+  controller.abort()
+  await closed
+  assert.deepEqual(resumeCalls, [])
+})
+
 test('Qwen AI stream does not treat SSE heartbeats as generation progress', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
   const upstream = new PassThrough()
@@ -186,6 +267,205 @@ test('Qwen AI stream does not treat SSE heartbeats as generation progress', asyn
   assert.match(failure.message, /idle for more than/)
   assert.equal(failure.status, 504)
   upstream.destroy()
+})
+
+test('Qwen AI stream does not treat duplicate cumulative summaries as progress', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 500,
+    idleTimeoutMs: 25,
+  })
+  output.resume()
+  const ended = once(output, 'end')
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const event = `data: ${JSON.stringify({
+    choices: [{
+      delta: {
+        phase: 'thinking_summary',
+        status: 'typing',
+        extra: { summary_thought: { content: ['same cumulative summary'] } },
+      },
+    }],
+  })}\n\n`
+
+  upstream.write(event)
+  const heartbeat = setInterval(() => upstream.write(event), 5)
+  const [failure] = await failurePromise
+  clearInterval(heartbeat)
+
+  assert.equal(failure.status, 504)
+  assert.match(failure.message, /idle for more than 1s/)
+  await ended
+  upstream.destroy()
+})
+
+test('Qwen AI stream resumes the same response after duplicate summaries exhaust the idle budget', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 30,
+    recoverFromIdle: error => bridge.recoverFromIdle(error),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => {
+    failure = error
+  })
+  const ended = once(output, 'end')
+
+  const created = `data: ${JSON.stringify({
+    'response.created': { response_id: 'response-semantic-idle', response_index: 0 },
+  })}\n\n`
+  const summary = `data: ${JSON.stringify({
+    response_id: 'response-semantic-idle',
+    choices: [{ delta: {
+      phase: 'thinking_summary',
+      status: 'typing',
+      extra: { summary_thought: { content: ['same cumulative summary'] } },
+    } }],
+  })}\n\n`
+  initial.write(created)
+  initial.write(summary)
+  const duplicateEvents = setInterval(() => initial.write(`${created}${summary}`), 5)
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      clearInterval(poll)
+      reject(new Error('semantic idle did not invoke response-id continuation'))
+    }, 500)
+    const poll = setInterval(() => {
+      if (resumeCalls.length === 0) return
+      clearInterval(poll)
+      clearTimeout(timeout)
+      resolve()
+    }, 5)
+  })
+  clearInterval(duplicateEvents)
+
+  resumed.end(`${created}${summary}data: ${JSON.stringify({
+    response_id: 'response-semantic-idle',
+    choices: [{ delta: {
+      phase: 'thinking_summary',
+      status: 'typing',
+      extra: { summary_thought: { content: ['same cumulative summary and more'] } },
+    } }],
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'response-semantic-idle',
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'done' } }],
+  })}\n\n`)
+  await ended
+
+  const events = Buffer.concat(chunks).toString().split('\n\n')
+    .filter(frame => frame.startsWith('data: {'))
+    .map(frame => JSON.parse(frame.slice('data: '.length)))
+  const reasoning = events
+    .map(event => event.choices?.[0]?.delta?.reasoning_content)
+    .filter(value => typeof value === 'string')
+    .join('')
+  const content = events
+    .map(event => event.choices?.[0]?.delta?.content)
+    .filter(value => typeof value === 'string')
+    .join('')
+
+  assert.deepEqual(resumeCalls, ['response-semantic-idle'])
+  assert.equal(failure, undefined)
+  assert.equal(reasoning, 'same cumulative summary and more')
+  assert.equal(content, 'done')
+})
+
+test('Qwen AI non-stream parsing resumes on semantic idle without resubmitting the prompt', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 30,
+    recoverFromIdle: error => bridge.recoverFromIdle(error),
+  })
+
+  const created = `data: ${JSON.stringify({
+    'response.created': { response_id: 'response-non-stream-idle', response_index: 0 },
+  })}\n\n`
+  const summary = `data: ${JSON.stringify({
+    response_id: 'response-non-stream-idle',
+    choices: [{ delta: {
+      phase: 'thinking_summary',
+      status: 'typing',
+      extra: { summary_thought: { content: ['summary'] } },
+    } }],
+  })}\n\n`
+  initial.write(`${created}${summary}`)
+  const duplicateEvents = setInterval(() => initial.write(`${created}${summary}`), 5)
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      clearInterval(poll)
+      reject(new Error('non-stream semantic idle did not invoke continuation'))
+    }, 500)
+    const poll = setInterval(() => {
+      if (resumeCalls.length === 0) return
+      clearInterval(poll)
+      clearTimeout(timeout)
+      resolve()
+    }, 5)
+  })
+  clearInterval(duplicateEvents)
+
+  resumed.end(`${summary}data: ${JSON.stringify({
+    response_id: 'response-non-stream-idle',
+    choices: [{ delta: {
+      phase: 'thinking_summary',
+      status: 'typing',
+      extra: { summary_thought: { content: ['summary continued'] } },
+    } }],
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'response-non-stream-idle',
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'complete' } }],
+  })}\n\n`)
+
+  const result = await resultPromise
+  assert.deepEqual(resumeCalls, ['response-non-stream-idle'])
+  assert.equal(result.choices[0].message.reasoning_content, 'summary continued')
+  assert.equal(result.choices[0].message.content, 'complete')
 })
 
 test('Qwen AI response timeout zero disables the absolute deadline for stream and non-stream parsing', async () => {

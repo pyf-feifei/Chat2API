@@ -245,6 +245,11 @@ can keep a slot busy long enough for later requests to receive `429`. Do not
 raise the queue timeout solely because a single generation is slow; raise it
 only when the client and deployment are intended to tolerate a longer
 admission wait.
+Qwen transport resets are continued by response id instead of submitting the
+prompt a second time. `CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` defaults to `3`
+and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` to `1000` ms; set attempts to `0`
+to disable this bounded recovery. These are generic deployment controls and do
+not depend on a Claude session, project directory, model name, or prompt.
 The queue limit is applied per governor admission attempt; a logical request
 that opts into a provider recovery retry can have more than one attempt and a
 longer total wall-clock duration. A client abort during a later attempt is

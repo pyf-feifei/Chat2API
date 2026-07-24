@@ -18,6 +18,8 @@ const LITELLM_IMAGE = 'chat2api-litellm:integration-test'
 const LITELLM_MASTER_KEY = 'sk-litellm-offline-integration-test'
 const MANAGEMENT_SECRET = 'mgmt_litellm_offline_integration_test'
 const SYNTHETIC_CLIENT_MODEL = 'client-connectivity-probe'
+const ADAPTIVE_MODEL_ALIAS = 'chat2api-adaptive-mock'
+const RESPONSES_MODEL_ALIAS = 'chat2api-responses-mock'
 const MOCK_PROVIDER_ID = 'litellm-offline-openai-mock'
 const MOCK_MODEL_ALIAS = 'chat2api-mock'
 const MOCK_UPSTREAM_MODEL = 'mock-model'
@@ -39,6 +41,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(config, /use_chat_completions_url_for_anthropic_messages:\s*os\.environ\/LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES/)
   assert.match(config, /model_name:\s*["']\*["']/)
   assert.match(config, /model:\s*["']openai\/\*["']/)
+  assert.match(config, /allowed_openai_params:\s*\[["']reasoning_effort["']\]/)
   assert.doesNotMatch(config, /api\.anthropic\.com|claude-[\w-]+/i)
 
   assert.doesNotMatch(config, /CHAT2API_CONNECTIVITY_MODEL/)
@@ -49,10 +52,19 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(compose, /LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:\s*"\$\{LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000\}"/)
   assert.match(compose, /LITELLM_BASE_IMAGE:\s*"\$\{LITELLM_BASE_IMAGE:-docker\.litellm\.ai\/berriai\/litellm:v1\.93\.0\}"/)
   assert.match(compose, /image:\s*"\$\{LITELLM_IMAGE:-chat2api-litellm:v1\.93\.0-anthropic-stream-guard\}"/)
+  const serverCompose = fs.readFileSync('docker-compose.yml', 'utf8')
+  const serverDockerfile = fs.readFileSync('Dockerfile', 'utf8')
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000\}/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000/)
   assert.match(dockerfile, /apply-anthropic-midstream-error-patch\.py/)
   assert.match(patcher, /Expected exactly one .*Refusing to apply a potentially unsafe patch/s)
   assert.match(patcher, /event: error\\\\ndata:/)
   assert.match(patcher, /event: ping\\\\ndata: \{\"type\":\"ping\"\}/)
+  assert.match(patcher, /RESPONSES_MODULE_PATH/)
+  assert.match(patcher, /responses_adapters/)
+  assert.match(patcher, /RESPONSES_PATCHED_WRAPPER/)
 })
 
 function captureOutput(child, maxLength = 64 * 1024) {
@@ -294,6 +306,72 @@ function writeOpenAiDelayedStream(response, model, delayMs = 450) {
   }, delayMs).unref()
 }
 
+function writeOpenAiResponsesDelayedStream(response, model, delayMs = 450) {
+  const writeEvent = (event) => {
+    response.write(`data: ${JSON.stringify(event)}\n\n`)
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'close',
+  })
+
+  writeEvent({
+    type: 'response.created',
+    response: {
+      id: 'resp-offline-thinking-mock',
+      object: 'response',
+      model,
+      status: 'in_progress',
+      output: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_item.added',
+    item: { type: 'reasoning', id: 'rs_offline_1' },
+  })
+  writeEvent({
+    type: 'response.reasoning_summary_text.delta',
+    item_id: 'rs_offline_1',
+    delta: 'before pause',
+  })
+
+  setTimeout(() => {
+    if (response.destroyed) return
+
+    writeEvent({
+      type: 'response.output_item.done',
+      item: { type: 'reasoning', id: 'rs_offline_1' },
+    })
+    writeEvent({
+      type: 'response.output_item.added',
+      item: { type: 'message', id: 'msg_offline_1' },
+    })
+    writeEvent({
+      type: 'response.output_text.delta',
+      item_id: 'msg_offline_1',
+      delta: 'after pause',
+    })
+    writeEvent({
+      type: 'response.output_item.done',
+      item: { type: 'message', id: 'msg_offline_1' },
+    })
+    writeEvent({
+      type: 'response.completed',
+      response: {
+        id: 'resp-offline-thinking-mock',
+        object: 'response',
+        model,
+        status: 'completed',
+        output: [],
+        usage: { input_tokens: 11, output_tokens: 5 },
+      },
+    })
+    response.end()
+  }, delayMs).unref()
+}
+
 function writeOpenAiMidstreamError(response, model) {
   const base = {
     id: 'chatcmpl-offline-midstream-error',
@@ -359,9 +437,30 @@ async function startMockUpstream() {
       body,
     })
 
-    if (request.method !== 'POST' || request.url !== '/v1/chat/completions') {
+    if (
+      request.method !== 'POST'
+      || !['/v1/chat/completions', '/v1/responses'].includes(request.url)
+    ) {
       response.writeHead(404, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: { message: 'Mock route not found' } }))
+      return
+    }
+
+    if (request.url === '/v1/responses') {
+      if (body.stream) {
+        writeOpenAiResponsesDelayedStream(response, body.model || MOCK_UPSTREAM_MODEL)
+        return
+      }
+
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify({
+        id: 'resp-offline-thinking-mock',
+        object: 'response',
+        model: body.model || MOCK_UPSTREAM_MODEL,
+        status: 'completed',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'offline response reply' }] }],
+        usage: { input_tokens: 11, output_tokens: 5 },
+      }))
       return
     }
 
@@ -442,12 +541,31 @@ function createLiteLlmConfig(chat2ApiPort, chat2ApiKey, mockPort) {
     `      api_base: ${JSON.stringify(`http://host.docker.internal:${mockPort}/v1`)}`,
     `      api_key: ${JSON.stringify(MOCK_UPSTREAM_KEY)}`,
     '      num_retries: 0',
+    `  - model_name: ${JSON.stringify(ADAPTIVE_MODEL_ALIAS)}`,
+    '    litellm_params:',
+    `      model: ${JSON.stringify(`openai/${ADAPTIVE_MODEL_ALIAS}`)}`,
+    `      api_base: ${JSON.stringify(`http://host.docker.internal:${mockPort}/v1`)}`,
+    `      api_key: ${JSON.stringify(MOCK_UPSTREAM_KEY)}`,
+    '      num_retries: 0',
+    '      allowed_openai_params: ["reasoning_effort"]',
+    '    model_info:',
+    '      supports_reasoning: true',
+    `  - model_name: ${JSON.stringify(RESPONSES_MODEL_ALIAS)}`,
+    '    litellm_params:',
+    `      model: ${JSON.stringify(`openai/${RESPONSES_MODEL_ALIAS}`)}`,
+    `      api_base: ${JSON.stringify(`http://host.docker.internal:${mockPort}/v1`)}`,
+    `      api_key: ${JSON.stringify(MOCK_UPSTREAM_KEY)}`,
+    '      num_retries: 0',
+    '      allowed_openai_params: ["reasoning_effort"]',
+    '    model_info:',
+    '      supports_reasoning: true',
     '  - model_name: "*"',
     '    litellm_params:',
     '      model: "openai/*"',
     `      api_base: ${JSON.stringify(`http://host.docker.internal:${chat2ApiPort}/v1`)}`,
     `      api_key: ${JSON.stringify(chat2ApiKey)}`,
     '      num_retries: 0',
+    '      allowed_openai_params: ["reasoning_effort"]',
     '      timeout: 20',
     'general_settings:',
     `  master_key: ${JSON.stringify(LITELLM_MASTER_KEY)}`,
@@ -785,13 +903,19 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       method: 'POST',
       headers: anthropicHeaders(),
       body: JSON.stringify(anthropicRequest({
+        model: ADAPTIVE_MODEL_ALIAS,
         stream: true,
+        thinking: { type: 'adaptive', display: 'omitted' },
+        output_config: { effort: 'high' },
         messages: [{ role: 'user', content: 'HEARTBEAT_CASE' }],
       })),
       signal: AbortSignal.timeout(10_000),
     })
     const text = await response.text()
     assert.equal(response.status, 200, text)
+
+    const call = mock.calls.at(-1)
+    assert.equal(call?.url, '/v1/chat/completions', JSON.stringify(call))
 
     const events = parseSse(text)
     const pingEvents = events.filter((event) => event.event === 'ping')
@@ -808,6 +932,46 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
         < events.findIndex((event) => (event.event || event.data?.type) === 'message_stop'),
       text,
     )
+  })
+
+  await t.test('emits Anthropic ping events for thinking Responses streams', async () => {
+    const response = await fetch(`${liteLlmBaseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify(anthropicRequest({
+        model: RESPONSES_MODEL_ALIAS,
+        max_tokens: 256,
+        stream: true,
+        thinking: { type: 'enabled', budget_tokens: 64 },
+        messages: [{ role: 'user', content: 'RESPONSES_HEARTBEAT_CASE' }],
+      })),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const text = await response.text()
+    assert.equal(response.status, 200, text)
+
+    const call = mock.calls.at(-1)
+    assert.equal(call?.url, '/v1/responses', JSON.stringify(call))
+
+    const events = parseSse(text)
+    const pingEvents = events.filter((event) => event.event === 'ping')
+    assert.ok(pingEvents.length >= 1, text)
+    assert.ok(pingEvents.every((event) => event.data?.type === 'ping'), text)
+    assert.ok(
+      events.some((event) => (
+        event.event === 'content_block_delta'
+        && event.data?.delta?.type === 'thinking_delta'
+      )),
+      text,
+    )
+    assert.ok(
+      events.some((event) => (
+        event.event === 'content_block_delta'
+        && event.data?.delta?.text === 'after pause'
+      )),
+      text,
+    )
+    assert.equal(events.at(-1)?.event, 'message_stop', text)
   })
 
   await t.test('terminates mid-stream provider failures with an Anthropic error event', async () => {

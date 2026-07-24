@@ -25,6 +25,10 @@ services:
       CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-false}
       # Preserve early HTTP errors briefly, then release a live SSE response.
       CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS: ${CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS:-15000}
+      # Resume a Qwen response by chat/response id after a transport reset.
+      # Both values are deployment controls; no request or session is special-cased.
+      CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS: ${CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3}
+      CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS: ${CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}

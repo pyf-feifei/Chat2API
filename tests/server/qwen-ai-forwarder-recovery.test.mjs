@@ -61,6 +61,7 @@ function loadRequestForwarder(overrides = {}) {
     './adapters/qwen-ai': {
       describeErrorForLog: error => error?.message || String(error),
       QWEN_AI_STREAM_FAILURE_EVENT: 'qwen-ai-stream-failure',
+      createQwenAiResumableStream: stream => stream,
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
     },

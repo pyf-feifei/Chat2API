@@ -104,8 +104,9 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(forwarderSource, /headers: lastHeaders/)
   assert.match(forwarderSource, /lastRetryable = result\.retryable/)
   assert.match(forwarderSource, /retryable: lastRetryable/)
-  assert.match(qwenAiForwarderSource, /handler\.handleStream\(response\.data, \{\s*signal: context\?\.signal,\s*onFailure: \(\) => cleanupChat\(chatId\),\s*\}\)/)
-  assert.match(qwenAiForwarderSource, /handler\.handleNonStream\(response\.data, \{\s*signal: context\?\.signal,\s*\}\)/)
+  assert.match(qwenAiForwarderSource, /createQwenAiResumableStream\(response\.data, \{[\s\S]*?resume: responseId => adapter\.resumeChatCompletion/)
+  assert.match(qwenAiForwarderSource, /handler\.handleStream\(resumableResponseStream, \{\s*signal: context\?\.signal,\s*onFailure: \(\) => cleanupChat\(chatId\),\s*recoverFromIdle: error => resumableResponseStream\.recoverFromIdle\(error\),\s*\}\)/)
+  assert.match(qwenAiForwarderSource, /handler\.handleNonStream\(resumableResponseStream, \{\s*signal: context\?\.signal,\s*recoverFromIdle: error => resumableResponseStream\.recoverFromIdle\(error\),\s*\}\)/)
 
   assert.match(governorSource, /CHAT2API_QWEN_AI_MAX_CONCURRENT/)
   assert.match(governorSource, /CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS/)

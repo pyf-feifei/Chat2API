@@ -86,6 +86,22 @@ type StreamHandlingOptions = {
   responseTimeoutMs?: number
   idleTimeoutMs?: number
   onFailure?: (error: Error) => void
+  recoverFromIdle?: (error: Error) => Promise<boolean>
+}
+
+type QwenAiResumableStreamOptions = {
+  signal?: AbortSignal
+  getResponseId: () => string
+  resume?: (responseId: string) => Promise<any>
+  /** Return true once the adapter has emitted a terminal response. */
+  isComplete?: () => boolean
+  maxAttempts?: number
+  delayMs?: number
+}
+
+export type QwenAiResumableStream = PassThrough & {
+  /** Replace a semantically stalled source with Qwen's response-id continuation. */
+  recoverFromIdle: (error: Error) => Promise<boolean>
 }
 
 interface ChatCompletionRequest {
@@ -115,6 +131,27 @@ function nonNegativeNumberFromEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value >= 0 ? value : fallback
 }
 
+function nonNegativeIntegerFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : fallback
+}
+
+export function qwenAiStreamResumeAttemptsFromEnv(): number {
+  return Math.min(
+    10,
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS', 3),
+  )
+}
+
+export function qwenAiStreamResumeDelayMsFromEnv(): number {
+  return Math.min(
+    60_000,
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS', 1_000),
+  )
+}
+
 /**
  * Decide whether a parsed SSE message represents provider progress.
  *
@@ -124,7 +161,10 @@ function nonNegativeNumberFromEnv(name: string, fallback: number): number {
  * refreshed after parsing a meaningful event, rather than for every raw
  * network buffer.
  */
-function isMeaningfulQwenAiEvent(event: { data?: unknown }): boolean {
+function isMeaningfulQwenAiEvent(
+  event: { data?: unknown },
+  previousSummaryLength = 0,
+): boolean {
   const raw = typeof event.data === 'string' ? event.data.trim() : ''
   if (!raw) return false
   if (raw === '[DONE]') return true
@@ -138,13 +178,12 @@ function isMeaningfulQwenAiEvent(event: { data?: unknown }): boolean {
     return true
   }
 
-  if (!isObjectValue(data)) return true
-  if (data.error || data.errors || data.ret || data['response.created']) return true
+  if (!isObjectValue(data)) return false
+  if (data.error || data.errors || data.ret) return true
+  if (data['response.created']) return false
 
   const choices = data.choices
-  if (!Array.isArray(choices)) {
-    return Boolean(data.response_id || data.id)
-  }
+  if (!Array.isArray(choices)) return false
 
   return choices.some((choice) => {
     if (!isObjectValue(choice)) return false
@@ -153,15 +192,18 @@ function isMeaningfulQwenAiEvent(event: { data?: unknown }): boolean {
 
     const content = delta.content
     const reasoning = delta.reasoning_content
-    const summary = isObjectValue(delta.extra)
+    const summaryText = isObjectValue(delta.extra)
       && isObjectValue(delta.extra.summary_thought)
       && Array.isArray(delta.extra.summary_thought.content)
-      && delta.extra.summary_thought.content.some((part: unknown) => typeof part === 'string' && part.length > 0)
+      ? delta.extra.summary_thought.content
+        .filter((part: unknown): part is string => typeof part === 'string')
+        .join('\n')
+      : ''
 
     return (typeof content === 'string' && content.length > 0)
       || (typeof reasoning === 'string' && reasoning.length > 0)
-      || (delta.phase === 'thinking_summary' && summary)
-      || delta.status === 'finished'
+      || (delta.phase === 'thinking_summary' && summaryText.length > previousSummaryLength)
+      || (delta.status === 'finished' && (delta.phase === 'answer' || delta.phase === null))
       || (typeof choice.finish_reason === 'string' && Boolean(choice.finish_reason))
   })
 }
@@ -177,6 +219,400 @@ function destroyReadableStream(stream: any, error?: Error): void {
   if (typeof stream.abort === 'function') {
     stream.abort()
   }
+}
+
+function isResumableQwenAiTransportError(error: unknown): boolean {
+  if (!error || isClientCancellationError(error)) return false
+
+  const candidate = error as {
+    status?: unknown
+    code?: unknown
+    name?: unknown
+    message?: unknown
+  }
+  if (typeof candidate.status === 'number' && candidate.status >= 400) return false
+
+  const code = typeof candidate.code === 'string' ? candidate.code : ''
+  const name = typeof candidate.name === 'string' ? candidate.name : ''
+  const message = typeof candidate.message === 'string'
+    ? candidate.message
+    : String(error)
+
+  return /ECONNRESET|ECONNABORTED|ERR_STREAM_PREMATURE_CLOSE|ERR_NETWORK|ERR_SOCKET|socket hang up|premature close|network error/i.test(
+    `${name} ${code} ${message}`,
+  )
+}
+
+/**
+ * Keep a Qwen SSE response alive across a transport close. Qwen's web client
+ * resumes an in-progress response with the chat and response identifiers;
+ * keeping that recovery below the protocol adapter means every compatible
+ * downstream client benefits without knowing provider-specific details.
+ */
+export function createQwenAiResumableStream(
+  initialStream: any,
+  options: QwenAiResumableStreamOptions,
+): QwenAiResumableStream {
+  const bridge = new PassThrough() as QwenAiResumableStream
+  const maxAttempts = Math.max(0, options.maxAttempts ?? qwenAiStreamResumeAttemptsFromEnv())
+  const delayMs = Math.max(0, options.delayMs ?? qwenAiStreamResumeDelayMsFromEnv())
+
+  let source = initialStream
+  let sourceGeneration = 0
+  let sourceHandled = false
+  let sourceComplete = false
+  let terminalMarkerSeen = false
+  let recoveryInFlight = false
+  let attempts = 0
+  let settled = false
+
+  type SourceListeners = {
+    data: (chunk: Buffer | string) => void
+    error: (error: Error) => void
+    end: () => void
+    close: () => void
+  }
+
+  // Keep the exact callbacks installed by this bridge. The response stream
+  // may also have listeners owned by Axios or the protocol parser; removing
+  // those with removeAllListeners() can break cancellation and parsing.
+  const sourceListeners = new Map<any, SourceListeners>()
+  let completionScan = ''
+  let completionCheckError: Error | undefined
+
+  const removeAbortListener = () => {
+    options.signal?.removeEventListener('abort', onAbort)
+  }
+
+  const detachSource = (stream: any, destroy = false) => {
+    const listeners = sourceListeners.get(stream)
+    if (listeners && typeof stream?.removeListener === 'function') {
+      stream.removeListener('data', listeners.data)
+      stream.removeListener('error', listeners.error)
+      stream.removeListener('end', listeners.end)
+      stream.removeListener('close', listeners.close)
+      sourceListeners.delete(stream)
+    }
+    if (destroy) destroyReadableStream(stream)
+  }
+
+  const fail = (error: Error) => {
+    if (settled) return
+    settled = true
+    detachSource(source, true)
+    removeAbortListener()
+    bridge.destroy(error)
+  }
+
+  const finish = () => {
+    if (settled) return
+    settled = true
+    detachSource(source, true)
+    removeAbortListener()
+    bridge.end()
+  }
+
+  const checkComplete = (): boolean => {
+    if (sourceComplete) return true
+    if (!options.isComplete) return false
+    try {
+      if (options.isComplete()) sourceComplete = true
+    } catch (error) {
+      completionCheckError = error instanceof Error ? error : new Error(String(error))
+    }
+    return sourceComplete
+  }
+
+  const takeCompletionCheckError = (): Error | undefined => {
+    const error = completionCheckError
+    completionCheckError = undefined
+    return error
+  }
+
+  const sawDoneMarker = (chunk: Buffer | string): boolean => {
+    const text = typeof chunk === 'string'
+      ? chunk
+      : Buffer.isBuffer(chunk)
+        ? chunk.toString('utf8')
+        : ''
+    if (!text) return false
+
+    // Keep enough tail to recognize a marker split across network chunks,
+    // while requiring an SSE data-line boundary to avoid matching model text.
+    completionScan = `${completionScan}${text}`.slice(-128)
+    return /(?:^|\r?\n)data\s*:\s*\[DONE\](?:\r?\n|$)/.test(completionScan)
+  }
+
+  const waitForRetry = async (): Promise<boolean> => {
+    if (delayMs <= 0) return !options.signal?.aborted
+    if (options.signal?.aborted) return false
+
+    return new Promise<boolean>(resolve => {
+      let timer: NodeJS.Timeout | undefined
+      let finished = false
+
+      const complete = (result: boolean) => {
+        if (finished) return
+        finished = true
+        if (timer) clearTimeout(timer)
+        options.signal?.removeEventListener('abort', onRetryAbort)
+        resolve(result && !options.signal?.aborted)
+      }
+
+      const onRetryAbort = () => complete(false)
+      timer = setTimeout(() => complete(true), delayMs)
+      options.signal?.addEventListener('abort', onRetryAbort, { once: true })
+    })
+  }
+
+  const retireCurrentSource = () => {
+    detachSource(source, true)
+  }
+
+  const recover = async (initialError?: Error): Promise<boolean> => {
+    if (recoveryInFlight || settled) return false
+    recoveryInFlight = true
+    let lastError = initialError || new Error('Qwen AI response stream closed before completion')
+
+    while (!settled && attempts < maxAttempts) {
+      if (checkComplete()) {
+        const completionError = takeCompletionCheckError()
+        recoveryInFlight = false
+        if (completionError) fail(completionError)
+        else finish()
+        return false
+      }
+      const completionError = takeCompletionCheckError()
+      if (completionError) {
+        recoveryInFlight = false
+        fail(completionError)
+        return false
+      }
+
+      if (options.signal?.aborted) {
+        recoveryInFlight = false
+        fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        return false
+      }
+
+      const responseId = options.getResponseId().trim()
+      if (!responseId || !options.resume) break
+
+      attempts += 1
+      if (!(await waitForRetry())) {
+        recoveryInFlight = false
+        fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        return false
+      }
+      if (settled) return false
+
+      if (checkComplete()) {
+        const lateCompletionError = takeCompletionCheckError()
+        recoveryInFlight = false
+        if (lateCompletionError) fail(lateCompletionError)
+        else finish()
+        return false
+      }
+      const lateCompletionCheckError = takeCompletionCheckError()
+      if (lateCompletionCheckError) {
+        recoveryInFlight = false
+        fail(lateCompletionCheckError)
+        return false
+      }
+
+      try {
+        console.warn('[QwenAI] Resuming interrupted response stream', JSON.stringify({
+          responseId,
+          attempt: attempts,
+          maxAttempts,
+        }))
+        const resumed = await options.resume(responseId)
+        const nextStream = resumed?.data ?? resumed
+
+        // Abort/completion can race the resume request. Never attach a late
+        // response to the bridge; release it immediately instead.
+        if (settled || options.signal?.aborted || sourceComplete || checkComplete()) {
+          destroyReadableStream(nextStream)
+          if (!settled) {
+            const lateResumeError = takeCompletionCheckError()
+            if (lateResumeError) fail(lateResumeError)
+            else finish()
+          }
+          return false
+        }
+
+        if (!nextStream || typeof nextStream.on !== 'function') {
+          throw new Error('Qwen AI resume endpoint did not return a stream')
+        }
+
+        source = nextStream
+        sourceGeneration += 1
+        sourceHandled = false
+        sourceComplete = false
+        terminalMarkerSeen = false
+        completionScan = ''
+        recoveryInFlight = false
+        attachSource(nextStream, sourceGeneration)
+        return true
+      } catch (error) {
+        if (settled) return false
+        lastError = error instanceof Error ? error : new Error(String(error))
+        if (isClientCancellationError(lastError) || options.signal?.aborted) {
+          recoveryInFlight = false
+          fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
+          return false
+        }
+      }
+    }
+
+    if (settled) return false
+    recoveryInFlight = false
+    if (checkComplete()) {
+      const completionError = takeCompletionCheckError()
+      if (completionError) fail(completionError)
+      else finish()
+      return false
+    }
+    const completionError = takeCompletionCheckError()
+    if (completionError) {
+      fail(completionError)
+      return false
+    }
+    const transportError = normalizeQwenAiStreamFailure(lastError)
+    // A transport reset is not evidence that credentials/account state is bad;
+    // avoid cooling a single account when the shared upstream path is failing.
+    transportError.accountFault = false
+    fail(transportError)
+    return false
+  }
+
+  bridge.recoverFromIdle = async (error: Error): Promise<boolean> => {
+    if (settled || recoveryInFlight) return false
+
+    const complete = checkComplete()
+    const completionError = takeCompletionCheckError()
+    if (completionError) {
+      fail(completionError)
+      return false
+    }
+    if (complete) {
+      finish()
+      return false
+    }
+
+    // Mark and detach synchronously so late bytes from the stalled socket
+    // cannot race the continuation stream into the shared parser.
+    sourceHandled = true
+    retireCurrentSource()
+    return recover(error)
+  }
+
+  const handleSourceEnd = (generation: number) => {
+    if (settled || generation !== sourceGeneration || sourceHandled) return
+    sourceHandled = true
+    const complete = checkComplete()
+    const completionError = takeCompletionCheckError()
+    retireCurrentSource()
+    if (completionError) {
+      fail(completionError)
+      return
+    }
+    if (complete) {
+      finish()
+      return
+    }
+    void recover()
+  }
+
+  const handleSourceError = (generation: number, error: Error) => {
+    if (settled || generation !== sourceGeneration || sourceHandled) return
+    sourceHandled = true
+    const complete = checkComplete()
+    const completionError = takeCompletionCheckError()
+    retireCurrentSource()
+    if (completionError) {
+      fail(completionError)
+      return
+    }
+    if (complete) {
+      finish()
+      return
+    }
+    if (options.signal?.aborted || isClientCancellationError(error)) {
+      fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
+      return
+    }
+    if (isResumableQwenAiTransportError(error)) {
+      void recover(error)
+      return
+    }
+    fail(error)
+  }
+
+  function attachSource(nextStream: any, generation: number) {
+    const listeners: SourceListeners = {
+      data: (chunk: Buffer | string) => {
+        if (settled || generation !== sourceGeneration || terminalMarkerSeen) return
+        try {
+          bridge.write(chunk)
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)))
+          return
+        }
+
+        const done = sawDoneMarker(chunk)
+        const complete = checkComplete()
+        const completionError = takeCompletionCheckError()
+        if (completionError) {
+          fail(completionError)
+          return
+        }
+        if (done) {
+          sourceComplete = true
+          terminalMarkerSeen = true
+          // [DONE] is definitive; close the downstream bridge even if the
+          // provider forgets to emit its final close event.
+          finish()
+        } else if (complete) {
+          // Defer bridge completion until end/close so a handler can still
+          // consume a provider finish event and emit its own terminal frame.
+          sourceComplete = true
+        }
+      },
+      error: (error: Error) => handleSourceError(generation, error),
+      end: () => handleSourceEnd(generation),
+      close: () => {
+        if (!sourceHandled) handleSourceEnd(generation)
+      },
+    }
+    sourceListeners.set(nextStream, listeners)
+    nextStream.on('data', listeners.data)
+    nextStream.once('error', listeners.error)
+    nextStream.once('end', listeners.end)
+    nextStream.once('close', listeners.close)
+  }
+
+  function onAbort() {
+    if (settled) return
+    fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
+  }
+
+  bridge.once('close', () => {
+    if (settled) return
+    settled = true
+    detachSource(source, true)
+    removeAbortListener()
+  })
+
+  if (options.signal?.aborted) {
+    onAbort()
+  } else {
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    sourceGeneration = 1
+    attachSource(source, sourceGeneration)
+  }
+
+  return bridge
 }
 
 function uuid(): string {
@@ -685,6 +1121,23 @@ export class QwenAiAdapter {
       this.account = await this.tokenRefresher.refreshAfterUnauthorized(this.account, options.signal)
       options = createOptions()
       response = await this.axiosInstance.post(url, payload, options)
+    }
+
+    return response
+  }
+
+  private async getWithRefreshRetry(
+    url: string,
+    createOptions: () => Record<string, any>,
+  ): Promise<AxiosResponse> {
+    let options = createOptions()
+    let response = await this.axiosInstance.get(url, options)
+
+    if (response.status === 401) {
+      destroyReadableStream(response.data)
+      this.account = await this.tokenRefresher.refreshAfterUnauthorized(this.account, options.signal)
+      options = createOptions()
+      response = await this.axiosInstance.get(url, options)
     }
 
     return response
@@ -1255,6 +1708,44 @@ export class QwenAiAdapter {
     }
   }
 
+  /**
+   * Resume an in-progress Qwen response after the transport drops. This is
+   * the same response-id based endpoint used by Qwen's web client; it does
+   * not submit the prompt a second time or duplicate tool execution.
+   */
+  async resumeChatCompletion(
+    chatId: string,
+    responseId: string,
+    signal?: AbortSignal,
+  ): Promise<AxiosResponse> {
+    if (!chatId || !responseId) {
+      throw new Error('Qwen AI resume requires both chat ID and response ID')
+    }
+
+    await this.refreshTokenIfNeeded(signal)
+
+    const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}&response_id=${encodeURIComponent(responseId)}`
+    const response = await this.getWithRefreshRetry(url, () => ({
+      headers: {
+        ...this.getHeaders(chatId),
+        Accept: 'text/event-stream',
+        'x-accel-buffering': 'no',
+      },
+      responseType: 'stream',
+      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      signal,
+      validateStatus: () => true,
+    }))
+
+    if (QWEN_AI_DEBUG_REQUEST_LOGS) {
+      console.log('[QwenAI] Resume response status:', response.status)
+      console.log('[QwenAI] Resume response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers)))
+    }
+
+    await this.assertChatCompletionStreamResponse(response)
+    return response
+  }
+
   async startDirectFileUpload(input: QwenAiDirectUploadInput): Promise<QwenAiDirectUploadStartResult> {
     await this.refreshTokenIfNeeded()
 
@@ -1305,6 +1796,7 @@ export class QwenAiStreamHandler {
   private ignoredResponseIds = new Set<string>()
   private responseBranchLocked = false
   private processedResponseEvent = false
+  private streamCompleted = false
   private readonly toolCallIdPrefix: string
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
@@ -1649,6 +2141,7 @@ export class QwenAiStreamHandler {
     let sawUpstreamCompletion = false
     let responseTimer: NodeJS.Timeout | undefined
     let idleTimer: NodeJS.Timeout | undefined
+    let idleRecoveryInFlight = false
     const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
 
     const cleanupTimers = () => {
@@ -1720,13 +2213,41 @@ export class QwenAiStreamHandler {
       destroyReadableStream(stream, upstreamError)
     }
 
+    const handleIdle = async () => {
+      if (finalChunkSent || idleRecoveryInFlight) return
+      idleTimer = undefined
+      const idleError = new Error(
+        `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
+      )
+
+      if (!options.recoverFromIdle) {
+        failStream(idleError)
+        return
+      }
+
+      idleRecoveryInFlight = true
+      try {
+        const recovered = await options.recoverFromIdle(idleError)
+        if (recovered) {
+          if (!finalChunkSent) refreshIdleTimer()
+          return
+        }
+        if (!finalChunkSent) failStream(idleError)
+      } catch (error) {
+        if (!finalChunkSent) {
+          failStream(error instanceof Error ? error : idleError)
+        }
+      } finally {
+        idleRecoveryInFlight = false
+      }
+    }
+
     const refreshIdleTimer = () => {
       if (idleTimer) {
         clearTimeout(idleTimer)
       }
       idleTimer = setTimeout(() => {
-        const idleMessage = `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`
-        failStream(new Error(idleMessage))
+        void handleIdle()
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
     }
 
@@ -1754,6 +2275,7 @@ export class QwenAiStreamHandler {
     }
 
     const completeStream = () => {
+      this.streamCompleted = true
       finalChunkSent = true
       cleanup()
       destroyReadableStream(stream)
@@ -1931,9 +2453,7 @@ export class QwenAiStreamHandler {
           }
 
           if (data['response.created']) {
-            if (this.recordResponseCreated(data['response.created'])) {
-              refreshIdleTimer()
-            }
+            this.recordResponseCreated(data['response.created'])
           }
 
           if (data.choices && data.choices.length > 0) {
@@ -1951,8 +2471,9 @@ export class QwenAiStreamHandler {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
             }
 
+            const previousSummaryLength = summaryText.length
             const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
-            if (isMeaningfulQwenAiEvent(event) || nativeToolProgress.declaredProgress) {
+            if (isMeaningfulQwenAiEvent(event, previousSummaryLength) || nativeToolProgress.declaredProgress) {
               refreshIdleTimer()
             }
 
@@ -2143,6 +2664,7 @@ export class QwenAiStreamHandler {
       let sawUpstreamCompletion = false
       let responseTimer: NodeJS.Timeout | undefined
       let idleTimer: NodeJS.Timeout | undefined
+      let idleRecoveryInFlight = false
       const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
 
       const cleanupTimers = () => {
@@ -2164,6 +2686,7 @@ export class QwenAiStreamHandler {
       const resolveOnce = (value: any) => {
         if (!resolved) {
           resolved = true
+          this.streamCompleted = true
           cleanup()
           destroyReadableStream(stream)
           resolve(value)
@@ -2253,13 +2776,39 @@ export class QwenAiStreamHandler {
         resolveOnce(response)
       }
 
+      const handleIdle = async () => {
+        if (resolved || idleRecoveryInFlight) return
+        idleTimer = undefined
+        const idleError = new Error(
+          `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
+        )
+
+        if (!options.recoverFromIdle) {
+          rejectOnce(idleError)
+          return
+        }
+
+        idleRecoveryInFlight = true
+        try {
+          const recovered = await options.recoverFromIdle(idleError)
+          if (recovered) {
+            if (!resolved) refreshIdleTimer()
+            return
+          }
+          if (!resolved) rejectOnce(idleError)
+        } catch (error) {
+          if (!resolved) rejectOnce(error instanceof Error ? error : idleError)
+        } finally {
+          idleRecoveryInFlight = false
+        }
+      }
+
       const refreshIdleTimer = () => {
         if (idleTimer) {
           clearTimeout(idleTimer)
         }
         idleTimer = setTimeout(() => {
-          const idleMessage = `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`
-          rejectOnce(new Error(idleMessage))
+          void handleIdle()
         }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
       }
 
@@ -2317,9 +2866,7 @@ export class QwenAiStreamHandler {
             }
 
             if (parsed['response.created']) {
-              if (this.recordResponseCreated(parsed['response.created'])) {
-                refreshIdleTimer()
-              }
+              this.recordResponseCreated(parsed['response.created'])
               if (this.responseId) {
                 data.id = this.responseId
               }
@@ -2338,8 +2885,9 @@ export class QwenAiStreamHandler {
               const status = delta.status
               const content = delta.content || ''
 
+              const previousSummaryLength = summaryText.length
               const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
-              if (isMeaningfulQwenAiEvent(event) || nativeToolProgress.declaredProgress) {
+              if (isMeaningfulQwenAiEvent(event, previousSummaryLength) || nativeToolProgress.declaredProgress) {
                 refreshIdleTimer()
               }
 
@@ -2415,6 +2963,10 @@ export class QwenAiStreamHandler {
 
   getResponseId(): string {
     return this.responseId
+  }
+
+  isComplete(): boolean {
+    return this.streamCompleted
   }
 }
 

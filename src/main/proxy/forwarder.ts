@@ -22,6 +22,7 @@ import {
   QwenAiAdapter,
   QwenAiStreamHandler,
   type QwenAiOutputStream,
+  createQwenAiResumableStream,
 } from './adapters/qwen-ai'
 import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
@@ -1308,11 +1309,18 @@ export class RequestForwarder {
 
       const handler = new QwenAiStreamHandler(actualModel, undefined, transformed.plan)
       handler.setChatId(chatId)
+      const resumableResponseStream = createQwenAiResumableStream(response.data, {
+        signal: context?.signal,
+        getResponseId: () => handler.getResponseId(),
+        isComplete: () => handler.isComplete(),
+        resume: responseId => adapter.resumeChatCompletion(chatId, responseId, context?.signal),
+      })
 
       if (request.stream) {
-        let transformedStream: any = await handler.handleStream(response.data, {
+        let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
           onFailure: () => cleanupChat(chatId),
+          recoverFromIdle: error => resumableResponseStream.recoverFromIdle(error),
         })
 
         // Keep the HTTP status mutable until Qwen produces the first visible
@@ -1371,8 +1379,9 @@ export class RequestForwarder {
         }
       }
 
-      const result = await handler.handleNonStream(response.data, {
+      const result = await handler.handleNonStream(resumableResponseStream, {
         signal: context?.signal,
+        recoverFromIdle: error => resumableResponseStream.recoverFromIdle(error),
       })
 
       this.applyToolCallsToResponse(result, transformed)

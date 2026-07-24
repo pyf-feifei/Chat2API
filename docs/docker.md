@@ -211,6 +211,13 @@ Chat2API emits legal SSE comment frames after
 `CHAT2API_SSE_KEEPALIVE_INTERVAL_MS` of downstream silence. These comments do
 not become model output and do not reset the Qwen meaningful-progress timer;
 set the value to `0` only when another layer owns transport keep-alives.
+If Qwen closes a response socket before its terminal event, Chat2API can ask
+Qwen to continue the same response using its `chat_id` and `response_id`.
+`CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` (default `3`) bounds those
+continuations and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` (default `1000`)
+controls the pause between attempts. Set the attempts value to `0` to disable
+this transport recovery. It never resubmits the original prompt and is not
+selected by a session id, project path, or task content.
 Qwen's early-error preflight is bounded by
 `CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS`. Once that window expires, the
 HTTP response switches to live SSE and later provider failures are reported

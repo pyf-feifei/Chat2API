@@ -10,6 +10,9 @@ model_list:
       # retries disabled so a queue response or client cancellation is not
       # submitted a second time by the outer proxy.
       num_retries: 0
+      # Preserve Anthropic adaptive-thinking effort through the generic
+      # OpenAI-compatible bridge. Chat2API decides how each provider uses it.
+      allowed_openai_params: ["reasoning_effort"]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
