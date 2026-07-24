@@ -71,6 +71,12 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /PROXY_SERVER_MODULE_PATH/)
   assert.match(patcher, /ANTHROPIC_ENDPOINTS_MODULE_PATH/)
   assert.match(patcher, /_chat2api_anthropic_image_url/)
+  assert.match(patcher, /_chat2api_count_anthropic_value/)
+  assert.match(patcher, /_CHAT2API_ANTHROPIC_MAX_TOKENIZED_CHARS/)
+  assert.match(patcher, /_CHAT2API_ANTHROPIC_STRUCTURAL_FALLBACK_TOKENS/)
+  assert.match(patcher, /_CHAT2API_ANTHROPIC_STRUCTURAL_FIELDS = frozenset\(\{"type", "cache_control"\}\)/)
+  assert.match(patcher, /if \"citations\" in c/)
+  assert.match(patcher, /asyncio\.to_thread/)
   assert.match(patcher, /LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY/)
 })
 
@@ -1169,6 +1175,316 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(Number.isInteger(result.body?.input_tokens), true, result.text)
     assert.ok(result.body.input_tokens > 0, result.text)
     assert.equal(mock.calls.length, callsBefore)
+  })
+
+  await t.test('counts Anthropic file images without resolving opaque file IDs', async () => {
+    const callsBefore = mock.calls.length
+    const countFileImage = async (content) => {
+      const result = await requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: anthropicHeaders(),
+        body: JSON.stringify({
+          model: MOCK_MODEL_ALIAS,
+          messages: [{ role: 'user', content }],
+        }),
+      })
+
+      assert.equal(result.response.status, 200, result.text)
+      assert.equal(Number.isInteger(result.body?.input_tokens), true, result.text)
+      assert.ok(result.body.input_tokens > 0, result.text)
+      return result.body.input_tokens
+    }
+
+    const emptyTokens = await countFileImage([])
+    const base64Tokens = await countFileImage([{
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: 'image/png',
+        data: ONE_PIXEL_PNG_BASE64,
+      },
+    }])
+    const urlTokens = await countFileImage([{
+      type: 'image',
+      source: { type: 'url', url: 'https://example.invalid/image.png' },
+    }])
+    const shortFileTokens = await countFileImage([{
+      type: 'image',
+      source: { type: 'file', file_id: 'file_image_short' },
+    }])
+    const longFileTokens = await countFileImage([{
+      type: 'image',
+      source: { type: 'file', file_id: `file_${'opaque'.repeat(4096)}` },
+    }])
+    const nestedFileTokens = await countFileImage([{
+      type: 'tool_result',
+      tool_use_id: 'tool_file_image',
+      content: [{
+        type: 'image',
+        source: { type: 'file', file_id: 'file_image_nested' },
+      }],
+    }])
+    const nestedEmptyTokens = await countFileImage([{
+      type: 'tool_result',
+      tool_use_id: 'tool_file_image',
+      content: [],
+    }])
+
+    assert.ok(shortFileTokens > emptyTokens)
+    assert.equal(shortFileTokens, base64Tokens)
+    assert.equal(shortFileTokens, urlTokens)
+    assert.equal(longFileTokens, shortFileTokens)
+    assert.ok(nestedFileTokens > nestedEmptyTokens)
+    assert.equal(mock.calls.length, callsBefore)
+  })
+
+  await t.test('counts extended Anthropic blocks with bounded conservative fallbacks', async () => {
+    const callsBefore = mock.calls.length
+    const countBlock = async (name, content) => {
+      const result = await requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: anthropicHeaders(),
+        body: JSON.stringify({
+          model: MOCK_MODEL_ALIAS,
+          messages: [{ role: 'user', content: [content] }],
+        }),
+      })
+
+      assert.equal(result.response.status, 200, `${name}: ${result.text}`)
+      assert.equal(Number.isInteger(result.body?.input_tokens), true, `${name}: ${result.text}`)
+      assert.ok(result.body.input_tokens > 0, `${name}: ${result.text}`)
+      return result.body.input_tokens
+    }
+
+    const shortDocumentTokens = await countBlock('short document', {
+      type: 'document',
+      source: {
+        type: 'base64',
+        media_type: 'application/pdf',
+        data: 'JVBERiQ=',
+      },
+      title: 'Offline document',
+      context: 'Reference material.',
+    })
+    const longDocumentTokens = await countBlock('long document', {
+      type: 'document',
+      source: {
+        type: 'base64',
+        media_type: 'application/pdf',
+        data: 'A'.repeat(1024 * 1024),
+      },
+      title: 'Offline document',
+      context: 'Reference material.',
+    })
+    assert.ok(longDocumentTokens > shortDocumentTokens)
+
+    const textDocumentTokens = await countBlock('text document', {
+      type: 'document',
+      source: {
+        type: 'text',
+        media_type: 'text/plain',
+        data: 'This source text must contribute to the count.',
+      },
+    })
+    assert.ok(textDocumentTokens > 0)
+
+    const shortCitationTokens = await countBlock('short citation', {
+      type: 'text',
+      text: 'Answer with a cited source.',
+      citations: [{
+        type: 'char_location',
+        cited_text: 'Short cited passage.',
+        document_index: 0,
+        document_title: 'Offline source',
+        start_char_index: 0,
+        end_char_index: 21,
+      }],
+    })
+    const longCitationTokens = await countBlock('long citation', {
+      type: 'text',
+      text: 'Answer with a cited source.',
+      citations: [{
+        type: 'char_location',
+        cited_text: 'A'.repeat(4096),
+        document_index: 0,
+        document_title: 'Offline source',
+        start_char_index: 0,
+        end_char_index: 4096,
+      }],
+    })
+    assert.ok(longCitationTokens > shortCitationTokens)
+
+    const fileDocumentTokens = await countBlock('file document', {
+      type: 'document',
+      source: {
+        type: 'file',
+        file_id: 'file_document_opaque_identifier',
+      },
+    })
+    assert.ok(fileDocumentTokens > textDocumentTokens)
+    const urlDocumentTokens = await countBlock('url document', {
+      type: 'document',
+      source: {
+        type: 'url',
+        url: 'https://example.invalid/reference.pdf',
+      },
+    })
+    assert.ok(urlDocumentTokens > textDocumentTokens)
+
+    const emptyServerToolTokens = await countBlock('empty server tool use', {
+      type: 'server_tool_use',
+      id: 'server_tool_opaque_id',
+      name: 'web_search',
+      input: {},
+    })
+    const serverToolTokens = await countBlock('scalar server tool use', {
+      type: 'server_tool_use',
+      id: 'server_tool_opaque_id',
+      name: 'web_search',
+      input: { attempts: 123456789, enabled: true },
+    })
+    const longKeyServerToolTokens = await countBlock('long-key server tool use', {
+      type: 'server_tool_use',
+      id: 'server_tool_opaque_id',
+      name: 'web_search',
+      input: { ['query_key_'.repeat(1024)]: false },
+    })
+    assert.ok(serverToolTokens > emptyServerToolTokens)
+    assert.ok(longKeyServerToolTokens > serverToolTokens)
+
+    const shortToolUseTokens = await countBlock('short tool use', {
+      type: 'tool_use',
+      id: 'tool_use_opaque_id',
+      name: 'web_search',
+      input: { query: 'short' },
+    })
+    const longToolUseTokens = await countBlock('long tool use', {
+      type: 'tool_use',
+      id: 'tool_use_opaque_id',
+      name: 'web_search',
+      input: { query: 'A'.repeat(1024 * 1024) },
+    })
+    assert.ok(longToolUseTokens > shortToolUseTokens)
+
+    const shortToolResultTokens = await countBlock('short tool result', {
+      type: 'tool_result',
+      tool_use_id: 'tool_use_opaque_id',
+      content: [{ type: 'text', text: 'short result' }],
+    })
+    const longToolResultTokens = await countBlock('long tool result', {
+      type: 'tool_result',
+      tool_use_id: 'tool_use_opaque_id',
+      content: [{ type: 'text', text: 'A'.repeat(1024 * 1024) }],
+    })
+    assert.ok(longToolResultTokens > shortToolResultTokens)
+
+    const webSearchTokens = await countBlock('web search result', {
+      type: 'web_search_tool_result',
+      tool_use_id: 'server_tool_opaque_id',
+      content: [{
+        type: 'web_search_result',
+        title: 'Offline result title',
+        url: 'https://example.invalid/result',
+        encrypted_content: 'A'.repeat(32 * 1024),
+      }],
+    })
+    const shortEncryptedWebSearchTokens = await countBlock('short encrypted web search result', {
+      type: 'web_search_tool_result',
+      tool_use_id: 'server_tool_opaque_id',
+      content: [{
+        type: 'web_search_result',
+        title: 'Offline result title',
+        url: 'https://example.invalid/result',
+        encrypted_content: 'opaque',
+      }],
+    })
+    assert.equal(webSearchTokens, shortEncryptedWebSearchTokens)
+
+    const shortSearchSourceTokens = await countBlock('short search source', {
+      type: 'search_result',
+      source: 's',
+      title: 'Offline search result',
+      content: [{ type: 'text', text: 'Result body.' }],
+    })
+    const longSearchSourceTokens = await countBlock('long search source', {
+      type: 'search_result',
+      source: 'source-value-'.repeat(1024),
+      title: 'Offline search result',
+      content: [{ type: 'text', text: 'Result body.' }],
+    })
+    assert.ok(longSearchSourceTokens > shortSearchSourceTokens)
+
+    const shortRedactedTokens = await countBlock('short redacted thinking', {
+      type: 'redacted_thinking',
+      data: 'opaque',
+    })
+    const longRedactedTokens = await countBlock('long redacted thinking', {
+      type: 'redacted_thinking',
+      data: 'A'.repeat(32 * 1024),
+    })
+    assert.equal(longRedactedTokens, shortRedactedTokens)
+    assert.ok(textDocumentTokens > shortRedactedTokens)
+    assert.ok(serverToolTokens > shortRedactedTokens)
+    assert.ok(webSearchTokens > shortRedactedTokens)
+
+    const containerUploadTokens = await countBlock('container upload', {
+      type: 'container_upload',
+      file_id: 'file_opaque_identifier',
+    })
+    assert.ok(containerUploadTokens > shortRedactedTokens)
+
+    const smallFuturePayloadTokens = await countBlock('small bounded future payload', {
+      type: 'future_payload',
+      payload: 'A'.repeat(64 * 1024),
+    })
+    const futurePayloadTokens = await countBlock('bounded future payload', {
+      type: 'future_payload',
+      payload: 'A'.repeat(1024 * 1024),
+    })
+    assert.ok(futurePayloadTokens > smallFuturePayloadTokens)
+    assert.ok(futurePayloadTokens > 0)
+
+    let deeplyNested = { type: 'future_nested', content: 'Counted before the depth guard.' }
+    for (let index = 0; index < 80; index += 1) {
+      deeplyNested = { type: 'future_nested', content: [deeplyNested] }
+    }
+    const deeplyNestedTokens = await countBlock('deeply nested future payload', deeplyNested)
+    assert.ok(deeplyNestedTokens > 0)
+
+    const manyNodes = Object.fromEntries(
+      Array.from({ length: 20_050 }, (_, index) => [`field_${index}`, index]),
+    )
+    const manyNodeTokens = await countBlock('node-bounded future payload', {
+      type: 'future_nodes',
+      payload: manyNodes,
+    })
+    assert.ok(manyNodeTokens > 0)
+    assert.equal(mock.calls.length, callsBefore)
+  })
+
+  await t.test('keeps the event loop responsive during large local token counts', async () => {
+    const countPromise = requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({
+        model: MOCK_MODEL_ALIAS,
+        messages: [{ role: 'user', content: '测'.repeat(64 * 1024) }],
+      }),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const startedAt = Date.now()
+    const liveliness = await fetch(`${liteLlmBaseUrl}/health/liveliness`, {
+      signal: AbortSignal.timeout(2_000),
+    })
+    const elapsedMs = Date.now() - startedAt
+    assert.equal(liveliness.status, 200, await liveliness.text())
+    assert.ok(elapsedMs < 2_000, `liveliness took ${elapsedMs}ms`)
+
+    const countResult = await countPromise
+    assert.equal(countResult.response.status, 200, countResult.text)
+    assert.equal(Number.isInteger(countResult.body?.input_tokens), true, countResult.text)
   })
 
   await t.test('records the LiteLLM v1.93.0 upstream error envelope', async () => {
