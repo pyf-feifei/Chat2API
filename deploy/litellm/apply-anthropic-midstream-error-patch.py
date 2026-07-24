@@ -496,7 +496,10 @@ def _chat2api_count_anthropic_document_source(
 
     source_type = source.get("type")
     state["nodes"] += 1
-    if state["nodes"] > _CHAT2API_ANTHROPIC_MAX_CONTENT_NODES:
+    if (
+        state["nodes"] > _CHAT2API_ANTHROPIC_MAX_CONTENT_NODES
+        or len(source) + state["nodes"] > _CHAT2API_ANTHROPIC_MAX_CONTENT_NODES
+    ):
         state["truncated"] = True
         _chat2api_add_fallback_value(source, state)
         return 0
