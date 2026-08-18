@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { ToolCallingEngine } from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
+import {
+  extractLatestActiveUserAttachments,
+  ToolCallingEngine,
+} from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
 import { MANAGED_TOOL_PROMPT_MESSAGE_NAME } from '../../src/main/proxy/toolCalling/managedPromptMetadata.ts'
 import type { ChatCompletionRequest } from '../../src/main/proxy/types.ts'
 import type { Provider } from '../../src/main/store/types.ts'
@@ -82,6 +85,38 @@ const tools = [
     },
   },
 ]
+
+test('active user attachment extraction keeps only the current user turn', () => {
+  const attachments = extractLatestActiveUserAttachments([
+    {
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'https://example.test/old.png' } }],
+    },
+    { role: 'assistant', content: 'old answer' },
+    {
+      role: 'user',
+      content: [{
+        type: 'image_url', image_url: { url: 'https://example.test/current.png' },
+      }],
+    },
+    { role: 'user', content: 'Image source metadata.' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_read',
+        type: 'function',
+        function: { name: 'read_file', arguments: '{}' },
+      }],
+    },
+    { role: 'tool', tool_call_id: 'call_read', content: '{}' },
+  ])
+
+  assert.deepEqual(attachments, [{
+    type: 'image_url',
+    image_url: { url: 'https://example.test/current.png' },
+  }])
+})
 
 function request(overrides: Partial<ChatCompletionRequest> = {}): ChatCompletionRequest {
   return {
@@ -909,7 +944,7 @@ test('non-stream parsing removes malformed managed XML without fabricating optio
   assert.equal(result.choices[0].finish_reason, 'stop')
 })
 
-test('non-stream Qwen Hermes rejects a malformed auto tool block as structured 422', () => {
+test('non-stream Qwen Hermes removes a malformed optional tool block', () => {
   const engine = new ToolCallingEngine()
   const transformed = engine.transformRequest({
     request: request({
@@ -934,13 +969,8 @@ test('non-stream Qwen Hermes rejects a malformed auto tool block as structured 4
     }],
   }
 
-  assert.throws(
-    () => engine.applyNonStreamResponse(result, transformed.plan),
-    (error: Error & { status?: number, code?: string, retryable?: boolean }) => (
-      error.status === 422
-      && error.code === 'malformed_tool_call'
-      && error.retryable === false
-    ),
-  )
+  engine.applyNonStreamResponse(result, transformed.plan)
+
   assert.equal(result.choices[0].message.tool_calls, undefined)
+  assert.equal(result.choices[0].message.content, null)
 })

@@ -1267,6 +1267,9 @@ function loadForwarderForBridgeTests(overrides = {}) {
         content: 'Continue after the completed tool result.',
       }),
       extractLatestActiveUserRequest: () => 'Read package.json.',
+      extractLatestActiveUserAttachments: messages => messages
+        .filter(message => message.role === 'user' && Array.isArray(message.content))
+        .flatMap(message => message.content.filter(part => part.type === 'image_url')),
     },
     './toolCalling/assistantInputBoundary': {
       sanitizeAssistantInputHistory: messages => ({ messages, removedMessageCount: 0 }),
@@ -1542,6 +1545,34 @@ test('Qwen forwarder sends only the continuation delta to the pinned chat', asyn
     parentId: 'qwen-parent-after-turn',
     requestFingerprint: 'bridge-fingerprint',
     toolProtocol: 'managed-tools-v1',
+  })
+})
+
+test('Qwen forwarder carries active user attachments into a retained continuation', async () => {
+  const { forwarder, calls } = createForwarderBridgeHarness()
+  const request = bridgeForwardRequest()
+  request.messages = request.messages.map(message => message.role === 'user'
+    ? {
+        ...message,
+        content: [{ type: 'text', text: 'Inspect this screenshot.' }, {
+          type: 'image_url', image_url: { url: 'https://example.test/screenshot.png' },
+        }],
+      }
+    : message)
+
+  const result = await forwarder.forwardQwenAi(
+    request,
+    { id: 'account-pinned' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'qwen3.8-max',
+    Date.now(),
+    bridgeForwardContext(),
+  )
+
+  assert.equal(result.success, true)
+  assert.deepEqual(calls.continuations[0].messages[1], {
+    role: 'user',
+    content: [{ type: 'image_url', image_url: { url: 'https://example.test/screenshot.png' } }],
   })
 })
 

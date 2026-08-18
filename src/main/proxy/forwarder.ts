@@ -44,6 +44,7 @@ import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
 import {
   createToolWorkflowContinuationMessage,
+  extractLatestActiveUserAttachments,
   extractLatestActiveUserRequest,
   ToolCallingEngine,
 } from './toolCalling/ToolCallingEngine'
@@ -3327,8 +3328,12 @@ export class RequestForwarder {
           failedToolResultPending: transformed.plan.failedToolResultPending,
           plan: transformed.plan,
         })
+        const activeUserAttachments = extractLatestActiveUserAttachments(providerRequest.messages)
         const continuationMessages: ChatMessage[] = [
           ...continuation.inputMessages,
+          ...(activeUserAttachments.length > 0
+            ? [{ role: 'user' as const, content: activeUserAttachments }]
+            : []),
           workflowContinuationMessage,
         ]
 
@@ -3362,6 +3367,7 @@ export class RequestForwarder {
             chatId,
             parentId: continuationBinding.parentId,
             deltaMessageCount: continuationMessages.length,
+            activeUserAttachmentCount: activeUserAttachments.length,
           }))
         } catch (error) {
           const continuationCode = errorCodeFromError(error)

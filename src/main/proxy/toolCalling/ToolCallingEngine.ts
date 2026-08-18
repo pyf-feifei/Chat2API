@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { ChatCompletionRequest, ChatMessage } from '../types.ts'
+import type { ChatCompletionRequest, ChatMessage, ChatMessageContent } from '../types.ts'
 import type { Provider } from '../../store/types.ts'
 import {
   DEFAULT_TOOL_CALLING_CONFIG,
@@ -136,6 +136,50 @@ export function extractLatestActiveUserRequest(messages: ChatMessage[]): string 
     if (!isToolResultMessage(message)) return undefined
   }
   return undefined
+}
+
+const ACTIVE_USER_ATTACHMENT_TYPES = new Set<ChatMessageContent['type']>([
+  'image_url',
+  'file',
+  'input_audio',
+  'video_url',
+])
+
+/**
+ * Retain attachments from the active user turn for provider-native follow-ups.
+ * Some upstream chats keep text history across a continuation but do not keep
+ * the provider-side visual/file context unless the attachment is sent again.
+ */
+export function extractLatestActiveUserAttachments(
+  messages: ChatMessage[],
+): ChatMessageContent[] {
+  const attachments: ChatMessageContent[] = []
+  let activeUserTurnStarted = false
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (isToolResultMessage(message)) continue
+
+    if (message.role === 'assistant') {
+      if (activeUserTurnStarted) break
+      continue
+    }
+    if (message.role === 'system') {
+      if (activeUserTurnStarted) break
+      continue
+    }
+    if (message.role !== 'user') continue
+
+    activeUserTurnStarted = true
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (ACTIVE_USER_ATTACHMENT_TYPES.has(part.type)) {
+        attachments.push({ ...part })
+      }
+    }
+  }
+
+  return attachments.reverse()
 }
 
 export class ToolCallingEngine {
