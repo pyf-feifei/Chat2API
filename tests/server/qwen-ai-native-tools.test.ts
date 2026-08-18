@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   isCompleteJsonText,
   mergeNativeToolArguments,
+  mergeNativeToolName,
   normalizeNativeFunctionCallDelta,
 } from '../../src/main/proxy/adapters/qwen-ai-native-tools.ts'
 import { getToolArgumentValidationIssues } from '../../src/main/proxy/toolCalling/protocols/shared.ts'
@@ -34,6 +35,36 @@ test('Qwen AI native tool argument merge replaces newer complete snapshots', () 
 
   assert.equal(args, '{"command":"node dist/cli.js","workdir":"C:\\\\tmp"}')
   assert.equal(isCompleteJsonText(args), true)
+})
+
+test('Qwen AI native tool name merge collapses repeated cumulative snapshots', () => {
+  const allowed = new Set(['shell_exec'])
+  let name = ''
+  name = mergeNativeToolName(name, 'shell_exec', allowed)
+  name = mergeNativeToolName(name, 'shell_execshell_exec', allowed)
+  name = mergeNativeToolName(name, 'shell_execshell_execshell_exec', allowed)
+
+  assert.equal(name, 'shell_exec')
+  assert.equal(mergeNativeToolName('', 'shell_execshell_exec', allowed), 'shell_exec')
+})
+
+test('Qwen AI native tool name merge supports genuine name fragments', () => {
+  const allowed = new Set(['namespace:search_tool'])
+  let name = ''
+  name = mergeNativeToolName(name, 'namespace:', allowed)
+  name = mergeNativeToolName(name, 'search_', allowed)
+  name = mergeNativeToolName(name, 'tool', allowed)
+
+  assert.equal(name, 'namespace:search_tool')
+})
+
+test('Qwen AI native tool name merge preserves unknown names for validation', () => {
+  const allowed = new Set(['declared_tool'])
+
+  assert.equal(
+    mergeNativeToolName('unknown', 'unknown_suffix', allowed),
+    'unknown_suffix',
+  )
 })
 
 test('Qwen AI native function call normalization accepts OpenAI-style tool_calls and legacy function_call', () => {

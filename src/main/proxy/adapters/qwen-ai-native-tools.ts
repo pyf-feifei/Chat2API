@@ -120,6 +120,52 @@ export function mergeNativeToolArguments(previous: string, fragment?: string): s
   return previous + fragment
 }
 
+export function mergeNativeToolName(
+  previous: string,
+  fragment: string | undefined,
+  allowedToolNames: ReadonlySet<string>,
+): string {
+  if (!fragment) return previous
+
+  const repeatedDeclaredName = [...allowedToolNames].find(name =>
+    name.length > 0
+    && fragment.length > name.length
+    && fragment.length % name.length === 0
+    && fragment === name.repeat(fragment.length / name.length),
+  )
+  const normalizedFragment = repeatedDeclaredName ?? fragment
+  if (!previous || normalizedFragment === previous) return normalizedFragment
+
+  // Qwen may alternate between cumulative snapshots and token deltas. Prefer a
+  // candidate declared by the client, then a candidate that can still grow
+  // into one. This keeps the reconciliation protocol-based and tool-agnostic.
+  const snapshotLooksCumulative = normalizedFragment.startsWith(previous)
+  const candidates = snapshotLooksCumulative
+    ? [normalizedFragment, previous + normalizedFragment]
+    : [previous + normalizedFragment, normalizedFragment]
+  const exact = candidates.find(candidate => allowedToolNames.has(candidate))
+  if (exact) return exact
+
+  const viablePrefix = candidates.find(candidate =>
+    [...allowedToolNames].some(name => name.startsWith(candidate)),
+  )
+  if (viablePrefix) return viablePrefix
+
+  // Some Qwen streams repeat an already-complete name in their cumulative
+  // field (name -> namename -> namenamename). Preserve the declared name so a
+  // provider framing defect cannot turn it into a different downstream tool.
+  if (
+    allowedToolNames.has(previous)
+    && normalizedFragment.length > previous.length
+    && normalizedFragment.length % previous.length === 0
+    && normalizedFragment === previous.repeat(normalizedFragment.length / previous.length)
+  ) {
+    return previous
+  }
+
+  return normalizedFragment
+}
+
 export function isCompleteJsonText(value: string): boolean {
   const trimmed = value.trim()
   if (!trimmed) return false

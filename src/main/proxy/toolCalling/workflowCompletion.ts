@@ -1,6 +1,10 @@
 import type { ToolCallingPlan } from './types.ts'
 
 export const MANAGED_WORKFLOW_COMPLETE_MARKER = '<chat2api_workflow_complete/>'
+const MANAGED_WORKFLOW_COMPLETE_MARKER_VARIANTS = [
+  MANAGED_WORKFLOW_COMPLETE_MARKER,
+  '<chat2api_workflow_complete>',
+] as const
 
 type ManagedWorkflowCompletionPlan = Pick<
   ToolCallingPlan,
@@ -25,14 +29,17 @@ export function parseManagedWorkflowCompletionProof(
   }
 
   const trimmed = content.trimEnd()
-  if (!trimmed.endsWith(MANAGED_WORKFLOW_COMPLETE_MARKER)) {
+  const marker = MANAGED_WORKFLOW_COMPLETE_MARKER_VARIANTS.find(candidate => (
+    trimmed.endsWith(candidate)
+  ))
+  if (!marker) {
     return { complete: false, content }
   }
 
-  const markerStart = trimmed.length - MANAGED_WORKFLOW_COMPLETE_MARKER.length
+  const markerStart = trimmed.length - marker.length
   const prefix = trimmed.slice(0, markerStart)
   if (
-    prefix.includes(MANAGED_WORKFLOW_COMPLETE_MARKER)
+    MANAGED_WORKFLOW_COMPLETE_MARKER_VARIANTS.some(candidate => prefix.includes(candidate))
     || isInsideOpenCodeFence(trimmed, markerStart)
     || isQuotedOrCodeLine(trimmed, markerStart)
   ) {

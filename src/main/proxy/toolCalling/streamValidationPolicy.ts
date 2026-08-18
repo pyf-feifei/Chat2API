@@ -16,14 +16,6 @@ export function getToolStreamValidationFailure(input: {
   if (!plan?.shouldParseResponse || emittedToolCall) return undefined
 
   const requiresToolCall = plan.toolChoiceMode === 'required' || plan.toolChoiceMode === 'forced'
-  if (pendingToolProtocol && plan.protocol === 'qwen_hermes') {
-    return {
-      message: 'Provider returned a malformed or empty Qwen Hermes tool call block',
-      type: 'tool_call_parse_error',
-      param: 'tool_calls',
-      code: 'malformed_tool_call',
-    }
-  }
   // `auto` means that a tool call is optional.  A model can start emitting the
   // managed marker and then finish with an incomplete block (for example when
   // it changes its mind during a reasoning turn).  The non-stream path treats

@@ -62,6 +62,15 @@ test('successful tool-result continuations use terminal assistant text as comple
   )
 })
 
+test('completion proof strips the model-emitted marker variant without a slash', () => {
+  const content = 'The work is complete.<chat2api_workflow_complete>'
+  assert.deepEqual(
+    parseManagedWorkflowCompletionProof(content, managedPlan()),
+    { complete: true, content: 'The work is complete.' },
+  )
+  assert.equal(stripManagedWorkflowCompletionMarker(content, managedPlan()), 'The work is complete.')
+})
+
 test('failed-result continuations allow terminal assistant text', () => {
   assert.equal(
     requiresManagedWorkflowCompletionMarker(managedPlan({

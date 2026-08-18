@@ -53,6 +53,7 @@ import type { ToolCall } from '../types'
 import {
   isCompleteJsonText,
   mergeNativeToolArguments,
+  mergeNativeToolName,
   normalizeNativeFunctionCallDelta,
   type NativeToolCallState,
 } from './qwen-ai-native-tools'
@@ -3520,7 +3521,14 @@ export class QwenAiAdapter {
     const upstreamStatus = response.status >= 400 && response.status <= 599
       ? response.status
       : 502
-    const error = new Error(`Qwen AI upstream ${reason} (HTTP ${response.status}, content-type ${contentType})${detail}`) as QwenAiUpstreamError
+    // The response headers may look like a WAF challenge even when Qwen's
+    // body explicitly says the service is overloaded (RGV587). Keep the
+    // client-facing reason aligned with the body classification so callers
+    // do not treat a retryable busy response as an account challenge.
+    const effectiveReason = isUpstreamBusy
+      ? 'returned an upstream-busy response instead of a chat event stream'
+      : reason
+    const error = new Error(`Qwen AI upstream ${effectiveReason} (HTTP ${response.status}, content-type ${contentType})${detail}`) as QwenAiUpstreamError
     // Preserve only retry pacing metadata. The governor uses Retry-After to
     // distinguish ordinary quota throttling without exposing upstream cookies
     // or transport headers to the client.
@@ -4859,7 +4867,11 @@ export class QwenAiStreamHandler {
     for (const fragment of fragments) {
       sawFragment = true
       const existing = this.nativeToolCallStates.get(fragment.key)
-      const name = fragment.name || existing?.name || ''
+      const name = mergeNativeToolName(
+        existing?.name ?? '',
+        fragment.name,
+        this.toolCallingPlan.allowedToolNames,
+      )
       const allowed = Boolean(name && this.toolCallingPlan.allowedToolNames.has(name))
       const argumentsText = mergeNativeToolArguments(existing?.arguments ?? '', fragment.arguments)
       const nextState: NativeToolCallState = {

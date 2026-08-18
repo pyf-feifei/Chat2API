@@ -46,14 +46,14 @@ test('optional tool calls tolerate a pending managed protocol block', () => {
   )
 })
 
-test('optional Qwen Hermes calls reject a started malformed protocol block', () => {
+test('optional Qwen Hermes calls tolerate a started malformed protocol block', () => {
   assert.equal(
     getToolStreamValidationFailure({
       plan: plan('auto', 'qwen_hermes'),
       emittedToolCall: false,
       pendingToolProtocol: true,
-    })?.code,
-    'malformed_tool_call',
+    }),
+    undefined,
   )
 })
 
