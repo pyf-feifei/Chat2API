@@ -231,7 +231,9 @@ export function qwenAiSafeExplicitRetryScope(
   if (!isRecord(value) || value.retryScope !== 'next-account') return undefined
   if (value.accountFault !== false) return undefined
   const code = rootStringField(value, ['errorCode', 'error_code', 'code'])?.toLowerCase()
-  return code === 'qwen_ai_file_parse_timeout' || code === 'qwen_ai_queue_timeout'
+  return code === 'qwen_ai_file_parse_timeout'
+    || code === 'qwen_ai_queue_timeout'
+    || code === 'chat_in_progress'
     ? 'next-account'
     : undefined
 }

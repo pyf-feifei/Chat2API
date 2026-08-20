@@ -36,6 +36,7 @@ import {
   qwenAiRequestTimeoutMsFromEnv,
   qwenAiResponsesContinuationRetryAttemptsFromEnv,
   type QwenAiOutputStream,
+  type QwenAiUpstreamError,
   createQwenAiResumableStream,
 } from './adapters/qwen-ai'
 import type { QwenAiMessageTransport } from './adapters/qwen-ai-files'
@@ -3398,10 +3399,35 @@ export class RequestForwarder {
             )
           if (!isQwenAiStaleSessionError(error) && !continuationBusy) throw error
 
-          // Qwen can lose the retained branch or still be finalizing it when
-          // Claude immediately submits the tool result. Recreate only the
-          // provider branch on the same credential and replay the full client
-          // transcript; neither case is an account-health event.
+          // Clean up the busy/stale chat regardless of which path we take.
+          cleanupChat(continuationBinding.chatId)
+
+          if (continuationBusy) {
+            // The upstream chat is still finalizing a prior turn. Switching
+            // to a fresh account avoids the expensive full-transcript replay
+            // (100-200+ seconds for large contexts) and lets an idle account
+            // serve the request immediately.
+            console.info('[QwenAI] Responses session continuation busy; failing over to next account', JSON.stringify({
+              requestId: context?.requestId,
+              accountId: account.id,
+              chatId: continuationBinding.chatId,
+              status: continuationStatus,
+              errorCode: continuationCode,
+            }))
+            const busyError = new Error(
+              `Qwen AI chat is still in progress; switching to another account`,
+            ) as QwenAiUpstreamError
+            busyError.status = 429
+            busyError.code = 'CHAT_IN_PROGRESS'
+            busyError.retryable = true
+            busyError.accountFault = false
+            busyError.retryScope = 'next-account'
+            throw busyError
+          }
+
+          // Qwen can lose the retained branch when Claude immediately
+          // submits the tool result. Recreate only the provider branch on
+          // the same credential and replay the full client transcript.
           console.info('[QwenAI] Responses session continuation unavailable; replaying full transcript on the same account', JSON.stringify({
             requestId: context?.requestId,
             accountId: account.id,
@@ -3409,7 +3435,6 @@ export class RequestForwarder {
             status: continuationStatus,
             errorCode: continuationCode,
           }))
-          cleanupChat(continuationBinding.chatId)
           activeChatId = undefined
           activeChatIsRetained = false
           const restarted = await adapter.chatCompletion(

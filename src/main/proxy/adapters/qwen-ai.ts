@@ -1910,7 +1910,7 @@ export function describeErrorForLog(error: unknown): string {
   return `${name}:${status}${code} ${message}`.trim()
 }
 
-type QwenAiUpstreamError = Error & {
+export type QwenAiUpstreamError = Error & {
   status?: number
   type?: string
   param?: string
