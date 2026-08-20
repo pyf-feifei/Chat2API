@@ -21,6 +21,7 @@ import { DeepSeekAdapter } from './adapters/deepseek'
 import { DeepSeekStreamHandler } from './adapters/deepseek-stream'
 import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
 import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
+import { M365Adapter } from './adapters/m365'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
 import {
@@ -85,6 +86,19 @@ function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFaul
 
 function shouldDeleteSession(): boolean {
   return sessionManager.shouldDeleteAfterChat()
+}
+
+/**
+ * True when an error surfaced by the ChatHub client looks like an M365
+ * auth rejection (expired/revoked access token) rather than rate limiting
+ * or a content policy block.
+ */
+function isM365AuthIssue(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/rate limit|too many requests|content policy|contentfilter|safetyblocked/i.test(message)) {
+    return false
+  }
+  return /401|403|unauthorized|access token|token expired|expired token|invalid_grant|aadsts/i.test(message)
 }
 
 type ThreeLevelReasoningEffort = 'low' | 'medium' | 'high'
@@ -678,9 +692,9 @@ function qwenAiRetryCountFromEnv(recoverManagedToolStream: boolean): number {
 
 function qwenAiBusyRetryCountFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
-  if (raw === undefined || raw.trim() === '') return 1
+  if (raw === undefined || raw.trim() === '') return 3
   const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) return 1
+  if (!Number.isSafeInteger(value) || value < 0) return 3
   return value
 }
 
@@ -1013,6 +1027,12 @@ export class RequestForwarder {
       matches: KimiAdapter.isKimiProvider,
       forward: (request, account, provider, actualModel, startTime, context) =>
         this.forwardKimi(request, account, provider, actualModel, startTime, context),
+    },
+    {
+      profileKey: 'm365-copilot',
+      matches: M365Adapter.isM365Provider,
+      forward: (request, account, provider, actualModel, startTime) =>
+        this.forwardM365Copilot(request, account, provider, actualModel, startTime),
     },
     {
       profileKey: 'qwen',
@@ -4205,6 +4225,175 @@ export class RequestForwarder {
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
+        latency,
+      }
+    }
+  }
+
+  /**
+   * Forward to M365 Copilot via ChatHub WebSocket protocol
+   */
+  private async forwardM365Copilot(
+    request: ChatCompletionRequest,
+    account: Account,
+    provider: Provider,
+    actualModel: string,
+    startTime: number
+  ): Promise<ForwardResult> {
+    console.log('[forwardM365Copilot] actualModel:', actualModel)
+    try {
+      const adapter = new M365Adapter(provider, account)
+
+      // Validate account credentials
+      const validation = adapter.validateAccount()
+      if (!validation.valid) {
+        return {
+          success: false,
+          status: 401,
+          error: validation.error || 'Invalid M365 account credentials',
+          latency: Date.now() - startTime,
+        }
+      }
+
+      // Proactively refresh the access token when it is expired or within
+      // the refresh buffer; a refreshed set is persisted back to the account
+      // store so concurrent requests reuse it (kimi-style closed loop).
+      const freshCredentials = await adapter.acquireCredentials()
+
+      // Transform the request
+      const transformedRequest = adapter.transformRequest(request)
+
+      const chatRequest = {
+        text: transformedRequest.text,
+        tone: transformedRequest.tone || 'magic',
+        sessionId: transformedRequest.sessionId,
+        conversationId: transformedRequest.conversationId,
+        attachments: transformedRequest.attachments || [],
+        tools: transformedRequest.tools || [],
+        toolChoice: transformedRequest.toolChoice,
+      }
+
+      // Import ChatHub client dynamically
+      const { ChatHubClient } = await import('../providers/builtin/m365/chathub/client')
+
+      const client = new ChatHubClient()
+      const chatHubAccount = {
+        accessToken: freshCredentials.accessToken,
+        oid: freshCredentials.oid,
+        tid: freshCredentials.tid,
+      }
+
+      const latency = Date.now() - startTime
+
+      if (request.stream) {
+        // Create a passthrough stream for SSE
+        const { PassThrough } = await import('stream')
+        const passThrough = new PassThrough()
+
+        // Track whether any delta went out so an auth rejection before the
+        // first byte can be retried once with a refreshed token.
+        let streamed = false
+        const onDelta = (delta: string): void => {
+          streamed = true
+          const chunk = adapter.transformStreamChunk({ text: delta }, actualModel)
+          passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+        }
+        const finishStream = (): void => {
+          // Send final chunk with finish_reason
+          const finalChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: actualModel,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: 'stop',
+            }],
+          }
+          passThrough.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+          passThrough.write('data: [DONE]\n\n')
+          passThrough.end()
+        }
+        const startChat = (creds: { accessToken: string; oid: string; tid: string }) =>
+          client.chat(creds, chatRequest, onDelta)
+
+        // Start the ChatHub chat in background; retry once on an early auth
+        // rejection before any delta has been streamed.
+        const runChat = async (): Promise<void> => {
+          try {
+            await startChat(chatHubAccount)
+            finishStream()
+          } catch (error) {
+            if (!streamed && isM365AuthIssue(error)) {
+              console.warn('[M365Copilot] stream auth failure, retrying once with refreshed token:', error instanceof Error ? error.message : error)
+              adapter.invalidateAccessToken(chatHubAccount.accessToken)
+              try {
+                const refreshed = await adapter.acquireCredentials(true)
+                await startChat({ accessToken: refreshed.accessToken, oid: refreshed.oid, tid: refreshed.tid })
+                finishStream()
+                return
+              } catch (retryError) {
+                console.error('[M365Copilot] ChatHub stream retry error:', retryError)
+                passThrough.end()
+                return
+              }
+            }
+            console.error('[M365Copilot] ChatHub stream error:', error)
+            passThrough.end()
+          }
+        }
+        void runChat()
+
+        return {
+          success: true,
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+          stream: passThrough as any,
+          skipTransform: true,
+          latency,
+        }
+      }
+
+      // Non-streaming: collect full response; when the failure looks like an
+      // auth rejection, refresh the token and retry once.
+      let result: any
+      try {
+        result = await client.chat(chatHubAccount, chatRequest)
+      } catch (error) {
+        if (!isM365AuthIssue(error)) {
+          throw error
+        }
+        console.warn('[M365Copilot] auth failure, retrying once with refreshed token:', error instanceof Error ? error.message : error)
+        adapter.invalidateAccessToken(chatHubAccount.accessToken)
+        const refreshed = await adapter.acquireCredentials(true)
+        result = await client.chat(
+          { accessToken: refreshed.accessToken, oid: refreshed.oid, tid: refreshed.tid },
+          chatRequest,
+        )
+      }
+
+      const body = adapter.transformResponse(result, actualModel)
+
+      return {
+        success: true,
+        status: 200,
+        headers: {},
+        body,
+        latency: Date.now() - startTime,
+      }
+    } catch (error) {
+      const latency = Date.now() - startTime
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      // A deterministic auth failure (invalid_grant / AADSTS* from the
+      // refresh grant) will not heal by retrying the same account; surface
+      // 401 and stop the forwarder retry loop.
+      const authIssue = isM365AuthIssue(error)
+      return {
+        success: false,
+        status: authIssue ? 401 : undefined,
+        error: message,
+        retryable: authIssue ? false : undefined,
         latency,
       }
     }

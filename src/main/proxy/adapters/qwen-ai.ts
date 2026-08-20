@@ -2913,6 +2913,7 @@ function createQwenAiStreamEnvelopeError(
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
       error.accountFault = false
+      error.retryScope = 'next-account'
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
       error.retryable = true
@@ -3033,6 +3034,7 @@ function createQwenAiStreamEnvelopeError(
     error.code = 'qwen_ai_upstream_busy'
     error.retryable = true
     error.accountFault = false
+    error.retryScope = 'next-account'
   } else if (isRiskControl) {
     error.code = 'qwen_ai_risk_control'
   } else if (isChatInProgress) {
@@ -3553,6 +3555,7 @@ export class QwenAiAdapter {
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
       error.accountFault = false
+      error.retryScope = 'next-account'
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
     } else if (chatInProgress) {

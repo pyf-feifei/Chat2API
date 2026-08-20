@@ -354,6 +354,10 @@ function qwenAiFileParseTimeoutMsFromEnv(): number {
   return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_TIMEOUT_MS', 120000)
 }
 
+function qwenAiFileOperationRequestTimeoutMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_OPERATION_TIMEOUT_MS', 120000)
+}
+
 function boundedPositiveIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, positiveIntegerFromEnv(name, fallback)))
 }
@@ -2371,7 +2375,7 @@ export class QwenAiFileUploader {
       },
       () => ({
         headers: this.getHeaders(),
-        timeout: 30000,
+        timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
         validateStatus: () => true,
       }),
       options,
@@ -2470,7 +2474,7 @@ export class QwenAiFileUploader {
       { file_id: fileId },
       () => ({
         headers: this.getHeaders(),
-        timeout: 30000,
+        timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
         validateStatus: () => true,
       }),
       options,
@@ -2509,7 +2513,7 @@ export class QwenAiFileUploader {
         { file_id_list: [fileId] },
         () => ({
           headers: this.getHeaders(),
-          timeout: Math.max(1, Math.min(30000, pollingDeadlineAt - Date.now())),
+          timeout: Math.max(1, Math.min(qwenAiFileOperationRequestTimeoutMsFromEnv(), pollingDeadlineAt - Date.now())),
           validateStatus: () => true,
         }),
         options,
