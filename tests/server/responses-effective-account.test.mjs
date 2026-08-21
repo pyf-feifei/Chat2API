@@ -122,8 +122,18 @@ function loadResponsesRoute(createResult, options = {}) {
       this.stack = []
     }
 
-    post(path, handler) {
-      this.stack.push({ path, handler })
+    post(path, ...handlers) {
+      const handler = async ctx => {
+        let current = -1
+        const dispatch = async index => {
+          assert.ok(index > current, 'next() must not be called more than once')
+          current = index
+          const middleware = handlers[index]
+          if (middleware) await middleware(ctx, () => dispatch(index + 1))
+        }
+        await dispatch(0)
+      }
+      this.stack.push({ path, handler, handlers })
       return this
     }
   }
@@ -296,6 +306,14 @@ function loadResponsesRoute(createResult, options = {}) {
         clearQwenAiSessionBinding: () => {},
       },
     },
+    '../responses/sessionLock': {
+      responsesSessionLock: {
+        acquire: async () => () => {},
+      },
+    },
+    '../responses/toolLoopGuard': {
+      detectResponsesToolLoop: () => undefined,
+    },
     '../responses/stream': {
       createResponsesStreamTransform: options => ({
         start: () => new MockResponsesStream(options),
@@ -315,6 +333,9 @@ function loadResponsesRoute(createResult, options = {}) {
         textChars: 0,
         lastUserTextChars: 0,
       }),
+    },
+    '../qwenAiCompactionBoundary': {
+      estimateQwenAiRequestInputTokens: () => 1,
     },
     '../qwenAiSessionBridge': {
       createQwenAiSessionRequestFingerprint: () => 'qwen-responses-test-fingerprint',

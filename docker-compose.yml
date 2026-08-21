@@ -120,6 +120,16 @@ services:
       # Emit protocol-neutral SSE comments while a downstream stream is quiet.
       # Zero disables keep-alives for deployments that manage them elsewhere.
       CHAT2API_SSE_KEEPALIVE_INTERVAL_MS: ${CHAT2API_SSE_KEEPALIVE_INTERVAL_MS:-15000}
+      # Store bounded previous_response_id lineages in the mounted /data volume.
+      # Set the path to disabled to keep this state memory-only.
+      CHAT2API_RESPONSES_STORE_PATH: ${CHAT2API_RESPONSES_STORE_PATH:-/data/responses/conversations.jsonl}
+      CHAT2API_RESPONSES_STORE_TTL_MS: ${CHAT2API_RESPONSES_STORE_TTL_MS:-86400000}
+      CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL: ${CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL:-32}
+      # Reject repeated completed calls only when both arguments and results
+      # remain unchanged. Poll/wait tools are ignored by default.
+      CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD: ${CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD:-3}
+      CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS: ${CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS:-wait,wait_agent,write_stdin}
+      CHAT2API_RESPONSES_TOOL_LOOP_WINDOW: ${CHAT2API_RESPONSES_TOOL_LOOP_WINDOW:-8}
       CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS: ${CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:-540000}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}

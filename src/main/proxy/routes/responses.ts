@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { PassThrough, type Readable } from 'node:stream'
 import Router from '@koa/router'
-import type { Context } from 'koa'
+import type { Context, Next } from 'koa'
 import {
   requestForwarder,
   shouldDeferQwenAiManagedStreamCommit,
@@ -30,8 +30,11 @@ import {
   type ResponseCreateRequest,
 } from '../responses/compat'
 import { responsesConversationStore } from '../responses/store'
+import { responsesSessionLock } from '../responses/sessionLock'
+import { detectResponsesToolLoop } from '../responses/toolLoopGuard'
 import { createResponsesStreamTransform } from '../responses/stream'
 import { classifyChatRequest } from '../requestIntent'
+import { estimateQwenAiRequestInputTokens } from '../qwenAiCompactionBoundary'
 import {
   createQwenAiSessionRequestFingerprint,
   resolveQwenAiSessionBinding,
@@ -215,7 +218,68 @@ function responseOutputToolCallIds(output: Array<Record<string, any>>): string[]
   return Array.from(ids)
 }
 
-router.post('/responses', async (ctx: Context) => {
+async function responsesLineageLockMiddleware(ctx: Context, next: Next): Promise<void> {
+  const request = ctx.request.body as ResponseCreateRequest
+  const previousResponseId = typeof request?.previous_response_id === 'string'
+    ? request.previous_response_id.trim()
+    : ''
+  if (!previousResponseId) {
+    await next()
+    return
+  }
+
+  const waitAbort = new AbortController()
+  const abortWait = () => waitAbort.abort()
+  ctx.req.once('aborted', abortWait)
+  ctx.res.once('close', abortWait)
+  let release: (() => void) | undefined
+  try {
+    release = await responsesSessionLock.acquire(previousResponseId, waitAbort.signal)
+  } catch (error) {
+    ctx.status = 499
+    ctx.body = {
+      error: {
+        message: error instanceof Error ? error.message : 'Responses session lock wait was aborted.',
+        type: 'api_error',
+        param: 'previous_response_id',
+        code: 'responses_session_lock_aborted',
+      },
+    }
+    return
+  } finally {
+    ctx.req.removeListener('aborted', abortWait)
+    ctx.res.removeListener('close', abortWait)
+  }
+
+  let released = false
+  const releaseOnce = () => {
+    if (released) return
+    released = true
+    release?.()
+  }
+  try {
+    await next()
+  } catch (error) {
+    releaseOnce()
+    throw error
+  }
+
+  const body = ctx.body as (NodeJS.ReadableStream & {
+    readableEnded?: boolean
+    destroyed?: boolean
+  }) | undefined
+  if (!body || typeof body.once !== 'function' || body.readableEnded || body.destroyed) {
+    releaseOnce()
+    return
+  }
+  body.once('end', releaseOnce)
+  body.once('close', releaseOnce)
+  body.once('error', releaseOnce)
+  ctx.res.once('finish', releaseOnce)
+  ctx.res.once('close', releaseOnce)
+}
+
+router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) => {
   const startedAt = Date.now()
   const createdAt = Math.floor(startedAt / 1000)
   const responseId = createResponseId()
@@ -285,6 +349,9 @@ router.post('/responses', async (ctx: Context) => {
     }))
   }
   const requestIntent = classifyChatRequest(chatRequest)
+  const estimatedInputTokens = estimateQwenAiRequestInputTokens(chatRequest)
+  const messageBytes = Buffer.byteLength(JSON.stringify(chatRequest.messages), 'utf8')
+  const toolSchemaBytes = Buffer.byteLength(JSON.stringify(chatRequest.tools ?? []), 'utf8')
   console.info('[Responses] request-intent', JSON.stringify({
     requestId: responseId,
     intent: requestIntent.intent,
@@ -294,7 +361,34 @@ router.post('/responses', async (ctx: Context) => {
     toolCount: requestIntent.toolCount,
     toolResultCount: requestIntent.toolResultCount,
     textChars: requestIntent.textChars,
+    estimatedInputTokens,
+    messageBytes,
+    toolSchemaBytes,
+    usageEstimator: 'qwen_conservative_v1',
   }))
+
+  const toolLoop = requestIntent.intent === 'normal'
+    ? detectResponsesToolLoop(chatRequest.messages)
+    : undefined
+  if (toolLoop) {
+    abort.cleanup()
+    storeManager.addLog('warn', 'Stopped a Responses tool-call loop with no observable progress', {
+      requestId: responseId,
+      model: chatRequest.model,
+      errorCode: 'repeated_tool_call_loop',
+      data: toolLoop,
+    })
+    ctx.status = 422
+    ctx.body = {
+      error: {
+        message: `Repeated tool call loop detected for ${toolLoop.toolName} after ${toolLoop.repeatCount} unchanged results.`,
+        type: 'invalid_request_error',
+        param: 'previous_response_id',
+        code: 'repeated_tool_call_loop',
+      },
+    }
+    return
+  }
 
   const qwenAiToolCallSessionEnabled = config.qwenAiSessionMode !== 'legacy'
   const managedToolResponsesRequest = qwenAiToolCallSessionEnabled
@@ -755,9 +849,13 @@ router.post('/responses', async (ctx: Context) => {
     output: Array<Record<string, any>>,
     qwenAiSessionState?: QwenAiSessionState,
   ) => {
-    const transcript = [
-      ...translated.conversationMessages,
+    const appendedMessages = [
+      ...translated.conversationMessages.slice(previousMessages.length),
       ...responseOutputToChatMessages(output),
+    ]
+    const transcript = [
+      ...previousMessages,
+      ...appendedMessages,
     ]
     const toolCallIds = responseOutputToolCallIds(output)
     const qwenAiSessionBinding = managedToolResponsesRequest && toolCallIds.length > 0
@@ -800,7 +898,15 @@ router.post('/responses', async (ctx: Context) => {
         })
       }
     }
-    const stored = responsesConversationStore.set(responseId, transcript, qwenAiSessionBinding)
+    const stored = responsesConversationStore.set(
+      responseId,
+      transcript,
+      qwenAiSessionBinding,
+      {
+        ...(previousResponseId ? { parentResponseId: previousResponseId } : {}),
+        deltaMessages: appendedMessages,
+      },
+    )
     if (!stored) {
       storeManager.addLog('warn', 'Responses context exceeded the bounded previous_response store', {
         requestId: responseId,

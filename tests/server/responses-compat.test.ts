@@ -124,6 +124,53 @@ test('Responses request translates Codex messages, function history, strict tool
   assert.equal(conversationMessages.some((message) => message.content === 'current instructions'), false)
 })
 
+test('Responses preserves a 683-message Codex history with 312 tool results', () => {
+  const input: NonNullable<ResponseCreateRequest['input']> = []
+  for (let index = 0; index < 312; index += 1) {
+    const callId = `call_scale_${index}`
+    input.push({
+      type: 'function_call',
+      id: `fc_scale_${index}`,
+      call_id: callId,
+      name: 'exec_command',
+      arguments: JSON.stringify({ cmd: `Get-Content fixture-${index}.txt` }),
+    })
+    input.push({
+      type: 'function_call_output',
+      call_id: callId,
+      output: `fixture result ${index}`,
+    })
+  }
+  for (let index = 0; index < 59; index += 1) {
+    input.push({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: [{
+        type: index % 2 === 0 ? 'input_text' : 'output_text',
+        text: `development history ${index}`,
+      }],
+    })
+  }
+
+  const { chatRequest, conversationMessages } = responsesRequestToChatCompletion({
+    model: 'gpt-compatible',
+    input,
+  })
+
+  assert.equal(input.length, 683)
+  assert.equal(chatRequest.messages.length, 683)
+  assert.equal(conversationMessages.length, 683)
+  assert.equal(chatRequest.messages.filter(message => message.role === 'tool').length, 312)
+  assert.equal(
+    chatRequest.messages.filter(message => message.role === 'assistant' && message.tool_calls).length,
+    312,
+  )
+  assert.equal(chatRequest.messages[0].tool_calls?.[0].id, 'call_scale_0')
+  assert.equal(chatRequest.messages[623].tool_call_id, 'call_scale_311')
+  assert.deepEqual(chatRequest.messages[682].content, [
+    { type: 'text', text: 'development history 58' },
+  ])
+})
+
 test('Responses preserves compaction protocol metadata for the shared intent classifier', () => {
   const { chatRequest } = responsesRequestToChatCompletion({
     model: 'gpt-compatible',

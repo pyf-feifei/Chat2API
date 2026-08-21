@@ -208,11 +208,33 @@ CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
+# Persist bounded previous_response_id state in the mounted data volume.
+# Use disabled, false, or off to keep this state memory-only.
+CHAT2API_RESPONSES_STORE_PATH=/data/responses/conversations.jsonl
+CHAT2API_RESPONSES_STORE_TTL_MS=86400000
+CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL=32
+# Stop a fourth unchanged tool cycle after three identical completed calls.
+CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD=3
+CHAT2API_RESPONSES_TOOL_LOOP_WINDOW=8
+CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS=wait,wait_agent,write_stdin
 # During an image update, stop accepting new requests and drain active HTTP/SSE
 # streams for this long before the process exits. Keep this at or below the
 # Compose stop_grace_period (default 10m).
 CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS=540000
 ```
+Responses conversation state is stored as bounded plaintext JSONL at
+`CHAT2API_RESPONSES_STORE_PATH`. It contains the message history needed to
+resolve `previous_response_id` after a restart, so protect the mounted data
+volume with the same access controls as request logs and account data. The
+default retention is 24 hours; setting the path to `disabled`, `false`, or
+`off` keeps this state in memory only. Checkpoints limit delta-chain recovery
+work and are independent of Codex or Claude client-side context compaction.
+
+The Responses tool-loop guard compares canonical tool arguments and completed
+results within the current user turn. It returns
+`422/repeated_tool_call_loop` when the configured unchanged-call threshold is
+reached. Add long-polling tools to the comma-separated ignored list so normal
+wait cycles do not count as repeated work.
 
 Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
 

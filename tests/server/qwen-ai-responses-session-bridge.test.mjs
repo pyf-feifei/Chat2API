@@ -38,6 +38,7 @@ const storeModule = loadTypeScriptModule('src/main/proxy/responses/store.ts', {
 })
 const accountFailover = loadTypeScriptModule('src/main/proxy/accountFailover.ts')
 const workflowHeuristics = loadTypeScriptModule('src/main/proxy/toolCalling/workflowHeuristics.ts')
+const toolLoopGuard = loadTypeScriptModule('src/main/proxy/responses/toolLoopGuard.ts')
 const toolCallSessionStoreModule = loadTypeScriptModule(
   'src/main/proxy/qwenAiToolCallSessionStore.ts',
   { './toolCalling/workflowHeuristics': workflowHeuristics },
@@ -322,8 +323,18 @@ function loadResponsesRouteHarness(options = {}) {
       this.stack = []
     }
 
-    post(path, handler) {
-      this.stack.push({ path, handler })
+    post(path, ...handlers) {
+      const handler = async ctx => {
+        let current = -1
+        const dispatch = async index => {
+          assert.ok(index > current, 'next() must not be called more than once')
+          current = index
+          const middleware = handlers[index]
+          if (middleware) await middleware(ctx, () => dispatch(index + 1))
+        }
+        await dispatch(0)
+      }
+      this.stack.push({ path, handler, handlers })
       return this
     }
   }
@@ -596,6 +607,12 @@ function loadResponsesRouteHarness(options = {}) {
         },
       },
     },
+    '../responses/sessionLock': {
+      responsesSessionLock: {
+        acquire: async () => () => {},
+      },
+    },
+    '../responses/toolLoopGuard': toolLoopGuard,
     '../responses/stream': {
       createResponsesStreamTransform: streamOptions => ({ start: () => new MockResponsesStream(streamOptions) }),
     },
@@ -609,6 +626,9 @@ function loadResponsesRouteHarness(options = {}) {
         toolResultCount: 0,
         textChars: 0,
       }),
+    },
+    '../qwenAiCompactionBoundary': {
+      estimateQwenAiRequestInputTokens: () => 1,
     },
     '../qwenAiSessionBridge': sessionBridge,
     '../qwenAiToolCallSessionStore': {
@@ -658,6 +678,42 @@ function createRouteContext(body) {
     set: (name, value) => { responseHeaders[name] = value },
   }
 }
+
+test('Responses route rejects an unchanged repeated tool loop before forwarding', async () => {
+  const { handler, calls } = loadResponsesRouteHarness()
+  const input = [{
+    type: 'message',
+    role: 'user',
+    content: 'Inspect the route and stop if the command makes no progress.',
+  }]
+  for (let index = 1; index <= 3; index += 1) {
+    input.push(
+      {
+        type: 'function_call',
+        call_id: `call_exec_${index}`,
+        name: 'exec_command',
+        arguments: index === 2
+          ? '{ "yield_time_ms": 10000, "cmd": "rg route" }'
+          : '{"cmd":"rg route","yield_time_ms":10000}',
+      },
+      {
+        type: 'function_call_output',
+        call_id: `call_exec_${index}`,
+        output: 'same command output',
+      },
+    )
+  }
+
+  const context = createRouteContext({
+    model: 'Qwen3.8-Max_Auto',
+    input,
+  })
+  await handler(context)
+
+  assert.equal(context.status, 422)
+  assert.equal(context.body?.error?.code, 'repeated_tool_call_loop')
+  assert.equal(calls.forwards.length, 0)
+})
 
 test('Responses route saves a real Qwen binding then pins continuation to the same account with only tool-result delta', async () => {
   const { handler, calls, conversations, provider, account } = loadResponsesRouteHarness()
