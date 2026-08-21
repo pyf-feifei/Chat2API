@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir --disable-pip-version-check 'litellm[proxy]==1.93.0'
+
+COPY apply-anthropic-midstream-error-patch.py /tmp/apply-anthropic-midstream-error-patch.py
+RUN python /tmp/apply-anthropic-midstream-error-patch.py \
+    && rm /tmp/apply-anthropic-midstream-error-patch.py
+
+ENTRYPOINT ["litellm"]

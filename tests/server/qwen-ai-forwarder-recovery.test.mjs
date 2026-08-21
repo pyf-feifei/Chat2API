@@ -7,6 +7,7 @@ import test from 'node:test'
 import ts from 'typescript'
 import {
   createToolWorkflowContinuationMessage as createRealToolWorkflowContinuationMessage,
+  extractLatestActiveUserAttachments as extractRealLatestActiveUserAttachments,
   extractLatestActiveUserRequest as extractRealLatestActiveUserRequest,
 } from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
 import {
@@ -130,6 +131,8 @@ function loadRequestForwarder(overrides = {}) {
       ToolCallingEngine: overrides.ToolCallingEngine || class {},
       createToolWorkflowContinuationMessage: overrides.createToolWorkflowContinuationMessage
         || (() => ({ role: 'user', content: 'generic workflow continuation' })),
+      extractLatestActiveUserAttachments: overrides.extractLatestActiveUserAttachments
+        || extractRealLatestActiveUserAttachments,
       extractLatestActiveUserRequest: overrides.extractLatestActiveUserRequest
         || extractRealLatestActiveUserRequest,
     },
@@ -2629,7 +2632,7 @@ test('Qwen Responses bridge keeps CHAT_IN_PROGRESS account-neutral but forwards 
         retryable: true,
       }),
       expectedAccountFault: false,
-      expectedRetryScope: undefined,
+      expectedRetryScope: 'next-account',
     },
     {
       name: 'credential 401',
@@ -2707,8 +2710,7 @@ test('Qwen Responses bridge keeps CHAT_IN_PROGRESS account-neutral but forwards 
       assert.equal(result.accountFault, scenario.expectedAccountFault)
       assert.equal(result.retryScope, scenario.expectedRetryScope)
       if (scenario.name === 'busy chat') {
-        assert.equal(freshChatCalls.length, 1)
-        assert.deepEqual(freshChatCalls[0].messages, qwenResponsesBridgeRequest().messages)
+        assert.equal(freshChatCalls.length, 0, 'busy continuation must not replay on the same account')
         assert.deepEqual(deletedChats, ['chat-pinned'])
       } else {
         assert.equal(freshChatCalls.length, 0)

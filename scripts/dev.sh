@@ -4,6 +4,9 @@
 
 cd "$(dirname "$0")/.."
 
+# Docker Chat2API uses 8080; keep the Electron dev proxy on its own port.
+export CHAT2API_DEV_PORT="${CHAT2API_DEV_PORT:-8081}"
+
 # 检测操作系统
 OS="$(uname -s)"
 

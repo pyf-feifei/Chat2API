@@ -90,6 +90,19 @@ async function initializeApp(): Promise<void> {
 }
 
 async function setupApp(): Promise<void> {
+  // Keep the Electron development proxy separate from the Docker deployment.
+  // The Docker Chat2API instance owns 8080; dev runs on 8081 by default.
+  if (process.env.NODE_ENV === 'development' && process.env.CHAT2API_DEV_PORT) {
+    const devPort = Number.parseInt(process.env.CHAT2API_DEV_PORT, 10)
+    if (Number.isInteger(devPort) && devPort >= 1 && devPort <= 65535) {
+      const config = storeManager.getConfig()
+      if (config.proxyPort !== devPort) {
+        storeManager.updateConfig({ proxyPort: devPort })
+        console.info(`[App] Development proxy port set to ${devPort}`)
+      }
+    }
+  }
+
   const mainWindow = createWindow({
     width: 1200,
     height: 800,

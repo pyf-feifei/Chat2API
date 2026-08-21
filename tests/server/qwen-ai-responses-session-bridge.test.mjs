@@ -1011,6 +1011,56 @@ test('Responses invalid continuation input clears the old Qwen binding and falls
   assert.equal(conversations.get('resp_prior').qwenAiSessionBinding, undefined)
 })
 
+test('Responses CHAT_IN_PROGRESS failovers to the next account without marking the busy account failed', async () => {
+  const { handler, calls, account, secondaryAccount, toolCallSessions } = loadResponsesRouteHarness({
+    includeSecondaryAccount: true,
+    forwardResult: ({ chatRequest, account: forwardedAccount, provider, actualModel, context }) => {
+      if (forwardedAccount.id === account.id) {
+        return {
+          success: false,
+          status: 429,
+          error: 'Qwen AI chat is still in progress; switching to another account',
+          errorCode: 'CHAT_IN_PROGRESS',
+          accountFault: false,
+          retryScope: 'next-account',
+        }
+      }
+      return {
+        success: true,
+        status: 200,
+        body: { choices: [] },
+        qwenAiToolCallIds: [],
+        qwenAiSessionState: {
+          providerId: provider.id,
+          accountId: forwardedAccount.id,
+          requestedModel: chatRequest.model,
+          actualModel,
+          requestFingerprint: context.qwenAiSessionBridge?.requestFingerprint || 'missing',
+          getChatId: () => 'replayed-qwen-chat',
+          getParentId: () => 'replayed-qwen-parent',
+        },
+      }
+    },
+  })
+  const tools = [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object' } } }]
+  const stored = storedBridgeConversation(tools)
+  assert.equal(toolCallSessions.set(['call_read'], stored.qwenAiSessionBinding), true)
+
+  await handler(createRouteContext(fullHistoryToolResultRequest(tools)))
+
+  assert.equal(calls.forwards.length, 2)
+  assert.equal(calls.forwards[0].account.id, account.id)
+  assert.equal(calls.forwards[0].context.qwenAiSessionBridge.continuation.binding.chatId, 'retained-qwen-chat')
+  assert.equal(calls.forwards[1].account.id, secondaryAccount.id)
+  assert.equal(calls.forwards[1].context.qwenAiSessionBridge.continuation, undefined)
+  assert.deepEqual(
+    calls.forwards[1].chatRequest.messages.map(message => message.role),
+    ['user', 'assistant', 'tool'],
+  )
+  assert.deepEqual(calls.accountFailures, [])
+  assert.equal(toolCallSessions.resolve(['call_read']), undefined)
+})
+
 test('Responses CHAT_IN_PROGRESS keeps a compatible Qwen binding for the next retry', async () => {
   const { handler, calls, conversations } = loadResponsesRouteHarness({
     forwardResult: () => ({
@@ -1530,7 +1580,7 @@ test('Qwen forwarder sends only the continuation delta to the pinned chat', asyn
   assert.equal(
     calls.continuations[0].chatInProgressRetryAttempts,
     0,
-    'Responses retained-chat continuations must fail fast into same-account replay',
+    'Responses retained-chat continuations must fail fast into next-account failover',
   )
   assert.deepEqual(calls.continuations[0].messages, [
     { role: 'tool', tool_call_id: 'call_read', content: '{"name":"chat2api"}' },
@@ -1670,11 +1720,12 @@ test('Qwen account faults retain next-account failover while CHAT_IN_PROGRESS st
     Date.now(),
     bridgeForwardContext(),
   )
-  assert.equal(result.success, true)
-  assert.equal(result.status, 200)
-  assert.equal(result.accountFault, undefined)
-  assert.equal(result.retryScope, undefined)
-  assert.equal(calls.starts.length, 1, 'busy continuation must replay the full transcript on the same account')
+  assert.equal(result.success, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'CHAT_IN_PROGRESS')
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, 'next-account')
+  assert.equal(calls.starts.length, 0, 'busy continuation must fail over instead of replaying on the same account')
 })
 
 test('Qwen continuation does not switch accounts for an account-neutral 5xx replay hint', async () => {

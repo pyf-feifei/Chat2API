@@ -2,12 +2,7 @@ name: chat2api-litellm
 
 services:
   litellm:
-    build:
-      context: ./deploy/litellm
-      dockerfile: Dockerfile
-      args:
-        LITELLM_BASE_IMAGE: "${LITELLM_BASE_IMAGE:-docker.litellm.ai/berriai/litellm:v1.93.0}"
-    image: "${LITELLM_IMAGE:-chat2api-litellm:v1.93.0-anthropic-stream-guard}"
+    image: "${LITELLM_IMAGE:-skatef/chat2api-litellm:cpu-compat-20260821-r2}"
     container_name: chat2api-litellm
     restart: unless-stopped
     command:
@@ -20,7 +15,7 @@ services:
       - --num_workers
       - "1"
     ports:
-      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+      - "${LITELLM_BIND:-127.0.0.1}:${LITELLM_PORT:-4000}:4000"
     environment:
       CHAT2API_BASE_URL: "${CHAT2API_BASE_URL:-http://host.docker.internal:8080/v1}"
       CHAT2API_API_KEY: "${CHAT2API_API_KEY:-sk-chat2api-local}"

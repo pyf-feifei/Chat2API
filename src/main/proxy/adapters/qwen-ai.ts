@@ -3900,12 +3900,18 @@ export class QwenAiAdapter {
         request.enable_thinking,
         modelCapability,
       )
-      const shouldEnableThinking = featureMode.thinkingEnabled
+      // When managed tool calling is active, disable thinking mode to prevent
+      // the model from producing a long reasoning chain followed by a text-only
+      // end_turn instead of calling tools. Qwen3's thinking mode is a primary
+      // cause of the "text first, then stop without tool call" failure pattern.
+      const shouldEnableThinking = request.managedToolCalling
+        ? false
+        : featureMode.thinkingEnabled
 
       const featureConfig = createQwenAiFeatureConfig({
         thinkingEnabled: shouldEnableThinking,
-        autoThinking: featureMode.autoThinking,
-        thinkingBudget: request.thinking_budget,
+        autoThinking: request.managedToolCalling ? false : featureMode.autoThinking,
+        thinkingBudget: request.managedToolCalling ? undefined : request.thinking_budget,
       })
 
       const createPayload = () => ({
@@ -4145,11 +4151,17 @@ export class QwenAiAdapter {
       request.enable_thinking,
       modelCapability,
     )
-    const shouldEnableThinking = featureMode.thinkingEnabled
+    // When managed tool calling is active, disable thinking mode to prevent
+    // the model from producing a long reasoning chain followed by a text-only
+    // end_turn instead of calling tools. Qwen3's thinking mode is a primary
+    // cause of the "text first, then stop without tool call" failure pattern.
+    const shouldEnableThinking = request.managedToolCalling
+      ? false
+      : featureMode.thinkingEnabled
     const featureConfig = createQwenAiFeatureConfig({
       thinkingEnabled: shouldEnableThinking,
-      autoThinking: featureMode.autoThinking,
-      thinkingBudget: request.thinking_budget,
+      autoThinking: request.managedToolCalling ? false : featureMode.autoThinking,
+      thinkingBudget: request.managedToolCalling ? undefined : request.thinking_budget,
     })
 
     // A Responses tool-result follow-up can contain generated files or

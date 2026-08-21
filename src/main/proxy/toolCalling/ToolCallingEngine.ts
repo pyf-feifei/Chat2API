@@ -616,6 +616,18 @@ function renderToolChoicePolicyPrompt(plan: ToolCallingPlan): string {
     ].join('\n')
   }
 
+  // Auto mode: encourage tool-first behavior to prevent the model from
+  // returning a text-only response (end_turn) when work remains. This
+  // addresses the common failure mode where the model describes what it
+  // will do instead of actually calling a tool.
+  if (plan.toolChoiceMode === 'auto' && plan.allowedToolNames.size > 0) {
+    return [
+      'Tool preference: when any part of the user request can be addressed by calling one of the listed tools, call the tool directly instead of describing the action or asking for confirmation.',
+      'Do not promise to perform an operation and then stop — invoke the appropriate tool immediately.',
+      'Only return a plain-text final answer after all requested operations have been completed and verified through tool results.',
+    ].join('\n')
+  }
+
   return ''
 }
 

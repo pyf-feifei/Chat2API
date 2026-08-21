@@ -649,8 +649,11 @@ router.post('/completions', async (ctx: Context) => {
         qwenAiContinuationBinding
         && selection.provider.id === qwenAiContinuationBinding.providerId
         && selection.account.id === qwenAiContinuationBinding.accountId
-        && result.accountFault === true
         && result.retryScope === 'next-account'
+        && (
+          result.accountFault === true
+          || isQwenAiChatInProgressErrorCode(result.errorCode)
+        )
       ) {
         consumeQwenAiToolCallClaim('account_failover')
       }

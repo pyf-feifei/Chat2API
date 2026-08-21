@@ -289,6 +289,38 @@ test('exhausted malformed-tool recovery replays the complete request on the next
   assert.equal(outcome.failoverCount, 1)
 })
 
+test('account-neutral CHAT_IN_PROGRESS continues on the next account', async () => {
+  const first = selection('account-1')
+  const second = selection('account-2')
+  const chatInProgress: ForwardResult = {
+    success: false,
+    status: 429,
+    error: 'Qwen AI chat is still in progress; switching to another account',
+    errorCode: 'CHAT_IN_PROGRESS',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  }
+  const attempted: string[] = []
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: first,
+    maxFailovers: 1,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      return current.account.id === first.account.id
+        ? chatInProgress
+        : { success: true, status: 200, body: { choices: [] } }
+    },
+    selectNext: excluded => excluded.has(first.account.id) ? second : null,
+  })
+
+  assert.deepEqual(attempted, ['account-1', 'account-2'])
+  assert.equal(outcome.result.success, true)
+  assert.equal(outcome.selection.account.id, 'account-2')
+  assert.equal(outcome.failoverCount, 1)
+})
+
 test('account failover is bounded and never reselects an excluded account', async () => {
   const accounts = [selection('account-1'), selection('account-2'), selection('account-3')]
   const attempted: string[] = []

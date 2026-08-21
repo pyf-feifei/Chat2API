@@ -11,7 +11,7 @@
   "license": "GPL-3.0",
   "scripts": {
     "dev": "bash scripts/dev.sh",
-    "dev:win": "electron-vite dev",
+    "dev:win": "set CHAT2API_DEV_PORT=8081&& electron-vite dev",
     "check:source-artifacts": "node scripts/check-source-artifacts.js",
     "build": "npm run check:source-artifacts && electron-vite build",
     "build:admin": "vite build --config vite.admin.config.ts",
