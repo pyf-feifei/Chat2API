@@ -1,6 +1,6 @@
 services:
   chat2api:
-    image: skatef/chat2api:20260821-qwen-stream-fix
+    image: skatef/chat2api:20260821-codex-responses-fix
     container_name: chat2api
     restart: unless-stopped
     # Match the server's default 14-minute request budget plus a small margin;
