@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 
-const baseUrl = (process.env.CHAT2API_CLAUDE_BASE_URL || 'http://127.0.0.1:4000').replace(/\/$/, '')
-const apiKey = process.env.CHAT2API_CLAUDE_API_KEY || 'sk-litellm-local'
+const baseUrl = (process.env.CHAT2API_CLAUDE_BASE_URL || 'http://127.0.0.1:8080').replace(/\/$/, '')
+const apiKey = process.env.CHAT2API_CLAUDE_API_KEY
 const model = process.env.CHAT2API_CLAUDE_MODEL || 'Qwen3.8-Max'
 const timeoutMs = Number(process.env.CHAT2API_CLAUDE_TEST_TIMEOUT_MS || 600_000)
 const toolName = 'record_attempt'
 
 assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs > 0, 'timeout must be a positive integer')
+assert.ok(apiKey, 'CHAT2API_CLAUDE_API_KEY is required')
 
 function requestBody({ stream, isError, suffix }) {
   const previousToolUseId = `toolu_chat2api_attempt_1_${suffix}`

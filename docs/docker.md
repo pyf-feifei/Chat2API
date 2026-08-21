@@ -267,13 +267,6 @@ another eligible account without marking the previous account faulty. The
 polling cadence is controlled by `QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS`. If the
 cumulative request deadline expires first, `qwen_ai_request_timeout` remains
 terminal and does not trigger account failover.
-When using the bundled LiteLLM Compose service, its generic outer
-`REQUEST_TIMEOUT` defaults to `900` seconds (via `LITELLM_REQUEST_TIMEOUT`).
-The bundled LiteLLM configuration maps
-`general_settings.pass_through_request_timeout` to `REQUEST_TIMEOUT`; this
-keeps pass-through Anthropic Messages and Responses requests from falling back
-to LiteLLM's built-in 600-second timeout. Streaming activity refreshes
-LiteLLM's outer connect/read budget. This value is independent from Chat2API's
 Qwen cumulative request, queue, and meaningful-idle limits and remains
 configurable.
 Chat2API emits legal SSE comment frames after
@@ -301,7 +294,7 @@ Once a managed semantic recovery starts,
 `CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` (default `840000` ms) adds an
 absolute wall-clock limit across every replacement branch. Unlike the
 no-progress budget, this timer keeps running while a continuation emits output,
-so repeated incomplete branches cannot outlive the outer LiteLLM timeout. On
+so repeated incomplete branches cannot outlive the outer timeout. On
 each request it is also clamped to the remaining `QWEN_AI_REQUEST_TIMEOUT_MS`
  budget. Configure the request budget below any downstream client or proxy
  deadline so the transport layers have time to carry the terminal response.

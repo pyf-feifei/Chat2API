@@ -603,7 +603,7 @@ function postRawPaused(url, headers, body) {
   return { request, responsePromise }
 }
 
-test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and context stress', { timeout: 75_000 }, async (t) => {
+test('Responses API and Claude boundary survive compatibility, load, and context stress', { timeout: 75_000 }, async (t) => {
   if (!fs.existsSync(serverEntry)) {
     t.skip('run npm run build:server before this test')
     return
@@ -919,7 +919,7 @@ test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and
     assert.equal(responseOutputText(result.body), '')
   })
 
-  await t.test('keeps the Claude/LiteLLM Chat Completions tool boundary intact', async () => {
+  await t.test('keeps the Claude Chat Completions tool boundary intact', async () => {
     const toolRequest = {
       model: clientModel,
       messages: [{ role: 'user', content: 'CLAUDE_TOOL_CASE: read README.md' }],
@@ -940,7 +940,7 @@ test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and
     }
     const toolResult = await requestJson(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: apiHeaders(apiKey, { 'User-Agent': 'litellm/1.93.0 offline-test' }),
+      headers: apiHeaders(apiKey, { 'User-Agent': 'claude/offline-test' }),
       body: JSON.stringify(toolRequest),
     })
     assert.equal(toolResult.response.status, 200, toolResult.text)
@@ -950,7 +950,7 @@ test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and
 
     const continuation = await requestJson(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: apiHeaders(apiKey, { 'User-Agent': 'litellm/1.93.0 offline-test' }),
+      headers: apiHeaders(apiKey, { 'User-Agent': 'claude/offline-test' }),
       body: JSON.stringify({
         model: clientModel,
         messages: [
@@ -988,7 +988,7 @@ test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and
     const claudeInput = `LONG_CLAUDE_CONTEXT:${'C'.repeat(oneMiB)}`
     const claudeResult = await requestJson(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: apiHeaders(apiKey, { 'User-Agent': 'litellm/1.93.0 offline-test' }),
+      headers: apiHeaders(apiKey, { 'User-Agent': 'claude/offline-test' }),
       signal: AbortSignal.timeout(20_000),
       body: JSON.stringify({
         model: clientModel,
@@ -1016,7 +1016,7 @@ test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and
         useResponses ? `${baseUrl}/v1/responses` : `${baseUrl}/v1/chat/completions`,
         {
           method: 'POST',
-          headers: apiHeaders(apiKey, useResponses ? {} : { 'User-Agent': 'litellm/1.93.0 long-load-test' }),
+          headers: apiHeaders(apiKey, useResponses ? {} : { 'User-Agent': 'claude/long-load-test' }),
           signal: AbortSignal.timeout(30_000),
           body: JSON.stringify(useResponses
             ? { model: clientModel, input }
@@ -1059,7 +1059,7 @@ test('Responses API and Claude/LiteLLM boundary survive compatibility, load, and
           }
       const response = await fetch(url, {
         method: 'POST',
-        headers: apiHeaders(apiKey, useResponses ? {} : { 'User-Agent': 'litellm/1.93.0 load-test' }),
+        headers: apiHeaders(apiKey, useResponses ? {} : { 'User-Agent': 'claude/load-test' }),
         signal: AbortSignal.timeout(20_000),
         body: JSON.stringify(body),
       })

@@ -146,7 +146,7 @@ test('Anthropic context_management identifies a compaction turn structurally', (
   assert.ok(result.signals.includes('protocol_compaction_field'))
 })
 
-test('a nested LiteLLM protocol envelope identifies context compaction', () => {
+test('a nested proxy protocol envelope identifies context compaction', () => {
   const result = classifyChatRequest({
     model: 'Qwen3.8-Max-Preview',
     extra_body: {

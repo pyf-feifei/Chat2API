@@ -150,7 +150,6 @@ function statusFromError(error: unknown): number | undefined {
     return status === undefined ? undefined : { status, depth }
   }).filter((candidate): candidate is { status: number; depth: number } => candidate !== undefined))
   if (candidates.length > 0) {
-    // LiteLLM's MidStreamFallbackError frequently carries a synthetic 503 on
     // the outer object and the real provider status below original_exception
     // or response.data. Prefer the deepest client status, then the deepest
     // upstream status, so the bridge can preserve account-bound 4xx errors.
@@ -291,7 +290,7 @@ function qwenAiErrorNumber(value: unknown): number | undefined {
 }
 
 function qwenAiErrorMessage(error: unknown): string {
-  const generic = /^(?:litellm\.)?midstreamfallbackerror|response api in-stream error$/i
+  const generic = /^midstreamfallbackerror|response api in-stream error$/i
   const candidates = qwenAiErrorNodes(error)
     .map(({ record, depth }) => {
       const message = typeof record.message === 'string' ? record.message.trim() : ''

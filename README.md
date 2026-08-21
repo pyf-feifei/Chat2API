@@ -29,7 +29,7 @@ Chat2API is a cross-platform desktop app and headless server that turns web-base
 - **Long-running request controls**: Context compaction, request and stream deadlines, queue admission, keep-alives, bounded retries, and Qwen session/response recovery.
 - **Desktop and server deployments**: Use the Electron UI on macOS, Windows, or Linux, or run the Koa proxy and browser admin UI in Docker without Electron.
 - **Operations UI**: Dashboard metrics, request logs, model synchronization, API keys, proxy settings, themes, system tray access, and English/Simplified Chinese localization.
-- **Client bridges**: [Codex CLI Responses compatibility](docs/codex.md) and an optional [Anthropic-compatible LiteLLM deployment](docs/litellm.md).
+- **Client bridges**: [Codex CLI Responses compatibility](docs/codex.md).
 
 ## Supported providers
 
@@ -127,7 +127,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-For Codex CLI, use the Responses endpoint and the configuration in [docs/codex.md](docs/codex.md). For Claude or other Anthropic clients, see the [LiteLLM guide](docs/litellm.md).
+For Codex CLI, use the Responses endpoint and the configuration in [docs/codex.md](docs/codex.md).
 
 ## Screenshots
 

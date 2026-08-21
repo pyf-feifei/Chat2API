@@ -4272,7 +4272,6 @@ export class QwenAiAdapter {
     ): QwenAiUpstreamError => {
       const exhausted = (validationError || new Error('Qwen AI chat is still in progress')) as QwenAiUpstreamError
       // CHAT_IN_PROGRESS means the provider is temporarily serializing the
-      // same chat. Surface it as a transient 429 so Claude/LiteLLM can retry
       // instead of waiting five minutes and receiving an opaque 504.
       exhausted.status = 429
       exhausted.code = 'CHAT_IN_PROGRESS'

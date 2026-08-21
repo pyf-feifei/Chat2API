@@ -164,7 +164,6 @@ export function createDeferredQwenAiFailoverStream(
     ) {
       // `destroy(error)` discards PassThrough data that is still queued for a
       // downstream Responses parser. Ending normally lets the already-written
-      // `event: error` and `[DONE]` bytes drain before EOF, which LiteLLM can
       // translate into a structured failed response.
       output.end()
       return

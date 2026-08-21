@@ -8,7 +8,7 @@ import Router from '@koa/router'
 import bodyParser from 'koa-bodyparser'
 import { Server as HttpServer, type ServerResponse } from 'http'
 import type { Socket } from 'net'
-import routes from './routes'
+import routes, { anthropicRouter } from './routes'
 import managementRoutes from './routes/management'
 import { proxyStatusManager } from './status'
 import { storeManager } from '../store/store'
@@ -308,6 +308,10 @@ export class ProxyServer {
   private setupRoutes(): void {
     mountWebAdminAssets(this.app)
 
+    // Register Anthropic Messages API route directly (bypasses array to avoid bundling issues)
+    this.app.use(anthropicRouter.routes())
+    this.app.use(anthropicRouter.allowedMethods())
+
     // Register OpenAI API routes
     for (const route of routes) {
       this.router.use(route.routes())
@@ -321,6 +325,7 @@ export class ProxyServer {
         description: 'OpenAI API compatible proxy service',
         endpoints: [
           'POST /v1/chat/completions',
+          'POST /v1/messages',
           'POST /v1/responses',
           'GET /v1/models',
           'GET /v1/models/:model',

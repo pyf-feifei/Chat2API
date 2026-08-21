@@ -10,11 +10,9 @@ param(
 
   [Parameter(Mandatory = $true)]
   [ValidateNotNullOrEmpty()]
-  [string]$LiteLlmVenvPath,
 
   [Parameter(Mandatory = $true)]
   [ValidateNotNullOrEmpty()]
-  [string]$LiteLlmConfigPath,
 
   [Parameter(Mandatory = $true)]
   [ValidateNotNullOrEmpty()]
@@ -22,7 +20,6 @@ param(
 
   [Parameter(Mandatory = $true)]
   [ValidateNotNullOrEmpty()]
-  [string]$LiteLlmContainer,
 
   [ValidateRange(1, 65535)]
   [int]$Chat2ApiPort = 18080,
@@ -31,10 +28,8 @@ param(
   [string]$Chat2ApiHost = '127.0.0.1',
 
   [ValidateRange(1, 65535)]
-  [int]$LiteLlmPort = 4000,
 
   [ValidateNotNullOrEmpty()]
-  [string]$LiteLlmHost = '127.0.0.1',
 
   [string]$ConfigPath = (Join-Path $env:LOCALAPPDATA 'Chat2API\native\supervisor-config.clixml'),
 
@@ -211,17 +206,11 @@ function New-HttpUrl {
   return $builder.Uri.AbsoluteUri.TrimEnd('/')
 }
 
-if ($Chat2ApiHost.Equals($LiteLlmHost, [StringComparison]::OrdinalIgnoreCase) -and $Chat2ApiPort -eq $LiteLlmPort) {
-  throw 'Chat2API and LiteLLM must use different ports.'
-}
 
 $chatSource = Resolve-RequiredDirectory -Path $Chat2ApiSourcePath -Description 'Chat2API source directory'
 $chatData = Resolve-RequiredDirectory -Path $Chat2ApiDataPath -Description 'Chat2API data directory'
-$liteVenv = Resolve-RequiredDirectory -Path $LiteLlmVenvPath -Description 'LiteLLM virtual environment'
-$liteConfig = Resolve-RequiredFile -Path $LiteLlmConfigPath -Description 'LiteLLM config'
 $chatEntryPoint = Resolve-RequiredFile -Path (Join-Path $chatSource 'out-server\server\index.js') -Description 'Built Chat2API server entry point'
 $nodeExecutable = (Get-Command node.exe -ErrorAction Stop).Source
-$liteExecutable = Resolve-RequiredFile -Path (Join-Path $liteVenv 'Scripts\litellm.exe') -Description 'LiteLLM console entry point'
 $dockerExecutable = Get-DockerExecutable
 
 $chatEnvironment = Select-Environment `
@@ -232,14 +221,8 @@ $chatEnvironment['CHAT2API_PORT'] = [string]$Chat2ApiPort
 $chatEnvironment['CHAT2API_DATA_DIR'] = $chatData
 $chatEnvironment['NODE_ENV'] = 'production'
 
-$liteEnvironment = Select-Environment `
-  -Source (Get-ContainerEnvironment -DockerExecutable $dockerExecutable -ContainerName $LiteLlmContainer) `
-  -NamePattern '^(LITELLM_|CHAT2API_API_KEY$|REQUEST_TIMEOUT$)'
 $chatBaseUrl = New-HttpUrl -Host $Chat2ApiHost -Port $Chat2ApiPort -Path '/'
 $chatHealthUrl = New-HttpUrl -Host $Chat2ApiHost -Port $Chat2ApiPort -Path '/health'
-$liteHealthUrl = New-HttpUrl -Host $LiteLlmHost -Port $LiteLlmPort -Path '/health/liveliness'
-$liteEnvironment['CHAT2API_BASE_URL'] = "$chatBaseUrl/v1"
-$liteEnvironment['CHAT2API_HEALTH_URL'] = $chatHealthUrl
 
 $resolvedLogDirectory = [IO.Path]::GetFullPath($LogDirectory)
 New-Item -ItemType Directory -Path $resolvedLogDirectory -Force | Out-Null
@@ -259,33 +242,6 @@ $services = @(
     PidPath = Join-Path $resolvedLogDirectory 'chat2api.pid'
     StartTimeoutSeconds = 60
     RestartAfterSeconds = 120
-  },
-  [pscustomobject]@{
-    Name = 'litellm'
-    Executable = $liteExecutable
-    CommandLineArguments = Join-NativeArguments -Value @(
-      '--config',
-      $liteConfig,
-      '--host',
-      $LiteLlmHost,
-      '--port',
-      [string]$LiteLlmPort,
-      '--num_workers',
-      '1'
-    )
-    WorkingDirectory = (Split-Path -Parent $liteConfig)
-    HealthUrl = $liteHealthUrl
-    DependsOn = @('chat2api')
-    # Keep an explicit URL prerequisite as well as the named dependency. This
-    # lets the supervisor detect a stale/standalone LiteLLM config that was
-    # generated before both processes were managed together.
-    DependencyHealthUrls = @($chatHealthUrl)
-    Environment = Protect-Environment -Environment $liteEnvironment
-    StdOutPath = Join-Path $resolvedLogDirectory 'litellm.out.log'
-    StdErrPath = Join-Path $resolvedLogDirectory 'litellm.err.log'
-    PidPath = Join-Path $resolvedLogDirectory 'litellm.pid'
-    StartTimeoutSeconds = 120
-    RestartAfterSeconds = 180
   }
 )
 
@@ -312,6 +268,5 @@ Move-Item -LiteralPath $temporaryPath -Destination $resolvedConfigPath -Force
 [pscustomobject]@{
   ConfigPath = $resolvedConfigPath
   Chat2ApiHealth = $services[0].HealthUrl
-  LiteLlmHealth = $services[1].HealthUrl
   EnvironmentValues = 'DPAPI-encrypted for the current Windows user'
 } | Format-List

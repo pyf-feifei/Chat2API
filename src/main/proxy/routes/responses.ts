@@ -1100,7 +1100,6 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       // when the source is already being destroyed). Do not rely on the
       // transport error to close the Responses stream: fail it directly so
       // clients always receive a terminal `response.failed` event instead of
-      // a bare EOF that LiteLLM reports as MidStreamFallbackError.
       if (qwenAiStream) {
         const failResponsesStream = (error: Error) => {
           recordFailure(

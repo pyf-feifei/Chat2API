@@ -29,7 +29,7 @@ Chat2API 是一个跨平台桌面应用和无 Electron 服务端。它将基于 
 - **长请求控制**：提供上下文压缩、请求和流式超时、队列准入、连接保活、有限重试，以及 Qwen 会话和响应恢复。
 - **桌面与服务端部署**：在 macOS、Windows、Linux 上使用 Electron 界面，也可以在 Docker 中运行 Koa 代理和浏览器管理端。
 - **运维界面**：仪表盘统计、请求日志、模型同步、API Key、代理设置、主题、系统托盘，以及中英文界面。
-- **客户端桥接**：支持 [Codex CLI Responses 接口](docs/codex.md)，并可通过 [LiteLLM 部署 Anthropic 兼容接口](docs/litellm.md)。
+- **客户端桥接**：支持 [Codex CLI Responses 接口](docs/codex.md)。
 
 ## 支持的服务商
 
@@ -127,7 +127,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Codex CLI 请使用 Responses 接口并参考 [docs/codex.md](docs/codex.md)；Claude 或其他 Anthropic 客户端请参考 [LiteLLM 指南](docs/litellm.md)。
+Codex CLI 请使用 Responses 接口并参考 [docs/codex.md](docs/codex.md)。
 
 ## 截图
 

@@ -25,7 +25,7 @@ const {
   qwenAiAccountRetryScope,
 } = loadPolicy()
 
-test('nested LiteLLM 503 wrapper preserves a real 401 account fault', () => {
+test('nested Proxy 503 wrapper preserves a real 401 account fault', () => {
   const error = {
     status_code: 503,
     original_exception: {

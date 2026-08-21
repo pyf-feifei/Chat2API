@@ -57,6 +57,3 @@ selected model can produce one.
 Codex-specific server-side namespace tools are not representable in a generic
 Chat Completions upstream and are omitted from that provider request. Ordinary
 Codex coding tools are function or custom tools and pass through the bridge.
-
-For Claude Code through the Anthropic-compatible LiteLLM boundary, see
-[litellm.md](litellm.md).

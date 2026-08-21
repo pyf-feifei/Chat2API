@@ -14,13 +14,7 @@ const nativeDocs = fs.readFileSync('docs/windows-native-services.md', 'utf8')
 
 test('native deployment keeps the proxy endpoint and dependency graph generic', () => {
   assert.match(configScript, /\[string\]\$Chat2ApiHost\s*=\s*'127\.0\.0\.1'/)
-  assert.match(configScript, /\[string\]\$LiteLlmHost\s*=\s*'127\.0\.0\.1'/)
   assert.match(configScript, /\[int\]\$Chat2ApiPort\s*=\s*18080/)
-  assert.match(configScript, /\[int\]\$LiteLlmPort\s*=\s*4000/)
-  assert.match(configScript, /CHAT2API_BASE_URL['\"]\]\s*=\s*"\$chatBaseUrl\/v1"/)
-  assert.match(configScript, /CHAT2API_HEALTH_URL['\"]\]\s*=\s*\$chatHealthUrl/)
-  assert.match(configScript, /DependsOn\s*=\s*@\('chat2api'\)/)
-  assert.match(configScript, /DependencyHealthUrls\s*=\s*@\(\$chatHealthUrl\)/)
   assert.match(configScript, /SchemaVersion\s*=\s*2/)
 })
 
@@ -39,7 +33,7 @@ test('native supervisor validates dependencies before starting downstream servic
   assert.match(supervisorScript, /\$serviceIndexes\[\$dependency\]/)
   assert.match(supervisorScript, /Stop-ManagedService -Service \$Service -Reason 'a required dependency is unavailable' \| Out-Null/)
   assert.match(supervisorScript, /Stop-ManagedService -Service \$Service -Reason 'its health check remained unhealthy' \| Out-Null/)
-  assert.match(nativeDocs, /generated schema records a named `chat2api` dependency/)
+  assert.match(nativeDocs, /generated schema records the exact Chat2API health URL/)
   assert.match(nativeDocs, /Docker Compose deployment uses Chat2API port `8080`/)
 })
 
@@ -49,9 +43,8 @@ test('native supervisor treats mixed-case dependency names as the same service i
   // the same comparer contract with a local JavaScript map as a smoke check.
   const services = new Map([
     ['chat2api', { name: 'chat2api' }],
-    ['litellm', { name: 'litellm', dependsOn: ['CHAT2API'] }],
   ])
-  const dependencyName = services.get('litellm').dependsOn[0]
+  const dependencyName = 'CHAT2API'
   assert.equal(
     [...services.keys()].find((name) => name.toLowerCase() === dependencyName.toLowerCase()),
     'chat2api',

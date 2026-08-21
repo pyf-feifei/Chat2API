@@ -8,6 +8,7 @@ import modelsRouter from './models'
 import completionsRouter from './completions'
 import geminiRouter from './gemini'
 import responsesRouter from './responses'
+import anthropicRouter from './anthropic'
 
 export {
   chatRouter,
@@ -15,12 +16,15 @@ export {
   completionsRouter,
   geminiRouter,
   responsesRouter,
+  anthropicRouter,
 }
 
-export default [
+const allRoutes = [
   chatRouter,
   modelsRouter,
   completionsRouter,
   geminiRouter,
   responsesRouter,
+  anthropicRouter,
 ]
+export default allRoutes

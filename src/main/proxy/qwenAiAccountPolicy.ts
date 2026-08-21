@@ -122,7 +122,6 @@ function effectiveStatus(value: unknown): number | undefined {
   const candidates = statusCandidates(value)
   if (candidates.length === 0) return undefined
 
-  // LiteLLM commonly puts a synthetic 503 on the outer exception and the
   // provider's real status on original_exception/response.data. Prefer the
   // deepest 4xx in that case; otherwise use the deepest observed upstream
   // status. This keeps nested 401/403/429 actionable while preserving a

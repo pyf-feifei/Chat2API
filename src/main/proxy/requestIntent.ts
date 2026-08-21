@@ -189,7 +189,6 @@ function explicitCompactionMarker(
     signals.push('protocol_compaction_field')
   }
 
-  // LiteLLM can move unknown Anthropic fields under metadata or a nested
   // request envelope. Inspect protocol keys without scanning prompt text.
   const protocolEnvelopes = [
     requestRecord.anthropic,
@@ -272,8 +271,8 @@ function classifyTerminalText(
 }
 
 /**
- * Detect the protocol-level context summary request emitted by Claude Code
- * through LiteLLM. The classifier uses structural instructions and tool-result
+ * Detect the protocol-level context summary request emitted by Claude Code.
+ * The classifier uses structural instructions and tool-result
  * history rather than a fixed prompt or a fixed message/token count.
  * Deployments can disable it or add a pattern with environment configuration.
  */

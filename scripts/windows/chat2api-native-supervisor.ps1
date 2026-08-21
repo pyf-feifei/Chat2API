@@ -118,7 +118,6 @@ function Get-InferredDependencyHealthUrls {
 
   # A Chat2API process also carries CHAT2API_BASE_URL for optional upstream
   # integrations. Its own listener must not be gated on that value; only a
-  # downstream bridge such as LiteLLM (which has no CHAT2API_PORT) needs this
   # backward-compatible inference for schema-1 configs.
   if (-not [string]::IsNullOrWhiteSpace((Get-ServiceEnvironmentValue -Service $Service -Name 'CHAT2API_PORT'))) {
     return @()
@@ -452,7 +451,6 @@ function Invoke-SupervisorCheck {
   foreach ($service in @($Services)) {
     # Evaluate every service on every pass. A downstream process that is
     # already running must be stopped when its dependency fails; skipping it
-    # here would leave a stale LiteLLM listener accepting doomed requests.
     Ensure-ManagedService -Service $service -ServiceMap $serviceMap | Out-Null
   }
 }
