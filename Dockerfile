@@ -33,7 +33,8 @@ ENV CHAT2API_QWEN_AI_COMPACTION_MAX_ACCOUNT_ATTEMPTS=0
 # Limit simultaneous recovery candidates only; account rotation still uses
 # the complete active pool unless the deployment sets an attempt cap.
 ENV CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE=2
-ENV CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=0
+# The local deployment profile allows up to five account failovers.
+ENV CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=5
 # Keep the adaptive pacing floor aligned with the validated multi-account
 # deployment; upstream 429/risk responses still control account cooldowns.
 ENV CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
@@ -64,14 +65,14 @@ ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 # Managed-branch and upstream-busy recovery counts are deployment controls.
 # Their request deadlines remain authoritative; zero disables each path.
 ENV CHAT2API_QWEN_AI_RETRY_COUNT=1
-ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
 # Response-id resumes and managed workflow continuations share this
 # no-progress budget; it pauses while a replacement stream is active.
-ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
+ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 # Default to one same-chat semantic correction; the deployment controls the count.
 ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 # Semantic continuation branches also share an absolute wall-clock deadline.

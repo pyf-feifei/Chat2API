@@ -713,8 +713,10 @@ function validatedSseMaxHoldMsFromEnv(): number {
 }
 
 /**
- * Keep managed answers and tool arguments private for validation and account
- * failover. Managed reasoning remains inside the same validated branch.
+ * Managed Qwen tool streams need a client-visible Responses stream while the
+ * provider is still being selected and preflighted. Content buffering remains
+ * controlled independently by qwenAiBufferManagedStreamsFromEnv(); this flag
+ * only controls when the route commits the HTTP stream to the client.
  */
 export function qwenAiBufferManagedStreamsFromEnv(): boolean {
   const raw = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
@@ -730,7 +732,6 @@ export function shouldDeferQwenAiManagedStreamCommit(
 ): boolean {
   return request.stream === true
     && requestUsesManagedTools(request)
-    && qwenAiBufferManagedStreamsFromEnv()
 }
 
 function qwenAiCompactionThinkingFromEnv(): boolean | undefined {

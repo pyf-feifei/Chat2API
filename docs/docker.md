@@ -196,9 +196,9 @@ CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
 CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 CHAT2API_QWEN_AI_RETRY_COUNT=1
-CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
-CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
+CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
 # explicit retry cap (0 disables busy-chat recovery).
@@ -266,7 +266,7 @@ controls the pause between attempts. Set the attempts value to `0` to disable
 this transport recovery. It never resubmits the original prompt and is not
 selected by a session id, project path, or task content.
 Transport resumes and managed workflow continuations also share the bounded
- `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `180000` ms). The budget is
+ `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `600000` ms). The budget is
  spent only while a replacement stream is being admitted, including retry
  delays and a stalled JSON admission response; it pauses once a replacement
  stream is attached. Active generation does not spend this smaller no-progress

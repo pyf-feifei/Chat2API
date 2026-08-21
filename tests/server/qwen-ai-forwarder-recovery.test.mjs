@@ -215,8 +215,26 @@ function loadRequestForwarder(overrides = {}) {
   }
 
   new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
-  return module.exports.RequestForwarder
+  return overrides.returnExports ? module.exports : module.exports.RequestForwarder
 }
+
+test('Qwen managed Responses streams stay deferred when content buffering is disabled', () => {
+  const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
+  try {
+    const forwarderExports = loadRequestForwarder({ returnExports: true })
+    assert.equal(
+      forwarderExports.shouldDeferQwenAiManagedStreamCommit({
+        stream: true,
+        tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+      }),
+      true,
+    )
+  } finally {
+    if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+    else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer
+  }
+})
 
 test('adapter registry passes the Qwen profile key for a custom provider id', () => {
   let capturedInput
