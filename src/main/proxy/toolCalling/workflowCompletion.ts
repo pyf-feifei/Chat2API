@@ -69,11 +69,10 @@ export function stripManagedWorkflowCompletionMarker(
 export function requiresManagedWorkflowCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
   return Boolean(
     supportsManagedWorkflowCompletionMarker(plan)
-    // A matched tool-result batch, including an error result, opens a normal
-    // assistant turn. In auto mode the model may call another tool or explain
-    // why the operation could not complete; ordinary terminal text is valid
-    // in either case. The private marker is needed only on the initial turn,
-    // where it distinguishes a final answer from a progress announcement.
+    // A strictly matched trailing tool-result batch is the protocol boundary
+    // for a normal assistant turn. At that boundary, auto mode may either call
+    // another tool or return ordinary terminal text; requiring a private marker
+    // would discard valid client-visible answers from providers that omit it.
     && !plan?.workflowContinuation
   )
 }

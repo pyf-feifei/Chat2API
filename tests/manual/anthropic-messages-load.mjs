@@ -14,6 +14,7 @@ const CONCURRENCY = Number(process.env.CONCURRENCY || 5)
 const MAX_TOKENS = Number(process.env.MAX_TOKENS || 60)
 const STREAM_RATIO = Number(process.env.STREAM_RATIO || 0.5)
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120000)
+const STREAM_COUNT = Math.round(TOTAL * Math.min(1, Math.max(0, STREAM_RATIO)))
 
 const prompts = [
   'Say hello in one short sentence.',
@@ -26,7 +27,8 @@ const prompts = [
 const results = []
 
 async function runOne(index) {
-  const stream = (index % 100) / 100 < STREAM_RATIO
+  const stream = Math.floor(((index + 1) * STREAM_COUNT) / TOTAL)
+    > Math.floor((index * STREAM_COUNT) / TOTAL)
   const body = {
     model: MODEL,
     max_tokens: MAX_TOKENS,

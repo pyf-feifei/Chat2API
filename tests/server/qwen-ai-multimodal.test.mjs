@@ -313,13 +313,13 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
 
   assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-600000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-840000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160\}/)
   assert.match(source, /CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:\s*\$\{CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240\}/)
   assert.match(source, /CHAT2API_QWEN_AI_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_RETRY_COUNT:-1\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-1\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-3\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-4\}/)
   const transcriptEnvironmentNames = [
     'MAX_BYTES',
     'REQUEST_RESERVE_BYTES',
@@ -338,13 +338,13 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(source, /QWEN_AI_FILE_PARSE_TIMEOUT_MS:\s*\$\{QWEN_AI_FILE_PARSE_TIMEOUT_MS:-120000\}/)
   assert.doesNotMatch(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_REQUEST_TIMEOUT_MS/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RETRY_COUNT=1/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=4/)
   assert.match(dockerfile, /ENV QWEN_AI_REQUEST_TIMEOUT_MS=840000/)
   assert.match(dockerfile, /ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0/)
   assert.match(governorSource, /numberFromEnv\('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS',\s*120 \* 1000\)/)

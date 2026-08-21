@@ -22,6 +22,19 @@ interface ResponsesStreamOptions {
   onComplete?: (response: ResponseObject) => void | Promise<void>
   onIncomplete?: (response: ResponseObject) => void | Promise<void>
   onFailure?: (error: Error, response: ResponseObject) => void
+  progressIntervalMs?: number
+}
+
+export const DEFAULT_RESPONSES_PROGRESS_INTERVAL_MS = 15_000
+
+export function responsesProgressIntervalMsFromEnv(): number {
+  const raw = process.env.CHAT2API_RESPONSES_PROGRESS_INTERVAL_MS
+  if (raw === undefined || raw.trim() === '') return DEFAULT_RESPONSES_PROGRESS_INTERVAL_MS
+
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0
+    ? value
+    : DEFAULT_RESPONSES_PROGRESS_INTERVAL_MS
 }
 
 interface ToolStreamState {
@@ -124,9 +137,13 @@ export class ChatCompletionsToResponsesStream extends Transform {
   private readonly onComplete?: ResponsesStreamOptions['onComplete']
   private readonly onIncomplete?: ResponsesStreamOptions['onIncomplete']
   private readonly onFailure?: ResponsesStreamOptions['onFailure']
+  private readonly progressIntervalMs: number
   private started = false
   private finalized = false
   private finalizationPromise?: Promise<void>
+  private progressResponse?: ResponseObject
+  private lastEventAt = Date.now()
+  private progressTimer?: NodeJS.Timeout
   private sawDone = false
   private finishReason?: string
   private sequenceNumber = 0
@@ -156,8 +173,10 @@ export class ChatCompletionsToResponsesStream extends Transform {
     this.onComplete = options.onComplete
     this.onIncomplete = options.onIncomplete
     this.onFailure = options.onFailure
+    this.progressIntervalMs = options.progressIntervalMs ?? responsesProgressIntervalMsFromEnv()
     this.textItemId = `msg_${responseIdSuffix(this.responseId)}`
     this.reasoningItemId = `rs_${responseIdSuffix(this.responseId)}`
+    this.once('close', () => this.stopProgressTimer())
   }
 
   start(): this {
@@ -170,8 +189,10 @@ export class ChatCompletionsToResponsesStream extends Transform {
       status: 'in_progress',
       usage: null,
     })
+    this.progressResponse = response
     this.enqueueEvent('response.created', { response })
     this.enqueueEvent('response.in_progress', { response: { ...response } })
+    this.startProgressTimer()
     return this
   }
 
@@ -179,6 +200,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
     if (this.finalized) return
     this.start()
     this.finalized = true
+    this.stopProgressTimer()
     const responseError = {
       code: typeof (error as Error & { code?: unknown }).code === 'string'
         ? (error as Error & { code: string }).code
@@ -632,6 +654,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
     }
     if (this.finalized) return
     this.finalized = true
+    this.stopProgressTimer()
 
     const baseResponse = createResponseObject(this.request, {
       id: this.responseId,
@@ -687,7 +710,35 @@ export class ChatCompletionsToResponsesStream extends Transform {
       ...fields,
     }
     this.sequenceNumber += 1
+    this.lastEventAt = Date.now()
     this.push(`event: ${type}\ndata: ${JSON.stringify(event)}\n\n`)
+  }
+
+  private startProgressTimer(): void {
+    if (this.progressTimer || this.progressIntervalMs <= 0) return
+    this.progressTimer = setInterval(() => {
+      if (
+        this.finalized
+        || this.destroyed
+        || !this.progressResponse
+        || Date.now() - this.lastEventAt < this.progressIntervalMs
+      ) {
+        return
+      }
+      // Responses clients reset their stream idle deadline on typed SSE
+      // events. Keep private managed-tool candidates buffered while exposing
+      // only the protocol's existing in-progress lifecycle state.
+      this.enqueueEvent('response.in_progress', {
+        response: { ...this.progressResponse },
+      })
+    }, this.progressIntervalMs)
+    this.progressTimer.unref?.()
+  }
+
+  private stopProgressTimer(): void {
+    if (!this.progressTimer) return
+    clearInterval(this.progressTimer)
+    this.progressTimer = undefined
   }
 }
 

@@ -76,3 +76,8 @@ backup/
 
 # Local live debug logs
 .tmp-live-*.ndjson
+
+# Codex local test runtime state and GitHub research scratch files
+.codex-local-test/
+/gh_*.py
+/gh_*.txt

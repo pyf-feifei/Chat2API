@@ -16,6 +16,7 @@ import {
 } from '../../src/main/proxy/responses/image.ts'
 
 const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3xkAAAAASUVORK5CYII='
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 async function collectResponseEvents(
   chunks: string[],
@@ -611,6 +612,66 @@ test('text streaming emits the official typed event sequence and complete respon
   assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index))
   assert.equal(events.at(-1).response.output[0].content[0].text, 'Hello')
   assert.equal(events.at(-1).response.usage.total_tokens, 3)
+})
+
+test('Responses streaming emits typed progress during a quiet managed hold', async () => {
+  const transform = createResponsesStreamTransform({
+    request: { model: 'test-model', input: 'hello', stream: true },
+    responseId: 'resp_progress',
+    model: 'test-model',
+    createdAt: 123,
+    progressIntervalMs: 15,
+  }).start()
+  const output: string[] = []
+  transform.setEncoding('utf8')
+  transform.on('data', chunk => output.push(chunk))
+
+  await wait(40)
+  const progressEvents = output
+    .join('')
+    .split('\n\n')
+    .filter(Boolean)
+    .map(block => JSON.parse(block.split('\n').find(line => line.startsWith('data: '))!.slice(6)))
+
+  assert.ok(progressEvents.filter(event => event.type === 'response.in_progress').length >= 2)
+  assert.deepEqual(
+    progressEvents.map(event => event.sequence_number),
+    progressEvents.map((_, index) => index),
+  )
+  assert.ok(progressEvents.every(event => event.type === 'response.created' || event.type === 'response.in_progress'))
+
+  transform.end([
+    'data: {"choices":[{"delta":{"content":"done"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join(''))
+  await once(transform, 'end')
+  const eventCountAfterEnd = output.join('').split('\n\n').filter(Boolean).length
+  await wait(35)
+  assert.equal(output.join('').split('\n\n').filter(Boolean).length, eventCountAfterEnd)
+})
+
+test('Responses protocol progress can be disabled without affecting completion', async () => {
+  const transform = createResponsesStreamTransform({
+    request: { model: 'test-model', input: 'hello', stream: true },
+    responseId: 'resp_progress_disabled',
+    model: 'test-model',
+    progressIntervalMs: 0,
+  }).start()
+  let output = ''
+  transform.setEncoding('utf8')
+  transform.on('data', chunk => { output += chunk })
+
+  await wait(35)
+  assert.equal((output.match(/event: response\.in_progress/g) ?? []).length, 1)
+
+  transform.end([
+    'data: {"choices":[{"delta":{"content":"done"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join(''))
+  await once(transform, 'end')
+  assert.match(output, /event: response\.completed/)
 })
 
 test('reasoning streaming emits live Responses deltas before answer text', async () => {

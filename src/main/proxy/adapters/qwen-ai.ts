@@ -337,11 +337,11 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
 export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
   if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
-    return 1
+    return 4
   }
 
   const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) return 1
+  if (!Number.isSafeInteger(value) || value < 0) return 4
   return value
 }
 
@@ -662,7 +662,10 @@ export function createQwenAiResumableStream(
   const effectiveRecoveryBudgetError = () => requestDeadlineExpired()
     ? createQwenAiRequestTimeoutError()
     : createQwenAiRecoveryBudgetError()
-  const effectiveWorkflowRecoveryTimeoutError = () => requestDeadlineExpired()
+  let workflowRecoveryBoundedByRequestDeadline = false
+  const effectiveWorkflowRecoveryTimeoutError = () => (
+    requestDeadlineExpired() || workflowRecoveryBoundedByRequestDeadline
+  )
     ? createQwenAiRequestTimeoutError()
     : createQwenAiWorkflowRecoveryTimeoutError()
   let workflowRecoveryStartedAt: number | undefined
@@ -724,6 +727,7 @@ export function createQwenAiResumableStream(
     workflowRecoveryController = undefined
     workflowRecoveryStartedAt = undefined
     workflowRecoveryEffectiveTimeoutMs = 0
+    workflowRecoveryBoundedByRequestDeadline = false
     if (abortInFlight && controller && !controller.signal.aborted) {
       controller.abort()
     }
@@ -816,6 +820,7 @@ export function createQwenAiResumableStream(
     const requestRemainingMs = workflowRecoveryRequestDeadlineAt === undefined
       ? Number.POSITIVE_INFINITY
       : Math.max(0, workflowRecoveryRequestDeadlineAt - Date.now())
+    workflowRecoveryBoundedByRequestDeadline = requestRemainingMs <= workflowRecoveryTimeoutMs
     workflowRecoveryEffectiveTimeoutMs = Math.min(
       workflowRecoveryTimeoutMs,
       requestRemainingMs,
@@ -1206,9 +1211,9 @@ export function createQwenAiResumableStream(
 
     // A response-id GET can only continue the provider's existing generation.
     // For a managed-tool semantic terminal, start a continuation user turn in
-    // the same chat instead of replaying that branch. One bounded correction
-    // is allowed by default; the selected text protocol is responsible for
-    // making the initial branch unambiguous.
+    // the same chat instead of replaying that branch. Correction attempts are
+    // bounded by deployment configuration, the shared no-progress budget,
+    // and the absolute workflow deadline.
     if (
       !settled
       && semanticRecoveryEligible
@@ -2913,7 +2918,7 @@ function createQwenAiStreamEnvelopeError(
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
       error.accountFault = false
-      error.retryScope = 'next-account'
+      delete error.retryScope
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
       error.retryable = true
@@ -3034,7 +3039,7 @@ function createQwenAiStreamEnvelopeError(
     error.code = 'qwen_ai_upstream_busy'
     error.retryable = true
     error.accountFault = false
-    error.retryScope = 'next-account'
+    delete error.retryScope
   } else if (isRiskControl) {
     error.code = 'qwen_ai_risk_control'
   } else if (isChatInProgress) {
@@ -3555,7 +3560,7 @@ export class QwenAiAdapter {
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
       error.accountFault = false
-      error.retryScope = 'next-account'
+      delete error.retryScope
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
     } else if (chatInProgress) {
@@ -3900,18 +3905,10 @@ export class QwenAiAdapter {
         request.enable_thinking,
         modelCapability,
       )
-      // When managed tool calling is active, disable thinking mode to prevent
-      // the model from producing a long reasoning chain followed by a text-only
-      // end_turn instead of calling tools. Qwen3's thinking mode is a primary
-      // cause of the "text first, then stop without tool call" failure pattern.
-      const shouldEnableThinking = request.managedToolCalling
-        ? false
-        : featureMode.thinkingEnabled
-
       const featureConfig = createQwenAiFeatureConfig({
-        thinkingEnabled: shouldEnableThinking,
-        autoThinking: request.managedToolCalling ? false : featureMode.autoThinking,
-        thinkingBudget: request.managedToolCalling ? undefined : request.thinking_budget,
+        thinkingEnabled: featureMode.thinkingEnabled,
+        autoThinking: featureMode.autoThinking,
+        thinkingBudget: request.thinking_budget,
       })
 
       const createPayload = () => ({
@@ -4008,7 +4005,7 @@ export class QwenAiAdapter {
         messageTransport: preparedUserMessage.transport,
         managedDocumentMode: preparedUserMessage.managedDocumentMode,
         managedToolCalling: request.managedToolCalling === true,
-        thinkingEnabled: shouldEnableThinking,
+        thinkingEnabled: featureMode.thinkingEnabled,
         modelMaxContextTokens: modelCapability?.maxContextLength,
         modelMaxSummaryTokens: modelCapability?.maxSummaryGenerationLength,
       }))
@@ -4151,17 +4148,10 @@ export class QwenAiAdapter {
       request.enable_thinking,
       modelCapability,
     )
-    // When managed tool calling is active, disable thinking mode to prevent
-    // the model from producing a long reasoning chain followed by a text-only
-    // end_turn instead of calling tools. Qwen3's thinking mode is a primary
-    // cause of the "text first, then stop without tool call" failure pattern.
-    const shouldEnableThinking = request.managedToolCalling
-      ? false
-      : featureMode.thinkingEnabled
     const featureConfig = createQwenAiFeatureConfig({
-      thinkingEnabled: shouldEnableThinking,
-      autoThinking: request.managedToolCalling ? false : featureMode.autoThinking,
-      thinkingBudget: request.managedToolCalling ? undefined : request.thinking_budget,
+      thinkingEnabled: featureMode.thinkingEnabled,
+      autoThinking: featureMode.autoThinking,
+      thinkingBudget: request.thinking_budget,
     })
 
     // A Responses tool-result follow-up can contain generated files or

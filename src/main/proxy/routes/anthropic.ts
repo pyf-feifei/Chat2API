@@ -20,6 +20,7 @@ import { storeManager } from '../../store/store'
 import { classifyChatRequest } from '../requestIntent'
 import { proxyStatusManager } from '../status'
 import { createAnthropicMessagesStream } from '../anthropic/stream'
+import { anthropicToolResultToChatMessage } from '../anthropic/request'
 
 const router = new Router({ prefix: '/v1' })
 
@@ -253,11 +254,7 @@ function convertAnthropicToOpenAI(
       }
 
       for (const result of toolResults) {
-        messages.push({
-          role: 'tool',
-          tool_call_id: result.tool_use_id,
-          content: result.content,
-        })
+        messages.push(anthropicToolResultToChatMessage(result))
       }
 
       if (imageParts.length > 0) {

@@ -14,6 +14,7 @@ import {
   supportsManagedWorkflowCompletionMarker,
 } from '../../src/main/proxy/toolCalling/workflowCompletion.ts'
 import type { Provider } from '../../src/main/store/types.ts'
+import type { ChatMessage } from '../../src/main/proxy/types.ts'
 import type { ToolCallingPlan } from '../../src/main/proxy/toolCalling/types.ts'
 
 function managedPlan(overrides: Partial<ToolCallingPlan> = {}): ToolCallingPlan {
@@ -49,7 +50,7 @@ test('initial Qwen managed auto turns require a workflow completion marker', () 
   assert.equal(requiresManagedWorkflowCompletionMarker(managedPlan()), true)
 })
 
-test('successful tool-result continuations use terminal assistant text as completion', () => {
+test('matched tool-result continuations accept ordinary terminal text', () => {
   const plan = managedPlan({ workflowContinuation: true })
   assert.equal(supportsManagedWorkflowCompletionMarker(plan), true)
   assert.equal(requiresManagedWorkflowCompletionMarker(plan), false)
@@ -71,7 +72,7 @@ test('completion proof strips the model-emitted marker variant without a slash',
   assert.equal(stripManagedWorkflowCompletionMarker(content, managedPlan()), 'The work is complete.')
 })
 
-test('failed-result continuations allow terminal assistant text', () => {
+test('failed-result continuations may explain the blocking failure without a marker', () => {
   assert.equal(
     requiresManagedWorkflowCompletionMarker(managedPlan({
       workflowContinuation: true,
@@ -171,8 +172,11 @@ test('workflow continuation completion proof follows protocol state and capabili
   assert.match(String(hermes.content), /chat2api_workflow_complete/)
   assert.match(String(hermes.content), /transport marker.*proxy removes it before delivery/i)
   assert.doesNotMatch(String(successfulHermes.content), /chat2api_workflow_complete/)
+  assert.match(String(successfulHermes.content), /tool-result batch completed successfully/i)
+  assert.match(String(successfulHermes.content), /do not repeat a completed call/i)
   assert.doesNotMatch(String(failedHermes.content), /chat2api_workflow_complete/)
   assert.match(String(failedHermes.content), /otherwise explain the blocking failure/i)
+  assert.doesNotMatch(String(failedHermes.content), /completed successfully/i)
   assert.doesNotMatch(String(failedHermes.content), /Return only one or more Qwen function calls/i)
   assert.doesNotMatch(String(managedXml.content), /chat2api_workflow_complete/)
 })
@@ -301,4 +305,36 @@ test('Qwen required-tool prompt keeps the bounded completion proof', () => {
   })
 
   assert.match(String(transformed.messages[0].content), /chat2api_workflow_complete/)
+})
+
+test('long matched tool history opens a marker-optional final-answer turn', () => {
+  const messages: ChatMessage[] = [{ role: 'user', content: 'complete the requested work' }]
+  for (let index = 0; index < 108; index += 1) {
+    const id = `call-${index}`
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id,
+        type: 'function',
+        function: { name: 'read_file', arguments: JSON.stringify({ path: `file-${index}` }) },
+      }],
+    })
+    messages.push({ role: 'tool', tool_call_id: id, content: `result-${index}` })
+  }
+
+  const transformed = new ToolCallingEngine().transformRequest({
+    request: {
+      model: 'configured-model',
+      messages,
+      tools: declaredTools,
+      tool_choice: 'auto',
+    },
+    provider: qwenAiProvider,
+    actualModel: 'configured-model',
+  })
+
+  assert.equal(transformed.plan.workflowContinuation, true)
+  assert.equal(requiresManagedWorkflowCompletionMarker(transformed.plan), false)
+  assert.doesNotMatch(String(transformed.messages[0].content), /chat2api_workflow_complete/)
 })

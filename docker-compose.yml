@@ -1,6 +1,6 @@
 services:
   chat2api:
-    image: skatef/chat2api:20260821-responses-stream-fix-v3
+    image: skatef/chat2api:20260822-anthropic-workflow-v2
     container_name: chat2api
     restart: unless-stopped
     # Match the server's default 14-minute request budget plus a small margin;
@@ -40,7 +40,7 @@ services:
       # Only pre-output 401/403 and capacity-classified 429 failures traverse
       # the active Qwen pool. Ordinary 5xx and chat/session errors stay on the
       # current account. A positive value can impose a deployment-specific cap.
-      CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:?Set CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS in .env}
+      CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:-5}
       # Active accounts need the Qwen Web token cookie before they can enter
       # the request pool. Repair incomplete sessions serially to limit sign-in load.
       CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED: ${CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED:-true}
@@ -59,7 +59,7 @@ services:
       CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS: ${CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS:-1}
       # Hold managed tool frames until their arguments pass terminal
       # validation. Context compaction strips tools and bypasses this path.
-      CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:?Set CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS in .env}
+      CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-true}
       # This UTF-8 JSON target triggers document offload; it is not a request ceiling.
       # Set 0 to disable automatic offload.
       CHAT2API_QWEN_AI_REQUEST_MAX_BYTES: ${CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160}
@@ -67,7 +67,7 @@ services:
       CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS: ${CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240}
       # Non-negative retry counts are bounded by the cumulative request deadline.
       CHAT2API_QWEN_AI_RETRY_COUNT: ${CHAT2API_QWEN_AI_RETRY_COUNT:-1}
-      CHAT2API_QWEN_AI_BUSY_RETRY_COUNT: ${CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:?Set CHAT2API_QWEN_AI_BUSY_RETRY_COUNT in .env}
+      CHAT2API_QWEN_AI_BUSY_RETRY_COUNT: ${CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-3}
       # Keep HTTP status mutable until the first visible frame by default.
       # Set a non-negative value only to impose an explicit preflight deadline.
       CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS: ${CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS-}
@@ -75,13 +75,13 @@ services:
       # Both values are deployment controls; no request or session is special-cased.
       CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS: ${CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3}
       CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS: ${CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000}
-      # Blank/default permits one same-chat semantic correction. Zero disables
-      # it; positive values remain bounded by the workflow recovery deadline.
-      CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:?Set CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS in .env}
+      # Blank/default permits four same-chat semantic corrections. Zero disables
+      # them; positive values remain bounded by the workflow recovery deadline.
+      CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-4}
       # One cumulative no-progress budget covers transport resumes and
       # workflow continuations. Active generation does not spend this smaller
       # budget, but remains bounded by QWEN_AI_REQUEST_TIMEOUT_MS.
-      CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:?Set CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS in .env}
+      CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-600000}
       # Once semantic recovery begins, cap the full continuation chain even
       # while replacement branches keep producing incomplete progress.
       CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-840000}
@@ -108,7 +108,7 @@ services:
       CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
       # Leave transport headroom for downstream clients and proxy layers to
       # receive a structured terminal response. Override per deployment.
-      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:?Set QWEN_AI_REQUEST_TIMEOUT_MS in .env}
+      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-840000}
       # Zero disables only the additional post-admission response cap. The
       # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline remains authoritative.
       QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-0}
@@ -120,6 +120,10 @@ services:
       # Emit protocol-neutral SSE comments while a downstream stream is quiet.
       # Zero disables keep-alives for deployments that manage them elsewhere.
       CHAT2API_SSE_KEEPALIVE_INTERVAL_MS: ${CHAT2API_SSE_KEEPALIVE_INTERVAL_MS:-15000}
+      # Responses clients use typed events for their idle deadline. Repeat the
+      # current in-progress lifecycle state without exposing buffered content.
+      # Zero disables protocol-level progress events.
+      CHAT2API_RESPONSES_PROGRESS_INTERVAL_MS: ${CHAT2API_RESPONSES_PROGRESS_INTERVAL_MS:-15000}
       # Store bounded previous_response_id lineages in the mounted /data volume.
       # Set the path to disabled to keep this state memory-only.
       CHAT2API_RESPONSES_STORE_PATH: ${CHAT2API_RESPONSES_STORE_PATH:-/data/responses/conversations.jsonl}
@@ -128,8 +132,11 @@ services:
       # Reject repeated completed calls only when both arguments and results
       # remain unchanged. Poll/wait tools are ignored by default.
       CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD: ${CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD:-3}
-      CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS: ${CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS:-wait,wait_agent,write_stdin}
       CHAT2API_RESPONSES_TOOL_LOOP_WINDOW: ${CHAT2API_RESPONSES_TOOL_LOOP_WINDOW:-8}
+      CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS: ${CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS:-wait,wait_agent,write_stdin}
+      # Emit protocol-native ping events while an Anthropic Messages stream is
+      # waiting on buffered upstream work. Zero disables these events.
+      CHAT2API_ANTHROPIC_PING_INTERVAL_MS: ${CHAT2API_ANTHROPIC_PING_INTERVAL_MS:-15000}
       CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS: ${CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:-540000}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}

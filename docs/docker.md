@@ -197,7 +197,7 @@ CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
 CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 CHAT2API_QWEN_AI_RETRY_COUNT=1
 CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3
-CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
+CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=4
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
@@ -208,6 +208,10 @@ CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
+# Emit typed response.in_progress events during otherwise silent Responses
+# streams. This keeps client idle deadlines active without releasing buffered
+# model content. Set to 0 to disable.
+CHAT2API_RESPONSES_PROGRESS_INTERVAL_MS=15000
 # Persist bounded previous_response_id state in the mounted data volume.
 # Use disabled, false, or off to keep this state memory-only.
 CHAT2API_RESPONSES_STORE_PATH=/data/responses/conversations.jsonl
@@ -217,11 +221,15 @@ CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL=32
 CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD=3
 CHAT2API_RESPONSES_TOOL_LOOP_WINDOW=8
 CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS=wait,wait_agent,write_stdin
+# Emit protocol-native ping events during otherwise silent Anthropic Messages
+# streams. Set to 0 to disable.
+CHAT2API_ANTHROPIC_PING_INTERVAL_MS=15000
 # During an image update, stop accepting new requests and drain active HTTP/SSE
 # streams for this long before the process exits. Keep this at or below the
 # Compose stop_grace_period (default 10m).
 CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS=540000
 ```
+
 Responses conversation state is stored as bounded plaintext JSONL at
 `CHAT2API_RESPONSES_STORE_PATH`. It contains the message history needed to
 resolve `previous_response_id` after a restart, so protect the mounted data
@@ -317,10 +325,10 @@ rejected locally with HTTP 413.
 inline tool description while the complete description remains in the tool
 reference attachment; `0` omits inline descriptions.
 When a managed-tool response reaches a semantic terminal without a tool call,
-Chat2API can start one corrective user turn in the same Qwen chat instead of
+Chat2API can start bounded corrective user turns in the same Qwen chat instead of
 replaying that completed response branch or the original transcript. A fresh
 chat replay is reserved for an undeclared provider-native tool call. The
-`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is `1`; `0` disables
+`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is `4`; `0` disables
 semantic recovery and positive values are bounded by the absolute workflow
 recovery deadline.
 The new turn is parented to Qwen's latest `response_id` and does not resend the

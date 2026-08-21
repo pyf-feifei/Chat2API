@@ -65,6 +65,12 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
   'Retry with an appropriate declared tool only when another attempt can make progress; otherwise explain the blocking failure clearly in the final answer instead of repeating the same operation.',
 ].join(' ')
 
+const SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT = [
+  'The immediately preceding matched tool-result batch completed successfully, so those corresponding tool calls have already run.',
+  'Use their returned results and do not repeat a completed call merely to satisfy the original request.',
+  'Call another tool only for a distinct unfinished operation or when a returned result explicitly shows that more work is required.',
+].join(' ')
+
 const MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT = [
   'The preceding assistant branch was rejected because its final answer omitted the required managed-workflow completion marker.',
   'If the active request is complete, reissue the complete final answer and end it with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + ' as the final characters; do not return the marker alone.',
@@ -106,7 +112,11 @@ export function createToolWorkflowContinuationMessage(options: {
       TOOL_WORKFLOW_CONTINUATION_PROMPT,
       activeUserRequestPrompt,
       options.completionProofMissing ? MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT : undefined,
-      options.failedToolResultPending ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT : undefined,
+      options.plan?.workflowContinuation
+        ? options.failedToolResultPending
+          ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT
+          : SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT
+        : undefined,
       recoveryPrompt,
       completionPrompt,
     ].filter((part): part is string => Boolean(part)).join('\n\n'),

@@ -173,6 +173,7 @@ async function runCase({ stream, isError, suffix }) {
 const results = []
 results.push(await runCase({ stream: false, isError: true, suffix: 'nonstream_error' }))
 results.push(await runCase({ stream: true, isError: true, suffix: 'stream_error' }))
-results.push(await runCase({ stream: false, isError: false, suffix: 'success_control' }))
+results.push(await runCase({ stream: false, isError: false, suffix: 'nonstream_success' }))
+results.push(await runCase({ stream: true, isError: false, suffix: 'stream_success' }))
 
 console.log(JSON.stringify({ outcome: 'all_passed', results }, null, 2))
