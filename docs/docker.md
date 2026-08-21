@@ -266,7 +266,8 @@ controls the pause between attempts. Set the attempts value to `0` to disable
 this transport recovery. It never resubmits the original prompt and is not
 selected by a session id, project path, or task content.
 Transport resumes and managed workflow continuations also share the bounded
- `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `600000` ms). The budget is
+ `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` is supplied by the deployment
+ environment. The budget is
  spent only while a replacement stream is being admitted, including retry
  delays and a stalled JSON admission response; it pauses once a replacement
  stream is attached. Active generation does not spend this smaller no-progress

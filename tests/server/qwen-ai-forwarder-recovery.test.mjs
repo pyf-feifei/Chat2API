@@ -956,6 +956,7 @@ test('Qwen request deadline stays absolute across governor queue time and accoun
 
   const adapterRequests = []
   const governorDeadlines = []
+  const governorOptions = []
   const resumableOptions = []
   const streamHandlingOptions = []
   const nonStreamHandlingOptions = []
@@ -1003,6 +1004,7 @@ test('Qwen request deadline stays absolute across governor queue time and accoun
     qwenAiRequestGovernor: {
       async run(_accountId, operation, options) {
         governorDeadlines.push(options.deadlineAt)
+        governorOptions.push(options)
         now += governorAdvanceMs
         return operation()
       },
@@ -1042,12 +1044,31 @@ test('Qwen request deadline stays absolute across governor queue time and accoun
     { id: 'account-2' },
     { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
     'model-1',
-    context,
+    {
+      ...context,
+      qwenAiSessionBridge: {
+        requestFingerprint: 'fingerprint',
+        continuation: {
+          binding: {
+            providerId: 'qwen-ai',
+            accountId: 'account-2',
+            requestedModel: 'model-1',
+            actualModel: 'model-1',
+            chatId: 'chat-1',
+            parentId: 'parent-1',
+            requestFingerprint: 'fingerprint',
+          },
+          inputMessages: [{ role: 'tool', content: 'ok', tool_call_id: 'call-1' }],
+        },
+      },
+    },
   )
 
   assert.equal(second.success, true)
   assert.equal(adapterRequests[1].timeoutMs, 40)
   assert.equal(adapterRequests[1].deadlineAt, firstStartedAt + 100)
+  assert.equal(governorOptions[0].recoveryBypassAccountInterval, false)
+  assert.equal(governorOptions[1].recoveryBypassAccountInterval, true)
   assert.equal(resumableOptions[1].workflowRecoveryDeadlineAt, firstStartedAt + 100)
   assert.equal(nonStreamHandlingOptions[0].requestDeadlineAt, firstStartedAt + 100)
 

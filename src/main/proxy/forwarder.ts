@@ -2246,6 +2246,13 @@ export class RequestForwarder {
     const requestClass: QwenAiRequestClass = requestIntent === 'context_compaction'
       ? 'context_compaction'
       : 'normal'
+    // A retained Responses tool-result continuation is already serialized by
+    // its Qwen chat/parent binding. Waiting for the account-wide pacing floor
+    // here only delays the client-visible continuation and can make clients
+    // abandon an otherwise healthy request. Ordinary turns and retries keep
+    // the configured account interval.
+    const isRetainedSessionContinuation = requestClass === 'normal'
+      && Boolean(context.qwenAiSessionBridge?.continuation)
 
     const runGoverned = () => qwenAiRequestGovernor.run(account.id,
       () => this.forwardQwenAi(request, account, provider, actualModel, startTime, context, {
@@ -2260,7 +2267,8 @@ export class RequestForwarder {
         // compaction must wait in its own scheduler so it never creates a
         // hidden queue behind another stage.
         allowQueue: requestClass === 'normal',
-        recoveryBypassAccountInterval: options.qwenAiRecoveryBypassAccountInterval,
+        recoveryBypassAccountInterval: options.qwenAiRecoveryBypassAccountInterval
+          || isRetainedSessionContinuation,
         requestId: context.requestId,
         attempt: options.attempt ?? 1,
         requestClass,

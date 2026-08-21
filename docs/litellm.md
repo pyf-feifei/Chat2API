@@ -321,7 +321,8 @@ once in a fresh chat on the same credential. The replay does not add a workflow
 correction prompt, does not penalize the account, and a second ended result is
 returned as an explicit `502`.
 Response-id resumes and managed-tool continuations share the cumulative
- `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `600000` ms). It covers only
+ `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` is supplied by the deployment
+ environment. It covers only
  no-progress recovery work and pauses while a replacement stream is active, so
  active generation does not spend this smaller budget. Active streams still
  remain inside the configured cumulative request deadline. Set the recovery
