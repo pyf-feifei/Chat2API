@@ -571,8 +571,8 @@ test('Qwen AI managed document transport keeps protocol and active tool exchange
     createManagedToolPromptMessage(
       'FULL_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool","description":"FULL_TOOL_DESCRIPTION_SENTINEL"}</tools>',
       {
-        content: 'COMPACT_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool"}</tools>',
-        referenceContent: 'FULL_TOOL_REFERENCE_SENTINEL\nFULL_TOOL_DESCRIPTION_SENTINEL',
+        content: 'FULL_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool","description":"FULL_TOOL_DESCRIPTION_SENTINEL"}</tools>',
+        referenceContent: '',
       },
     ),
     { role: 'user' as const, content: oldHistory },
@@ -600,28 +600,20 @@ test('Qwen AI managed document transport keeps protocol and active tool exchange
     workflowContinuation: true,
   })
 
-  assert.equal(uploads.length, 2)
+  assert.equal(uploads.length, 1)
   const transcriptUpload = uploads.find(upload => /^chat2api-conversation-/.test(upload.part.filename))
-  const toolReferenceUpload = uploads.find(upload => /^chat2api-tool-reference-/.test(upload.part.filename))
   assert.ok(transcriptUpload)
-  assert.ok(toolReferenceUpload)
   const transcriptUrl = transcriptUpload.part.file_url.url as string
   const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
-  const toolReferenceUrl = toolReferenceUpload.part.file_url.url as string
-  const toolReference = Buffer.from(toolReferenceUrl.split(',', 2)[1], 'base64').toString('utf8')
   assert.match(transcript, /OLD_HISTORY_START/)
   assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
   assert.doesNotMatch(
     transcript,
     /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL|ACTIVE_REQUEST_IN_DOCUMENT|ACTIVE_TOOL_RESULT_SENTINEL|ACTIVE_CONTINUATION_SENTINEL/,
   )
-  assert.match(toolReference, /FULL_TOOL_REFERENCE_SENTINEL/)
-  assert.match(toolReference, /FULL_TOOL_DESCRIPTION_SENTINEL/)
-
   assert.match(prepared.content, /Conversation context is attached/i)
-  assert.match(prepared.content, /Complete tool definitions are attached/i)
-  assert.match(prepared.content, /COMPACT_MANAGED_PROTOCOL_SENTINEL/)
-  assert.doesNotMatch(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL|FULL_TOOL_DESCRIPTION_SENTINEL/)
+  assert.match(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL/)
+  assert.match(prepared.content, /FULL_TOOL_DESCRIPTION_SENTINEL/)
   assert.match(prepared.content, /"name":"declared_dynamic_tool"/)
   assert.match(prepared.content, /ACTIVE_REQUEST_IN_DOCUMENT/)
   assert.match(prepared.content, /ACTIVE_TOOL_RESULT_SENTINEL/)
@@ -652,8 +644,8 @@ test('Qwen AI moves an oversized active Claude tool workflow into the complete t
     createManagedToolPromptMessage(
       `FULL_MANAGED_PROTOCOL_SENTINEL:${'schema'.repeat(20_000)}`,
       {
-        content: 'COMPACT_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"read_file"}</tools>',
-        referenceContent: 'FULL_TOOL_REFERENCE_SENTINEL',
+        content: `FULL_MANAGED_PROTOCOL_SENTINEL:${'schema'.repeat(20_000)}`,
+        referenceContent: '',
       },
     ),
     { role: 'user' as const, content: 'ORIGINAL_PENDING_TASK_SENTINEL' },
@@ -676,13 +668,11 @@ test('Qwen AI moves an oversized active Claude tool workflow into the complete t
 
   assert.equal(prepared.transport, 'document')
   assert.equal(prepared.managedDocumentMode, 'complete')
-  assert.ok(prepared.inlineUtf8Bytes < 90 * 1024)
-  assert.equal(uploads.length, 2)
+  assert.ok(prepared.inlineUtf8Bytes > 90 * 1024)
+  assert.equal(uploads.length, 1)
 
   const transcriptUpload = uploads.find(upload => /^chat2api-conversation-/.test(upload.part.filename))
-  const toolReferenceUpload = uploads.find(upload => /^chat2api-tool-reference-/.test(upload.part.filename))
   assert.ok(transcriptUpload)
-  assert.ok(toolReferenceUpload)
   const transcriptUrl = transcriptUpload.part.file_url.url as string
   const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
 
@@ -690,9 +680,9 @@ test('Qwen AI moves an oversized active Claude tool workflow into the complete t
   assert.match(transcript, /ORIGINAL_PENDING_TASK_SENTINEL/)
   assert.match(transcript, /ACTIVE_RESULT_0/)
   assert.match(transcript, /ACTIVE_RESULT_93/)
-  assert.doesNotMatch(transcript, /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.doesNotMatch(transcript, /FULL_MANAGED_PROTOCOL_SENTINEL/)
   assert.match(prepared.content, /complete managed conversation transcript is attached/i)
-  assert.match(prepared.content, /COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.match(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL/)
   assert.doesNotMatch(prepared.content, /ORIGINAL_PENDING_TASK_SENTINEL|ACTIVE_RESULT_0|ACTIVE_RESULT_93/)
   assert.deepEqual(messages, snapshot, 'complete document fallback must not mutate caller messages')
 })

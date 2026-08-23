@@ -115,7 +115,7 @@ test('Qwen managed workflow smoke: tool call, tool result, final answer', async 
   })
 
   assert.equal(finalTurn.plan.workflowContinuation, true)
-  assert.equal(requiresManagedWorkflowCompletionMarker(finalTurn.plan), false)
+  assert.equal(requiresManagedWorkflowCompletionMarker(finalTurn.plan), true)
   const prepared = await prepareQwenAiMultimodalMessage(finalTurn.messages, {} as never)
   assert.match(prepared.content, /<tool_call>/)
   assert.match(prepared.content, /"name":"Read"/)
@@ -192,11 +192,11 @@ test('custom Qwen provider instance keeps Hermes prompt and serialized tool hist
   assert.match(prepared.content, /<tools>/)
   assert.match(prepared.content, /<tool_call>/)
   assert.match(prepared.content, /<tool_response>\n# Chat2API\n<\/tool_response>/)
-  assert.doesNotMatch(prepared.content, /chat2api_workflow_complete/)
+  assert.match(prepared.content, /chat2api_workflow_complete/)
   assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_calls>/)
 })
 
-test('Qwen large managed workflow offloads history and complete tool references before first chat payload', async () => {
+test('Qwen large managed workflow offloads history while keeping the complete tool contract inline', async () => {
   const engine = new ToolCallingEngine()
   const fullDescriptionMarker = `${'documentation '.repeat(280)}:FULL_DESCRIPTION_MARKER`
   const largeTools = Array.from({ length: 35 }, (_, index) => ({
@@ -269,11 +269,13 @@ test('Qwen large managed workflow offloads history and complete tool references 
   })
 
   assert.equal(prepared.transport, 'document')
-  assert.ok(prepared.inlineUtf8Bytes < 90 * 1024)
-  assert.match(prepared.content, /ACTIVE_USER_TASK_SENTINEL/)
-  assert.match(prepared.content, /ACTIVE_TOOL_RESULT_SENTINEL/)
+  assert.ok(prepared.inlineUtf8Bytes > 90 * 1024)
+  assert.equal(
+    uploads.some(part => String(part.filename).startsWith('chat2api-tool-reference-')),
+    false,
+  )
   assert.match(prepared.content, /fixture_tool_00/)
-  assert.doesNotMatch(prepared.content, /ARCHIVED_HISTORY_START|FULL_DESCRIPTION_MARKER/)
+  assert.doesNotMatch(prepared.content, /ARCHIVED_HISTORY_START/)
 
   const decodeUpload = (prefix: string): string => {
     const upload = uploads.find(part => String(part.filename).startsWith(prefix))
@@ -281,10 +283,16 @@ test('Qwen large managed workflow offloads history and complete tool references 
     return Buffer.from(String(upload.file_url.url).split(',', 2)[1], 'base64').toString('utf8')
   }
   const archivedTranscript = decodeUpload('chat2api-conversation-')
-  const completeToolReference = decodeUpload('chat2api-tool-reference-')
   assert.match(archivedTranscript, /ARCHIVED_HISTORY_START/)
-  assert.doesNotMatch(archivedTranscript, /ACTIVE_USER_TASK_SENTINEL|ACTIVE_TOOL_RESULT_SENTINEL/)
-  assert.match(completeToolReference, /FULL_DESCRIPTION_MARKER/)
-  assert.match(completeToolReference, /fixture_tool_34/)
+  assert.match(
+    `${prepared.content}\n${archivedTranscript}`,
+    /ACTIVE_USER_TASK_SENTINEL/,
+  )
+  assert.match(
+    `${prepared.content}\n${archivedTranscript}`,
+    /ACTIVE_TOOL_RESULT_SENTINEL/,
+  )
+  assert.match(prepared.content, /FULL_DESCRIPTION_MARKER/)
+  assert.match(prepared.content, /fixture_tool_34/)
   assert.deepEqual(request, requestSnapshot)
 })

@@ -1476,7 +1476,6 @@ function partitionQwenAiManagedMessages(
 ): {
   archiveMessages: ChatMessage[]
   activeMessages: ChatMessage[]
-  toolReferenceContents: string[]
 } {
   let leadingSystemCount = 0
   while (messages[leadingSystemCount]?.role === 'system') {
@@ -1485,12 +1484,13 @@ function partitionQwenAiManagedMessages(
 
   const leadingSystemMessages = messages.slice(0, leadingSystemCount)
   const managedPromptMessages = leadingSystemMessages.filter(isManagedToolPromptMessage)
-  const toolReferenceContents: string[] = []
   const inlineManagedPromptMessages = managedPromptMessages.map((message) => {
     const documentPrompt = getManagedToolDocumentPrompt(message)
     if (!documentPrompt) return message
 
-    toolReferenceContents.push(documentPrompt.referenceContent)
+    // Active tool definitions stay inline. The reference field is retained in
+    // metadata for compatibility with older callers, but is deliberately not
+    // converted into a Qwen attachment.
     return { ...message, content: documentPrompt.content }
   })
   const ordinarySystemMessages = leadingSystemMessages.filter(message => (
@@ -1504,7 +1504,6 @@ function partitionQwenAiManagedMessages(
         ...messages.slice(leadingSystemCount),
       ],
       activeMessages: inlineManagedPromptMessages,
-      toolReferenceContents,
     }
   }
 
@@ -1547,7 +1546,7 @@ function partitionQwenAiManagedMessages(
     ...inlineManagedPromptMessages,
     ...messages.slice(activeStartIndex),
   ]
-  return { archiveMessages, activeMessages, toolReferenceContents }
+  return { archiveMessages, activeMessages }
 }
 
 function renderQwenAiManagedDocumentContext(
@@ -2592,10 +2591,6 @@ function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
   return createQwenAiTextDocument('chat2api-conversation', content)
 }
 
-function createQwenAiToolReferenceDocument(content: string): ChatMessageContent {
-  return createQwenAiTextDocument('chat2api-tool-reference', content)
-}
-
 function qwenAiTranscriptDocumentInstruction(filename: string): string {
   return [
     `The complete conversation transcript is attached as ${filename}.`,
@@ -2616,13 +2611,6 @@ function qwenAiCompleteManagedTranscriptDocumentInstruction(filename: string): s
     `The complete managed conversation transcript is attached as ${filename}.`,
     'Read it in full and treat its final event as the current workflow state, including the pending user task and every completed tool result.',
     'Use the inline managed-tool control for any next tool call, and do not repeat work already completed in the transcript.',
-  ].join(' ')
-}
-
-function qwenAiToolReferenceDocumentInstruction(filename: string): string {
-  return [
-    `Complete tool definitions are attached as ${filename}.`,
-    'The inline tool catalog is optimized for routing and argument construction; consult the attachment whenever additional tool semantics or schema annotations are needed.',
   ].join(' ')
 }
 
@@ -2648,7 +2636,7 @@ export async function prepareQwenAiMultimodalMessage(
       documents: ChatMessageContent[]
       content: string
     } => {
-      const { archiveMessages, activeMessages, toolReferenceContents } = partitionQwenAiManagedMessages(
+      const { archiveMessages, activeMessages } = partitionQwenAiManagedMessages(
         messages,
         options.workflowContinuation === true,
         documentMode,
@@ -2668,17 +2656,6 @@ export async function prepareQwenAiMultimodalMessage(
             : qwenAiEarlierTranscriptDocumentInstruction(
                 transcriptDocument.filename || 'the attached transcript',
               ),
-        )
-      }
-      if (toolReferenceContents.length > 0) {
-        const toolReferenceDocument = createQwenAiToolReferenceDocument(
-          toolReferenceContents.join('\n\n'),
-        )
-        documents.push(toolReferenceDocument)
-        inlineInstructions.push(
-          qwenAiToolReferenceDocumentInstruction(
-            toolReferenceDocument.filename || 'the attached tool reference',
-          ),
         )
       }
       return {

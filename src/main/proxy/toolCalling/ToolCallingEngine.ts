@@ -28,7 +28,6 @@ import {
   createManagedToolPromptMessage,
   type ManagedToolDocumentPrompt,
 } from './managedPromptMetadata.ts'
-import { createQwenHermesDocumentPrompt } from './protocols/qwenHermes.ts'
 
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
 
@@ -599,12 +598,18 @@ function renderPrompt(
   const content = finishPrompt(getToolProtocol(plan.protocol).renderPrompt(plan.tools))
   if (plan.protocol !== 'qwen_hermes') return { content }
 
-  const documentVariant = createQwenHermesDocumentPrompt(plan.tools)
+  // Keep the complete, request-scoped tool contract in the inline control
+  // message. Qwen document transport is intended for archived conversation
+  // state; putting schema annotations in a retrievable file makes tool choice
+  // dependent on a second model-side retrieval step and can cause hallucinated
+  // names or arguments. The document partitioner still understands the
+  // reference field for backwards-compatible callers, but new prompts do not
+  // put any active tool definition in a document.
   return {
     content,
     documentPrompt: {
-      content: finishPrompt(documentVariant.compactPrompt),
-      referenceContent: documentVariant.referenceContent,
+      content,
+      referenceContent: '',
     },
   }
 }

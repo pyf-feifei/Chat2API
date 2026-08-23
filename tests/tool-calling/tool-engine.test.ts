@@ -169,6 +169,8 @@ test('matched profile key selects Qwen Hermes for a custom provider instance', (
   assert.equal(result.plan.providerId, 'custom-qwen-instance')
   assert.equal(result.plan.diagnostics.providerId, 'custom-qwen-instance')
   assert.match(String(result.messages[0].content), /<tools>/)
+  assert.match(String(result.messages[0].content), /Read a file/)
+  assert.match(String(result.messages[0].content), /"required":\["filePath","content"\]/)
   assert.match(String(result.messages[0].content), /chat2api_workflow_complete/)
   assert.doesNotMatch(String(result.messages[0].content), /<\|CHAT2API\|tool_calls>/)
 })
