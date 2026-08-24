@@ -10,6 +10,7 @@ import {
 } from '../../src/main/proxy/responses/compat.ts'
 import { ResponsesConversationStore } from '../../src/main/proxy/responses/store.ts'
 import { createResponsesStreamTransform } from '../../src/main/proxy/responses/stream.ts'
+import { estimateQwenAiRequestInputTokens } from '../../src/main/proxy/qwenAiCompactionBoundary.ts'
 import {
   createResponseImageResolver,
   isPublicImageAddress,
@@ -170,6 +171,94 @@ test('Responses preserves a 683-message Codex history with 312 tool results', ()
   assert.deepEqual(chatRequest.messages[682].content, [
     { type: 'text', text: 'development history 58' },
   ])
+})
+
+test('retained 118388-token Codex history never completes a reasoning-only upstream turn', async () => {
+  const previousMessages: any[] = []
+  let toolResultCount = 0
+  for (let batch = 0; batch < 92; batch += 1) {
+    const callsInBatch = batch < 91 ? 2 : 1
+    const toolCalls = Array.from({ length: callsInBatch }, (_, offset) => {
+      const callId = `call_retained_${toolResultCount + offset}`
+      return {
+        id: callId,
+        type: 'function',
+        function: {
+          name: `fixture_tool_${(toolResultCount + offset) % 11}`,
+          arguments: JSON.stringify({ batch, offset }),
+        },
+      }
+    })
+    previousMessages.push({ role: 'assistant', content: null, tool_calls: toolCalls })
+    for (const toolCall of toolCalls) {
+      previousMessages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: `retained tool result ${toolResultCount}`,
+      })
+      toolResultCount += 1
+    }
+  }
+  for (let index = 0; index < 44; index += 1) {
+    previousMessages.push({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `retained development history ${index}`,
+    })
+  }
+
+  const binding = {
+    providerId: 'qwen-ai',
+    accountId: 'account-pinned',
+    requestedModel: 'Qwen3.8-Max_Auto',
+    actualModel: 'qwen3.8-max',
+    chatId: 'retained-chat-118388',
+    parentId: 'retained-parent-118388',
+    requestFingerprint: 'retained-contract-118388',
+  }
+  const store = new ResponsesConversationStore({ persistencePath: false })
+  const previousResponseId = 'resp_retained_118388'
+  assert.equal(store.set(previousResponseId, previousMessages, binding), true)
+  const retained = store.getConversation(previousResponseId)
+  assert.ok(retained)
+
+  const tools = Array.from({ length: 11 }, (_, index) => ({
+    type: 'function' as const,
+    name: `fixture_tool_${index}`,
+    description: `Fixture tool ${index}`,
+    parameters: { type: 'object', properties: { batch: { type: 'integer' } } },
+  }))
+  const request: ResponseCreateRequest = {
+    model: 'Qwen3.8-Max_Auto',
+    previous_response_id: previousResponseId,
+    input: 'continue the retained task',
+    tools,
+    reasoning: { effort: 'xhigh' },
+    stream: true,
+  }
+  let converted = responsesRequestToChatCompletion(request, retained.messages)
+  const targetInputTokens = 118_388
+  const initialEstimate = estimateQwenAiRequestInputTokens(converted.chatRequest)
+  assert.ok(initialEstimate < targetInputTokens)
+  const paddingTokens = targetInputTokens - initialEstimate
+  retained.messages[275].content += 'x'.repeat(paddingTokens * 3)
+  converted = responsesRequestToChatCompletion(request, retained.messages)
+
+  assert.equal(toolResultCount, 183)
+  assert.equal(converted.chatRequest.tools?.length, 11)
+  assert.equal(converted.chatRequest.messages.length, 320)
+  assert.equal(converted.chatRequest.messages.filter(message => message.role === 'tool').length, 183)
+  assert.equal(estimateQwenAiRequestInputTokens(converted.chatRequest), targetInputTokens)
+  assert.equal(retained.qwenAiSessionBinding?.chatId, binding.chatId)
+
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"reasoning_content":"reasoning summary without a deliverable answer"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ], request)
+  assert.equal(events.some(event => event.type === 'response.completed'), false)
+  const failed = events.find(event => event.type === 'response.failed')
+  assert.equal(failed.response.status, 'failed')
+  assert.equal(failed.response.error.code, 'reasoning_only_upstream_response')
 })
 
 test('Responses preserves compaction protocol metadata for the shared intent classifier', () => {
@@ -707,6 +796,33 @@ test('reasoning streaming emits live Responses deltas before answer text', async
   assert.equal(events.at(-1).response.output[0].type, 'reasoning')
   assert.equal(events.at(-1).response.output[0].summary[0].text, 'first second')
   assert.equal(events.at(-1).response.output[1].content[0].text, 'final')
+})
+
+test('reasoning-only streaming fails instead of reporting a completed Response', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"reasoning_content":"private reasoning"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ])
+
+  assert.equal(events.some((event) => event.type === 'response.completed'), false)
+  const failed = events.find((event) => event.type === 'response.failed')
+  assert.equal(failed.response.status, 'failed')
+  assert.equal(failed.response.error.code, 'reasoning_only_upstream_response')
+  assert.equal(failed.response.output[0].type, 'reasoning')
+})
+
+test('empty streaming output fails instead of reporting a completed Response', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ])
+
+  assert.equal(events.some((event) => event.type === 'response.completed'), false)
+  const failed = events.find((event) => event.type === 'response.failed')
+  assert.equal(failed.response.status, 'failed')
+  assert.equal(failed.response.error.code, 'empty_upstream_response')
+  assert.deepEqual(failed.response.output, [])
 })
 
 test('function streaming merges cumulative arguments and emits argument events', async () => {

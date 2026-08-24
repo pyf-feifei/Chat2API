@@ -81,3 +81,11 @@ backup/
 .codex-local-test/
 /gh_*.py
 /gh_*.txt
+
+# local temp / test artifacts
+.tmp-*
+index.bundle.js
+*.bak
+.claude/
+365.md
+

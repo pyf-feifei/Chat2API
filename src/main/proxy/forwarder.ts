@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Proxy Service Module - Request Forwarder
  * Forwards requests to corresponding API based on provider configuration
  */
@@ -21,6 +21,7 @@ import { DeepSeekAdapter } from './adapters/deepseek'
 import { DeepSeekStreamHandler } from './adapters/deepseek-stream'
 import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
 import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
+import { M365Adapter } from './adapters/m365'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
 import {
@@ -75,6 +76,7 @@ import {
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
   qwenAiAccountFailureDetails,
+  qwenAiAccountNeutralReplayScopeAfterRecovery,
   qwenAiSafeExplicitRetryScope,
   qwenAiAccountRetryScope,
 } from './qwenAiAccountPolicy'
@@ -133,11 +135,18 @@ function qwenAiErrorNodes(error: unknown): QwenAiErrorNode[] {
   return nodes
 }
 
+function isM365AuthIssue(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/rate limit|too many requests|content policy|contentfilter|safetyblocked/i.test(message)) {
+    return false
+  }
+  return /401|403|unauthorized|access token|token expired|expired token|invalid_grant|aadsts/i.test(message)
+}
+
 function statusFromError(error: unknown): number | undefined {
   if (isClientCancellationError(error)) {
     return 499
   }
-
   const nodes = qwenAiErrorNodes(error)
   const candidates = nodes.flatMap(({ record, depth }) => [
     record.status,
@@ -1015,6 +1024,12 @@ export class RequestForwarder {
         this.forwardKimi(request, account, provider, actualModel, startTime, context),
     },
     {
+      profileKey: 'm365-copilot',
+      matches: M365Adapter.isM365Provider,
+      forward: (request, account, provider, actualModel, startTime) =>
+        this.forwardM365Copilot(request, account, provider, actualModel, startTime),
+    },
+    {
       profileKey: 'qwen',
       matches: QwenAdapter.isQwenProvider,
       forward: (request, account, provider, actualModel, startTime) =>
@@ -1364,7 +1379,9 @@ export class RequestForwarder {
         lastHeaders = undefined
         lastError = 'Client disconnected before the next request attempt.'
         lastRetryable = false
+        lastErrorCode = undefined
         lastAccountFault = undefined
+        lastRetryScope = undefined
         break
       }
 
@@ -1394,7 +1411,9 @@ export class RequestForwarder {
           lastHeaders = undefined
           lastError = 'Client disconnected during request retry backoff.'
           lastRetryable = false
+          lastErrorCode = undefined
           lastAccountFault = undefined
+          lastRetryScope = undefined
           break
         }
       }
@@ -1536,6 +1555,7 @@ export class RequestForwarder {
             lastRetryable = false
             lastErrorCode = undefined
           }
+          lastRetryScope = undefined
         }
 
         if (scheduleQwenAiBusyRetry(result)) {
@@ -1619,6 +1639,7 @@ export class RequestForwarder {
             lastRetryable = false
             lastErrorCode = undefined
           }
+          lastRetryScope = undefined
         }
         if (scheduleQwenAiBusyRetry({
           success: false,
@@ -1656,6 +1677,16 @@ export class RequestForwarder {
       return createQwenAiRequestTimeoutResult(startTime)
     }
 
+    const recoveryExhaustedRetryScope = isQwenAiProvider
+      && !context.signal?.aborted
+      && lastStatus !== 499
+      ? qwenAiAccountNeutralReplayScopeAfterRecovery({
+          status: lastStatus,
+          errorCode: lastErrorCode,
+          accountFault: lastAccountFault,
+        })
+      : undefined
+
     return {
       success: false,
       status: lastStatus,
@@ -1665,7 +1696,7 @@ export class RequestForwarder {
       retryable: lastRetryable,
       errorCode: lastErrorCode,
       accountFault: lastAccountFault,
-      retryScope: lastRetryScope,
+      retryScope: lastRetryScope || recoveryExhaustedRetryScope,
     }
   }
 
@@ -1976,6 +2007,159 @@ export class RequestForwarder {
         success: false,
         status: statusFromError(error),
         error: error instanceof Error ? error.message : 'Unknown error',
+        latency,
+      }
+    }
+  }
+
+  /**
+   * M365 Copilot Forward (ChatHub WebSocket protocol)
+   */
+  private async forwardM365Copilot(
+    request: ChatCompletionRequest,
+    account: Account,
+    provider: Provider,
+    actualModel: string,
+    startTime: number,
+  ): Promise<ForwardResult> {
+    try {
+      const adapter = new M365Adapter(provider, account)
+      const validation = adapter.validateAccount()
+      if (!validation.valid) {
+        return {
+          success: false,
+          status: 401,
+          error: validation.error || 'Invalid M365 account credentials',
+          latency: Date.now() - startTime,
+        }
+      }
+
+      const freshCredentials = await adapter.acquireCredentials()
+      const transformedRequest = adapter.transformRequest(request)
+      const chatRequest = {
+        text: transformedRequest.text,
+        tone: transformedRequest.tone || 'magic',
+        sessionId: transformedRequest.sessionId,
+        conversationId: transformedRequest.conversationId,
+        attachments: transformedRequest.attachments || [],
+        tools: transformedRequest.tools || [],
+        toolChoice: transformedRequest.toolChoice,
+      }
+      const { ChatHubClient } = await import(
+        '../providers/builtin/m365/chathub/client.ts'
+      )
+      const client = new ChatHubClient()
+      const chatHubAccount = {
+        accessToken: freshCredentials.accessToken,
+        oid: freshCredentials.oid,
+        tid: freshCredentials.tid,
+      }
+
+      const latency = Date.now() - startTime
+
+      if (request.stream) {
+        const passThrough = new PassThrough()
+        let streamed = false
+        const onDelta = (delta: unknown): void => {
+          streamed = true
+          const chunk = adapter.transformStreamChunk({ text: delta }, actualModel)
+          passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+        }
+        const finishStream = (): void => {
+          const finalChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: actualModel,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: 'stop',
+            }],
+          }
+          passThrough.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+          passThrough.write('data: [DONE]\n\n')
+          passThrough.end()
+        }
+        const startChat = (creds: { accessToken: string; oid: string; tid: string }) =>
+          client.chat(creds, chatRequest, onDelta)
+        const runChat = async (): Promise<void> => {
+          try {
+            await startChat(chatHubAccount)
+            finishStream()
+          } catch (error) {
+            if (!streamed && isM365AuthIssue(error)) {
+              console.warn(
+                '[M365Copilot] stream auth failure, retrying once with refreshed token:',
+                error instanceof Error ? error.message : error,
+              )
+              adapter.invalidateAccessToken(chatHubAccount.accessToken)
+              try {
+                const refreshed = await adapter.acquireCredentials(true)
+                await startChat({
+                  accessToken: refreshed.accessToken,
+                  oid: refreshed.oid,
+                  tid: refreshed.tid,
+                })
+                finishStream()
+                return
+              } catch (retryError) {
+                console.error('[M365Copilot] ChatHub stream retry error:', retryError)
+                passThrough.end()
+                return
+              }
+            }
+            console.error('[M365Copilot] ChatHub stream error:', error)
+            passThrough.end()
+          }
+        }
+        void runChat()
+        return {
+          success: true,
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+          stream: passThrough,
+          skipTransform: true,
+          latency,
+        }
+      }
+
+      let result
+      try {
+        result = await client.chat(chatHubAccount, chatRequest)
+      } catch (error) {
+        if (!isM365AuthIssue(error)) {
+          throw error
+        }
+        console.warn(
+          '[M365Copilot] auth failure, retrying once with refreshed token:',
+          error instanceof Error ? error.message : error,
+        )
+        adapter.invalidateAccessToken(chatHubAccount.accessToken)
+        const refreshed = await adapter.acquireCredentials(true)
+        result = await client.chat(
+          { accessToken: refreshed.accessToken, oid: refreshed.oid, tid: refreshed.tid },
+          chatRequest,
+        )
+      }
+
+      const body = adapter.transformResponse(result, actualModel)
+      return {
+        success: true,
+        status: 200,
+        headers: {},
+        body,
+        latency: Date.now() - startTime,
+      }
+    } catch (error) {
+      const latency = Date.now() - startTime
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      const authIssue = isM365AuthIssue(error)
+      return {
+        success: false,
+        status: authIssue ? 401 : undefined,
+        error: message,
+        retryable: authIssue ? false : undefined,
         latency,
       }
     }
@@ -3360,9 +3544,9 @@ export class RequestForwarder {
             thinking_budget: providerRequest.thinking_budget,
             managedToolCalling: true,
             managedToolWorkflowContinuation: true,
-            // A retained Responses chat that is still finalizing should
-            // fail fast into next-account failover instead of waiting here.
-            // Keep the generic semantic continuation retry policy unchanged.
+            // Retry a retained Responses chat in place. Switching accounts
+            // loses the provider-side parent and forces a full-history replay,
+            // which becomes an expensive document upload for long sessions.
             chatInProgressRetryAttempts: qwenAiResponsesContinuationRetryAttemptsFromEnv(),
             messageTransport: options.messageTransport,
             signal: context?.signal,
@@ -3386,15 +3570,11 @@ export class RequestForwarder {
             )
           if (!isQwenAiStaleSessionError(error) && !continuationBusy) throw error
 
-          // Clean up the busy/stale chat regardless of which path we take.
-          cleanupChat(continuationBinding.chatId)
-
           if (continuationBusy) {
-            // The upstream chat is still finalizing a prior turn. Returning
-            // next-account failover avoids the expensive same-account
-            // full-transcript replay (100-200+ seconds for large contexts)
-            // and lets an idle account serve the request immediately.
-            console.info('[QwenAI] Responses session continuation busy; failing over to next account', JSON.stringify({
+            // The upstream chat is still finalizing a prior turn. Preserve
+            // the binding so a client retry of the same previous_response_id
+            // continues the original provider lineage.
+            console.info('[QwenAI] Responses session continuation busy; retaining session binding', JSON.stringify({
               requestId: context?.requestId,
               accountId: account.id,
               chatId: continuationBinding.chatId,
@@ -3404,14 +3584,23 @@ export class RequestForwarder {
             return {
               success: false,
               status: 429,
-              error: 'Qwen AI chat is still in progress; switching to another account',
+              error: 'Qwen AI chat is still in progress; retrying on another available account with the full transcript.',
               errorCode: 'CHAT_IN_PROGRESS',
-              retryable: false,
+              retryable: true,
               accountFault: false,
+              // The retained chat has already had its bounded same-chat retry
+              // budget. Let the route failover layer select another healthy
+              // account and replay the complete transcript there. The old
+              // provider chat is deliberately left intact for a client retry
+              // when no replacement account is available.
               retryScope: 'next-account',
               latency: Date.now() - startTime,
             }
           }
+
+          // A stale provider branch cannot be continued, so it is safe to
+          // remove the local chat and replay on the same credential.
+          cleanupChat(continuationBinding.chatId)
 
           // Qwen can lose the retained branch when Claude immediately
           // submits the tool result. Recreate only the provider branch on

@@ -32,6 +32,7 @@ import minimaxIcon from '@/assets/providers/minimax.svg'
 import perplexityIcon from '@/assets/providers/perplexity.svg'
 import qwenIcon from '@/assets/providers/qwen.svg'
 import zaiIcon from '@/assets/providers/zai.svg'
+import m365Icon from '@/assets/providers/m365-copilot.svg'
 import mimoIcon from '@/assets/providers/mimo.svg'
 
 const providerIcons: Record<string, string> = {
@@ -44,6 +45,7 @@ const providerIcons: Record<string, string> = {
   qwen: qwenIcon,
   'qwen-ai': qwenIcon,
   zai: zaiIcon,
+  'm365-copilot': m365Icon,
 }
 
 interface ProviderCardProps {

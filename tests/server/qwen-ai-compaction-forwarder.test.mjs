@@ -9,6 +9,7 @@ import {
 } from '../../src/main/proxy/toolCalling/assistantInputBoundary.ts'
 import {
   isQwenAiAccountFault,
+  qwenAiAccountNeutralReplayScopeAfterRecovery,
   qwenAiAccountRetryScope,
 } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
@@ -302,6 +303,7 @@ function loadRequestForwarder(overrides = {}) {
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
     },
+    './adapters/m365': { M365Adapter: class { static isM365Provider() { return false } } },
     './adapters/zai': { ZaiAdapter: class { static isZaiProvider() { return false } }, ZaiStreamHandler: class {} },
     './adapters/minimax': { MiniMaxAdapter: class { static isMiniMaxProvider() { return false } }, MiniMaxStreamHandler: class {} },
     './adapters/perplexity': { PerplexityAdapter: class { static isPerplexityProvider() { return false } } },
@@ -418,6 +420,7 @@ function loadRequestForwarder(overrides = {}) {
         accountFault: isQwenAiAccountFault(value),
         retryScope: qwenAiAccountRetryScope(value),
       }),
+      qwenAiAccountNeutralReplayScopeAfterRecovery,
       qwenAiSafeExplicitRetryScope: () => undefined,
     },
     './utils/validatedSseStream': {

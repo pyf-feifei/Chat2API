@@ -50,10 +50,10 @@ test('initial Qwen managed auto turns require a workflow completion marker', () 
   assert.equal(requiresManagedWorkflowCompletionMarker(managedPlan()), true)
 })
 
-test('matched tool-result continuations accept ordinary terminal text', () => {
+test('successful tool-result continuations require a completion proof', () => {
   const plan = managedPlan({ workflowContinuation: true })
   assert.equal(supportsManagedWorkflowCompletionMarker(plan), true)
-  assert.equal(requiresManagedWorkflowCompletionMarker(plan), false)
+  assert.equal(requiresManagedWorkflowCompletionMarker(plan), true)
   assert.deepEqual(
     parseManagedWorkflowCompletionProof(
       'The work is complete.<chat2api_workflow_complete/>',
@@ -171,7 +171,7 @@ test('workflow continuation completion proof follows protocol state and capabili
 
   assert.match(String(hermes.content), /chat2api_workflow_complete/)
   assert.match(String(hermes.content), /transport marker.*proxy removes it before delivery/i)
-  assert.doesNotMatch(String(successfulHermes.content), /chat2api_workflow_complete/)
+  assert.match(String(successfulHermes.content), /chat2api_workflow_complete/)
   assert.match(String(successfulHermes.content), /tool-result batch completed successfully/i)
   assert.match(String(successfulHermes.content), /do not repeat a completed call/i)
   assert.doesNotMatch(String(failedHermes.content), /chat2api_workflow_complete/)
@@ -307,7 +307,7 @@ test('Qwen required-tool prompt keeps the bounded completion proof', () => {
   assert.match(String(transformed.messages[0].content), /chat2api_workflow_complete/)
 })
 
-test('long matched tool history opens a marker-optional final-answer turn', () => {
+test('long matched tool history opens a completion-proved final-answer turn', () => {
   const messages: ChatMessage[] = [{ role: 'user', content: 'complete the requested work' }]
   for (let index = 0; index < 108; index += 1) {
     const id = `call-${index}`
@@ -335,6 +335,6 @@ test('long matched tool history opens a marker-optional final-answer turn', () =
   })
 
   assert.equal(transformed.plan.workflowContinuation, true)
-  assert.equal(requiresManagedWorkflowCompletionMarker(transformed.plan), false)
-  assert.doesNotMatch(String(transformed.messages[0].content), /chat2api_workflow_complete/)
+  assert.equal(requiresManagedWorkflowCompletionMarker(transformed.plan), true)
+  assert.match(String(transformed.messages[0].content), /chat2api_workflow_complete/)
 })

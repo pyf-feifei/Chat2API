@@ -13,6 +13,7 @@ import statisticsRouter from './statistics'
 import proxyRouter from './proxy'
 import toolCallingRouter from './toolCalling'
 import qwenAiGovernorRouter from './qwenAiGovernor'
+import m365OAuthRouter from './m365OAuth'
 
 export {
   configRouter,
@@ -25,6 +26,7 @@ export {
   proxyRouter,
   toolCallingRouter,
   qwenAiGovernorRouter,
+  m365OAuthRouter,
 }
 
 export default [
@@ -38,4 +40,5 @@ export default [
   proxyRouter,
   toolCallingRouter,
   qwenAiGovernorRouter,
+  m365OAuthRouter,
 ]

@@ -117,6 +117,9 @@ function loadRequestForwarder(overrides = {}) {
       qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
     },
+    './adapters/m365': {
+      M365Adapter: adapterWithMatcher('isM365Provider'),
+    },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
       ZaiStreamHandler: StreamHandler,
@@ -787,12 +790,53 @@ test('Qwen upstream busy recovery honors the configured retry count', async () =
 
     assert.equal(result.success, false)
     assert.equal(result.errorCode, 'qwen_ai_upstream_busy')
+    assert.equal(result.accountFault, false)
+    assert.equal(result.retryScope, 'next-account')
     assert.equal(attempts, 3)
     assert.equal(delayCalls, 2)
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
   }
+})
+
+test('Qwen semantic recovery exhaustion derives next-account replay at the forwarder boundary', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+  const forwarder = new RequestForwarder()
+  let attempts = 0
+  forwarder.doForward = async () => {
+    attempts += 1
+    return {
+      success: false,
+      status: 422,
+      error: 'Qwen AI completed without finishing the managed workflow',
+      errorCode: 'qwen_ai_semantic_incomplete',
+      retryable: false,
+      accountFault: false,
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    {
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'continue the task' }],
+      stream: true,
+      tools: [{
+        type: 'function',
+        function: { name: 'read_file', parameters: { type: 'object' } },
+      }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.errorCode, 'qwen_ai_semantic_incomplete')
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, 'next-account')
+  assert.equal(attempts, 1)
 })
 
 test('Qwen managed-tool busy retry switches to hybrid document transport', async () => {
@@ -2750,7 +2794,7 @@ test('Qwen Responses bridge keeps CHAT_IN_PROGRESS account-neutral but forwards 
       assert.equal(result.retryScope, scenario.expectedRetryScope)
       if (scenario.name === 'busy chat') {
         assert.equal(freshChatCalls.length, 0, 'busy continuation must not replay on the same account')
-        assert.deepEqual(deletedChats, ['chat-pinned'])
+        assert.deepEqual(deletedChats, [], 'busy continuation must retain the provider chat for retry or failover')
       } else {
         assert.equal(freshChatCalls.length, 0)
         assert.deepEqual(deletedChats, [])

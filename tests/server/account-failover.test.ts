@@ -6,7 +6,12 @@ import {
   isNextAccountFailoverEligible,
   resolveAccountFailoverLimit,
 } from '../../src/main/proxy/accountFailover.ts'
-import type { AccountSelection, ForwardResult } from '../../src/main/proxy/types.ts'
+import { estimateQwenAiRequestInputTokens } from '../../src/main/proxy/qwenAiCompactionBoundary.ts'
+import type {
+  AccountSelection,
+  ChatCompletionRequest,
+  ForwardResult,
+} from '../../src/main/proxy/types.ts'
 
 function selection(accountId: string): AccountSelection {
   return {
@@ -287,6 +292,184 @@ test('exhausted malformed-tool recovery replays the complete request on the next
   assert.equal(outcome.result.success, true)
   assert.equal(outcome.selection.account.id, 'account-2')
   assert.equal(outcome.failoverCount, 1)
+})
+
+test('account-neutral busy and semantic failures reach a healthy later account', async () => {
+  const accounts = [selection('account-1'), selection('account-2'), selection('account-3')]
+  const attempted: string[] = []
+  const accountFaults: Array<boolean | undefined> = []
+  const failures: ForwardResult[] = [
+    {
+      success: false,
+      status: 503,
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+      retryScope: 'next-account',
+    },
+    {
+      success: false,
+      status: 422,
+      error: 'Qwen AI completed without finishing the managed workflow',
+      errorCode: 'qwen_ai_semantic_incomplete',
+      retryable: false,
+      accountFault: false,
+      retryScope: 'next-account',
+    },
+  ]
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: accounts[0],
+    maxFailovers: 2,
+    forward: async ({ selection: current, attempt }) => {
+      attempted.push(current.account.id)
+      return failures[attempt - 1] ?? {
+        success: true,
+        status: 200,
+        body: { choices: [{ message: { content: 'healthy-account-only' } }] },
+      }
+    },
+    selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+    onFailedAttempt: (_attempt, result) => {
+      accountFaults.push(result.accountFault)
+    },
+  })
+
+  assert.deepEqual(attempted, ['account-1', 'account-2', 'account-3'])
+  assert.deepEqual(accountFaults, [false, false])
+  assert.equal(outcome.result.success, true)
+  assert.equal(outcome.selection.account.id, 'account-3')
+  assert.equal(outcome.failoverCount, 2)
+  assert.equal(outcome.result.body.choices[0].message.content, 'healthy-account-only')
+})
+
+test('concurrent 180K multi-tool requests remain intact across account-neutral failover', async () => {
+  const tools = Array.from({ length: 12 }, (_, index) => ({
+    type: 'function' as const,
+    function: {
+      name: `fixture_tool_${index}`,
+      description: `Stress fixture tool ${index}`,
+      parameters: {
+        type: 'object',
+        properties: { value: { type: 'string' } },
+        required: ['value'],
+      },
+    },
+  }))
+  const messages: ChatCompletionRequest['messages'] = [{
+    role: 'system',
+    content: 'LONG_CONTEXT_START::LONG_CONTEXT_END',
+  }]
+  for (let index = 0; index < 62; index += 1) {
+    const callId = `stress_call_${index}`
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: callId,
+        type: 'function',
+        function: {
+          name: `fixture_tool_${index % tools.length}`,
+          arguments: JSON.stringify({ value: `input-${index}` }),
+        },
+      }],
+    })
+    messages.push({
+      role: 'tool',
+      tool_call_id: callId,
+      content: JSON.stringify({ ok: true, index, result: `tool-result-${index}` }),
+    })
+  }
+  while (messages.length < 182) {
+    const index = messages.length
+    messages.push({
+      role: index % 2 === 0 ? 'assistant' : 'user',
+      content: `preserved-history-${index}`,
+    })
+  }
+  messages.push({ role: 'user', content: 'Finish the active task using the declared tools.' })
+
+  let request: ChatCompletionRequest = {
+    model: 'qwen3.8-max-preview',
+    messages,
+    tools,
+    stream: true,
+  }
+  const initialTokens = estimateQwenAiRequestInputTokens(request)
+  const padding = Math.max(0, (180_000 - initialTokens) * 3)
+  request = {
+    ...request,
+    messages: request.messages.map((message, index) => index === 0
+      ? { ...message, content: `LONG_CONTEXT_START:${'x'.repeat(padding)}:LONG_CONTEXT_END` }
+      : { ...message }),
+  }
+
+  const estimatedTokens = estimateQwenAiRequestInputTokens(request)
+  const serializedRequest = JSON.stringify(request)
+  const concurrentRequests = 16
+  let activeAttempts = 0
+  let peakAttempts = 0
+
+  assert.equal(request.messages.length, 183)
+  assert.equal(request.tools?.length, 12)
+  assert.equal(request.messages.filter(message => message.role === 'tool').length, 62)
+  assert.ok(estimatedTokens >= 180_000, `expected at least 180K tokens, got ${estimatedTokens}`)
+  assert.ok(estimatedTokens < 181_000, `expected a bounded 180K fixture, got ${estimatedTokens}`)
+
+  const outcomes = await Promise.all(Array.from({ length: concurrentRequests }, async (_, index) => {
+    const accounts = [0, 1, 2].map(accountIndex => selection(`stress-${index}-${accountIndex}`))
+    const accountFaults: Array<boolean | undefined> = []
+    const outcome = await forwardWithAccountFailover({
+      initialSelection: accounts[0],
+      maxFailovers: 2,
+      forward: async ({ attempt }) => {
+        activeAttempts += 1
+        peakAttempts = Math.max(peakAttempts, activeAttempts)
+        await new Promise(resolve => setImmediate(resolve))
+        activeAttempts -= 1
+        assert.equal(JSON.stringify(request), serializedRequest, 'account replay mutated the 180K request')
+        if (attempt === 1) {
+          return {
+            success: false,
+            status: 503,
+            error: 'Qwen AI upstream is busy',
+            errorCode: 'qwen_ai_upstream_busy',
+            retryable: true,
+            accountFault: false,
+            retryScope: 'next-account',
+          }
+        }
+        if (attempt === 2) {
+          return {
+            success: false,
+            status: 422,
+            error: 'managed workflow incomplete',
+            errorCode: 'qwen_ai_semantic_incomplete',
+            retryable: false,
+            accountFault: false,
+            retryScope: 'next-account',
+          }
+        }
+        return {
+          success: true,
+          status: 200,
+          body: { choices: [{ message: { content: `healthy-only-${index}` } }] },
+        }
+      },
+      selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+      onFailedAttempt: (_attempt, result) => accountFaults.push(result.accountFault),
+    })
+    return { outcome, accountFaults, expectedContent: `healthy-only-${index}` }
+  }))
+
+  assert.equal(peakAttempts, concurrentRequests)
+  for (const { outcome, accountFaults, expectedContent } of outcomes) {
+    assert.equal(outcome.result.success, true)
+    assert.equal(outcome.failoverCount, 2)
+    assert.deepEqual(accountFaults, [false, false])
+    assert.equal(outcome.result.body.choices[0].message.content, expectedContent)
+  }
 })
 
 test('account-neutral CHAT_IN_PROGRESS continues on the next account', async () => {

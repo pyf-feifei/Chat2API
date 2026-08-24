@@ -24,7 +24,9 @@ interface CompletedToolCall extends PendingToolCall {
 
 const DEFAULT_THRESHOLD = 3
 const DEFAULT_WINDOW_SIZE = 8
-const DEFAULT_IGNORED_TOOLS = ['wait', 'wait_agent', 'write_stdin']
+// Tool names are client-defined. Never classify a tool as harmless based on
+// a built-in client vocabulary; deployments may opt into explicit exclusions.
+const DEFAULT_IGNORED_TOOLS: string[] = []
 
 function positiveIntegerFromEnv(name: string, fallback: number): number {
   const raw = process.env[name]

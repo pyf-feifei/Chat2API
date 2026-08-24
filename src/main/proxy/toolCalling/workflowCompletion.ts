@@ -69,11 +69,11 @@ export function stripManagedWorkflowCompletionMarker(
 export function requiresManagedWorkflowCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
   return Boolean(
     supportsManagedWorkflowCompletionMarker(plan)
-    // A strictly matched trailing tool-result batch is the protocol boundary
-    // for a normal assistant turn. At that boundary, auto mode may either call
-    // another tool or return ordinary terminal text; requiring a private marker
-    // would discard valid client-visible answers from providers that omit it.
-    && !plan?.workflowContinuation
+    // A successful continuation must terminate with either a parsed tool call
+    // or an explicit completion proof. A failed tool result is different: the
+    // structured failure state permits a final explanation without inventing
+    // a success proof.
+    && (!plan?.workflowContinuation || plan.failedToolResultPending === false)
   )
 }
 

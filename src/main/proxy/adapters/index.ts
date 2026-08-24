@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Provider Adapter Index
  */
 
@@ -12,3 +12,4 @@ export { PerplexityAdapter, PerplexityStreamHandler, perplexityAdapter } from '.
 export { QwenAdapter, QwenStreamHandler, qwenAdapter } from './qwen'
 export { QwenAiAdapter, QwenAiStreamHandler, qwenAiAdapter } from './qwen-ai'
 export { ZaiAdapter, ZaiStreamHandler, zaiAdapter } from './zai'
+export { M365Adapter } from './m365'

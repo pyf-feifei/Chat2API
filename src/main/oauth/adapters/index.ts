@@ -1,4 +1,4 @@
-/**
+﻿/**
  * OAuth Adapter Index
  * Export all provider authentication adapters
  */
@@ -13,6 +13,7 @@ export { PerplexityAdapter } from './perplexity'
 export { QwenAdapter } from './qwen'
 export { QwenAiAdapter } from './qwen-ai'
 export { ZaiAdapter } from './zai'
+export { M365Adapter } from './m365'
 import { BaseOAuthAdapter } from './base'
 import { DeepSeekAdapter } from './deepseek'
 import { GLMAdapter } from './glm'
@@ -23,6 +24,7 @@ import { PerplexityAdapter } from './perplexity'
 import { QwenAdapter } from './qwen'
 import { QwenAiAdapter } from './qwen-ai'
 import { ZaiAdapter } from './zai'
+import { M365Adapter } from './m365'
 import { ProviderType, AdapterConfig } from '../types'
 
 /**
@@ -51,6 +53,8 @@ export function createAdapter(
       return new QwenAiAdapter(config)
     case 'zai':
       return new ZaiAdapter(config)
+    case 'm365-copilot':
+      return new M365Adapter(config)
     default:
       throw new Error(`Unsupported provider type: ${providerType}`)
   }
@@ -79,6 +83,8 @@ export function getSupportedAuthMethods(providerType: ProviderType): string[] {
       return ['manual']
     case 'zai':
       return ['manual']
+    case 'm365-copilot':
+      return ['oauth']
     default:
       return ['manual']
   }

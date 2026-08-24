@@ -1,6 +1,6 @@
 services:
   chat2api:
-    image: skatef/chat2api:20260822-anthropic-workflow-v2
+    image: skatef/chat2api:latest
     container_name: chat2api
     restart: unless-stopped
     # Match the server's default 14-minute request budget plus a small margin;
@@ -19,7 +19,7 @@ services:
       CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
       # Detect the protocol-level Claude context-summary turn from its
       # structural instructions. Set to off when a deployment owns this path.
-      CHAT2API_COMPACTION_DETECTION: ${CHAT2API_COMPACTION_DETECTION:-auto}
+      CHAT2API_COMPACTION_DETECTION: ${CHAT2API_COMPACTION_DETECTION:-off}
       # Summary turns default to provider answer mode; set true only when the
       # upstream model explicitly requires a thinking phase for summaries.
       CHAT2API_QWEN_AI_COMPACTION_THINKING: ${CHAT2API_QWEN_AI_COMPACTION_THINKING:-auto}
@@ -86,16 +86,17 @@ services:
       # while replacement branches keep producing incomplete progress.
       CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-840000}
       # A busy-chat admission response retries the exact same continuation
-      # payload; it never creates another user turn or switches accounts.
+      # payload first. If that bounded retry budget is exhausted, the normal
+      # account failover layer may replay the complete transcript elsewhere.
       # Busy-chat admission has its own wall-clock budget; it must not inherit
       # the much longer generation timeout. Set 0 to disable busy-chat retry.
       # Leave the generic retry-count override blank for deadline mode used by
-      # ordinary semantic workflow continuations. Bound Responses tool-result
-      # turns use the dedicated override below.
+      # ordinary semantic workflow continuations. Retained Responses
+      # tool-result turns retry the same provider chat before surfacing 429.
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS-}
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:-1000}
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:-300000}
-      CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS:-0}
+      CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS:-4}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}
@@ -130,10 +131,12 @@ services:
       CHAT2API_RESPONSES_STORE_TTL_MS: ${CHAT2API_RESPONSES_STORE_TTL_MS:-86400000}
       CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL: ${CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL:-32}
       # Reject repeated completed calls only when both arguments and results
-      # remain unchanged. Poll/wait tools are ignored by default.
+      # remain unchanged. No client-defined tool name is special by default.
       CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD: ${CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD:-3}
       CHAT2API_RESPONSES_TOOL_LOOP_WINDOW: ${CHAT2API_RESPONSES_TOOL_LOOP_WINDOW:-8}
-      CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS: ${CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS:-wait,wait_agent,write_stdin}
+      # Tool names belong to the client contract. Leave this empty by default;
+      # operators may explicitly list polling tools for their own client.
+      CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS: ${CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS-}
       # Emit protocol-native ping events while an Anthropic Messages stream is
       # waiting on buffered upstream work. Zero disables these events.
       CHAT2API_ANTHROPIC_PING_INTERVAL_MS: ${CHAT2API_ANTHROPIC_PING_INTERVAL_MS:-15000}

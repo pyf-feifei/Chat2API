@@ -17,7 +17,9 @@ ENV NODE_ENV=production
 ENV CHAT2API_HOST=0.0.0.0
 ENV CHAT2API_PORT=8080
 ENV CHAT2API_DATA_DIR=/data
-ENV CHAT2API_COMPACTION_DETECTION=auto
+# Keep the proxy transport-only by default. Clients that need the explicit
+# compaction workflow can opt in with CHAT2API_COMPACTION_DETECTION=auto.
+ENV CHAT2API_COMPACTION_DETECTION=off
 ENV CHAT2API_QWEN_AI_COMPACTION_THINKING=auto
 # Compaction input uses live model limits first; these values are deployment
 # controls for an explicit override, optional metadata cap, or a
@@ -79,9 +81,9 @@ ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # the dedicated override below.
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
-# Retained Responses tool-result continuations fail fast into same-account
-# full replay; semantic workflow continuations use the generic policy above.
-ENV CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0
+# Keep retained Responses tool-result continuations on the same provider chat
+# through short transient CHAT_IN_PROGRESS windows before account failover.
+ENV CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=4
 ENV CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 # Responses clients consume typed events rather than SSE comments when
@@ -94,7 +96,9 @@ ENV CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL=32
 # Stop unchanged command cycles before another upstream request is made.
 ENV CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD=3
 ENV CHAT2API_RESPONSES_TOOL_LOOP_WINDOW=8
-ENV CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS=wait,wait_agent,write_stdin
+# Tool names are client-defined; deployments may explicitly configure a
+# comma-separated exclusion list when their client has polling primitives.
+ENV CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS=
 # Anthropic Messages clients recognize typed ping events as stream activity.
 ENV CHAT2API_ANTHROPIC_PING_INTERVAL_MS=15000
 # Keep the HTTP listener alive long enough for the longest configured request

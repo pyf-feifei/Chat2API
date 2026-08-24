@@ -178,6 +178,14 @@ class PassthroughToolStreamParser {
   hasEmittedToolCall() { return false }
 }
 
+class SwallowingToolStreamParser {
+  push() { return [] }
+  flush() { return [] }
+  recoverFromContent() { return [] }
+  hasPendingToolProtocol() { return false }
+  hasEmittedToolCall() { return false }
+}
+
 function qwenHermesCompletionPlan(overrides = {}) {
   const tools = overrides.tools ?? [{ name: 'declared_tool', parameters: {}, source: 'openai' }]
   return {
@@ -1820,6 +1828,93 @@ test('Qwen AI stream resumes a reasoning-only [DONE] through the same response i
   assert.match(body, /\[DONE\]/)
 })
 
+test('Qwen AI continues a managed workflow when raw answer text produces no downstream output', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: SwallowingToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: delta => delta.tool_calls?.map((toolCall, index) => ({
+      key: toolCall.id || String(index),
+      id: toolCall.id,
+      index,
+      name: toolCall.function?.name,
+      arguments: toolCall.function?.arguments,
+    })) || [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model', undefined, qwenHermesCompletionPlan())
+  handler.setChatId('swallowed-answer-chat')
+  const continuationParents = []
+  const continuationErrorCodes = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => {
+      throw new Error('a consumed managed answer must continue the workflow')
+    },
+    continueWorkflow: async (parentId, recoveryError) => {
+      continuationParents.push(parentId)
+      continuationErrorCodes.push(recoveryError?.code)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    workflowContinuationAttempts: 1,
+    maxAttempts: 0,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'swallowed-answer', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'swallowed-answer', choices: [{ delta: {
+      phase: 'thinking_summary',
+      status: 'typing',
+      extra: { summary_thought: { content: ['private reasoning'] } },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'swallowed-answer', choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'raw protocol text consumed by the parser',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+  setImmediate(() => continued.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'swallowed-answer-corrected', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'swallowed-answer-corrected', choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      tool_calls: [{
+        id: 'corrected-call',
+        function: { name: 'declared_tool', arguments: '{"verified":true}' },
+      }],
+    } }] })}\n\ndata: [DONE]\n\n`,
+  ].join('')))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(continuationParents, ['swallowed-answer'])
+  assert.deepEqual(continuationErrorCodes, ['qwen_ai_semantic_incomplete'])
+  assert.equal(failure, undefined)
+  assert.doesNotMatch(body, /raw protocol text consumed|private reasoning/)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.match(body, /\[DONE\]/)
+})
+
 test('Qwen AI stream preserves ordinary prose ending in a colon', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
@@ -1914,7 +2009,7 @@ test('Qwen AI stream accepts ordinary text after a failed tool result without se
     allowedToolNames: new Set(['declared_tool']),
     tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
     toolChoiceMode: 'auto',
-    failedToolResultPending: true,
+    failedToolResultPending: false,
   })
   handler.setChatId('test-chat')
   const continuationParents = []
@@ -1975,6 +2070,91 @@ test('Qwen AI stream accepts ordinary text after a failed tool result without se
   assert.match(body, /Starting the next operation now/)
   assert.doesNotMatch(body, /response-continued/)
   assert.match(body, /"finish_reason":"stop"/)
+})
+
+test('Qwen AI retries investigation prose after a matched tool-result continuation', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'pending-action-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    protocol: 'qwen_hermes',
+    shouldParseResponse: true,
+    workflowContinuation: true,
+    failedToolResultPending: false,
+    allowedToolNames: new Set(['declared_tool']),
+    tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('pending-action-chat')
+  const parents = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async parentId => {
+      parents.push(parentId)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    workflowContinuationAttempts: 1,
+    maxAttempts: 0,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'pending-action-response', response_index: 0 },
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'pending-action-response',
+    choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: '继续排查 AADSTS9002313 错误。我需要确认当前使用的账号是否有真实的 refresh token，以及解密是否正确工作。',
+    } }],
+  })}\n\ndata: [DONE]\n\n`)
+
+  setImmediate(() => {
+    continued.end(`data: ${JSON.stringify({
+      'response.created': { response_id: 'pending-action-corrected', response_index: 0 },
+    })}\n\ndata: ${JSON.stringify({
+      response_id: 'pending-action-corrected',
+      choices: [{ delta: {
+        phase: 'answer',
+        status: 'typing',
+        function_call: { name: 'declared_tool', arguments: '{}' },
+      } }],
+    })}\n\ndata: [DONE]\n\n`)
+  })
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(parents, ['pending-action-response'])
+  assert.equal(failure, undefined)
+  assert.doesNotMatch(body, /继续排查 AADSTS9002313/)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
 })
 
 test('Qwen AI non-stream accepts ordinary text after a failed tool result without semantic recovery', async () => {
@@ -2478,6 +2658,8 @@ test('Qwen AI stream rejects a non-terminal completion marker when correction is
   assert.equal(continuationCalls, 0)
   assert.equal(failure?.status, 422)
   assert.equal(failure?.code, 'qwen_ai_semantic_incomplete')
+  assert.equal(failure?.accountFault, false)
+  assert.equal(failure?.retryScope, 'next-account')
   assert.doesNotMatch(body, /Premature|work is still running/)
   assert.match(body, /event: error/)
 })
@@ -4065,6 +4247,30 @@ test('Qwen AI stream keeps real RGV587 congestion account-neutral', async () => 
   assert.equal(failure.code, 'qwen_ai_upstream_busy')
   assert.equal(failure.retryable, true)
   assert.equal(failure.accountFault, false)
+  assert.equal(failure.retryScope, 'next-account')
+})
+
+test('Qwen AI stream does not replay RGV587 congestion after visible output was committed', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream)
+  const visiblePromise = once(output, 'data')
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  output.resume()
+
+  upstream.write(`data: ${JSON.stringify({
+    choices: [{ delta: { phase: 'answer', status: 'typing', content: 'visible branch' } }],
+  })}\n\n`)
+  await visiblePromise
+  upstream.end(`data: ${JSON.stringify({
+    ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::service busy, try again later'],
+  })}\n\n`)
+
+  const [failure] = await failurePromise
+  assert.equal(failure.code, 'qwen_ai_upstream_busy')
+  assert.equal(failure.accountFault, false)
   assert.equal(failure.retryScope, undefined)
 })
 
@@ -4930,7 +5136,7 @@ test('Qwen AI keeps an RGV587 busy JSON response account-neutral even with chall
       && error.code === 'qwen_ai_upstream_busy'
       && error.retryable === true
       && error.accountFault === false
-      && error.retryScope === undefined
+      && error.retryScope === 'next-account'
     ),
   )
 })
@@ -6837,7 +7043,7 @@ test('Qwen AI exposes incomplete native tool JSON as non-retryable after continu
   assert.equal(failure.code, 'malformed_tool_call')
   assert.equal(failure.retryable, false)
   assert.equal(failure.accountFault, false)
-  assert.equal(failure.retryScope, undefined)
+  assert.equal(failure.retryScope, 'next-account')
   assert.doesNotMatch(Buffer.concat(chunks).toString(), /"finish_reason":"tool_calls"/)
 })
 
@@ -8644,7 +8850,7 @@ test('Qwen AI accepts terminal prose after a failed tool result without retry', 
   assert.match(body, /data: \[DONE\]/)
 })
 
-test('Qwen AI accepts a long final answer after a matched tool-result continuation', async () => {
+test('Qwen AI accepts a long proved final answer after a matched tool-result continuation', async () => {
   const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
   })
@@ -8667,10 +8873,11 @@ test('Qwen AI accepts a long final answer after a matched tool-result continuati
       return false
     },
   })
-  const finalAnswer = Array.from(
+  const visibleFinalAnswer = Array.from(
     { length: 80 },
     (_, index) => `Verified result ${index + 1}.`,
   ).join(' ')
+  const finalAnswer = `${visibleFinalAnswer}<chat2api_workflow_complete/>`
 
   upstream.end(`data: ${JSON.stringify({
     response_id: 'matched-results-final-answer',
@@ -8683,7 +8890,7 @@ test('Qwen AI accepts a long final answer after a matched tool-result continuati
 
   const result = await resultPromise
   assert.equal(recoveryCalls, 0)
-  assert.equal(result.choices[0].message.content, finalAnswer)
+  assert.equal(result.choices[0].message.content, visibleFinalAnswer)
   assert.equal(result.choices[0].finish_reason, 'stop')
 })
 

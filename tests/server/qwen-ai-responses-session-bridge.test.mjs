@@ -1067,16 +1067,17 @@ test('Responses invalid continuation input clears the old Qwen binding and falls
   assert.equal(conversations.get('resp_prior').qwenAiSessionBinding, undefined)
 })
 
-test('Responses CHAT_IN_PROGRESS failovers to the next account without marking the busy account failed', async () => {
+test('Responses CHAT_IN_PROGRESS fails over after same-chat retries are exhausted', async () => {
   const { handler, calls, account, secondaryAccount, toolCallSessions } = loadResponsesRouteHarness({
     includeSecondaryAccount: true,
-    forwardResult: ({ chatRequest, account: forwardedAccount, provider, actualModel, context }) => {
+    forwardResult: ({ account: forwardedAccount, chatRequest, provider, actualModel, context }) => {
       if (forwardedAccount.id === account.id) {
         return {
           success: false,
           status: 429,
-          error: 'Qwen AI chat is still in progress; switching to another account',
+          error: 'Qwen AI chat is still in progress; retrying on another available account with the full transcript.',
           errorCode: 'CHAT_IN_PROGRESS',
+          retryable: true,
           accountFault: false,
           retryScope: 'next-account',
         }
@@ -1354,7 +1355,10 @@ function loadForwarderForBridgeTests(overrides = {}) {
       isQwenAiTransientTransportError: () => false,
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
-      qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
+      qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 4,
+    },
+    './adapters/m365': {
+      M365Adapter: adapterWithMatcher('isM365Provider'),
     },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
@@ -1635,8 +1639,8 @@ test('Qwen forwarder sends only the continuation delta to the pinned chat', asyn
   assert.equal(calls.continuations[0].parentId, 'retained-qwen-parent')
   assert.equal(
     calls.continuations[0].chatInProgressRetryAttempts,
-    0,
-    'Responses retained-chat continuations must fail fast into next-account failover',
+    4,
+    'Responses retained-chat continuations must retry the same provider chat',
   )
   assert.deepEqual(calls.continuations[0].messages, [
     { role: 'tool', tool_call_id: 'call_read', content: '{"name":"chat2api"}' },
@@ -1738,7 +1742,7 @@ test('Qwen ordinary continuation 400 clears the binding without replaying or fau
   assert.deepEqual(calls.deletedChats, [])
 })
 
-test('Qwen account faults retain next-account failover while CHAT_IN_PROGRESS stays account-neutral', async () => {
+test('Qwen account faults retain next-account failover and busy continuation failover is account-neutral', async () => {
   for (const status of [401, 403, 429]) {
     const accountFault = Object.assign(new Error(`Qwen account failure (${status})`), {
       status,
@@ -1781,7 +1785,7 @@ test('Qwen account faults retain next-account failover while CHAT_IN_PROGRESS st
   assert.equal(result.errorCode, 'CHAT_IN_PROGRESS')
   assert.equal(result.accountFault, false)
   assert.equal(result.retryScope, 'next-account')
-  assert.equal(calls.starts.length, 0, 'busy continuation must fail over instead of replaying on the same account')
+  assert.equal(calls.starts.length, 0, 'busy continuation must preserve the retained chat instead of replaying')
 })
 
 test('Qwen continuation does not switch accounts for an account-neutral 5xx replay hint', async () => {

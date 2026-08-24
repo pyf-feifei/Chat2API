@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, memo, useEffect } from 'react'
+﻿import { useState, useMemo, useCallback, memo, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -33,6 +33,7 @@ import mimoIcon from '@/assets/providers/mimo.svg'
 import perplexityIcon from '@/assets/providers/perplexity.svg'
 import qwenIcon from '@/assets/providers/qwen.svg'
 import zaiIcon from '@/assets/providers/zai.svg'
+import m365Icon from '@/assets/providers/m365-copilot.svg'
 import modelMappingIcon from '@/assets/providers/model-mapping.svg'
 
 const providerIcons: Record<string, string> = {
@@ -45,6 +46,7 @@ const providerIcons: Record<string, string> = {
   qwen: qwenIcon,
   'qwen-ai': qwenIcon,
   zai: zaiIcon,
+  'm365-copilot': m365Icon,
   mapping: modelMappingIcon,
 }
 

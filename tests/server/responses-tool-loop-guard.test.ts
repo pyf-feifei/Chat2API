@@ -55,5 +55,17 @@ test('Responses tool loop guard permits progress, a new user turn, and polling t
     ...completedCall(2, 'wait', '{"cell_id":"1"}', 'still running'),
     ...completedCall(3, 'wait', '{"cell_id":"1"}', 'still running'),
   ]
-  assert.equal(detectResponsesToolLoop(polling), undefined)
+  assert.equal(
+    detectResponsesToolLoop(polling, { ignoredTools: ['wait'] }),
+    undefined,
+  )
+})
+
+test('Responses tool loop guard does not ignore client-defined names by default', () => {
+  const polling: ChatMessage[] = [
+    ...completedCall(1, 'wait', '{"cell_id":"1"}', 'still running'),
+    ...completedCall(2, 'wait', '{"cell_id":"1"}', 'still running'),
+    ...completedCall(3, 'wait', '{"cell_id":"1"}', 'still running'),
+  ]
+  assert.equal(detectResponsesToolLoop(polling)?.toolName, 'wait')
 })

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * OAuth Module Type Definitions
  * Defines types and interfaces for provider authentication
  */
@@ -208,6 +208,16 @@ export const MANUAL_TOKEN_CONFIGS: Record<ProviderType, ManualTokenConfig[]> = {
       placeholder: 'Paste Perplexity cookies or import HAR file',
       description: 'Get cookies from perplexity.ai browser DevTools or import HAR file',
       helpUrl: 'https://www.perplexity.ai',
+    },
+  ],
+  'm365-copilot': [
+    {
+      providerType: 'm365-copilot',
+      tokenType: 'access',
+      label: 'Access Token',
+      placeholder: 'Enter Microsoft 365 access token',
+      description: 'Obtain via OAuth PKCE flow or device-code flow for M365 Copilot',
+      helpUrl: 'https://m365.cloud.microsoft',
     },
   ],
 }

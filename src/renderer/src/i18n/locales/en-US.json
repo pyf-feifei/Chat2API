@@ -444,7 +444,7 @@
     "mappingUpdatedPending": "Model mapping {{model}} modified (pending save)",
     "mappingDeletedPending": "Model mapping {{model}} deleted (pending save)",
     "configSaved": "Model mapping configuration saved",
-    "configSaveFailed": "Failed to save configuration, please try again",
+    "configSaveFailed": "Failed to save configuration",
     "unsavedChangesWarning": "You have unsaved changes. Are you sure you want to leave?",
     "unsavedChangesHint": "You have unsaved changes, click save button to save",
     "unsavedChangesTitle": "Unsaved Changes",
@@ -589,12 +589,7 @@
     "restartNow": "Restart Now",
     "restarting": "Restarting...",
     "proxyRestarted": "Proxy service has been restarted with new configuration",
-    "proxyRestartFailed": "Failed to restart proxy service",
-    "validationFailed": "Validation Failed",
-    "fixFormErrors": "Please fix the errors in the form",
-    "proxyConfigUpdated": "Proxy configuration has been updated",
-    "configSaveFailed": "Failed to save configuration",
-    "saving": "Saving..."
+    "proxyRestartFailed": "Failed to restart proxy service"
   },
   "apiKeys": {
     "title": "API Key Management",
@@ -1175,6 +1170,27 @@
       "customPrompt": "Custom Summary Prompt (Optional)",
       "customPromptPlaceholder": "Enter custom summary prompt...",
       "customPromptHint": "Leave empty to use default prompt"
+    }
+  },
+  "m365-copilot": {
+    "name": "Microsoft 365 Copilot",
+    "description": "Microsoft 365 Copilot via ChatHub WebSocket protocol",
+    "token": "Access Token",
+    "tokenPlaceholder": "Enter Microsoft 365 access token",
+    "tokenHelp": "Obtain access token from OAuth flow or browser DevTools",
+    "refreshToken": "Refresh Token",
+    "refreshTokenPlaceholder": "Enter refresh token",
+    "refreshTokenHelp": "Used to automatically renew expired access tokens",
+    "oid": "Object ID (OID)",
+    "oidPlaceholder": "User object ID",
+    "oidHelp": "Microsoft account object ID from JWT token",
+    "tid": "Tenant ID (TID)",
+    "tidPlaceholder": "Tenant ID",
+    "tidHelp": "Microsoft tenant ID from JWT token",
+    "models": {
+      "gpt-5.6-sol": "GPT-5.6 Sol model",
+      "gpt-5.6-terra": "GPT-5.6 Terra model",
+      "gpt-5.6-luna": "GPT-5.6 Luna model"
     }
   }
 }

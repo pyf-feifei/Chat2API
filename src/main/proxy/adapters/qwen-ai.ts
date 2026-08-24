@@ -84,9 +84,9 @@ const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS = 1_000
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_BUDGET_MS = 120_000
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS = 1_000
 // Retained Responses tool-result continuations are followed immediately by
-// a client request. A busy retained chat should be handed to the forwarder's
-// same-account full replay path instead of making Claude wait on backoff.
-const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 0
+// a client request. Keep transient busy states on the retained chat instead
+// of forcing a full-history replay on another account.
+const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 4
 // Recovery time is shared by response-id resumes and managed workflow
 // continuations. It pauses while a replacement stream is producing output,
 // so a valid long generation is not cut off by this guard.
@@ -1351,10 +1351,16 @@ export function createQwenAiResumableStream(
       failRecovery(completionError)
     }
     const transportError = normalizeQwenAiStreamFailure(lastError)
+    if (semanticRecoveryEligible && isQwenAiSemanticRecoveryError(transportError)) {
+      markQwenAiNextAccountReplay(transportError)
+    }
     // Network and upstream 5xx failures are account-neutral. Preserve the
     // provider's 4xx classification (auth, risk control, or capacity) so the
     // governor can apply the appropriate account/cooldown policy.
-    if (transportError.status === undefined || transportError.status >= 500) {
+    if (
+      transportError.retryScope !== 'next-account'
+      && (transportError.status === undefined || transportError.status >= 500)
+    ) {
       transportError.accountFault = false
       delete transportError.retryScope
     }
@@ -1941,6 +1947,14 @@ function markQwenAiNextAccountFailure(error: QwenAiUpstreamError): QwenAiUpstrea
   return error
 }
 
+function markQwenAiNextAccountReplay(error: QwenAiUpstreamError): QwenAiUpstreamError {
+  // The credential remains healthy. This only allows the outer request
+  // boundary to replay a still-private branch after local recovery is spent.
+  error.accountFault = false
+  error.retryScope = 'next-account'
+  return error
+}
+
 function markQwenAiResponseEnded(error: QwenAiUpstreamError): QwenAiUpstreamError {
   error.status = 502
   error.code = 'qwen_ai_response_ended'
@@ -2414,8 +2428,14 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
-  return requiresManagedWorkflowCompletionMarker(plan)
+  if (
+    requiresManagedWorkflowCompletionMarker(plan)
     && !hasManagedWorkflowCompletionMarker(content, plan)
+  ) {
+    return true
+  }
+
+  return false
 }
 
 function logQwenAiManagedParseFailure(
@@ -2917,8 +2937,7 @@ function createQwenAiStreamEnvelopeError(
     } else if (isUpstreamBusy) {
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
-      error.accountFault = false
-      delete error.retryScope
+      markQwenAiNextAccountReplay(error)
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
       error.retryable = true
@@ -2929,6 +2948,9 @@ function createQwenAiStreamEnvelopeError(
     if (isResponseEnded) {
       // The generation is terminal. Recovery may replay it in a fresh chat on
       // the same credential, but it must never rotate the account.
+    } else if (isUpstreamBusy) {
+      // A bounded same-account retry happens before the outer pool consumes
+      // this replay scope.
     } else if (error.status === 401 || error.status === 403 || isRiskControl || isRateLimited) {
       markQwenAiNextAccountFailure(error)
     } else if (error.status >= 500) {
@@ -3038,8 +3060,7 @@ function createQwenAiStreamEnvelopeError(
   } else if (isUpstreamBusy) {
     error.code = 'qwen_ai_upstream_busy'
     error.retryable = true
-    error.accountFault = false
-    delete error.retryScope
+    markQwenAiNextAccountReplay(error)
   } else if (isRiskControl) {
     error.code = 'qwen_ai_risk_control'
   } else if (isChatInProgress) {
@@ -3559,8 +3580,7 @@ export class QwenAiAdapter {
     } else if (isUpstreamBusy) {
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
-      error.accountFault = false
-      delete error.retryScope
+      markQwenAiNextAccountReplay(error)
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
     } else if (chatInProgress) {
@@ -3582,7 +3602,8 @@ export class QwenAiAdapter {
       // A permanently ended response is replayed once in a fresh chat using
       // this same adapter/account.
     } else if (isUpstreamBusy) {
-      // Keep the outer retry on this account; do not enter pool failover.
+      // The forwarder performs bounded retries on this account first. If they
+      // are exhausted, the still-private request can move to another account.
     } else if (chatInProgress) {
       error.accountFault = false
       delete error.retryScope
@@ -5056,6 +5077,7 @@ export class QwenAiStreamHandler {
     let hasSentReasoning = false
     let summaryText = ''
     let summarySourceText = ''
+    let deliveredAnswerText = ''
     let initialChunkSent = false
     let finalChunkSent = false
     let sawUpstreamCompletion = false
@@ -5129,6 +5151,7 @@ export class QwenAiStreamHandler {
       reasoningText = ''
       summaryText = ''
       summarySourceText = ''
+      deliveredAnswerText = ''
       sawUpstreamCompletion = false
       idleRecoveryInFlight = false
       semanticRecoveryInFlight = false
@@ -5384,6 +5407,7 @@ export class QwenAiStreamHandler {
         reasoningText = ''
         summaryText = ''
         summarySourceText = ''
+        deliveredAnswerText = ''
       } else {
         this.resetToolResultGuards()
       }
@@ -5550,7 +5574,12 @@ export class QwenAiStreamHandler {
         })) {
           emittedManagedToolCall = true
         }
-        writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
+        if (writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)) {
+          for (const choice of choices) {
+            const deliveredContent = choice?.delta?.content
+            if (typeof deliveredContent === 'string') deliveredAnswerText += deliveredContent
+          }
+        }
       }
 
       if (outputChunks.length > 0) {
@@ -5728,13 +5757,25 @@ export class QwenAiStreamHandler {
       const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
       for (const outputChunk of flushChunks) {
         this.recordEmittedToolCallIdsFromChunk(outputChunk)
-        writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
+        if (writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)) {
+          const choices = Array.isArray(outputChunk?.choices) ? outputChunk.choices : []
+          for (const choice of choices) {
+            const deliveredContent = choice?.delta?.content
+            if (typeof deliveredContent === 'string') deliveredAnswerText += deliveredContent
+          }
+        }
       }
 
       const recoveredToolChunks = this.toolStreamParser?.recoverFromContent(this.content, baseChunk, !initialChunkSent) ?? []
       for (const outputChunk of recoveredToolChunks) {
         this.recordEmittedToolCallIdsFromChunk(outputChunk)
-        writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
+        if (writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)) {
+          const choices = Array.isArray(outputChunk?.choices) ? outputChunk.choices : []
+          for (const choice of choices) {
+            const deliveredContent = choice?.delta?.content
+            if (typeof deliveredContent === 'string') deliveredAnswerText += deliveredContent
+          }
+        }
       }
       if (recoveredToolChunks.length > 0) {
         initialChunkSent = true
@@ -5811,7 +5852,12 @@ export class QwenAiStreamHandler {
         }
       }
 
-      let hasAnswerOrTool = Boolean(this.content.trim() || emittedToolCall)
+      let hasAnswerOrTool = Boolean(
+        deliveredAnswerText.trim()
+        || emittedToolCall
+        || this.emittedToolCallIds.size > 0
+        || this.generatedImages.length > 0,
+      )
 
       if (
         !hasAnswerOrTool
@@ -5821,7 +5867,7 @@ export class QwenAiStreamHandler {
         const fallbackContent = summaryText.trim() || reasoningText.trim()
         if (!initialChunkSent) sendInitialChunk()
         writeGuardedContent(fallbackContent)
-        hasAnswerOrTool = Boolean(this.content.trim())
+        hasAnswerOrTool = Boolean(deliveredAnswerText.trim())
         console.info('[QwenAI] Accepted reasoning-only output for context compaction', JSON.stringify({
           chars: fallbackContent.length,
           asContent: options.reasoningOnlyAsContent === true,
@@ -5831,6 +5877,10 @@ export class QwenAiStreamHandler {
       const hasReasoningOnlyOutput = Boolean(
         !hasAnswerOrTool && (reasoningText.trim() || summaryText.trim()),
       )
+      if (!hasAnswerOrTool && this.content.trim()) {
+        recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+        return
+      }
       if (hasReasoningOnlyOutput) {
         recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
         return

@@ -86,7 +86,7 @@ export function Providers() {
           if (provider.status) {
             statusMap[provider.id] = provider.status
           } else if (!statusMap[provider.id]) {
-            statusMap[provider.id] = 'unknown'
+            statusMap[provider.id] = accountsData.some(a => a.providerId === provider.id && a.status === 'active') ? 'online' : 'unknown'
           }
           const providerAccounts = accountsData.filter(a => a.providerId === provider.id)
           countMap[provider.id] = {

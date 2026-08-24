@@ -22,6 +22,8 @@ function loadPolicy() {
 const {
   isQwenAiAccountFault,
   isQwenAiAccountNeutralFailure,
+  qwenAiAccountNeutralReplayScopeAfterRecovery,
+  qwenAiSafeExplicitRetryScope,
   qwenAiAccountRetryScope,
 } = loadPolicy()
 
@@ -114,4 +116,32 @@ test('cyclic error graphs are bounded and remain classifiable', () => {
 
   assert.equal(isQwenAiAccountFault(error), true)
   assert.equal(qwenAiAccountRetryScope(error), 'next-account')
+})
+
+test('account-neutral recovery failures retain or derive a bounded pool replay scope', () => {
+  for (const errorCode of ['qwen_ai_upstream_busy', 'qwen_ai_semantic_incomplete']) {
+    const failure = { errorCode, accountFault: false }
+    assert.equal(qwenAiAccountNeutralReplayScopeAfterRecovery(failure), 'next-account')
+    assert.equal(qwenAiSafeExplicitRetryScope({
+      ...failure,
+      retryScope: 'next-account',
+    }), 'next-account')
+  }
+})
+
+test('ordinary upstream failures cannot acquire an account-neutral replay scope', () => {
+  const rejected = [
+    { status: 503, accountFault: false },
+    { errorCode: 'unknown_failure', accountFault: false },
+    { errorCode: 'qwen_ai_upstream_busy', accountFault: true },
+    { errorCode: 'qwen_ai_semantic_incomplete', accountFault: undefined },
+  ]
+
+  for (const failure of rejected) {
+    assert.equal(qwenAiAccountNeutralReplayScopeAfterRecovery(failure), undefined)
+    assert.equal(qwenAiSafeExplicitRetryScope({
+      ...failure,
+      retryScope: 'next-account',
+    }), undefined)
+  }
 })

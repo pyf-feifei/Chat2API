@@ -634,6 +634,24 @@ export class ChatCompletionsToResponsesStream extends Transform {
       this.fail(error)
       return
     }
+    const hasTextOutput = this.text.trim().length > 0
+    const hasToolOutput = Array.from(this.toolStates.values()).some(
+      state => state.name.trim().length > 0,
+    )
+    const hasImageOutput = this.images.length > 0
+    if (!hasTextOutput && !hasToolOutput && !hasImageOutput) {
+      this.finishReasoning()
+      const error = new Error(
+        this.reasoning.trim()
+          ? 'Upstream stream finished with reasoning but without an answer, tool call, or image.'
+          : 'Upstream stream finished without an answer, tool call, image, or reasoning.',
+      ) as Error & { code: string }
+      error.code = this.reasoning.trim()
+        ? 'reasoning_only_upstream_response'
+        : 'empty_upstream_response'
+      this.fail(error)
+      return
+    }
     const incompleteReason = this.finishReason === 'length'
       ? 'max_output_tokens'
       : this.finishReason === 'content_filter'

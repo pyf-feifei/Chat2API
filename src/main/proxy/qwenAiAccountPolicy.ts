@@ -220,21 +220,45 @@ export function qwenAiAccountFailureDetails(
   }
 }
 
+const QWEN_AI_ACCOUNT_NEUTRAL_REPLAY_CODES = new Set([
+  'qwen_ai_file_parse_timeout',
+  'qwen_ai_queue_timeout',
+  'chat_in_progress',
+  'qwen_ai_upstream_busy',
+  'qwen_ai_semantic_empty',
+  'qwen_ai_semantic_incomplete',
+  'qwen_ai_wrapper_leak',
+  'qwen_ai_invalid_tool_arguments',
+  'undeclared_native_tool_call',
+  'malformed_tool_call',
+  'missing_tool_call',
+])
+
 /**
- * Preserve the two deliberate account-neutral replay scopes emitted by the
- * governor/file transport. A nested wrapper's stale retryScope is ignored.
+ * Derive the pool replay signal only after all request-local recovery has
+ * finished. These failures do not make the credential unhealthy, but another
+ * account may still provide a clean, private branch for the same request.
+ */
+export function qwenAiAccountNeutralReplayScopeAfterRecovery(
+  value: QwenAiAccountFailureClassification | undefined,
+): 'next-account' | undefined {
+  if (!isRecord(value) || value.accountFault !== false) return undefined
+  const code = rootStringField(value, ['errorCode', 'error_code', 'code'])?.toLowerCase()
+  return code && QWEN_AI_ACCOUNT_NEUTRAL_REPLAY_CODES.has(code)
+    ? 'next-account'
+    : undefined
+}
+
+/**
+ * Preserve deliberate account-neutral replay scopes emitted after bounded
+ * request, transport, or managed-workflow recovery. A nested wrapper's stale
+ * retryScope is ignored.
  */
 export function qwenAiSafeExplicitRetryScope(
   value: QwenAiAccountFailureClassification | undefined,
 ): 'next-account' | undefined {
   if (!isRecord(value) || value.retryScope !== 'next-account') return undefined
-  if (value.accountFault !== false) return undefined
-  const code = rootStringField(value, ['errorCode', 'error_code', 'code'])?.toLowerCase()
-  return code === 'qwen_ai_file_parse_timeout'
-    || code === 'qwen_ai_queue_timeout'
-    || code === 'chat_in_progress'
-    ? 'next-account'
-    : undefined
+  return qwenAiAccountNeutralReplayScopeAfterRecovery(value)
 }
 
 /** Status/code combinations that must remain on the current conversation. */

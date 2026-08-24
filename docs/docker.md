@@ -194,6 +194,9 @@ QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
+# Keep context compaction detection disabled so the proxy forwards the full
+# client history; set to auto only when the service should own compaction.
+CHAT2API_COMPACTION_DETECTION=off
 CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 CHAT2API_QWEN_AI_RETRY_COUNT=1
 CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3
@@ -205,7 +208,7 @@ CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
-CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0
+CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=4
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 # Emit typed response.in_progress events during otherwise silent Responses
@@ -220,7 +223,9 @@ CHAT2API_RESPONSES_STORE_CHECKPOINT_INTERVAL=32
 # Stop a fourth unchanged tool cycle after three identical completed calls.
 CHAT2API_RESPONSES_TOOL_LOOP_THRESHOLD=3
 CHAT2API_RESPONSES_TOOL_LOOP_WINDOW=8
-CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS=wait,wait_agent,write_stdin
+# Tool names are client-defined; leave this empty unless the deployed client
+# explicitly has polling tools that should be excluded from loop detection.
+CHAT2API_RESPONSES_TOOL_LOOP_IGNORED_TOOLS=
 # Emit protocol-native ping events during otherwise silent Anthropic Messages
 # streams. Set to 0 to disable.
 CHAT2API_ANTHROPIC_PING_INTERVAL_MS=15000
@@ -341,9 +346,8 @@ payload until `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS` is spent
 `QWEN_AI_REQUEST_TIMEOUT_MS`; once a generation is accepted, the same
 cumulative request deadline remains in force. Leave
 Bound Claude tool-result continuations use the dedicated
-`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0` setting and fail fast
-into same-account full-history replay instead of waiting through a long
-busy-chat window. The generic
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=4` setting and retry
+the same retained provider chat before surfacing a busy response. The generic
 `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` remains blank by default,
 which preserves deadline mode for ordinary semantic workflow continuations.
 Set it to a positive value when explicit polling is desired.
@@ -354,9 +358,14 @@ invalidating its credentials. The response is recognized by the provider code
 only, so an ordinary JSON error remains a non-stream `502`, and cancellation
 stops the wait without another request.
 Retained Responses tool-result continuations use
-`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS` (default `0`) and
-therefore hand `CHAT_IN_PROGRESS` to the same-account full-transcript replay
-path immediately. Increase it only when the upstream chat settles quickly.
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS` (default `4`) to retry
+the exact same parent continuation. If all retries are exhausted, Chat2API
+marks the result eligible for the existing account failover layer. A healthy
+second account then receives a complete transcript replay; the old provider
+chat is never deleted as part of the busy decision. When no replacement
+account is available, Chat2API returns a retryable `429 CHAT_IN_PROGRESS` and
+keeps the retained binding so the client can retry the same
+`previous_response_id`.
 Qwen's early-error preflight keeps the HTTP status mutable until the first
 client-visible SSE frame or a terminal failure. This lets a provider rejection
 that arrives before output retain its HTTP status across protocol bridges.
