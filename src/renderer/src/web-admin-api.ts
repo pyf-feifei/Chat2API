@@ -981,6 +981,42 @@ const session = {
   cleanExpired: () => managementFetch<number>('/sessions/clean-expired', { method: 'POST' }),
 }
 
+type M365OAuthUserInfo = { name?: string; email?: string }
+type M365OAuthFilled = { credentials: Record<string, string>; userInfo?: M365OAuthUserInfo }
+type M365DeviceStartResult = {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete: string
+  message?: string
+  expiresIn?: number
+  interval: number
+}
+type M365DevicePollResult =
+  | { status: 'pending'; interval: number }
+  | ({ status: 'succeeded' } & M365OAuthFilled)
+const m365OAuth = {
+  browserStart: (accountType: 'personal' | 'work') =>
+    managementFetch<{ state: string; authUrl: string }>('/m365/oauth/start', {
+      method: 'POST',
+      body: JSON.stringify({ accountType }),
+    }),
+  browserExchange: (payload: { url?: string; code?: string; state?: string }) =>
+    managementFetch<M365OAuthFilled>('/m365/oauth/exchange', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  deviceStart: (accountType: 'personal' | 'work') =>
+    managementFetch<M365DeviceStartResult>('/m365/oauth/device/start', {
+      method: 'POST',
+      body: JSON.stringify({ accountType }),
+    }),
+  devicePoll: (sessionId: string) =>
+    managementFetch<M365DevicePollResult>('/m365/oauth/device/poll', {
+      method: 'POST',
+      body: JSON.stringify({ sessionId }),
+    }),
+}
 const managementApi = {
   getConfig: async () => (await getConfig()).managementApi,
   updateConfig: async (updates: Partial<AppConfig['managementApi']>) => {
@@ -1121,6 +1157,7 @@ window.electronAPI = {
   accounts,
   oauth,
   browserImport,
+  m365OAuth,
   logs,
   requestLogs,
   statistics,

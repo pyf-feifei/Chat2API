@@ -9,6 +9,7 @@
 | kimi | [Kimi](kimi.md) |
 | minimax | [MiniMax](minimax.md) |
 | mimo | [Mimo](mimo.md) |
+| m365-copilot | [M365 Copilot](m365-copilot.md) |
 | perplexity | [Perplexity](perplexity.md) |
 | qwen | [Qwen](qwen.md) |
 | qwen-ai | [Qwen AI](qwen-ai.md) |

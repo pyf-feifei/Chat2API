@@ -17,17 +17,20 @@ import {
   getRedirectUri,
   getScope,
   getTokenEndpoint,
-  MSA_CONSUMER_CLIENT_ID,
+  DEFAULT_CLIENT_ID,
   MSA_CONSUMER_TID,
 } from '../../../providers/builtin/m365/auth/config'
 import { pollDeviceCode, startDeviceCode } from '../../../providers/builtin/m365/auth/token'
 
 const router = new Router({ prefix: '/v0/management' })
 
-const CONSUMER_CLIENT_ID = MSA_CONSUMER_CLIENT_ID
-const CONSUMER_REDIRECT_URI = 'https://copilot.microsoft.com'
+// Personal accounts must mint tokens as the same client the m365.cloud
+// microsoft web app uses (c0ab8ce9) with the full sydney v2 permission set;
+// the Chathub WS rejects tokens from the narrower ChatAI-only grant.
+const CONSUMER_CLIENT_ID = DEFAULT_CLIENT_ID
+const CONSUMER_REDIRECT_URI = 'https://login.live.com/oauth20_desktop.srf'
 const CONSUMER_SCOPE =
-  '140e65af-45d1-4427-bf08-3e7295db6836/ChatAI.ReadWrite openid profile offline_access'
+  'https://substrate.office.com/sydney/v2/.default openid profile offline_access'
 
 const PENDING_TTL_MS = 10 * 60 * 1000
 const PENDING_MAX = 20
@@ -108,16 +111,20 @@ function credentialsFromTokens(
 ) {
   const accessClaims = decodeClaims(accessToken)
   const idClaims = idToken ? decodeClaims(idToken) : {}
+  // The Chathub WS path routes by the account's HOME id. MSA access tokens
+  // carry a resource-specific oid (substrate namespace) while the id_token
+  // carries the home PUID the endpoint expects; AAD work ids are identical in
+  // both, so preferring the id_token is safe for every account species.
   const oid =
-    str(accessClaims, 'oid') ||
-    str(accessClaims, 'sub') ||
     str(idClaims, 'oid') ||
-    str(idClaims, 'sub')
+    str(idClaims, 'sub') ||
+    str(accessClaims, 'oid') ||
+    str(accessClaims, 'sub')
   if (!oid) {
     return null
   }
   const tid =
-    str(accessClaims, 'tid') || str(idClaims, 'tid') || MSA_CONSUMER_TID
+    str(idClaims, 'tid') || str(accessClaims, 'tid') || MSA_CONSUMER_TID
   const email =
     str(accessClaims, 'preferred_username') ||
     str(accessClaims, 'email') ||
@@ -165,7 +172,7 @@ router.post('/m365/oauth/start', managementAuthMiddleware, async (ctx: Context) 
     client_id: clientId,
     response_type: 'code',
     redirect_uri: redirectUri,
-    response_mode: accountType === 'work' ? 'query' : 'fragment',
+    response_mode: 'query',
     scope,
     state,
     code_challenge: challenge,
@@ -240,7 +247,7 @@ router.post('/m365/oauth/exchange', managementAuthMiddleware, async (ctx: Contex
   if (!code) {
     ctx.body = createErrorResponse(
       'missing_code',
-      'No code in the redirect URL. Personal Copilot pages consume #code= instantly — use Device Login instead. / 跳转地址里没有 code。个人账号会被 Copilot 页面立刻清掉哈希，请改用设备代码登录。',
+      'No code in the redirect URL. Copy the FULL URL shown on the sign-in success page. / 跳转地址里没有 code，请完整复制登录成功页显示的地址。',
     )
     return
   }

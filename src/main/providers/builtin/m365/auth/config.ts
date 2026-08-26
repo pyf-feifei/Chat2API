@@ -70,6 +70,22 @@ export function getDeviceTokenEndpoint(): string {
   return process.env.M365_DEVICE_TOKEN_ENDPOINT || `${getDeviceAuthority()}/oauth2/v2.0/token`
 }
 
+export function getTokenOriginCandidates(): string[] {
+  const candidates = [(process.env.M365_TOKEN_ORIGIN || '').trim()]
+  try {
+    candidates.push(new URL(getRedirectUri()).origin)
+  } catch {
+    // ignore malformed redirect URI
+  }
+  candidates.push(
+    'https://copilot.microsoft.com',
+    'https://www.bing.com',
+    'https://m365.cloud.microsoft',
+    'https://www.office.com'
+  )
+  return [...new Set(candidates.filter(Boolean))]
+}
+
 export function generateVerifier(): string {
   const bytes = crypto.randomBytes(32)
   return bytes.toString('base64url')
@@ -162,32 +178,62 @@ interface TokenError extends Error {
 
 export async function requestToken(params: URLSearchParams, _endpoint?: string): Promise<TokenSet> {
   const tokenEndpoint = getTokenEndpoint()
-  const response = await axios.post(tokenEndpoint, params.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 30000,
-    // OAuth error bodies (invalid_grant, AADSTS*) arrive with HTTP 400;
-    // keep them parseable instead of letting axios throw on status alone.
-    validateStatus: () => true,
-  })
-  const tr = response.data as Record<string, string | number | undefined>
-  if (tr.error) {
-    const error = new Error(
-      `${tr.error}: ${tr.error_description || 'Unknown error'}`
-    ) as TokenError
-    error.code = tr.error as string
-    error.aadsts = extractAadstsCode((tr.error_description as string) || '')
-    error.httpStatus = response.status
-    error.correlationId = (tr.correlation_id as string) || response.headers['client-request-id']
-    error.traceId = (tr.trace_id as string) || response.headers['x-ms-request-id']
-    throw error
-  }
-  if (response.status < 200 || response.status >= 300) {
-    throw new Error(`Token endpoint HTTP ${response.status}`)
-  }
-  if (!tr.access_token) {
-    throw new Error(`Token endpoint HTTP ${response.status}: empty access token`)
-  }
+  // Candidate header sets: no Origin first (native-style redemption works for
+  // most clients), then each known web origin for clients that require
+  // cross-origin redemption.
+  const headerVariants: Record<string, string>[] = [
+    { 'Content-Type': 'application/x-www-form-urlencoded' },
+    ...getTokenOriginCandidates().map((origin) => ({
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Origin: origin,
+    })),
+  ]
+  let lastError: TokenError | null = null
 
+  for (let attempt = 0; attempt < headerVariants.length; attempt++) {
+    const index = (preferredTokenOriginIndex + attempt) % headerVariants.length
+    const response = await axios.post(tokenEndpoint, params.toString(), {
+      headers: headerVariants[index],
+      timeout: 30000,
+      // OAuth error bodies (invalid_grant, AADSTS*) arrive with HTTP 400;
+      // keep them parseable instead of letting axios throw on status alone.
+      validateStatus: () => true,
+    })
+    const tr = response.data as Record<string, string | number | undefined>
+    if (tr.error) {
+      const error = new Error(
+        `${tr.error}: ${tr.error_description || 'Unknown error'}`
+      ) as TokenError
+      error.code = tr.error as string
+      error.aadsts = extractAadstsCode((tr.error_description as string) || '')
+      error.httpStatus = response.status
+      error.correlationId = (tr.correlation_id as string) || response.headers['client-request-id']
+      error.traceId = (tr.trace_id as string) || response.headers['x-ms-request-id']
+      // AADSTS90023 marks an Origin/redemption-style mismatch; the accepted
+      // shape depends on the client registration, so rotate through the
+      // candidates before giving up.
+      if (error.aadsts !== '90023' || attempt === headerVariants.length - 1) {
+        throw error
+      }
+      lastError = error
+      continue
+    }
+    preferredTokenOriginIndex = index
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Token endpoint HTTP ${response.status}`)
+    }
+    if (!tr.access_token) {
+      throw new Error(`Token endpoint HTTP ${response.status}: empty access token`)
+    }
+
+    return buildTokenSet(tr)
+  }
+  throw lastError || new Error('Token endpoint failed')
+}
+
+let preferredTokenOriginIndex = 0
+
+function buildTokenSet(tr: Record<string, string | number | undefined>): TokenSet {
   const set: TokenSet = {
     accessToken: tr.access_token as string,
     refreshToken: tr.refresh_token as string | undefined,

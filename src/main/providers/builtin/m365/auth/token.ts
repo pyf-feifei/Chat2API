@@ -7,15 +7,21 @@ import {
   getDeviceAuthority,
   getDeviceCodeEndpoint,
   getDeviceTokenEndpoint,
+  getTokenOriginCandidates,
   requestToken,
 } from './config'
 
-export async function refresh(refreshToken: string, clientId?: string): Promise<TokenSet> {
+export async function refresh(
+  refreshToken: string,
+  clientId?: string,
+  scope?: string
+): Promise<TokenSet> {
   const params = new URLSearchParams({
     client_id: clientId || getClientId(),
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
   })
+  if (scope) params.set('scope', scope)
   return requestToken(params)
 }
 
@@ -77,7 +83,13 @@ export async function pollDeviceCode(
     grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
     device_code: deviceCode,
   })
-  const response = await axios.post(getDeviceTokenEndpoint(), params.toString(), axiosFormConfig)
+  const response = await axios.post(getDeviceTokenEndpoint(), params.toString(), {
+    ...axiosFormConfig,
+    headers: {
+      ...axiosFormConfig.headers,
+      Origin: getTokenOriginCandidates()[0],
+    },
+  })
   const tr = response.data as Record<string, string | number | undefined>
   switch (tr.error) {
     case '':

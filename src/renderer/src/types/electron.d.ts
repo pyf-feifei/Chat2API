@@ -499,12 +499,37 @@ interface QwenAiGovernorAPI {
   clearAllCooldowns: () => Promise<void>
 }
 
+interface M365OAuthAPI {
+  browserStart: (accountType: 'personal' | 'work') => Promise<{ state: string; authUrl: string }>
+  browserExchange: (payload: { url?: string; code?: string; state?: string }) => Promise<{
+    credentials: Record<string, string>
+    userInfo?: { name?: string; email?: string }
+  }>
+  deviceStart: (accountType: 'personal' | 'work') => Promise<{
+    sessionId: string
+    userCode: string
+    verificationUri: string
+    verificationUriComplete: string
+    message?: string
+    expiresIn?: number
+    interval: number
+  }>
+  devicePoll: (sessionId: string) => Promise<
+    | { status: 'pending'; interval: number }
+    | {
+        status: 'succeeded'
+        credentials: Record<string, string>
+        userInfo?: { name?: string; email?: string }
+      }
+  >
+}
 interface ElectronAPI {
   proxy: ProxyAPI
   store: StoreAPI
   providers: ProvidersAPI
   accounts: AccountsAPI
   oauth: OAuthAPI
+  m365OAuth: M365OAuthAPI
   browserImport: BrowserImportAPI
   logs: LogsAPI
   requestLogs: RequestLogsAPI

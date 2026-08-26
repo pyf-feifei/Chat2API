@@ -1,57 +1,62 @@
-import deepseekConfig from './deepseek.ts'
-import glmConfig from './glm.ts'
-import kimiConfig from './kimi.ts'
-import m365CopilotConfig from './m365-copilot.ts'
-import minimaxConfig from './minimax.ts'
-import mimoConfig from './mimo.ts'
-import perplexityConfig from './perplexity.ts'
-import qwenConfig from './qwen.ts'
-import qwenAiConfig from './qwen-ai.ts'
-import zaiConfig from './zai.ts'
-import type { BuiltinProviderConfig } from '../../store/types.ts'
+import type { BuiltinProviderConfig } from '../../store/types'
 
-export const builtinProviders: BuiltinProviderConfig[] = [
-  deepseekConfig,
-  glmConfig,
-  kimiConfig,
-  minimaxConfig,
-  mimoConfig,
-  perplexityConfig,
-  qwenConfig,
-  qwenAiConfig,
-  zaiConfig,
-]
-
-export const builtinProviderMap: Record<string, BuiltinProviderConfig> = {
-  deepseek: deepseekConfig,
-  glm: glmConfig,
-  kimi: kimiConfig,
-  minimax: minimaxConfig,
-  mimo: mimoConfig,
-  perplexity: perplexityConfig,
-  qwen: qwenConfig,
-  'qwen-ai': qwenAiConfig,
-  zai: zaiConfig,
+export const m365CopilotConfig: BuiltinProviderConfig = {
+  "id": "m365-copilot",
+  "name": "Microsoft 365 Copilot",
+  "type": "builtin",
+  "authType": "oauth",
+  "apiEndpoint": "https://substrate.office.com/m365Copilot/Chathub",
+  "chatPath": "",
+  "headers": {
+    "Origin": "https://m365.cloud.microsoft",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+  },
+  "enabled": true,
+  "description": "Microsoft 365 Copilot via ChatHub WebSocket protocol",
+  "supportedModels": [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna"
+  ],
+  "modelMappings": {
+    "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt-5.6-terra": "gpt-5.6-terra",
+    "gpt-5.6-luna": "gpt-5.6-luna"
+  },
+  "credentialFields": [
+    {
+      "name": "accessToken",
+      "label": "Access Token",
+      "type": "password",
+      "required": true,
+      "placeholder": "Microsoft 365 access token",
+      "helpText": "OAuth access token for Microsoft 365 Copilot"
+    },
+    {
+      "name": "refreshToken",
+      "label": "Refresh Token",
+      "type": "password",
+      "required": true,
+      "placeholder": "Microsoft 365 refresh token",
+      "helpText": "OAuth refresh token for automatic token renewal"
+    },
+    {
+      "name": "oid",
+      "label": "Object ID",
+      "type": "text",
+      "required": true,
+      "placeholder": "User object ID (OID)",
+      "helpText": "Microsoft account object ID from JWT token"
+    },
+    {
+      "name": "tid",
+      "label": "Tenant ID",
+      "type": "text",
+      "required": true,
+      "placeholder": "Tenant ID (TID)",
+      "helpText": "Microsoft tenant ID from JWT token"
+    }
+  ]
 }
 
-export function getBuiltinProvider(id: string): BuiltinProviderConfig | undefined {
-  return builtinProviderMap[id]
-}
-
-export function getBuiltinProviders(): BuiltinProviderConfig[] {
-  return builtinProviders
-}
-
-export {
-  deepseekConfig,
-  glmConfig,
-  kimiConfig,
-  minimaxConfig,
-  mimoConfig,
-  perplexityConfig,
-  qwenConfig,
-  qwenAiConfig,
-  zaiConfig,
-}
-
-export default builtinProviders
+export default m365CopilotConfig

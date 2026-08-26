@@ -183,11 +183,14 @@ async function copyTextToClipboard(text: string, visibleTextarea?: HTMLTextAreaE
   textarea.setAttribute('readonly', 'readonly')
   textarea.style.position = 'fixed'
   textarea.style.left = '-9999px'
-  document.body.appendChild(textarea)
+  const active = document.activeElement
+  const dialogHost = active ? active.closest('[role="dialog"]') : null
+  const host = dialogHost || document.body
+  host.appendChild(textarea)
   textarea.focus()
   textarea.select()
   const copied = document.execCommand('copy')
-  document.body.removeChild(textarea)
+  host.removeChild(textarea)
 
   return copied
 }
@@ -261,6 +264,20 @@ export function AddAccountDialog({
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
   const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi'].includes(provider.id)
+  const supportsM365OAuth = !!provider && provider.id === 'm365-copilot' && !isEditing && (isDockerWebAdmin || !!window.electronAPI?.m365OAuth)
+  const [m365AccountType, setM365AccountType] = useState<'personal' | 'work'>('personal')
+  const [m365DeviceSession, setM365DeviceSession] = useState<{
+    sessionId: string
+    userCode: string
+    verificationUri: string
+    verificationUriComplete: string
+    interval: number
+  } | null>(null)
+  const [isM365Busy, setIsM365Busy] = useState(false)
+  const [m365RedirectUrl, setM365RedirectUrl] = useState('')
+  const [isM365WaitingRedirect, setIsM365WaitingRedirect] = useState(false)
+  const m365PollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [deviceCodeCopied, setDeviceCodeCopied] = useState(false)
 
   useEffect(() => {
     if (open) {
@@ -288,6 +305,12 @@ export function AddAccountDialog({
     setBrowserImportPayload('')
     setIsBrowserImportWaiting(false)
     setBrowserImportCopied(false)
+    setM365AccountType('personal')
+    setM365DeviceSession(null)
+    setIsM365Busy(false)
+    setM365RedirectUrl('')
+    setIsM365WaitingRedirect(false)
+    stopM365Polling()
   }
 
   const handleCredentialChange = (fieldName: string, value: string) => {
@@ -296,6 +319,95 @@ export function AddAccountDialog({
       [fieldName]: value,
     }))
     setValidationResult({})
+  }
+
+  const stopM365Polling = () => {
+    if (m365PollTimer.current) {
+      clearTimeout(m365PollTimer.current)
+      m365PollTimer.current = null
+    }
+  }
+  const applyM365Credentials = (data: { credentials: Record<string, string>; userInfo?: { name?: string; email?: string } }) => {
+    setCredentials(prev => ({ ...prev, ...data.credentials }))
+    if (data.userInfo) {
+      const displayName = data.userInfo.name || data.userInfo.email || ''
+      if (displayName) setName(prev => (prev.trim() ? prev : displayName))
+    }
+    setValidationResult({ valid: true, userInfo: data.userInfo })
+    setOAuthStatus(t('providers.m365LoginSuccess'))
+  }
+  const pollM365Device = (sessionId: string, interval: number) => {
+    stopM365Polling()
+    m365PollTimer.current = setTimeout(async () => {
+      try {
+        const result = await window.electronAPI.m365OAuth.devicePoll(sessionId)
+        if (result.status === 'pending') {
+          pollM365Device(sessionId, result.interval || 5)
+        } else {
+          setM365DeviceSession(null)
+          setIsM365Busy(false)
+          applyM365Credentials(result)
+        }
+      } catch (error) {
+        setM365DeviceSession(null)
+        setIsM365Busy(false)
+        setValidationResult({ error: error instanceof Error ? error.message : String(error) })
+      }
+    }, Math.max(interval, 2) * 1000)
+  }
+  const handleM365DeviceLogin = async () => {
+    stopM365Polling()
+    setIsM365Busy(true)
+    setValidationResult({})
+    setOAuthStatus('')
+    try {
+      const started = await window.electronAPI.m365OAuth.deviceStart(m365AccountType)
+      setM365DeviceSession(started)
+      window.open(started.verificationUriComplete, '_blank')
+      pollM365Device(started.sessionId, started.interval || 5)
+    } catch (error) {
+      setIsM365Busy(false)
+      setValidationResult({ error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const handleM365BrowserLogin = async () => {
+    setIsM365Busy(true)
+    setValidationResult({})
+    setOAuthStatus('')
+    try {
+      const started = await window.electronAPI.m365OAuth.browserStart(m365AccountType)
+      window.open(started.authUrl, '_blank')
+      setIsM365WaitingRedirect(true)
+    } catch (error) {
+      setValidationResult({ error: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setIsM365Busy(false)
+    }
+  }
+  const handleM365Exchange = async () => {
+    setIsM365Busy(true)
+    setValidationResult({})
+    try {
+      const data = await window.electronAPI.m365OAuth.browserExchange({ url: m365RedirectUrl.trim() })
+      setIsM365WaitingRedirect(false)
+      setM365RedirectUrl('')
+      applyM365Credentials(data)
+    } catch (error) {
+      setValidationResult({ error: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setIsM365Busy(false)
+    }
+  }
+  useEffect(() => {
+    if (!open) stopM365Polling()
+  }, [open])
+  const handleCopyDeviceCode = async () => {
+    const code = m365DeviceSession?.userCode || ''
+    if (!code) return
+    const copied = await copyTextToClipboard(code)
+    if (!copied) return
+    setDeviceCodeCopied(true)
+    window.setTimeout(() => setDeviceCodeCopied(false), 2000)
   }
 
   const handleValidate = async () => {
@@ -759,6 +871,98 @@ export function AddAccountDialog({
               </Tabs>
             )}
 
+            {supportsM365OAuth && (
+              <div className="rounded-lg border p-4 space-y-3 mb-4">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium">{t('providers.m365LoginTitle')}</p>
+                  <div className="flex gap-1">
+                    <Button
+                      type="button"
+                      variant={m365AccountType === 'personal' ? 'secondary' : 'ghost'}
+                      size="sm"
+                      onClick={() => setM365AccountType('personal')}
+                    >
+                      {t('providers.m365Personal')}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={m365AccountType === 'work' ? 'secondary' : 'ghost'}
+                      size="sm"
+                      onClick={() => setM365AccountType('work')}
+                    >
+                      {t('providers.m365Work')}
+                    </Button>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  {/* Personal MSA device flow is rejected by AAD (AADSTS70002:
+                      the officeweb client is not a device-flow client), so only
+                      the browser login is offered for personal accounts. */}
+                  {m365AccountType === 'work' && (
+                    <Button type="button" onClick={handleM365DeviceLogin} disabled={isM365Busy}>
+                      {isM365Busy && m365DeviceSession ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <ExternalLink className="mr-2 h-4 w-4" />
+                      )}
+                      {t('providers.m365DeviceLogin')}
+                    </Button>
+                  )}
+                  <Button type="button" variant="outline" onClick={handleM365BrowserLogin} disabled={isM365Busy}>
+                    <ExternalLink className="mr-2 h-4 w-4" />
+                    {t('providers.m365BrowserLogin')}
+                  </Button>
+                </div>
+                {m365DeviceSession && (
+                  <div className="rounded-md bg-muted p-3 space-y-2">
+                    <p className="text-xs text-muted-foreground">{t('providers.m365DeviceCodeHint')}</p>
+                    <div className="flex items-center gap-2">
+                      <code className="text-lg font-mono font-semibold tracking-widest">{m365DeviceSession.userCode}</code>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0"
+                        onClick={handleCopyDeviceCode}
+                      >
+                        {deviceCodeCopied ? (
+                          <Check className="h-4 w-4 text-green-500" />
+                        ) : (
+                          <Copy className="h-4 w-4 text-muted-foreground" />
+                        )}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0"
+                        onClick={() => window.open(m365DeviceSession?.verificationUriComplete, '_blank')}
+                      >
+                        <ExternalLink className="h-4 w-4 text-muted-foreground" />
+                      </Button>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      <span>{t('providers.m365DevicePolling')}</span>
+                    </div>
+                  </div>
+                )}
+                {isM365WaitingRedirect && (
+                  <div className="space-y-2">
+                    <Input
+                      value={m365RedirectUrl}
+                      onChange={(e) => setM365RedirectUrl(e.target.value)}
+                      placeholder={t('providers.m365RedirectPlaceholder')}
+                    />
+                    <Button type="button" size="sm" onClick={handleM365Exchange} disabled={isM365Busy || !m365RedirectUrl.trim()}>
+                      <CheckCircle2 className="mr-2 h-4 w-4" />
+                      {t('providers.m365CompleteLogin')}
+                    </Button>
+                    <p className="text-xs text-muted-foreground">{t('providers.m365RedirectHelp')}</p>
+                  </div>
+                )}
+              </div>
+            )}
             {(!supportsOAuth || isEditing) && (
               <CredentialFieldsForm
                 fields={credentialFields}
@@ -776,14 +980,17 @@ export function AddAccountDialog({
               </div>
             )}
 
-            {validationResult.valid && validationResult.userInfo && (
+            {validationResult.valid && (
               <div className="flex items-center gap-2 text-sm text-green-600 bg-green-50 p-3 rounded-lg">
                 <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
                 <div>
                   <span className="font-medium">{t('providers.validationSuccess')}</span>
-                  {validationResult.userInfo.quota !== undefined && (
+                  {validationResult.userInfo?.email && (
+                    <span className="ml-2">{validationResult.userInfo.email}</span>
+                  )}
+                  {validationResult.userInfo?.quota !== undefined && (
                     <span className="ml-2">
-                      {t('providers.quota')}: {validationResult.userInfo.used || 0} / {validationResult.userInfo.quota}
+                      {t('providers.quota')}: {validationResult.userInfo?.used || 0} / {validationResult.userInfo?.quota}
                     </span>
                   )}
                 </div>
@@ -857,15 +1064,12 @@ function CredentialFieldsForm({ fields, credentials, onChange, t, providerId }: 
 
   const copyToClipboard = async (fieldName: string, value: string) => {
     if (!value) return
-    try {
-      await navigator.clipboard.writeText(value)
-      setCopiedFields(prev => ({ ...prev, [fieldName]: true }))
-      setTimeout(() => {
-        setCopiedFields(prev => ({ ...prev, [fieldName]: false }))
-      }, 2000)
-    } catch (err) {
-      console.error('Failed to copy:', err)
-    }
+    const copied = await copyTextToClipboard(value)
+    if (!copied) return
+    setCopiedFields(prev => ({ ...prev, [fieldName]: true }))
+    setTimeout(() => {
+      setCopiedFields(prev => ({ ...prev, [fieldName]: false }))
+    }, 2000)
   }
 
   const getFieldTranslation = (field: CredentialField) => {

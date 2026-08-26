@@ -223,7 +223,15 @@ router.put('/accounts/:id', managementAuthMiddleware, async (ctx: Context) => {
     if (request.dailyLimit !== undefined) {
       updates.dailyLimit = request.dailyLimit
     }
-    
+
+    if (request.status !== undefined) {
+      updates.status = request.status
+    }
+
+    if (request.errorMessage !== undefined) {
+      updates.errorMessage = request.errorMessage
+    }
+
     const updatedAccount = AccountManager.update(id, updates)
     
     if (!updatedAccount) {

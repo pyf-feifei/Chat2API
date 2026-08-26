@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Proxy Service Module - Request Forwarder
  * Forwards requests to corresponding API based on provider configuration
  */
@@ -2061,8 +2061,17 @@ export class RequestForwarder {
         const passThrough = new PassThrough()
         let streamed = false
         const onDelta = (delta: unknown): void => {
+          // The ChatHub handler emits structured StreamEvents ({kind,text,…});
+          // OpenAI clients expect plain string content chunks.
+          const text =
+            typeof delta === 'string'
+              ? delta
+              : typeof (delta as { text?: unknown })?.text === 'string'
+                ? (delta as { text: string }).text
+                : ''
+          if (!text) return
           streamed = true
-          const chunk = adapter.transformStreamChunk({ text: delta }, actualModel)
+          const chunk = adapter.transformStreamChunk({ text }, actualModel)
           passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
         }
         const finishStream = (): void => {
@@ -2105,12 +2114,12 @@ export class RequestForwarder {
                 return
               } catch (retryError) {
                 console.error('[M365Copilot] ChatHub stream retry error:', retryError)
-                passThrough.end()
+                finishStream()
                 return
               }
             }
             console.error('[M365Copilot] ChatHub stream error:', error)
-            passThrough.end()
+            finishStream()
           }
         }
         void runChat()

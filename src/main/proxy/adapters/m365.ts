@@ -8,7 +8,7 @@ import type { Account, Provider } from '../../store/types'
 import type { ChatCompletionRequest } from '../types'
 import {
   decodeAccessTokenExp,
-  MSA_CONSUMER_CLIENT_ID,
+  DEFAULT_CLIENT_ID,
   MSA_CONSUMER_TID,
   type TokenSet,
 } from '../../providers/builtin/m365/auth/config'
@@ -16,6 +16,15 @@ import { refresh } from '../../providers/builtin/m365/auth/token'
 import { storeManager } from '../../store/store'
 
 const REFRESH_BUFFER_MS = 5 * 60 * 1000
+
+// Consumer tokens must carry the full sydney v2 permission set for the
+// Chathub WS; narrow explicit scopes yield tokens the endpoint rejects.
+// The refresh client must match the one that issued the grant (the
+// officeweb client, c0ab8ce9) or MSA answers invalid_grant.
+const CONSUMER_REFRESH_CLIENT = process.env.M365_CONSUMER_REFRESH_CLIENT || DEFAULT_CLIENT_ID
+const CONSUMER_REFRESH_SCOPE =
+  process.env.M365_CONSUMER_REFRESH_SCOPE ||
+  'https://substrate.office.com/sydney/v2/.default openid profile offline_access'
 
 const refreshPromiseMap = new Map<string, Promise<TokenSet>>()
 const invalidatedAccessTokenMap = new Map<string, string>()
@@ -102,11 +111,15 @@ export class M365Adapter {
 
     let refreshPromise = refreshPromiseMap.get(refreshToken)
     if (!refreshPromise) {
-      // Consumer (MSA) tokens only refresh against their own app id; the
-      // default/FOCI clients answer with AADSTS9002313 for them.
+      // Consumer (MSA) accounts refresh with the full sydney v2 scope set so
+      // the Chathub WS accepts the token; work/school keep their own grant.
       const tid = this.getCredentials().tid
-      const clientId = tid === MSA_CONSUMER_TID ? MSA_CONSUMER_CLIENT_ID : undefined
-      refreshPromise = refresh(refreshToken, clientId)
+      const isConsumer = tid === MSA_CONSUMER_TID
+      refreshPromise = refresh(
+        refreshToken,
+        isConsumer ? CONSUMER_REFRESH_CLIENT : undefined,
+        isConsumer ? CONSUMER_REFRESH_SCOPE : undefined
+      )
       refreshPromiseMap.set(refreshToken, refreshPromise)
     }
 

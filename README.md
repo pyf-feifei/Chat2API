@@ -42,6 +42,7 @@ The built-in catalogue currently includes:
 | Kimi | JWT / web token | `Kimi-K2.6`, `Kimi-K3` |
 | MiniMax | JWT | `MiniMax-M2.7` |
 | Mimo | Browser cookies | `MiMo-V2.5-Pro`, `MiMo-V2.5`, `MiMo-V2-Flash` |
+| Microsoft 365 Copilot | OAuth refresh token (in-app browser login) | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
 | Perplexity | Session cookie | `Auto` |
 | Qwen (China) | SSO ticket | `Qwen3.6`, `Qwen3.7-Max`, `Qwen3.5-Flash`, `Qwen3-Max`, `Qwen3-Max-Thinking-Preview`, `Qwen3-Coder` |
 | Qwen AI (International) | JWT, optional cookies and login credentials | `Qwen3.8-Max`, `Qwen3.8-Max_Fast`, `Qwen3.8-Max_Auto`, `Qwen3.8-Max_Thinking`, `Qwen3.7-Plus`, `Qwen3.7-Max` |

@@ -157,6 +157,8 @@ export class ProviderChecker {
           account.credentials.user_id,
           account.credentials.ph_token
         )
+      case 'm365-copilot':
+        return this.checkM365Token(account.credentials)
       default:
         if (!builtinConfig.tokenCheckEndpoint) {
           return { valid: true }
@@ -180,6 +182,48 @@ export class ProviderChecker {
         name: 'Mimo User',
       },
     }
+  }
+
+  private static checkM365Token(credentials: Record<string, string>): TokenCheckResult {
+    const accessToken = credentials.accessToken || credentials.access_token
+    if (!accessToken) {
+      return { valid: false, error: 'Missing access token' }
+    }
+    // Consumer (officeweb) substrate tokens are JWE — an encrypted payload
+    // that cannot be inspected client-side. Only work-variant tokens arrive
+    // as readable JWTs; anything else gets a structural check, with liveness
+    // left to the forwarder's 401→refresh retry.
+    const parts = accessToken.split('.')
+    if (parts.length >= 2) {
+      try {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8')) as {
+          exp?: number
+          preferred_username?: string
+          email?: string
+          name?: string
+          oid?: string
+        }
+        if (payload && typeof payload === 'object') {
+          if (typeof payload.exp === 'number' && payload.exp * 1000 < Date.now()) {
+            return { valid: false, error: 'Token expired' }
+          }
+          const email = payload.preferred_username || payload.email
+          return {
+            valid: true,
+            userInfo: {
+              name: payload.name || email || payload.oid,
+              email,
+            },
+          }
+        }
+      } catch {
+        // not a decodable JWT — fall through to the JWE structural check
+      }
+    }
+    if (parts.length < 5) {
+      return { valid: false, error: 'Unrecognized M365 token format' }
+    }
+    return { valid: true }
   }
 
   private static async checkDeepSeekToken(token: string): Promise<TokenCheckResult> {

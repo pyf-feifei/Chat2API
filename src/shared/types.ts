@@ -405,6 +405,8 @@ export interface UpdateAccountRequest {
   email?: string
   credentials?: Record<string, string>
   dailyLimit?: number
+  status?: AccountStatus
+  errorMessage?: string
 }
 
 export interface CreateApiKeyRequest {

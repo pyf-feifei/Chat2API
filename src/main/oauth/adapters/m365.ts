@@ -12,7 +12,7 @@ import {
   AdapterConfig,
   CredentialInfo,
 } from '../types'
-import { refresh } from '../../providers/builtin/m365/auth/token'
+import { BaseOAuthAdapter } from './base'
 import { refresh } from '../../providers/builtin/m365/auth/token'
 
 export class M365Adapter extends BaseOAuthAdapter {
