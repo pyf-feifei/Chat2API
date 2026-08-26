@@ -194,6 +194,22 @@ QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
+# Route client system prompts through the upstream native system_message field
+# (verified against chat.qwen.ai 2026-08-26; the upstream remembers it per
+# chat across continuation turns). Set flattened to inline them into the
+# transcript instead; unknown values also fail over to flattened. The byte cap
+# flattens oversize prompts instead of trusting the undocumented field
+# (adherence verified up to 100KB); 0 disables the cap.
+CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE=native
+CHAT2API_QWEN_AI_NATIVE_SYSTEM_MAX_BYTES=65536
+# Where the proxy-generated managed tool protocol and runtime rules ride.
+# native (default) merges them into system_message together with the client
+# prompt — stress-verified upstream 2026-08-26 (3/3 correct multi-tool
+# sequences over ~275KB bodies). Set inline to keep them in the transcript
+# next to the active turn. Unknown values fail over to inline. The byte cap
+# above applies to the combined native prompt; oversize falls back to full
+# flattening.
+CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL=native
 # Keep context compaction detection disabled so the proxy forwards the full
 # client history; set to auto only when the service should own compaction.
 CHAT2API_COMPACTION_DETECTION=off

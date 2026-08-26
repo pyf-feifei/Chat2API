@@ -21,11 +21,16 @@ import {
   QwenAiFileUploader,
   QWEN_AI_DOCUMENT_EVIDENCE_MARKER,
   prepareQwenAiMultimodalMessage,
+  qwenAiNativeSystemMaxBytesFromEnv,
+  qwenAiSystemPromptModeFromEnv,
+  qwenAiToolProtocolChannelFromEnv,
   type QwenAiDirectUploadInput,
   type QwenAiDirectUploadStartResult,
   type QwenAiManagedDocumentMode,
   type QwenAiMessageTransport,
 } from './qwen-ai-files'
+
+export { resolveQwenAiNativeContinuationSystemPrompt } from './qwen-ai-files'
 import { createBaseChunk } from '../utils/streamToolHandler'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
@@ -263,6 +268,13 @@ interface QwenAiWorkflowContinuationRequest {
    * tool-result attachments through the ordinary multimodal uploader.
    */
   messages?: QwenAiMessage[]
+  /**
+   * Client system prompt to re-send as the upstream native field on every
+   * continuation round. The upstream applies system_message per chat, but
+   * instruction adherence after tool rounds measurably improves when the
+   * field is refreshed; empty/undefined keeps the legacy bare-delta shape.
+   */
+  nativeSystemPrompt?: string
   enable_thinking?: boolean
   thinking_budget?: number
   managedToolCalling?: boolean
@@ -3381,6 +3393,9 @@ export class QwenAiAdapter {
       model: payload.model,
       chat_id: payload.chat_id,
       chat_mode: payload.chat_mode,
+      systemMessageChars: typeof payload.system_message === 'string'
+        ? payload.system_message.length
+        : undefined,
       messageCount: messages.length,
       contentChars,
       fileCount: Array.isArray(primaryMessage.files) ? primaryMessage.files.length : 0,
@@ -3896,6 +3911,11 @@ export class QwenAiAdapter {
         { providerId: this.provider.id, accountId: this.account.id },
       )
       const requestMaxBytes = qwenAiRequestMaxBytesFromEnv()
+      // Image generation rides the same payload builder but is an unverified
+      // surface for the undocumented system_message field — keep it flattened.
+      const systemPromptMode = imageGeneration ? 'flattened' : qwenAiSystemPromptModeFromEnv()
+      const toolProtocolChannel = imageGeneration ? 'inline' : qwenAiToolProtocolChannelFromEnv()
+      const nativeSystemPromptMaxBytes = qwenAiNativeSystemMaxBytesFromEnv()
       const prepareUserMessage = (
         transport: QwenAiMessageTransport | undefined,
         managedDocumentMode?: QwenAiManagedDocumentMode,
@@ -3906,6 +3926,9 @@ export class QwenAiAdapter {
           workflowContinuation: request.managedToolWorkflowContinuation,
           managedDocumentMode,
           requestMaxBytes,
+          systemPromptMode,
+          nativeSystemPromptMaxBytes,
+          toolProtocolChannel,
           signal: scope.signal,
           deadlineAt: request.deadlineAt,
         })
@@ -3939,6 +3962,9 @@ export class QwenAiAdapter {
         chat_id: chatId,
         chat_mode: 'normal',
         model: modelId,
+        ...(preparedUserMessage.nativeSystemPrompt
+          ? { system_message: preparedUserMessage.nativeSystemPrompt }
+          : {}),
         parent_id: null,
         messages: [
           {
@@ -4020,6 +4046,9 @@ export class QwenAiAdapter {
         inlineUtf8Bytes: preparedUserMessage.inlineUtf8Bytes,
         payloadUtf8Bytes: payloadBytes,
         requestTargetBytes: requestMaxBytes,
+        nativeSystemPromptChars: preparedUserMessage.nativeSystemPrompt
+          ? preparedUserMessage.nativeSystemPrompt.length
+          : 0,
         conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
         fileCount: preparedUserMessage.files.length,
         requestedMessageTransport: request.messageTransport ?? 'inline',
@@ -4181,6 +4210,7 @@ export class QwenAiAdapter {
     // content field remains available for internal recovery continuations.
     let content = fallbackContent
     let files: any[] = []
+    let nativeSystemPrompt = ''
     if (continuationMessages.length > 0) {
       const uploader = new QwenAiFileUploader(
         this.axiosInstance,
@@ -4196,12 +4226,21 @@ export class QwenAiAdapter {
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
           requestMaxBytes: qwenAiRequestMaxBytesFromEnv(),
+          systemPromptMode: qwenAiSystemPromptModeFromEnv(),
+          nativeSystemPromptMaxBytes: qwenAiNativeSystemMaxBytesFromEnv(),
+          toolProtocolChannel: qwenAiToolProtocolChannelFromEnv(),
           signal: request.signal,
           deadlineAt: request.deadlineAt,
         },
       )
       content = preparedMessage.content
       files = preparedMessage.files
+      nativeSystemPrompt = preparedMessage.nativeSystemPrompt
+    }
+    // Continuation deltas carry no client system messages of their own, so
+    // the forwarder-supplied prompt is what refreshes the native field.
+    if (!nativeSystemPrompt && request.nativeSystemPrompt) {
+      nativeSystemPrompt = request.nativeSystemPrompt
     }
 
     const fid = uuid()
@@ -4214,6 +4253,11 @@ export class QwenAiAdapter {
       chat_id: chatId,
       chat_mode: 'normal',
       model: modelId,
+      // Continuations usually carry no client system content, so this is empty
+      // in practice. The upstream applies system_message per chat, so the
+      // first request's prompt keeps governing later turns (verified
+      // 2026-08-26); no resend bookkeeping is needed.
+      ...(nativeSystemPrompt ? { system_message: nativeSystemPrompt } : {}),
       parent_id: parentId,
       messages: [
         {

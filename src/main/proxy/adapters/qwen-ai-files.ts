@@ -166,10 +166,17 @@ export interface PreparedQwenAiMessage {
   managedDocumentMode?: QwenAiManagedDocumentMode
   transcriptUtf8Bytes: number
   inlineUtf8Bytes: number
+  /**
+   * Client leading system text routed to the upstream native channel instead
+   * of the flattened transcript. Empty when the feature is disabled.
+   */
+  nativeSystemPrompt: string
 }
 
 export type QwenAiMessageTransport = 'inline' | 'document'
 export type QwenAiManagedDocumentMode = 'hybrid' | 'complete'
+export type QwenAiSystemPromptMode = 'native' | 'flattened'
+export type QwenAiToolProtocolChannel = 'inline' | 'native'
 
 export interface QwenAiFileOperationOptions {
   signal?: AbortSignal
@@ -184,6 +191,23 @@ export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperati
   managedDocumentMode?: QwenAiManagedDocumentMode
   /** Target for automatic document offload. Zero disables automatic offload. */
   requestMaxBytes?: number
+  /**
+   * 'native' moves client leading system messages to the upstream
+   * system_message field instead of flattening them into the transcript.
+   * Undefined keeps the flattened legacy behavior.
+   */
+  systemPromptMode?: QwenAiSystemPromptMode
+  /**
+   * UTF-8 byte cap for the native prompt; oversize prompts fall back to the
+   * flattened transcript. Zero disables the cap. Undefined uses the env default.
+   */
+  nativeSystemPromptMaxBytes?: number
+  /**
+   * 'native' additionally merges the proxy-generated managed tool protocol
+   * and runtime rules into the system_message field. Undefined keeps them
+   * inline next to the active turn (the verified default layout).
+   */
+  toolProtocolChannel?: QwenAiToolProtocolChannel
 }
 
 export interface QwenAiFileUploadPartOptions extends QwenAiFileOperationOptions {
@@ -344,6 +368,18 @@ function positiveIntegerFromEnv(name: string, fallback: number): number {
 
   const parsed = Number(raw)
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
+}
+
+/** Oversize native system prompts flatten instead; 0 disables the cap. */
+const QWEN_AI_NATIVE_SYSTEM_MAX_BYTES_DEFAULT = 64 * 1024
+
+export function qwenAiNativeSystemMaxBytesFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_NATIVE_SYSTEM_MAX_BYTES
+  if (!raw) {
+    return QWEN_AI_NATIVE_SYSTEM_MAX_BYTES_DEFAULT
+  }
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : QWEN_AI_NATIVE_SYSTEM_MAX_BYTES_DEFAULT
 }
 
 function qwenAiFileParsePollIntervalMsFromEnv(): number {
@@ -1469,6 +1505,115 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
   return renderQwenAiTranscript(messages)
 }
 
+/**
+ * Client system prompts ride the upstream native `system_message` field by
+ * default. 'flattened' restores the flattened inline-transcript behavior —
+ * the field is undocumented upstream, so deployments need a rollback. Unknown
+ * values are treated as a typo'd rollback and fail over to the proven
+ * flattened path instead of silently staying on the new channel.
+ */
+let warnedUnknownSystemPromptMode = false
+export function qwenAiSystemPromptModeFromEnv(): QwenAiSystemPromptMode {
+  const raw = String(process.env.CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE ?? '').trim().toLowerCase()
+  if (raw === 'native') return 'native'
+  if (raw === 'flattened') return 'flattened'
+  if (raw && !warnedUnknownSystemPromptMode) {
+    warnedUnknownSystemPromptMode = true
+    console.warn(`[QwenAI] Unknown CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE=${raw}, using "flattened"`)
+  }
+  return raw ? 'flattened' : 'native'
+}
+
+/**
+ * Where the proxy-generated managed tool protocol and runtime rules ride.
+ * 'native' (default) merges them into the upstream system_message field with
+ * the client prompt — stress-verified upstream (3/3 correct multi-tool
+ * sequences over ~275KB bodies). 'inline' keeps them next to the active turn
+ * as a one-line rollback. Unknown values fail over to the original inline
+ * path.
+ */
+let warnedUnknownToolProtocolChannel = false
+export function qwenAiToolProtocolChannelFromEnv(): 'inline' | 'native' {
+  const raw = String(process.env.CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL ?? '').trim().toLowerCase()
+  if (raw === 'inline') return 'inline'
+  if (raw && raw !== 'native' && !warnedUnknownToolProtocolChannel) {
+    warnedUnknownToolProtocolChannel = true
+    console.warn(`[QwenAI] Unknown CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL=${raw}, using "inline"`)
+  }
+  if (!raw || raw === 'native') return 'native'
+  return 'inline'
+}
+
+/**
+ * Native-field text to re-send on continuation rounds. Pass the TRANSFORMED
+ * pipeline messages so the managed tool protocol rides along when the
+ * protocol channel is 'native'. Returns '' when the native mode is disabled,
+ * when there is no leading system content, or when the combined prompt
+ * exceeds the native byte cap — mirroring round-1 extraction so both paths
+ * always agree.
+ */
+export function resolveQwenAiNativeContinuationSystemPrompt(messages: ChatMessage[]): string {
+  if (qwenAiSystemPromptModeFromEnv() !== 'native') return ''
+  const { systemPrompt } = extractQwenAiNativeSystemPrompt(
+    messages,
+    'native',
+    qwenAiNativeSystemMaxBytesFromEnv(),
+    qwenAiToolProtocolChannelFromEnv(),
+  )
+  return systemPrompt
+}
+
+/**
+ * Split leading system messages out of the transcript when the caller opts
+ * into the upstream native channel. Ordinary client instructions always move;
+ * managed tool prompts join them only when the tool-protocol channel is
+ * 'native'. Whitespace-only system messages stay inline so the flattened
+ * rendering stays byte-compatible with the legacy path.
+ */
+function extractQwenAiNativeSystemPrompt(
+  messages: ChatMessage[],
+  mode: QwenAiSystemPromptMode | undefined,
+  nativeSystemPromptMaxBytes?: number,
+  toolProtocolChannel?: QwenAiToolProtocolChannel,
+): { messages: ChatMessage[]; systemPrompt: string } {
+  if (!mode || mode === 'flattened') return { messages, systemPrompt: '' }
+
+  const includeManagedPrompts = toolProtocolChannel === 'native'
+  let leadingSystemCount = 0
+  while (messages[leadingSystemCount]?.role === 'system') {
+    leadingSystemCount += 1
+  }
+  const leadingSystemMessages = messages.slice(0, leadingSystemCount)
+  const hasNativeText = (message: ChatMessage) => textFromContent(message.content).trim().length > 0
+  const isNativeCandidate = (message: ChatMessage) => (
+    hasNativeText(message) && (includeManagedPrompts || !isManagedToolPromptMessage(message))
+  )
+  const nativeMessages = leadingSystemMessages.filter(isNativeCandidate)
+  if (nativeMessages.length === 0) {
+    return { messages, systemPrompt: '' }
+  }
+  const systemPrompt = nativeMessages.map(message => textFromContent(message.content)).join('\n\n')
+  // The field's upstream size behavior is undocumented; oversize prompts fall
+  // back to the proven flattened transcript rather than risk silent truncation.
+  if (
+    typeof nativeSystemPromptMaxBytes === 'number'
+    && nativeSystemPromptMaxBytes > 0
+    && Buffer.byteLength(systemPrompt, 'utf8') > nativeSystemPromptMaxBytes
+  ) {
+    return { messages, systemPrompt: '' }
+  }
+  const keptLeading = leadingSystemMessages.filter(message => !isNativeCandidate(message))
+  // A transcript emptied by extraction would post a user turn with empty
+  // content. Keep system-only requests on the flattened path.
+  if (keptLeading.length === 0 && leadingSystemCount === messages.length) {
+    return { messages, systemPrompt: '' }
+  }
+  return {
+    messages: [...keptLeading, ...messages.slice(leadingSystemCount)],
+    systemPrompt,
+  }
+}
+
 function partitionQwenAiManagedMessages(
   messages: ChatMessage[],
   workflowContinuation: boolean,
@@ -1497,13 +1642,19 @@ function partitionQwenAiManagedMessages(
     !isManagedToolPromptMessage(message)
   ))
 
+  // Managed transports keep client system instructions inline: archiving them
+  // into the transcript document turns instruction-following into a model-side
+  // file-retrieval step, which web chat models perform poorly. Only
+  // conversation history is archived.
   if (documentMode === 'complete') {
     return {
       archiveMessages: [
-        ...ordinarySystemMessages,
         ...messages.slice(leadingSystemCount),
       ],
-      activeMessages: inlineManagedPromptMessages,
+      activeMessages: [
+        ...ordinarySystemMessages,
+        ...inlineManagedPromptMessages,
+      ],
     }
   }
 
@@ -1538,11 +1689,13 @@ function partitionQwenAiManagedMessages(
     }
   }
 
+  // Same rule as complete mode: system instructions stay inline (original
+  // leading order preserved), only older history is archived.
   const archiveMessages = [
-    ...ordinarySystemMessages,
     ...messages.slice(leadingSystemCount, activeStartIndex),
   ]
   const activeMessages = [
+    ...ordinarySystemMessages,
     ...inlineManagedPromptMessages,
     ...messages.slice(activeStartIndex),
   ]
@@ -2620,7 +2773,13 @@ export async function prepareQwenAiMultimodalMessage(
   options: PrepareQwenAiMultimodalMessageOptions = {},
 ): Promise<PreparedQwenAiMessage> {
   throwIfQwenAiFileOperationStopped(options)
-  const { content: userContent, fileParts } = buildQwenAiTranscript(messages)
+  const { messages: effectiveMessages, systemPrompt: nativeSystemPrompt } = extractQwenAiNativeSystemPrompt(
+    messages,
+    options.systemPromptMode,
+    options.nativeSystemPromptMaxBytes,
+    options.toolProtocolChannel,
+  )
+  const { content: userContent, fileParts } = buildQwenAiTranscript(effectiveMessages)
   const uniqueFileParts = deduplicateQwenFileParts(fileParts)
   const transcriptUtf8Bytes = qwenAiJsonStringUtf8Bytes(userContent)
   const requestedTransport = options.transport ?? 'inline'
@@ -2637,7 +2796,7 @@ export async function prepareQwenAiMultimodalMessage(
       content: string
     } => {
       const { archiveMessages, activeMessages } = partitionQwenAiManagedMessages(
-        messages,
+        effectiveMessages,
         options.workflowContinuation === true,
         documentMode,
       )
@@ -2717,6 +2876,7 @@ export async function prepareQwenAiMultimodalMessage(
     files,
     transport,
     managedDocumentMode,
+    nativeSystemPrompt,
     transcriptUtf8Bytes,
     inlineUtf8Bytes: qwenAiJsonStringUtf8Bytes(content),
   }

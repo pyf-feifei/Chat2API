@@ -35,6 +35,7 @@ import {
   isQwenAiTransientTransportError,
   qwenAiRequestTimeoutMsFromEnv,
   qwenAiResponsesContinuationRetryAttemptsFromEnv,
+  resolveQwenAiNativeContinuationSystemPrompt,
   type QwenAiOutputStream,
   createQwenAiResumableStream,
 } from './adapters/qwen-ai'
@@ -3545,6 +3546,7 @@ export class RequestForwarder {
             model: actualModel,
             originalModel: providerRequest.model,
             messages: continuationMessages,
+            nativeSystemPrompt: resolveQwenAiNativeContinuationSystemPrompt(transformed.messages),
             enable_thinking: providerRequest.enable_thinking !== undefined
               ? providerRequest.enable_thinking
               : providerRequest.reasoning_effort !== undefined
@@ -3822,6 +3824,7 @@ export class RequestForwarder {
                   model: actualModel,
                   originalModel: providerRequest.model,
                   content: workflowContinuationContent,
+                  nativeSystemPrompt: resolveQwenAiNativeContinuationSystemPrompt(transformed.messages),
                   enable_thinking: providerRequest.enable_thinking !== undefined
                     ? providerRequest.enable_thinking
                     : providerRequest.reasoning_effort !== undefined

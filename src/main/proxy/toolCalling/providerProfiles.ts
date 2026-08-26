@@ -7,6 +7,9 @@ export interface ProviderToolProfile {
   managedSupport: boolean
   supportsNativeTools: boolean
   preferredManagedProtocol: ToolProtocolId
+  // True when the provider adapter may archive conversation history into an
+  // attached transcript document, so transcript-handling rules apply.
+  usesTranscriptDocumentTransport: boolean
   formatAssistantToolCalls(calls: Array<{ id: string; name: string; arguments: string }>): string
   formatToolResult(result: NormalizedToolResult): string
 }
@@ -15,6 +18,7 @@ const chat2ApiXmlHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   managedSupport: true,
   supportsNativeTools: false,
   preferredManagedProtocol: 'managed_xml',
+  usesTranscriptDocumentTransport: false,
   formatAssistantToolCalls(calls) {
     return managedXmlProtocol.formatAssistantToolCalls(calls)
   },
@@ -27,6 +31,7 @@ const qwenAiHermesHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   managedSupport: true,
   supportsNativeTools: false,
   preferredManagedProtocol: 'qwen_hermes',
+  usesTranscriptDocumentTransport: true,
   formatAssistantToolCalls(calls) {
     return qwenHermesProtocol.formatAssistantToolCalls(calls)
   },

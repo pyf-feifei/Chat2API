@@ -996,7 +996,10 @@ function serializeQwenXmlParameterValue(value: unknown): string {
 }
 
 function formatToolResponse(result: NormalizedToolResult): string {
-  return `${TOOL_RESPONSE_START}\n${escapeHermesTextBoundaries(result.content)}\n${TOOL_RESPONSE_END}`
+  // Surface failure explicitly so the model can react to failed tools instead
+  // of reading them as successful output.
+  const statusLine = result.isError ? 'status: error\n' : ''
+  return `${TOOL_RESPONSE_START}\n${statusLine}${escapeHermesTextBoundaries(result.content)}\n${TOOL_RESPONSE_END}`
 }
 
 function serializeHermesJson(value: unknown): string {

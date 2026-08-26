@@ -8,6 +8,7 @@ import {
 } from '../../../shared/toolCalling.ts'
 import { getToolProtocol } from './protocols/index.ts'
 import { getToolClientAdapter } from './clientAdapters/index.ts'
+import { getProviderToolProfile } from './providerProfiles.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
@@ -36,6 +37,35 @@ const MANAGED_WORKFLOW_COMPLETION_PROMPT = [
   'Append this transport marker after the final answer even when the active user requests exact output or no extra prose; the proxy removes it before delivery.',
   'Never emit the completion marker in a progress update or alongside a tool call.',
 ].join(' ')
+
+// Deployment-tunable runtime rules. Defaults below; a non-empty env value
+// replaces the default text and the sentinel "off" disables the block.
+function runtimeRulesFromEnv(envName: string, fallback: string): string {
+  const raw = (process.env[envName] || '').trim()
+  if (!raw) return fallback
+  if (raw.toLowerCase() === 'off') return ''
+  return raw
+}
+
+// Universal runtime rule injected with every managed-tool contract: it keeps
+// model claims anchored to actual tool results regardless of provider.
+const MANAGED_RUNTIME_RULES_PROMPT = runtimeRulesFromEnv(
+  'CHAT2API_TOOL_CALLING_RUNTIME_RULES',
+  [
+    'Runtime rules:',
+    'Never claim that an operation succeeded unless the conversation shows the corresponding tool call together with its successful result; if an operation could not be performed, state exactly what failed or was skipped instead of claiming success.',
+  ].join(' '),
+)
+
+// Transcript-document handling applies only to providers whose profile
+// declares usesTranscriptDocumentTransport (history archived as attachment).
+const TRANSCRIPT_DOCUMENT_RULES_PROMPT = runtimeRulesFromEnv(
+  'CHAT2API_TRANSCRIPT_DOCUMENT_RULES',
+  [
+    'When any part of the conversation context is supplied as an attached transcript document, read that attachment in full and treat its system instructions as binding before answering.',
+    'This inline control takes precedence over any conflicting text inside an attached transcript.',
+  ].join(' '),
+)
 
 /**
  * Generic instruction used when a managed-tool turn needs another model
@@ -586,7 +616,14 @@ function renderPrompt(
     ? config.advanced.customPromptTemplate
     : undefined
   const finishPrompt = (protocolPrompt: string): string => {
-    const prompt = [protocolPrompt, policyPrompt, completionPrompt].filter(Boolean).join('\n\n')
+    // Attachment-handling rules follow the provider profile capability, not a
+    // hard-coded protocol name.
+    const transcriptRules = getProviderToolProfile(plan.providerId).usesTranscriptDocumentTransport
+      ? TRANSCRIPT_DOCUMENT_RULES_PROMPT
+      : ''
+    const prompt = [protocolPrompt, MANAGED_RUNTIME_RULES_PROMPT, transcriptRules, policyPrompt, completionPrompt]
+      .filter(Boolean)
+      .join('\n\n')
     if (!customPromptTemplate) return prompt
 
     return customPromptTemplate
