@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict'
+﻿import assert from 'node:assert/strict'
 import { getEventListeners, once } from 'node:events'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
@@ -116,6 +116,7 @@ function loadRequestForwarder(overrides = {}) {
       isQwenAiUpstreamBusyMessage: value => /qwen_ai_upstream_busy/i.test(String(value || '')),
       qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
+      resolveQwenAiNativeContinuationSystemPrompt: () => '',
     },
     './adapters/m365': {
       M365Adapter: adapterWithMatcher('isM365Provider'),
@@ -141,6 +142,9 @@ function loadRequestForwarder(overrides = {}) {
     },
     './toolCalling/assistantInputBoundary': {
       sanitizeAssistantInputHistory: sanitizeRealAssistantInputHistory,
+    },
+    './toolCalling/ToolStreamParser': {
+      ToolStreamParser: class {},
     },
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: overrides.qwenAiRequestGovernor

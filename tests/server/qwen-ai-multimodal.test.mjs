@@ -122,7 +122,9 @@ test('Qwen AI multimodal helper preserves full tool-call transcript instead of o
   assert.doesNotMatch(source, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(source, /renderCompletedToolState|Authoritative completed tool ledger|Do not repeat an already successful operation/)
   assert.match(source, /fileParts\.push\(\.\.\.messageFileParts\)/)
-  assert.match(source, /buildQwenAiTranscript\(messages\)/)
+  // Native system-prompt mode derives effectiveMessages from the full list
+  // before rendering; either variable satisfies the full-transcript contract.
+  assert.match(source, /buildQwenAiTranscript\((effectiveMessages|messages)\)/)
   assert.doesNotMatch(source, /userContent = textFromContent\(msg\.content\)/)
   assert.doesNotMatch(source, /fileParts\.splice\(0,\s*fileParts\.length/)
 })

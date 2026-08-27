@@ -6,6 +6,8 @@
  */
 import type { Account, Provider } from '../../store/types'
 import type { ChatCompletionRequest } from '../types'
+import type { ManagedToolTranscriptMessage } from '../toolCalling/m365Transcript.ts'
+import { flattenManagedTranscript } from '../toolCalling/m365Transcript.ts'
 import {
   decodeAccessTokenExp,
   DEFAULT_CLIENT_ID,
@@ -175,22 +177,48 @@ export class M365Adapter {
     throw new Error('M365 access token expired; re-authenticate this account')
   }
 
-  transformRequest(request: ChatCompletionRequest): any {
-    const lastUserMessage = this.extractLastUserMessage(request.messages)
+  transformRequest(request: ChatCompletionRequest, managed?: ManagedToolContext): any {
+    // Managed tool calling has no native channel on the Chathub wire, so the
+    // engine-injected conversation is flattened into the single free-text
+    // field. Without tools the legacy single-last-user-message shape must
+    // stay byte-identical.
+    const useManaged = Boolean(
+      managed?.shouldParseResponse
+      && Array.isArray(managed.messages)
+      && managed.messages.length > 0
+      && Array.isArray(request.tools)
+      && request.tools.length > 0,
+    )
+    const systemPrompt = this.extractSystemPrompt(request.messages)
+    const text = useManaged
+      ? flattenManagedTranscript(managed!.messages)
+      : this.extractLastUserMessage(request.messages)
 
-    if (!lastUserMessage) {
+    if (!text) {
       throw new Error('No user message found in request')
     }
 
     return {
-      text: lastUserMessage,
+      text,
       tone: 'magic',
       conversationId: undefined,
       sessionId: undefined,
       attachments: this.extractAttachments(request.messages),
-      tools: request.tools || [],
-      toolChoice: request.tool_choice,
+      tools: useManaged ? [] : (request.tools || []),
+      toolChoice: useManaged ? undefined : request.tool_choice,
+      customInstructions: systemPrompt,
     }
+  }
+
+  /**
+   * Serialize the ToolCallingEngine output (injected prompt + history with
+   * textualized tool calls/results) into one role-labelled transcript. The
+   * consumer invocation carries only `message.text`, so this transcript is
+   * the sole carrier for system rules and multi-turn context.
+   * Implementation lives in toolCalling/m365Transcript.ts (node-testable).
+   */
+  private flattenManagedTranscript(messages: ManagedToolContext['messages']): string {
+    return flattenManagedTranscript(messages)
   }
 
   extractLastUserMessage(messages: Array<{ role: string; content: unknown }>): string | null {
@@ -209,6 +237,23 @@ export class M365Adapter {
       }
     }
     return null
+  }
+
+  extractSystemPrompt(messages: Array<{ role: string; content: unknown }>): string | null {
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        if (typeof msg.content === 'string') {
+          return msg.content;
+        }
+        if (Array.isArray(msg.content)) {
+          const textPart = msg.content.find((p: any) => p.type === 'text');
+          if (textPart && typeof textPart.text === 'string') {
+            return textPart.text;
+          }
+        }
+      }
+    }
+    return null;
   }
 
   extractAttachments(messages: Array<{ role: string; content: unknown }>): unknown[] {
@@ -277,4 +322,13 @@ interface ChatCompletionRequest {
   messages: Array<{ role: string; content: unknown }>
   tools?: unknown[]
   tool_choice?: unknown
+}
+
+/**
+ * Output of ToolCallingEngine.transformRequest that the forwarder threads in
+ * when managed tool calling is active for this request.
+ */
+export interface ManagedToolContext {
+  shouldParseResponse: boolean
+  messages: ManagedToolTranscriptMessage[]
 }

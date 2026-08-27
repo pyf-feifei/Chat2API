@@ -8,6 +8,7 @@ export type ToolProtocolId =
   | 'qwen_hermes'
   | 'anthropic_tool_use'
   | 'codex_responses'
+  | 'm365_fenced'
 
 export type ToolSource = 'openai' | 'mcp'
 

@@ -1,6 +1,7 @@
 import type { NormalizedToolResult, ToolProtocolId } from './types.ts'
 import { managedXmlProtocol } from './protocols/managedXml.ts'
 import { qwenHermesProtocol } from './protocols/qwenHermes.ts'
+import { m365FencedProtocol } from './protocols/m365Fenced.ts'
 
 export interface ProviderToolProfile {
   providerId: 'deepseek' | 'kimi' | 'glm' | 'qwen' | string
@@ -40,6 +41,20 @@ const qwenAiHermesHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   },
 }
 
+
+const m365FencedHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
+  managedSupport: true,
+  supportsNativeTools: false,
+  preferredManagedProtocol: 'm365_fenced',
+  usesTranscriptDocumentTransport: false,
+  formatAssistantToolCalls(calls) {
+    return m365FencedProtocol.formatAssistantToolCalls(calls)
+  },
+  formatToolResult(result) {
+    return m365FencedProtocol.formatToolResult(result)
+  },
+}
+
 const profiles: Record<string, ProviderToolProfile> = {
   deepseek: {
     providerId: 'deepseek',
@@ -60,6 +75,15 @@ const profiles: Record<string, ProviderToolProfile> = {
   'qwen-ai': {
     providerId: 'qwen-ai',
     ...qwenAiHermesHistoryProfile,
+  },
+  // Explicit so protocol choice for the Copilot transport is intentional
+  // instead of riding the unknown-provider fallback. The consumer Chathub has
+  // no native tool channel (verified against winnstorm/m365-copilot-api,
+  // cramt/m365-copilot-proxy, edlaver/m365-copilot-bun-proxy), so managed
+  // XML prompt injection is the only path here.
+  'm365-copilot': {
+    providerId: 'm365-copilot',
+    ...m365FencedHistoryProfile,
   },
 }
 

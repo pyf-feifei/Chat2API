@@ -707,6 +707,15 @@ test('qwen Hermes formats assistant calls and tool results for conversation hist
     }),
     '<tool_response>\nfile contents\n</tool_response>',
   )
+  assert.equal(
+    qwenHermesProtocol.formatToolResult({
+      toolCallId: 'call_err',
+      name: 'read_file',
+      content: 'path not found',
+      isError: true,
+    }),
+    '<tool_response>\nstatus: error\npath not found\n</tool_response>',
+  )
 })
 
 test('qwen XML history round-trips schema-typed scalar and structured parameter values', () => {

@@ -336,7 +336,7 @@ function parseFirstValidToolBlock(
 
 function findMarkerStart(buffer: string, plan: ToolCallingPlan): { matched: boolean; partial: boolean; index: number } {
   const protocol = getToolProtocol(plan.protocol)
-  const ranges = fencedRanges(buffer)
+  const ranges = plan.protocol === 'm365_fenced' ? [] : fencedRanges(buffer)
   let searchStart = 0
   let partialIndex = -1
 
@@ -374,7 +374,7 @@ function hasProtocolMarker(buffer: string, plan: ToolCallingPlan): boolean {
 
 function mayBecomeValidToolCall(buffer: string, plan: ToolCallingPlan): boolean {
   void buffer
-  return plan.protocol === 'managed_xml' || plan.protocol === 'qwen_hermes'
+  return plan.protocol === 'managed_xml' || plan.protocol === 'qwen_hermes' || plan.protocol === 'm365_fenced'
 }
 
 function fencedRanges(content: string): Array<{ start: number; end: number }> {

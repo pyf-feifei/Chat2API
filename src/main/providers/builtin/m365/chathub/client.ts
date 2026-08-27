@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ChatHub WebSocket Client
  *
  * All accounts talk SignalR over wss://substrate.office.com/m365Copilot/Chathub.
@@ -149,7 +149,7 @@ const CONSUMER_VARIANTS = [
 
 // Synthetic routing tenant substrate uses for MSA consumer identities on the
 // m365Copilot Chathub (observed from the officeweb client; distinct from the
-// MSA tid 9188040d-…).
+// MSA tid 9188040d-鈥?.
 const CONSUMER_ROUTING_TID = '84df9e7f-e9f6-40af-b435-aaaaaaaaaaaa'
 
 // Options sets sent by the m365.cloud.microsoft officeweb consumer client
@@ -209,8 +209,8 @@ function isConsumerTid(tid: string | undefined): boolean {
   return !!tid && tid === MSA_CONSUMER_TID
 }
 
-// Consumer tokens carry appid 14638111-… while commercial web
-// tokens carry c0ab8ce9-…; mirror the token's own app so ChatHub accepts both.
+// Consumer tokens carry appid 14638111-鈥?while commercial web
+// tokens carry c0ab8ce9-鈥? mirror the token's own app so ChatHub accepts both.
 function clientIdForToken(accessToken: string): string {
   try {
     const parts = accessToken.split('.')
@@ -267,17 +267,18 @@ function buildWsUrl(
 }
 
 function buildChatPayload(
-  text: string,
-  sessionId: string,
-  conversationId: string,
-  requestId: string,
-  tone: string,
-  firstTurn: boolean,
-  attachments?: unknown[],
-  tools?: unknown[],
-  toolChoice?: unknown,
-  mcpServerUrl?: string,
-): string {
+    text: string,
+    sessionId: string,
+    conversationId: string,
+    requestId: string,
+    tone: string,
+    firstTurn: boolean,
+    attachments?: unknown[],
+    tools?: unknown[],
+    toolChoice?: unknown,
+    mcpServerUrl?: string,
+    customInstructions?: string,
+  ): string {
   const payload = {
     type: 4,
     target: 'chat',
@@ -293,6 +294,7 @@ function buildChatPayload(
         tools: tools || [],
         toolChoice,
         mcpServerUrl,
+        options: customInstructions ? { customInstructions: { text: customInstructions } } : {},
       },
     ],
   }
@@ -300,11 +302,12 @@ function buildChatPayload(
 }
 
 function buildConsumerChatPayload(
-  text: string,
-  sessionId: string,
-  requestId: string,
-  firstTurn: boolean,
-): string {
+    text: string,
+    sessionId: string,
+    requestId: string,
+    firstTurn: boolean,
+    customInstructions?: string,
+  ): string {
   // Mirrored from the m365.cloud.microsoft officeweb consumer client; the
   // ChatHub silently ignores invocations whose shape drifts too far.
   const clientInfo = {
@@ -327,7 +330,7 @@ function buildConsumerChatPayload(
         sessionId,
         optionsSets: CONSUMER_OPTIONS_SETS,
         streamingMode: 'ConciseWithPadding',
-        options: {},
+        options: customInstructions ? { customInstructions: { text: customInstructions } } : {},
         extraExtensionParameters: {},
         allowedMessageTypes: CONSUMER_ALLOWED_MESSAGE_TYPES,
         sliceIds: [],
@@ -439,7 +442,7 @@ export class ChatHubClient {
               // frame; without it the hub silently drops the invocation.
               const payload =
                 (variant === 'consumer'
-                  ? buildConsumerChatPayload(request.text, sessionId, requestId, firstTurn)
+                  ? buildConsumerChatPayload(request.text, sessionId, requestId, firstTurn, request.customInstructions)
                   : buildChatPayload(
                       request.text,
                       sessionId,
@@ -451,6 +454,7 @@ export class ChatHubClient {
                       request.tools,
                       request.toolChoice,
                       request.mcpServerUrl,
+                      request.customInstructions,
                     )) + RECORD_SEPARATOR
               this.ws?.send(payload)
               continue
@@ -600,3 +604,4 @@ export class ChatHubClient {
     }
   }
 }
+

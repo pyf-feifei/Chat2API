@@ -1,4 +1,4 @@
-import type { ToolProtocolAdapter } from './base.ts'
+﻿import type { ToolProtocolAdapter } from './base.ts'
 import type {
   NormalizedToolDefinition,
   NormalizedToolResult,
@@ -27,6 +27,10 @@ const PARAMETER_START = '<parameter='
 const PARAMETER_END = '</parameter>'
 const FUNCTION_INVOCATION_START = '<function_invocation>'
 const FUNCTION_INVOCATION_END = '</function_invocation>'
+const FUNCTION_CALLS_START = '<function_calls>'
+const FUNCTION_CALLS_END = '</function_calls>'
+const INVOKE_OPEN_TAG = '<invoke '
+const INVOKE_END = '</invoke>'
 
 const QWEN_HERMES_PROTOCOL_ID = 'qwen_hermes' as const
 const QWEN_HERMES_ROUTING_SUMMARY_DEFAULT_CODE_POINTS = 240
@@ -517,6 +521,9 @@ function parseWrappedQwenCall(
   allowPartial: boolean,
   toolDefinitions: Map<string, NormalizedToolDefinition>,
 ): ParsedQwenCall | undefined {
+  if (content.startsWith(FUNCTION_CALLS_START, markerStart)) {
+    return parseFunctionCallsBlock(content, markerStart, toolDefinitions)
+  }
   const bodyStart = markerStart + TOOL_CALL_START.length
   const jsonBoundary = extractJsonObject(content, bodyStart)
   if (jsonBoundary) {
@@ -630,6 +637,83 @@ function parseBareQwenXmlCall(
     rawText: content.slice(functionStart, end),
     envelope: parseQwenXmlEnvelope(xmlBoundary.text, toolDefinitions),
   }
+}
+
+
+function parseFunctionCallsBlock(
+  content: string,
+  blockStart: number,
+  toolDefinitions: Map<string, NormalizedToolDefinition>,
+): ParsedQwenCall | undefined {
+  const innerStart = blockStart + FUNCTION_CALLS_START.length
+  const endTag = content.indexOf(FUNCTION_CALLS_END, innerStart)
+  if (endTag === -1) return undefined
+
+  const blockBody = content.slice(innerStart, endTag)
+  const end = endTag + FUNCTION_CALLS_END.length
+  const envelopes: ParsedEnvelope[] = []
+  let invokeSearchIndex = 0
+
+  while (invokeSearchIndex < blockBody.length) {
+    const invokeIdx = blockBody.indexOf(INVOKE_OPEN_TAG, invokeSearchIndex)
+    if (invokeIdx === -1) break
+
+    const nameAttrStart = invokeIdx + INVOKE_OPEN_TAG.length
+    const nameQuote1 = blockBody.indexOf('"', nameAttrStart)
+    if (nameQuote1 === -1) break
+    const nameQuote2 = blockBody.indexOf('"', nameQuote1 + 1)
+    if (nameQuote2 === -1) break
+    const name = decodeXml(blockBody.slice(nameQuote1 + 1, nameQuote2))
+
+    const invokeBodyStart = blockBody.indexOf('>', nameQuote2 + 1)
+    if (invokeBodyStart === -1) break
+
+    const invokeEndIdx = blockBody.indexOf(INVOKE_END, invokeBodyStart + 1)
+    if (invokeEndIdx === -1) break
+
+    const invokeBody = blockBody.slice(invokeBodyStart + 1, invokeEndIdx)
+    const args: Record<string, unknown> = {}
+    let paramSearchIdx = 0
+
+    while (paramSearchIdx < invokeBody.length) {
+      const paramOpenTag = '<parameter name="'
+      const paramOpenMatch = invokeBody.indexOf(paramOpenTag, paramSearchIdx)
+      if (paramOpenMatch === -1) break
+
+      const paramNameStart = paramOpenMatch + paramOpenTag.length
+      const paramNameEndQuote = invokeBody.indexOf('"', paramNameStart)
+      if (paramNameEndQuote === -1) break
+      const paramName = decodeXml(invokeBody.slice(paramNameStart, paramNameEndQuote))
+
+      const paramValueStart = invokeBody.indexOf('>', paramNameEndQuote + 1)
+      if (paramValueStart === -1) break
+
+      const paramCloseTag = '</parameter>'
+      const paramValueEnd = invokeBody.indexOf(paramCloseTag, paramValueStart + 1)
+      let paramValue: string
+      if (paramValueEnd !== -1) {
+        paramValue = invokeBody.slice(paramValueStart + 1, paramValueEnd).trim()
+        paramSearchIdx = paramValueEnd + paramCloseTag.length
+      } else {
+        paramValue = invokeBody.slice(paramValueStart + 1).trim()
+        paramSearchIdx = invokeBody.length
+      }
+
+      const tool = toolDefinitions.get(name)
+      const parameterSchema = qwenXmlParameterSchema(tool, paramName)
+      addParameter(
+        args,
+        paramName,
+        schemaAcceptsQwenRawString(parameterSchema) ? decodeXml(paramValue) : parseJsonValue(paramValue),
+      )
+    }
+
+    envelopes.push({ name, arguments: args })
+    invokeSearchIndex = invokeEndIdx + INVOKE_END.length
+  }
+
+  if (envelopes.length === 0) return undefined
+  return { end, rawText: content.slice(blockStart, end), envelopes }
 }
 
 function extractQwenXmlFunction(
@@ -833,12 +917,15 @@ function findNextQwenManagedCallStart(
   fromIndex: number,
 ): QwenManagedCallStart | undefined {
   const wrapped = content.indexOf(TOOL_CALL_START, fromIndex)
+  const functionCalls = content.indexOf(FUNCTION_CALLS_START, fromIndex)
   const bare = findNextBareFunctionStart(content, fromIndex)
-  if (wrapped === -1 && bare === -1) return undefined
-  if (wrapped !== -1 && (bare === -1 || wrapped <= bare)) {
-    return { index: wrapped, kind: 'hermes_json_or_xml' }
-  }
-  return { index: bare, kind: 'bare_xml' }
+  const candidates: Array<{ index: number; kind: 'hermes_json_or_xml' | 'bare_xml' }> = []
+  if (wrapped !== -1) candidates.push({ index: wrapped, kind: 'hermes_json_or_xml' })
+  if (functionCalls !== -1) candidates.push({ index: functionCalls, kind: 'hermes_json_or_xml' })
+  if (bare !== -1) candidates.push({ index: bare, kind: 'bare_xml' })
+  if (candidates.length === 0) return undefined
+  candidates.sort((a, b) => a.index - b.index)
+  return candidates[0]
 }
 
 function findNextBareFunctionStart(content: string, fromIndex: number): number {
@@ -856,6 +943,7 @@ function findNextBareFunctionStart(content: string, fromIndex: number): number {
 
 function detectQwenManagedStart(buffer: string) {
   const wrapped = detectMarkers(buffer, [TOOL_CALL_START])
+  const functionCalls = detectMarkers(buffer, [FUNCTION_CALLS_START])
   const completeBare = findNextBareFunctionStart(buffer, 0)
   if (completeBare !== -1) {
     if (wrapped.markerStart === undefined || completeBare < wrapped.markerStart) {
@@ -864,13 +952,13 @@ function detectQwenManagedStart(buffer: string) {
   }
 
   const partialBare = detectTrailingBareFunctionPrefix(buffer)
-  if (wrapped.markerStart === undefined) {
-    return partialBare ?? wrapped
-  }
-  if (partialBare?.markerStart !== undefined && partialBare.markerStart < wrapped.markerStart) {
-    return partialBare
-  }
-  return wrapped
+  const allCandidates = [wrapped, functionCalls, partialBare].filter(
+    (c2): c2 is NonNullable<typeof c2> => c2?.markerStart !== undefined
+  )
+  if (allCandidates.length === 0) return wrapped
+  return allCandidates.reduce((earliest, current) =>
+    (current.markerStart ?? Infinity) < (earliest.markerStart ?? Infinity) ? current : earliest
+  )
 }
 
 function detectTrailingBareFunctionPrefix(buffer: string): {

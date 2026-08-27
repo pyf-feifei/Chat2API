@@ -61,7 +61,10 @@ function loadQwenAiStreamHandler(overrides = {}) {
       QwenAiFileUploader: overrides.QwenAiFileUploader || class {},
       QWEN_AI_DOCUMENT_EVIDENCE_MARKER: '[Attached document evidence]',
       prepareQwenAiMultimodalMessage: overrides.prepareQwenAiMultimodalMessage
-        || (async () => ({ content: '', files: [] })),
+        || (async () => ({ content: '', files: [], nativeSystemPrompt: '' })),
+      qwenAiSystemPromptModeFromEnv: () => 'flattened',
+      qwenAiNativeSystemMaxBytesFromEnv: () => 0,
+      qwenAiToolProtocolChannelFromEnv: () => 'inline',
     },
     '../utils/streamToolHandler': {
       createBaseChunk: (id, model, created) => ({

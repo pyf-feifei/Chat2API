@@ -491,7 +491,7 @@ test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn',
 
   assert.ok(invokePosition >= 0)
   assert.ok(resultPosition > invokePosition)
-  assert.deepEqual(responses.map(response => response.content), ['nested failure'])
+  assert.deepEqual(responses.map(response => response.content), ['status: error\nnested failure'])
   assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
 })
 
@@ -606,12 +606,13 @@ test('Qwen AI managed document transport keeps protocol and active tool exchange
   const transcriptUrl = transcriptUpload.part.file_url.url as string
   const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
   assert.match(transcript, /OLD_HISTORY_START/)
-  assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
+  assert.doesNotMatch(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
   assert.doesNotMatch(
     transcript,
     /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL|ACTIVE_REQUEST_IN_DOCUMENT|ACTIVE_TOOL_RESULT_SENTINEL|ACTIVE_CONTINUATION_SENTINEL/,
   )
   assert.match(prepared.content, /Conversation context is attached/i)
+  assert.match(prepared.content, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
   assert.match(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL/)
   assert.match(prepared.content, /FULL_TOOL_DESCRIPTION_SENTINEL/)
   assert.match(prepared.content, /"name":"declared_dynamic_tool"/)
@@ -620,7 +621,7 @@ test('Qwen AI managed document transport keeps protocol and active tool exchange
   assert.match(prepared.content, /ACTIVE_CONTINUATION_SENTINEL/)
   assert.doesNotMatch(
     prepared.content,
-    /OLD_HISTORY_START|OLD_HISTORY_END|ORDINARY_SYSTEM_CONTEXT_SENTINEL/,
+    /OLD_HISTORY_START|OLD_HISTORY_END/,
   )
   assert.equal(prepared.transport, 'document')
   assert.ok(prepared.inlineUtf8Bytes < prepared.transcriptUtf8Bytes)
@@ -676,12 +677,13 @@ test('Qwen AI moves an oversized active Claude tool workflow into the complete t
   const transcriptUrl = transcriptUpload.part.file_url.url as string
   const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
 
-  assert.match(transcript, /ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL/)
+  assert.doesNotMatch(transcript, /ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL/)
   assert.match(transcript, /ORIGINAL_PENDING_TASK_SENTINEL/)
   assert.match(transcript, /ACTIVE_RESULT_0/)
   assert.match(transcript, /ACTIVE_RESULT_93/)
   assert.doesNotMatch(transcript, /FULL_MANAGED_PROTOCOL_SENTINEL/)
   assert.match(prepared.content, /complete managed conversation transcript is attached/i)
+  assert.match(prepared.content, /ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL/)
   assert.match(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL/)
   assert.doesNotMatch(prepared.content, /ORIGINAL_PENDING_TASK_SENTINEL|ACTIVE_RESULT_0|ACTIVE_RESULT_93/)
   assert.deepEqual(messages, snapshot, 'complete document fallback must not mutate caller messages')
@@ -719,19 +721,20 @@ test('Qwen AI managed document retry changes a first-turn inline payload', async
   assert.equal(uploads.length, 1)
   const transcriptUrl = uploads[0].file_url?.url || uploads[0].part?.file_url?.url
   const transcript = Buffer.from(String(transcriptUrl).split(',', 2)[1], 'base64').toString('utf8')
-  assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
+  assert.doesNotMatch(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
   assert.match(transcript, /ARCHIVED_USER_HISTORY/)
   assert.match(transcript, /ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/)
   assert.doesNotMatch(
     transcript,
     /HERMES_PROTOCOL_SENTINEL|FIRST_TURN_REQUEST_SENTINEL/,
   )
+  assert.match(prepared.content, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
   assert.match(prepared.content, /HERMES_PROTOCOL_SENTINEL/)
   assert.match(prepared.content, /User: FIRST_TURN_REQUEST_SENTINEL/)
   assert.match(prepared.content, /Conversation context is attached/i)
   assert.doesNotMatch(
     prepared.content,
-    /ORDINARY_SYSTEM_CONTEXT_SENTINEL|ARCHIVED_USER_HISTORY|ARCHIVED_HISTORY_END|ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/,
+    /ARCHIVED_USER_HISTORY|ARCHIVED_HISTORY_END|ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/,
   )
   assert.ok(prepared.inlineUtf8Bytes < prepared.transcriptUtf8Bytes)
   assert.deepEqual(messages, snapshot, 'managed first-turn document retry must not mutate caller messages')

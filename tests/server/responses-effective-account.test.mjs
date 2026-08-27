@@ -233,6 +233,7 @@ function loadResponsesRoute(createResult, options = {}) {
       QwenAiAdapter: {
         isQwenAiProvider: provider => provider?.apiEndpoint === 'https://chat.qwen.ai',
       },
+      resolveQwenAiNativeContinuationSystemPrompt: () => '',
     },
     '../modelMapper': {
       modelMapper: {

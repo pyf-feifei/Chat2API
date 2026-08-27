@@ -5,6 +5,7 @@ import { managedXmlProtocol } from './managedXml.ts'
 import { qwenHermesProtocol } from './qwenHermes.ts'
 import { anthropicToolUseProtocol } from './anthropicToolUse.ts'
 import { codexResponsesProtocol } from './codexResponses.ts'
+import { m365FencedProtocol } from './m365Fenced.ts'
 
 const protocols: Record<ToolProtocolId, ToolProtocolAdapter> = {
   openai_chat: managedBracketProtocol,
@@ -13,6 +14,7 @@ const protocols: Record<ToolProtocolId, ToolProtocolAdapter> = {
   qwen_hermes: qwenHermesProtocol,
   anthropic_tool_use: anthropicToolUseProtocol,
   codex_responses: codexResponsesProtocol,
+  m365_fenced: m365FencedProtocol,
 }
 
 export function getToolProtocol(id: ToolProtocolId): ToolProtocolAdapter {
@@ -26,5 +28,6 @@ export function getManagedProtocols(): ToolProtocolAdapter[] {
     qwenHermesProtocol,
     anthropicToolUseProtocol,
     codexResponsesProtocol,
+    m365FencedProtocol,
   ]
 }

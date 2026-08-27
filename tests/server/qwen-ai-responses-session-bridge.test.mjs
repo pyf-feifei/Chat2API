@@ -1340,6 +1340,7 @@ function loadForwarderForBridgeTests(overrides = {}) {
       createQwenAiResumableStream: overrides.createQwenAiResumableStream || (stream => stream),
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
+      resolveQwenAiNativeContinuationSystemPrompt: () => '',
       findModelCapability: () => undefined,
       isQwenAiStaleSessionError: value => Boolean(
         value && (
@@ -1383,6 +1384,14 @@ function loadForwarderForBridgeTests(overrides = {}) {
     },
     './toolCalling/assistantInputBoundary': {
       sanitizeAssistantInputHistory: messages => ({ messages, removedMessageCount: 0 }),
+    },
+    './toolCalling/ToolStreamParser': {
+      ToolStreamParser: class {
+        push() { return [] }
+        flush() { return [] }
+        getProtocolError() { return undefined }
+        hasEmittedToolCall() { return false }
+      },
     },
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: { run: (_accountId, operation) => operation() },

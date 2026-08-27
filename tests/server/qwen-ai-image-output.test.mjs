@@ -55,7 +55,11 @@ function loadQwenAiModule() {
       prepareQwenAiMultimodalMessage: async messages => ({
         content: String(messages.at(-1)?.content || ''),
         files: [],
+        nativeSystemPrompt: '',
       }),
+      qwenAiSystemPromptModeFromEnv: () => 'flattened',
+      qwenAiNativeSystemMaxBytesFromEnv: () => 0,
+      qwenAiToolProtocolChannelFromEnv: () => 'inline',
     },
     '../utils/streamToolHandler': {
       createBaseChunk: (id, model, created) => ({

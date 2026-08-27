@@ -1,4 +1,4 @@
-/**
+﻿/**
  * M365 ChatHub Types
  * Mirrors M365-Copilot2API/internal/chathub/types.go
  */
@@ -19,6 +19,7 @@ export interface ChatRequest {
   tools?: unknown[]
   toolChoice?: unknown
   mcpServerUrl?: string
+  customInstructions?: string
 }
 
 export interface ChatResult {

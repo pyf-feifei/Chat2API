@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict'
+﻿import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
@@ -302,6 +302,7 @@ function loadRequestForwarder(overrides = {}) {
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
+      resolveQwenAiNativeContinuationSystemPrompt: () => '',
     },
     './adapters/m365': { M365Adapter: class { static isM365Provider() { return false } } },
     './adapters/zai': { ZaiAdapter: class { static isZaiProvider() { return false } }, ZaiStreamHandler: class {} },
@@ -315,6 +316,9 @@ function loadRequestForwarder(overrides = {}) {
     },
     './toolCalling/assistantInputBoundary': {
       sanitizeAssistantInputHistory: sanitizeRealAssistantInputHistory,
+    },
+    './toolCalling/ToolStreamParser': {
+      ToolStreamParser: class {},
     },
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: {

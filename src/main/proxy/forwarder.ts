@@ -51,6 +51,7 @@ import {
   ToolCallingEngine,
 } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
+import { ToolStreamParser } from './toolCalling/ToolStreamParser'
 import { sanitizeAssistantInputHistory } from './toolCalling/assistantInputBoundary'
 import {
   qwenAiRequestGovernor,
@@ -2036,7 +2037,13 @@ export class RequestForwarder {
       }
 
       const freshCredentials = await adapter.acquireCredentials()
-      const transformedRequest = adapter.transformRequest(request)
+      // Managed tool calling rides the prompt channel; the Chathub wire has
+      // no native tools field for consumer accounts.
+      const transformed = this.transformRequestForPromptToolUse(request, provider)
+      const transformedRequest = adapter.transformRequest(request, {
+        shouldParseResponse: transformed.plan.shouldParseResponse,
+        messages: transformed.messages as any,
+      })
       const chatRequest = {
         text: transformedRequest.text,
         tone: transformedRequest.tone || 'magic',
@@ -2046,6 +2053,10 @@ export class RequestForwarder {
         tools: transformedRequest.tools || [],
         toolChoice: transformedRequest.toolChoice,
       }
+      const toolStreamParser = transformed.plan.shouldParseResponse
+        ? new ToolStreamParser(transformed.plan)
+        : undefined
+      let sentManagedRole = false
       const { ChatHubClient } = await import(
         '../providers/builtin/m365/chathub/client.ts'
       )
@@ -2060,10 +2071,16 @@ export class RequestForwarder {
 
       if (request.stream) {
         const passThrough = new PassThrough()
+        // A destroyed stream (protocol-leak failure) must not crash the
+        // process on write-after-destroy; surface the error to the client.
+        passThrough.on('error', () => {})
         let streamed = false
+        let streamFinished = false
         const onDelta = (delta: unknown): void => {
           // The ChatHub handler emits structured StreamEvents ({kind,text,…});
-          // OpenAI clients expect plain string content chunks.
+          // OpenAI clients expect plain string content chunks. When managed
+          // tool calling is active the raw text is routed through the stream
+          // parser, which buffers protocol markers and emits tool_calls deltas.
           const text =
             typeof delta === 'string'
               ? delta
@@ -2072,11 +2089,20 @@ export class RequestForwarder {
                 : ''
           if (!text) return
           streamed = true
-          const chunk = adapter.transformStreamChunk({ text }, actualModel)
-          passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+          const baseChunk = adapter.transformStreamChunk({ text }, actualModel)
+          const outs = toolStreamParser
+            ? toolStreamParser.push(text, baseChunk, !sentManagedRole)
+            : [baseChunk]
+          if (!outs || outs.length === 0) return
+          sentManagedRole = true
+          for (const chunk of outs) {
+            passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+          }
         }
         const finishStream = (): void => {
-          const finalChunk = {
+          if (streamFinished) return
+          streamFinished = true
+          const skeletonChunk = {
             id: `chatcmpl-${Date.now()}`,
             object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
@@ -2084,7 +2110,28 @@ export class RequestForwarder {
             choices: [{
               index: 0,
               delta: {},
-              finish_reason: 'stop',
+              finish_reason: null,
+            }],
+          }
+          if (toolStreamParser) {
+            const protoError = toolStreamParser.getProtocolError()
+            if (protoError) {
+              // Fail loudly rather than emitting a clean-looking empty answer;
+              // matches the kimi/deepseek wrapper-leak handling.
+              console.error('[M365Copilot] managed tool stream rejected:', protoError.message)
+              passThrough.destroy(protoError)
+              return
+            }
+            for (const chunk of toolStreamParser.flush(skeletonChunk)) {
+              passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+            }
+          }
+          const finalChunk = {
+            ...skeletonChunk,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop',
             }],
           }
           passThrough.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
@@ -2154,6 +2201,9 @@ export class RequestForwarder {
       }
 
       const body = adapter.transformResponse(result, actualModel)
+      if (transformed.plan.shouldParseResponse) {
+        this.applyToolCallsToResponse(body, transformed)
+      }
       return {
         success: true,
         status: 200,
