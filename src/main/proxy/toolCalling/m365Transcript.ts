@@ -27,6 +27,25 @@ function messageContentToText(content: unknown): string {
   return ''
 }
 
+/**
+ * Flatten a plain (no-tools) multi-turn conversation into the single
+ * `message.text` field. API clients resend the full history on every request;
+ * without this the upstream only ever sees the last user message and loses
+ * all prior context. Single-turn requests must NOT use this path — the legacy
+ * single-message shape stays byte-identical.
+ */
+export function flattenPlainTranscript(messages: ManagedToolTranscriptMessage[]): string {
+  const blocks: string[] = []
+  for (const msg of messages) {
+    // System content rides options.customInstructions (adapter handles it).
+    if (msg.role === 'system') continue
+    const text = messageContentToText(msg.content)
+    if (!text) continue
+    blocks.push(`[${msg.role}]\n${text}`)
+  }
+  return blocks.join('\n\n')
+}
+
 export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[]): string {
   const toolProfile = getProviderToolProfile('m365-copilot')
   const blocks: string[] = []

@@ -7,7 +7,7 @@
 import type { Account, Provider } from '../../store/types'
 import type { ChatCompletionRequest } from '../types'
 import type { ManagedToolTranscriptMessage } from '../toolCalling/m365Transcript.ts'
-import { flattenManagedTranscript } from '../toolCalling/m365Transcript.ts'
+import { flattenManagedTranscript, flattenPlainTranscript } from '../toolCalling/m365Transcript.ts'
 import {
   decodeAccessTokenExp,
   DEFAULT_CLIENT_ID,
@@ -206,9 +206,17 @@ export class M365Adapter {
       && request.tools.length > 0,
     )
     const systemPrompt = this.extractSystemPrompt(request.messages)
+    // Multi-turn no-tools requests carry their history in the same
+    // role-labelled transcript shape; single-turn stays byte-identical to the
+    // legacy last-user-message form.
+    const plainText = this.extractLastUserMessage(request.messages)
+    const usePlainTranscript =
+      !useManaged && request.messages.length > 1 && Boolean(plainText)
     const text = useManaged
       ? flattenManagedTranscript(managed!.messages)
-      : this.extractLastUserMessage(request.messages)
+      : usePlainTranscript
+        ? flattenPlainTranscript(request.messages as ManagedToolTranscriptMessage[])
+        : plainText
 
     if (!text) {
       throw new Error('No user message found in request')
