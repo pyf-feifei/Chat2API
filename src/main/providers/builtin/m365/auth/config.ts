@@ -10,7 +10,7 @@ export const DEFAULT_AUTHORITY = 'https://login.microsoftonline.com/common'
 export const DEFAULT_REDIRECT_URI =
   'https://login.microsoftonline.com/common/oauth2/nativeclient'
 export const DEFAULT_SCOPE =
-  'openid profile offline_access https://substrate.office.com/sydney/M365-Chat.Read https://substrate.office.com/sydney/sydney.readwrite'
+  'https://substrate.office.com/sydney/v2/.default openid profile offline_access'
 
 export function getClientId(): string {
   return (

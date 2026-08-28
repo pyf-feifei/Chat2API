@@ -89,3 +89,11 @@ index.bundle.js
 .claude/
 365.md
 
+
+# Local M365 debug artifacts (credential/token dumps, local fixtures)
+/m365_*.json
+/m365_*.txt
+/m365_*.html
+/docker_data*.json
+/local_docker_accounts.json
+/remote_accounts.json
