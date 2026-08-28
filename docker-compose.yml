@@ -1,6 +1,6 @@
 services:
   chat2api:
-    image: skatef/chat2api:latest
+    image: chat2api-local:latest
     container_name: chat2api
     restart: unless-stopped
     # Match the server's default 14-minute request budget plus a small margin;

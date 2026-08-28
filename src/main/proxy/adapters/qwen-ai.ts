@@ -5,6 +5,7 @@
  */
 
 import axios, { AxiosResponse } from 'axios'
+import { isProgressStyleManagedAnswer } from './qwenAiProgressIntent.ts'
 import { PassThrough } from 'stream'
 import { performance } from 'node:perf_hooks'
 import { createParser } from 'eventsource-parser'
@@ -2440,11 +2441,47 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
+  // An explicit completion proof marks a genuine final answer.
+  if (hasManagedWorkflowCompletionMarker(content, plan)) {
+    return false
+  }
+
+  const trimmedContent = content.trim()
+  if (!trimmedContent) {
+    return false
+  }
+
+  // Intent statements without a tool call silently stop agentic workflows —
+  // in ANY tool-choice mode. Recovery re-prompts for the actual tool call.
+  if (isProgressStyleManagedAnswer(trimmedContent)) {
+    console.info('[QwenAI] Progress-style answer without tool call triggers continuation', JSON.stringify({
+      requestId: plan.diagnostics?.requestId,
+      contentLength: trimmedContent.length,
+      protocol: plan.protocol,
+      workflowContinuation: plan.workflowContinuation,
+      toolChoiceMode: plan.toolChoiceMode,
+    }))
+    return true
+  }
+
+  // In auto tool-choice mode a tool-less substantive answer is otherwise
+  // legitimate; only progress-style statements are recovered above.
+  if (plan.toolChoiceMode === 'auto') {
+    return false
+  }
+
+  // First-turn requests may legitimately answer directly without tools.
+  if (!plan.workflowContinuation && trimmedContent.length > 0) {
+    return false
+  }
+
+  // Continuation turns require the completion proof, but substantive
+  // marker-less answers are accepted to avoid wasteful retry loops.
   if (
     requiresManagedWorkflowCompletionMarker(plan)
     && !hasManagedWorkflowCompletionMarker(content, plan)
   ) {
-    return true
+    return trimmedContent.length <= 800
   }
 
   return false
@@ -5922,12 +5959,38 @@ export class QwenAiStreamHandler {
         !hasAnswerOrTool && (reasoningText.trim() || summaryText.trim()),
       )
       if (!hasAnswerOrTool && this.content.trim()) {
-        recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
-        return
+        if (this.toolCallingPlan?.toolChoiceMode === 'auto') {
+          // Auto mode treats a tool-less answer as legitimate; deliver the
+          // buffered text instead of failing the stream.
+          const bufferedAnswer = this.content.trim()
+          if (!initialChunkSent) sendInitialChunk()
+          writeGuardedContent(bufferedAnswer)
+          hasAnswerOrTool = Boolean(deliveredAnswerText.trim())
+          console.info('[QwenAI] Delivered buffered answer text in auto mode', JSON.stringify({
+            chars: bufferedAnswer.length,
+          }))
+        } else {
+          recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+          return
+        }
       }
       if (hasReasoningOnlyOutput) {
-        recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
-        return
+        // In auto tool-choice mode, reasoning-only output is a legitimate response.
+        // Deliver it as content instead of triggering a retry.
+        if (this.toolCallingPlan?.toolChoiceMode === 'auto') {
+          const reasoningFallback = summaryText.trim() || reasoningText.trim()
+          if (reasoningFallback) {
+            if (!initialChunkSent) sendInitialChunk()
+            writeGuardedContent(reasoningFallback)
+            hasAnswerOrTool = true
+            console.info('[QwenAI] Accepted reasoning-only output in auto mode', JSON.stringify({
+              chars: reasoningFallback.length,
+            }))
+          }
+        } else {
+          recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
+          return
+        }
       }
 
       const hasUsableOutput = Boolean(hasAnswerOrTool)
@@ -6464,8 +6527,10 @@ export class QwenAiStreamHandler {
         )
         if (completionProof.complete) {
           if (!completionProof.content.trim()) {
-            recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
-            return
+            if (this.toolCallingPlan?.toolChoiceMode !== 'auto') {
+              recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+              return
+            }
           }
           choice.message.content = completionProof.content
         }
@@ -6477,6 +6542,12 @@ export class QwenAiStreamHandler {
             console.info('[QwenAI] Accepted non-stream reasoning-only output for context compaction', JSON.stringify({
               chars: finalReasoning.length,
               asContent: options.reasoningOnlyAsContent === true,
+            }))
+          } else if (this.toolCallingPlan?.toolChoiceMode === 'auto') {
+            // In auto tool-choice mode, reasoning-only output is legitimate.
+            choice.message.content = finalReasoning
+            console.info('[QwenAI] Accepted reasoning-only output in auto mode (non-stream)', JSON.stringify({
+              chars: finalReasoning.length,
             }))
           } else {
             recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())

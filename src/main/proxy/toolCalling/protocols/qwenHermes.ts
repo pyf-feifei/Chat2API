@@ -31,6 +31,14 @@ const FUNCTION_CALLS_START = '<function_calls>'
 const FUNCTION_CALLS_END = '</function_calls>'
 const INVOKE_OPEN_TAG = '<invoke '
 const INVOKE_END = '</invoke>'
+// Qwen platform MCP dialect the model drifts to despite prompt teaching:
+// <tool_calls><tool><tool_name>name</tool_name><param>value</param>…</tool>…</tool_calls>
+const TOOL_CALLS_WRAPPER_START = '<tool_calls>'
+const TOOL_CALLS_WRAPPER_END = '</tool_calls>'
+const TOOL_ENTRY_START = '<tool>'
+const TOOL_ENTRY_END = '</tool>'
+const TOOL_NAME_TAG_START = '<tool_name>'
+const TOOL_NAME_TAG_END = '</tool_name>'
 
 const QWEN_HERMES_PROTOCOL_ID = 'qwen_hermes' as const
 const QWEN_HERMES_ROUTING_SUMMARY_DEFAULT_CODE_POINTS = 240
@@ -89,7 +97,7 @@ interface ParsedEnvelope {
 
 interface QwenManagedCallStart {
   index: number
-  kind: 'hermes_json_or_xml' | 'bare_xml'
+  kind: 'hermes_json_or_xml' | 'bare_xml' | 'mcp_dialect'
 }
 
 interface QwenXmlFunctionBoundary {
@@ -177,12 +185,14 @@ Repeat the parameter block for every argument required by the selected function'
 
       const parsedCall = callStart.kind === 'bare_xml'
         ? parseBareQwenXmlCall(parseable, callStart.index, toolDefinitions)
-        : parseWrappedQwenCall(
-            parseable,
-            callStart.index,
-            context.allowPartial === true,
-            toolDefinitions,
-          )
+        : callStart.kind === 'mcp_dialect'
+          ? parseToolCallsDialectBlock(parseable, callStart.index, toolDefinitions)
+          : parseWrappedQwenCall(
+              parseable,
+              callStart.index,
+              context.allowPartial === true,
+              toolDefinitions,
+            )
 
       if (!parsedCall) {
         if (context.allowPartial) {
@@ -716,6 +726,76 @@ function parseFunctionCallsBlock(
   return { end, rawText: content.slice(blockStart, end), envelopes }
 }
 
+/**
+ * Parse the Qwen platform MCP serialization dialect
+ * (<tool_calls><tool><tool_name>…</tool></tool_calls>) the model sometimes
+ * emits from training memory instead of the taught Hermes tags. Parameter
+ * names become tags, so the declared schema decides raw-string vs JSON
+ * decoding exactly like the native-invoke parser.
+ */
+function parseToolCallsDialectBlock(
+  content: string,
+  blockStart: number,
+  toolDefinitions: Map<string, NormalizedToolDefinition>,
+): ParsedQwenCall | undefined {
+  const innerStart = blockStart + TOOL_CALLS_WRAPPER_START.length
+  const endTag = content.indexOf(TOOL_CALLS_WRAPPER_END, innerStart)
+  if (endTag === -1) return undefined
+
+  const blockBody = content.slice(innerStart, endTag)
+  const end = endTag + TOOL_CALLS_WRAPPER_END.length
+  const envelopes: ParsedEnvelope[] = []
+  let entrySearchIndex = 0
+
+  while (entrySearchIndex < blockBody.length) {
+    const entryStart = blockBody.indexOf(TOOL_ENTRY_START, entrySearchIndex)
+    if (entryStart === -1) break
+
+    const nameTagStart = blockBody.indexOf(TOOL_NAME_TAG_START, entryStart)
+    const entryEndIdx = blockBody.indexOf(TOOL_ENTRY_END, entryStart)
+    if (nameTagStart === -1 || entryEndIdx === -1 || nameTagStart > entryEndIdx) break
+
+    const nameEndTag = blockBody.indexOf(TOOL_NAME_TAG_END, nameTagStart)
+    if (nameEndTag === -1 || nameEndTag > entryEndIdx) break
+    const name = decodeXml(blockBody.slice(nameTagStart + TOOL_NAME_TAG_START.length, nameEndTag).trim())
+    if (!name) break
+
+    // The model sometimes repeats the name tag (observed: tool_name twice).
+    // Repeated occurrences are structural, never parameters.
+    const entryBody = blockBody
+      .slice(nameEndTag + TOOL_NAME_TAG_END.length, entryEndIdx)
+      .replace(new RegExp(`${TOOL_NAME_TAG_START}[^<]*${TOOL_NAME_TAG_END}`, 'g'), '')
+    const tool = toolDefinitions.get(name)
+    const args: Record<string, unknown> = {}
+    let paramSearchIdx = 0
+
+    while (paramSearchIdx < entryBody.length) {
+      const nextTagOpen = entryBody.indexOf('<', paramSearchIdx)
+      if (nextTagOpen === -1) break
+      const nextTagClose = entryBody.indexOf('>', nextTagOpen)
+      if (nextTagClose === -1) break
+      const parameterName = decodeXml(entryBody.slice(nextTagOpen + 1, nextTagClose).trim())
+      const closeTag = `</${parameterName}>`
+      const valueEnd = entryBody.indexOf(closeTag, nextTagClose + 1)
+      if (!parameterName || valueEnd === -1) break
+
+      const parameterSchema = qwenXmlParameterSchema(tool, parameterName)
+      addParameter(
+        args,
+        parameterName,
+        schemaAcceptsQwenRawString(parameterSchema) ? decodeXml(entryBody.slice(nextTagClose + 1, valueEnd).trim()) : parseJsonValue(entryBody.slice(nextTagClose + 1, valueEnd).trim()),
+      )
+      paramSearchIdx = valueEnd + closeTag.length
+    }
+
+    envelopes.push({ name, arguments: args })
+    entrySearchIndex = entryEndIdx + TOOL_ENTRY_END.length
+  }
+
+  if (envelopes.length === 0) return undefined
+  return { end, rawText: content.slice(blockStart, end), envelopes }
+}
+
 function extractQwenXmlFunction(
   content: string,
   fromIndex: number,
@@ -918,10 +998,12 @@ function findNextQwenManagedCallStart(
 ): QwenManagedCallStart | undefined {
   const wrapped = content.indexOf(TOOL_CALL_START, fromIndex)
   const functionCalls = content.indexOf(FUNCTION_CALLS_START, fromIndex)
+  const dialect = content.indexOf(TOOL_CALLS_WRAPPER_START, fromIndex)
   const bare = findNextBareFunctionStart(content, fromIndex)
-  const candidates: Array<{ index: number; kind: 'hermes_json_or_xml' | 'bare_xml' }> = []
+  const candidates: Array<QwenManagedCallStart> = []
   if (wrapped !== -1) candidates.push({ index: wrapped, kind: 'hermes_json_or_xml' })
   if (functionCalls !== -1) candidates.push({ index: functionCalls, kind: 'hermes_json_or_xml' })
+  if (dialect !== -1) candidates.push({ index: dialect, kind: 'mcp_dialect' })
   if (bare !== -1) candidates.push({ index: bare, kind: 'bare_xml' })
   if (candidates.length === 0) return undefined
   candidates.sort((a, b) => a.index - b.index)
@@ -944,6 +1026,7 @@ function findNextBareFunctionStart(content: string, fromIndex: number): number {
 function detectQwenManagedStart(buffer: string) {
   const wrapped = detectMarkers(buffer, [TOOL_CALL_START])
   const functionCalls = detectMarkers(buffer, [FUNCTION_CALLS_START])
+  const dialect = detectMarkers(buffer, [TOOL_CALLS_WRAPPER_START])
   const completeBare = findNextBareFunctionStart(buffer, 0)
   if (completeBare !== -1) {
     if (wrapped.markerStart === undefined || completeBare < wrapped.markerStart) {
@@ -952,7 +1035,7 @@ function detectQwenManagedStart(buffer: string) {
   }
 
   const partialBare = detectTrailingBareFunctionPrefix(buffer)
-  const allCandidates = [wrapped, functionCalls, partialBare].filter(
+  const allCandidates = [wrapped, functionCalls, dialect, partialBare].filter(
     (c2): c2 is NonNullable<typeof c2> => c2?.markerStart !== undefined
   )
   if (allCandidates.length === 0) return wrapped
@@ -1095,13 +1178,13 @@ function serializeHermesJson(value: unknown): string {
 }
 
 function escapeHermesJsonBoundaries(content: string): string {
-  return content.replace(/<\/?(?:tools|tool_call|tool_response)>/gi, boundary => (
+  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_response|tool_name)>/gi, boundary => (
     boundary.replace('<', '\\u003c').replace('>', '\\u003e')
   ))
 }
 
 function escapeHermesTextBoundaries(content: string): string {
-  return content.replace(/<\/?(?:tools|tool_call|tool_response)>/gi, boundary => (
+  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_response|tool_name)>/gi, boundary => (
     boundary.replace('<', '&lt;').replace('>', '&gt;')
   ))
 }

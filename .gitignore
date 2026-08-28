@@ -97,3 +97,18 @@ index.bundle.js
 /docker_data*.json
 /local_docker_accounts.json
 /remote_accounts.json
+
+# One-off local debug/patch scripts and captures (root level)
+/fix-semantic-*.cjs
+/patch*.cjs
+/probe-*.cjs
+/remove-hardcoded-*.cjs
+/replay-*.cjs
+/stress_*.cjs
+/stress-test-*.mjs
+/test-*.cjs
+.qwen-*
+/chat2api-patch-*.tgz
+
+# Local Codex helper scratch files
+.codex-*.txt

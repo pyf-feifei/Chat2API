@@ -33,9 +33,11 @@ import {
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
 
 const MANAGED_WORKFLOW_COMPLETION_PROMPT = [
-  'A final answer is protocol-valid only when it ends with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + '.',
+  'CRITICAL REQUIREMENT: Your final answer MUST end with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + '.',
+  'This marker is mandatory for protocol validation and cannot be omitted. A final answer without it will be rejected and trigger a continuation retry.',
   'Append this transport marker after the final answer even when the active user requests exact output or no extra prose; the proxy removes it before delivery.',
   'Never emit the completion marker in a progress update or alongside a tool call.',
+  'If you are unsure whether the request is complete, call the next appropriate tool rather than returning a final answer without the marker.',
 ].join(' ')
 
 // Deployment-tunable runtime rules. Defaults below; a non-empty env value
@@ -285,7 +287,7 @@ export class ToolCallingEngine {
       messages: injectPrompt(
         workflow.messages,
         renderedPrompt.content,
-        planWithWorkflow.protocol === 'qwen_hermes',
+        planWithWorkflow.protocol === 'qwen_hermes' || planWithWorkflow.protocol === 'qwen_native',
         renderedPrompt.documentPrompt,
       ),
       tools: undefined,
@@ -633,7 +635,7 @@ function renderPrompt(
   }
 
   const content = finishPrompt(getToolProtocol(plan.protocol).renderPrompt(plan.tools))
-  if (plan.protocol !== 'qwen_hermes') return { content }
+  if (plan.protocol !== 'qwen_hermes' && plan.protocol !== 'qwen_native') return { content }
 
   // Keep the complete, request-scoped tool contract in the inline control
   // message. Qwen document transport is intended for archived conversation

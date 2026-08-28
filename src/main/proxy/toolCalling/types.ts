@@ -6,6 +6,7 @@ export type ToolProtocolId =
   | 'managed_bracket'
   | 'managed_xml'
   | 'qwen_hermes'
+  | 'qwen_native'
   | 'anthropic_tool_use'
   | 'codex_responses'
   | 'm365_fenced'

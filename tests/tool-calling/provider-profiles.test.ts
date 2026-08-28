@@ -80,3 +80,23 @@ test('qwen-ai history uses matching Hermes call and result blocks', () => {
     '<tool_response>\nfile body\n</tool_response>',
   )
 })
+
+test('qwen-ai history formatters follow the managed-protocol knob per call', () => {
+  const previous = process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL
+  try {
+    delete process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL
+    const hermes = getProviderToolProfile('qwen-ai')
+    assert.equal(hermes.preferredManagedProtocol, 'qwen_hermes')
+    assert.match(hermes.formatAssistantToolCalls([{ id: 'c', name: 'shell', arguments: '{}' }]), /<tool_call>/)
+
+    process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL = 'qwen_native'
+    const native = getProviderToolProfile('qwen-ai')
+    assert.equal(native.preferredManagedProtocol, 'qwen_native')
+    const nativeHistory = native.formatAssistantToolCalls([{ id: 'c', name: 'shell', arguments: '{}' }])
+    assert.match(nativeHistory, /<function_calls>/)
+    assert.doesNotMatch(nativeHistory, /<tool_call>|<function=/)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL
+    else process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL = previous
+  }
+})

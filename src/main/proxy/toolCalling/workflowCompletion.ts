@@ -87,7 +87,7 @@ export function supportsManagedWorkflowCompletionMarker(
 ): boolean {
   return Boolean(
     plan?.shouldParseResponse
-    && plan.protocol === 'qwen_hermes'
+    && (plan.protocol === 'qwen_hermes' || plan.protocol === 'qwen_native')
     && plan.allowedToolNames.size > 0
   )
 }

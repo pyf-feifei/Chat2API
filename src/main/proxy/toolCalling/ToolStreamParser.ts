@@ -99,7 +99,7 @@ export class ToolStreamParser {
 
     // Hermes parallel calls are adjacent, individually delimited blocks. Wait
     // for stream completion so the first block does not suppress later calls.
-    if (this.plan.protocol === 'qwen_hermes') {
+    if (this.plan.protocol === 'qwen_hermes' || this.plan.protocol === 'qwen_native') {
       return chunks
     }
 
@@ -317,7 +317,7 @@ function parseFirstValidToolBlock(
   options: { allowPartial?: boolean } = {},
 ) {
   const parsed = parseBufferedToolCall(content, plan, options)
-  if (plan.protocol === 'qwen_hermes') {
+  if (plan.protocol === 'qwen_hermes' || plan.protocol === 'qwen_native') {
     return parsed
   }
   if (parsed.toolCalls.length === 0 || parsed.rawMatches.length <= 1) {
@@ -374,7 +374,7 @@ function hasProtocolMarker(buffer: string, plan: ToolCallingPlan): boolean {
 
 function mayBecomeValidToolCall(buffer: string, plan: ToolCallingPlan): boolean {
   void buffer
-  return plan.protocol === 'managed_xml' || plan.protocol === 'qwen_hermes' || plan.protocol === 'm365_fenced'
+  return plan.protocol === 'managed_xml' || plan.protocol === 'qwen_hermes' || plan.protocol === 'qwen_native' || plan.protocol === 'm365_fenced'
 }
 
 function fencedRanges(content: string): Array<{ start: number; end: number }> {

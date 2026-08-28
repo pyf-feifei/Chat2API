@@ -1,0 +1,297 @@
+﻿import type { ToolProtocolAdapter } from './base.ts'
+import type {
+  NormalizedToolDefinition,
+  NormalizedToolResult,
+  ToolParseContext,
+  ToolParseResult,
+} from '../types.ts'
+import {
+  buildToolCall,
+  createParseResult,
+  decodeXml,
+  detectMarkers,
+  escapeXmlAttribute,
+  hasToolArgumentValidationIssues,
+  parseJsonValue,
+  stripFencedCodeBlocks,
+  toolNames,
+} from './shared.ts'
+import {
+  renderQwenNativeFunctionCallsPrompt,
+  renderQwenNativeRecoveryPrompt,
+} from './qwenNativePrompt.ts'
+
+const QWEN_NATIVE_PROTOCOL_ID = 'qwen_native' as const
+
+const FUNCTION_CALLS_START = '<function_calls>'
+const FUNCTION_CALLS_END = '</function_calls>'
+const INVOKE_OPEN_TAG = '<invoke '
+const INVOKE_END = '</invoke>'
+// The full attribute prefix keeps the name extraction between the quotes;
+// matching only '<parameter' would capture ' name=' as the parameter name.
+const PARAMETER_OPEN_TAG = '<parameter name="'
+const PARAMETER_CLOSE_TAG = '</parameter>'
+const TOOL_RESPONSE_START = '<tool_response>'
+const TOOL_RESPONSE_END = '</tool_response>'
+
+export const qwenNativeProtocol: ToolProtocolAdapter = {
+  id: QWEN_NATIVE_PROTOCOL_ID,
+
+  renderPrompt(tools) {
+    return renderQwenNativeFunctionCallsPrompt(tools)
+  },
+
+  renderRecoveryPrompt(tools) {
+    return renderQwenNativeRecoveryPrompt(tools)
+  },
+
+  detectStart(buffer) {
+    return detectMarkers(buffer, [FUNCTION_CALLS_START])
+  },
+
+  parse(content: string, context: ToolParseContext): ToolParseResult {
+    const parsable = stripFencedCodeBlocks(content)
+    const allowedNames = toolNames(context.tools)
+    const toolDefinitions = new Map(context.tools.map((tool) => [tool.name, tool]))
+    const rawMatches: string[] = []
+    const invalidToolNames: string[] = []
+    const toolCalls: ReturnType<typeof buildToolCall>[] = []
+    let malformedReason: string | undefined
+    let searchIndex = 0
+
+    while (searchIndex < parsable.length) {
+      const callStart = parsable.indexOf(FUNCTION_CALLS_START, searchIndex)
+      if (callStart === -1) break
+
+      const parsed = parseFunctionCallsBlock(parsable, callStart, toolDefinitions)
+      if (!parsed) {
+        if (context.allowPartial) {
+          rawMatches.push(parsable.slice(callStart))
+          malformedReason ??= 'qwen_native_function_calls_incomplete'
+        }
+        break
+      }
+
+      rawMatches.push(parsed.rawText)
+      searchIndex = parsed.end
+
+      if (parsed.malformedReason) {
+        malformedReason ??= parsed.malformedReason
+        continue
+      }
+
+      const envelopes = parsed.envelopes
+      if (envelopes.length === 0) {
+        malformedReason ??= 'qwen_native_invalid_invoke'
+        continue
+      }
+
+      for (const envelope of envelopes) {
+        if (!allowedNames.has(envelope.name)) {
+          invalidToolNames.push(envelope.name)
+          continue
+        }
+
+        const tool = toolDefinitions.get(envelope.name)
+        if (hasToolArgumentValidationIssues(envelope.arguments, tool)) {
+          malformedReason ??= 'qwen_native_schema_validation_failed'
+          continue
+        }
+
+        toolCalls.push(
+          buildToolCall(
+            `call_${toolCalls.length}`,
+            toolCalls.length,
+            envelope.name,
+            envelope.arguments,
+            parsed.rawText,
+            tool,
+          ),
+        )
+      }
+    }
+
+    if (rawMatches.length === 0) {
+      return createParseResult({
+        content,
+        toolCalls,
+        protocol: 'unknown',
+        rawMatches,
+        invalidToolNames,
+        malformedReason,
+      })
+    }
+
+    const cleanContent = rawMatches
+      .reduce((current, raw) => current.replace(raw, ''), parsable)
+      .trim()
+    const atomicToolCalls = malformedReason || invalidToolNames.length > 0
+      ? []
+      : toolCalls
+
+    return createParseResult({
+      content: cleanContent,
+      toolCalls: atomicToolCalls,
+      protocol: QWEN_NATIVE_PROTOCOL_ID,
+      rawMatches,
+      invalidToolNames,
+      malformedReason,
+    })
+  },
+
+  formatAssistantToolCalls(calls) {
+    return calls
+      .map((call) => formatNativeInvoke(call.name, parseHistoryArgs(call.arguments)))
+      .join('\n')
+  },
+
+  formatToolResult(result) {
+    return formatNativeToolResponse(result)
+  },
+}
+
+function parseFunctionCallsBlock(
+  content: string,
+  blockStart: number,
+  toolDefinitions: Map<string, NormalizedToolDefinition>,
+): { end: number; rawText: string; envelopes: Array<{ name: string; arguments: Record<string, unknown> }>; malformedReason?: string } | undefined {
+  const innerStart = blockStart + FUNCTION_CALLS_START.length
+  const endTag = content.indexOf(FUNCTION_CALLS_END, innerStart)
+  if (endTag === -1) return undefined
+
+  const blockBody = content.slice(innerStart, endTag)
+  const end = endTag + FUNCTION_CALLS_END.length
+  const envelopes: Array<{ name: string; arguments: Record<string, unknown> }> = []
+  let invokeSearchIndex = 0
+
+  while (invokeSearchIndex < blockBody.length) {
+    const invokeIdx = blockBody.indexOf(INVOKE_OPEN_TAG, invokeSearchIndex)
+    if (invokeIdx === -1) break
+
+    const nameQuote1 = blockBody.indexOf('"', invokeIdx + INVOKE_OPEN_TAG.length)
+    if (nameQuote1 === -1) break
+    const nameQuote2 = blockBody.indexOf('"', nameQuote1 + 1)
+    if (nameQuote2 === -1) break
+    const name = decodeXml(blockBody.slice(nameQuote1 + 1, nameQuote2))
+
+    const invokeBodyStart = blockBody.indexOf('>', nameQuote2 + 1)
+    if (invokeBodyStart === -1) break
+
+    const invokeEndIdx = blockBody.indexOf(INVOKE_END, invokeBodyStart + 1)
+    if (invokeEndIdx === -1) break
+
+    const invokeBody = blockBody.slice(invokeBodyStart + 1, invokeEndIdx)
+    const args: Record<string, unknown> = {}
+    let paramSearchIdx = 0
+
+    while (paramSearchIdx < invokeBody.length) {
+      const paramOpenMatch = invokeBody.indexOf(PARAMETER_OPEN_TAG, paramSearchIdx)
+      if (paramOpenMatch === -1) break
+
+      const paramNameEndQuote = invokeBody.indexOf('"', paramOpenMatch + PARAMETER_OPEN_TAG.length)
+      if (paramNameEndQuote === -1) break
+      const paramName = decodeXml(invokeBody.slice(paramOpenMatch + PARAMETER_OPEN_TAG.length, paramNameEndQuote))
+
+      const paramValueStart = invokeBody.indexOf('>', paramNameEndQuote + 1)
+      if (paramValueStart === -1) break
+
+      const paramValueEnd = invokeBody.indexOf(PARAMETER_CLOSE_TAG, paramValueStart + 1)
+      let paramValue: string
+      if (paramValueEnd !== -1) {
+        paramValue = invokeBody.slice(paramValueStart + 1, paramValueEnd).trim()
+        paramSearchIdx = paramValueEnd + PARAMETER_CLOSE_TAG.length
+      } else {
+        paramValue = invokeBody.slice(paramValueStart + 1).trim()
+        paramSearchIdx = invokeBody.length
+      }
+
+      // Schema-aware decode keeps string-typed values verbatim (a value like
+      // 007 or {"a":1} stays a string) exactly like the Hermes parser.
+      const parameterSchema = nativeParameterSchema(toolDefinitions.get(name), paramName)
+      args[paramName] = schemaAcceptsNativeRawString(parameterSchema)
+        ? decodeXml(paramValue)
+        : parseJsonValue(paramValue)
+    }
+
+    envelopes.push({ name, arguments: args })
+    invokeSearchIndex = invokeEndIdx + INVOKE_END.length
+  }
+
+  return {
+    end,
+    rawText: content.slice(blockStart, end),
+    envelopes,
+  }
+}
+
+function parseHistoryArgs(argumentsJson: string): unknown {
+  const trimmed = argumentsJson.trim()
+  if (!trimmed) return {}
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return argumentsJson
+  }
+}
+
+function nativeParameterSchema(
+  tool: NormalizedToolDefinition | undefined,
+  parameterName: string,
+): unknown {
+  if (!isObjectRecord(tool?.parameters)) return undefined
+  const properties = tool.parameters.properties
+  return isObjectRecord(properties) ? properties[parameterName] : undefined
+}
+
+function schemaAcceptsNativeRawString(schema: unknown): boolean {
+  if (!isObjectRecord(schema)) return false
+  if (schema.type === 'string') return true
+  if (Array.isArray(schema.type) && schema.type.includes('string')) return true
+  if (typeof schema.const === 'string') return true
+  if (Array.isArray(schema.enum) && schema.enum.some(value => typeof value === 'string')) return true
+  return ['anyOf', 'oneOf'].some((key) => (
+    Array.isArray(schema[key]) && schema[key].some(schemaAcceptsNativeRawString)
+  ))
+}
+
+function formatNativeInvoke(name: string, args: unknown): string {
+  const parameters = isObjectRecord(args)
+    ? Object.entries(args).map(([parameterName, value]) => [
+        `<parameter name="${escapeXmlAttribute(parameterName)}">`,
+        serializeNativeParameterValue(value),
+        PARAMETER_CLOSE_TAG,
+      ].join('\n'))
+    : []
+
+  return [
+    FUNCTION_CALLS_START,
+    `<invoke name="${escapeXmlAttribute(name)}">`,
+    ...parameters,
+    INVOKE_END,
+    FUNCTION_CALLS_END,
+  ].join('\n')
+}
+
+function serializeNativeParameterValue(value: unknown): string {
+  if (value !== null && typeof value === 'object') {
+    return JSON.stringify(value)
+      .replace(/</g, '\\u003c')
+      .replace(/>/g, '\\u003e')
+  }
+  return escapeXmlAttribute(String(value))
+}
+
+function formatNativeToolResponse(result: NormalizedToolResult): string {
+  const statusLine = result.isError ? 'status: error\n' : ''
+  return `${TOOL_RESPONSE_START}\n${statusLine}${escapeNativeTextBoundaries(result.content)}\n${TOOL_RESPONSE_END}`
+}
+
+function escapeNativeTextBoundaries(content: string): string {
+  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_name|tool_response|function_calls|invoke|parameter)>/gi, boundary => (
+    boundary.replace('<', '&lt;').replace('>', '&gt;')
+  ))
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
