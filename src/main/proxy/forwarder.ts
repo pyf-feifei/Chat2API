@@ -59,6 +59,7 @@ import {
 } from './qwenAiRequestGovernor'
 import { BufferedSseError, bufferValidatedSseStream } from './utils/validatedSseStream'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from './utils/errors'
+import { markAccountErrorIfPermanent } from './accountStatus'
 import { sessionManager } from './sessionManager'
 import {
   createContextManagementService,
@@ -2162,6 +2163,16 @@ export class RequestForwarder {
                 return
               } catch (retryError) {
                 console.error('[M365Copilot] ChatHub stream retry error:', retryError)
+                markAccountErrorIfPermanent(
+                  {
+                    success: false,
+                    status: 401,
+                    error:
+                      retryError instanceof Error ? retryError.message : String(retryError),
+                  },
+                  account.id,
+                  provider.id,
+                )
                 finishStream()
                 return
               }

@@ -1,4 +1,5 @@
 import type { AccountSelection, ForwardResult } from './types'
+import { markAccountErrorIfPermanent } from './accountStatus'
 
 export interface AccountFailoverAttempt {
   selection: AccountSelection
@@ -69,6 +70,7 @@ export async function forwardWithAccountFailover(
   while (true) {
     const attempt = { selection, attempt: failoverCount + 1 }
     const result = await options.forward(attempt)
+    markAccountErrorIfPermanent(result, selection.account.id, selection.provider.id)
 
     if (
       !isNextAccountFailoverEligible(result, options.signal)
