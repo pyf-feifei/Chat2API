@@ -52,6 +52,13 @@ export class M365Adapter {
 
   validateAccount(): { valid: boolean; error?: string } {
     const creds = this.getCredentials()
+    const encrypted = [creds.refreshToken, creds.accessToken].filter(Boolean) as string[]
+    if (encrypted.some((value) => value.startsWith('c2a:v1:'))) {
+      return {
+        valid: false,
+        error: 'Credentials are still encrypted: CHAT2API_STORAGE_ENCRYPTION_KEY is not set',
+      }
+    }
     if (creds.refreshToken) {
       return { valid: true }
     }
@@ -109,6 +116,15 @@ export class M365Adapter {
     const latestRefreshToken = this.getCredentials().refreshToken
     if (latestRefreshToken && latestRefreshToken !== refreshToken) {
       refreshToken = latestRefreshToken
+    }
+
+    // Ciphertext leaking through means the storage encryption key is missing
+    // (decryption is a no-op pass-through); sending it to Microsoft yields a
+    // misleading AADSTS9002313 that looks like a revoked token.
+    if (refreshToken.startsWith('c2a:v1:')) {
+      throw new Error(
+        'M365 credentials are still encrypted: CHAT2API_STORAGE_ENCRYPTION_KEY is not set in this environment'
+      )
     }
 
     let refreshPromise = refreshPromiseMap.get(refreshToken)
