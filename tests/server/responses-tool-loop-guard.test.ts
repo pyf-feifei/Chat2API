@@ -69,3 +69,41 @@ test('Responses tool loop guard does not ignore client-defined names by default'
   ]
   assert.equal(detectResponsesToolLoop(polling)?.toolName, 'wait')
 })
+
+test('first detection requests correction; a corrected loop escalates', async () => {
+  const { responsesToolLoopCorrectionMessage, RESPONSES_TOOL_LOOP_CORRECTION_TAG } = await import('../../src/main/proxy/responses/toolLoopGuard.ts')
+
+  const loop: ChatMessage[] = [
+    { role: 'user', content: 'run the pipeline' },
+    ...completedCall(1, 'update_plan', '{"plan":[]}', 'Plan updated'),
+    ...completedCall(2, 'update_plan', '{"plan":[]}', 'Plan updated'),
+    ...completedCall(3, 'update_plan', '{"plan":[]}', 'Plan updated'),
+  ]
+  const first = detectResponsesToolLoop(loop)
+  assert.equal(first?.toolName, 'update_plan')
+  assert.equal(first?.correctionAlreadyIssued, false)
+
+  // The injected correction names the loop and the exact fingerprint.
+  const correctionText = responsesToolLoopCorrectionMessage(first!)
+  assert.match(correctionText, /update_plan/)
+  assert.match(correctionText, new RegExp(RESPONSES_TOOL_LOOP_CORRECTION_TAG.replace(/[[\]]/g, '\\$&')))
+
+  // After the correction enters history and the loop STILL repeats, the next
+  // detection reports the correction as already issued.
+  const persisted: ChatMessage[] = [
+    ...loop,
+    { role: 'user', content: correctionText },
+    ...completedCall(4, 'update_plan', '{"plan":[]}', 'Plan updated'),
+  ]
+  const second = detectResponsesToolLoop(persisted)
+  assert.equal(second?.toolName, 'update_plan')
+  assert.equal(second?.correctionAlreadyIssued, true)
+
+  // A correction for a DIFFERENT loop fingerprint must not suppress this one.
+  const other = detectResponsesToolLoop([
+    ...loop,
+    { role: 'user', content: `${RESPONSES_TOOL_LOOP_CORRECTION_TAG} 0000000000000000]` },
+  ])
+  assert.equal(other?.correctionAlreadyIssued, false)
+})
+

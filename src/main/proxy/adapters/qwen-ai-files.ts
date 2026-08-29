@@ -208,6 +208,13 @@ export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperati
    * inline next to the active turn (the verified default layout).
    */
   toolProtocolChannel?: QwenAiToolProtocolChannel
+  /**
+   * Client-declared managed tool names. On document transport the tool
+   * contract otherwise rides only the system_message field; at very large
+   * contexts the model occasionally denies the tools exist. These names feed
+   * an inline attestation sentence that corroborates the field.
+   */
+  declaredToolNames?: string[]
 }
 
 export interface QwenAiFileUploadPartOptions extends QwenAiFileOperationOptions {
@@ -2825,6 +2832,22 @@ function qwenAiCompleteManagedTranscriptDocumentInstruction(filename: string, ta
 }
 
 /**
+ * Inline tool attestation for document transport: names the client-declared
+ * tools in the inline turn itself so the system_message contract is
+ * corroborated where the model is reading. Env-overridable with {tools}
+ * substitution; the sentinel "off" removes the sentence.
+ */
+function qwenAiDocumentToolAttestationFromEnv(toolNames: string[]): string {
+  const names = toolNames.filter(Boolean)
+  if (names.length === 0) return ''
+  const raw = (process.env.CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION ?? '').trim()
+  const template = !raw
+    ? 'The client has declared these managed tools for this request, and they are available now: {tools}. Call them directly when the task requires; do not deny their availability.'
+    : (raw.toLowerCase() === 'off' ? '' : raw)
+  return template.replaceAll('{tools}', names.join(', '))
+}
+
+/**
  * Byte-tail excerpt of the archived transcript kept inline on the active turn
  * in complete managed document mode, so the pending task (the transcript's
  * final events) is visible without a file read. The end is byte-exact (the
@@ -2950,6 +2973,12 @@ export async function prepareQwenAiMultimodalMessage(
                 transcriptDocument.filename || 'the attached transcript',
               ),
         )
+        // Corroborate the system_message tool contract inline: at very large
+        // contexts the model occasionally denies declared tools exist.
+        const attestation = qwenAiDocumentToolAttestationFromEnv(options.declaredToolNames ?? [])
+        if (attestation) {
+          inlineInstructions.push(attestation)
+        }
       }
       return {
         documents,

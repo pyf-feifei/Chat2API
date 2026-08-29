@@ -31,7 +31,7 @@ import {
 } from '../responses/compat'
 import { responsesConversationStore } from '../responses/store'
 import { responsesSessionLock } from '../responses/sessionLock'
-import { detectResponsesToolLoop } from '../responses/toolLoopGuard'
+import { detectResponsesToolLoop, responsesToolLoopCorrectionMessage } from '../responses/toolLoopGuard'
 import { createResponsesStreamTransform } from '../responses/stream'
 import { classifyChatRequest } from '../requestIntent'
 import { estimateQwenAiRequestInputTokens } from '../qwenAiCompactionBoundary'
@@ -370,7 +370,31 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   const toolLoop = requestIntent.intent === 'normal'
     ? detectResponsesToolLoop(chatRequest.messages)
     : undefined
-  if (toolLoop) {
+  if (toolLoop && !toolLoop.correctionAlreadyIssued) {
+    // First detection: guide instead of killing the turn. A repeated
+    // identical call with an identical result is a stalled model, not a bad
+    // request — inject a corrective note into this turn's delta so the model
+    // is told to switch tools or finish, and let the request proceed. The
+    // note persists in the stored transcript; if the loop continues past it,
+    // the next detection escalates to the 422 below.
+    const correction = {
+      role: 'user' as const,
+      content: responsesToolLoopCorrectionMessage(toolLoop),
+    }
+    chatRequest.messages = [...chatRequest.messages, correction]
+    translated.conversationMessages.push(correction)
+    storeManager.addLog('warn', 'Responses tool-call loop detected; injected corrective turn instead of failing', {
+      requestId: responseId,
+      model: chatRequest.model,
+      errorCode: 'repeated_tool_call_loop',
+      data: toolLoop,
+    })
+    console.info('[Responses] tool-loop correction injected', JSON.stringify({
+      requestId: responseId,
+      toolName: toolLoop.toolName,
+      repeatCount: toolLoop.repeatCount,
+    }))
+  } else if (toolLoop) {
     abort.cleanup()
     storeManager.addLog('warn', 'Stopped a Responses tool-call loop with no observable progress', {
       requestId: responseId,

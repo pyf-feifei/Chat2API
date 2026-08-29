@@ -64,3 +64,60 @@ export function isProgressStyleManagedAnswer(trimmedContent: string): boolean {
   const firstParagraph = trimmedContent.split('\n\n')[0]
   return regex.test(firstParagraph)
 }
+
+// Capability-denial detection: at very large contexts the model occasionally
+// answers that a client-declared tool "is not available" / "cannot be
+// accessed" (or announces it is fetching data through some other channel)
+// even though the managed contract just declared the tool. Such an answer
+// neither calls the tool nor completes the workflow, so it is a dangling
+// stall. Unlike intent openers, denial phrasing can sit mid-sentence, so the
+// patterns test the first paragraph UNANCHORED. Patterns are
+// deployment-tunable via CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS ("|" separated
+// regex sources, case-insensitive, tested against the first paragraph; "off"
+// disables detection entirely).
+const MANAGED_TOOL_DENIAL_DEFAULT_PATTERN_SOURCES = [
+  "i do not (?:have|currently have) access to",
+  "(?:do(?:es)? not|don't|doesn't|cannot|can't|unable to) (?:use|invoke|call|access) (?:the|any|this|your) (?:tool|function)",
+  "not (?:currently )?available in my (?:current )?(?:toolset|tool set|set of tools|environment)",
+  "no (?:such )?tool (?:is )?(?:available|defined|declared|registered)",
+  "tool (?:is )?not (?:available|accessible|defined|declared)",
+  "tool (?:call was )?(?:skipped|omitted|dropped) because",
+  "我(?:没有|无法|不能)(?:访问|调用|使用)(?:该|这个|任何)?工具",
+  "工具(?:不可用|不存在|无法访问)",
+  'i am (?:currently )?(?:retrieving|fetching|consulting)',
+  '正在(?:检索|获取|查询)实时',
+].join('|')
+
+let cachedToolDenialRegex: { sources: string; regex: RegExp } | undefined
+
+export function managedToolDenialRegex(): RegExp | undefined {
+  const raw = String(process.env.CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS ?? '').trim()
+  if (raw.toLowerCase() === 'off') return undefined
+  const sources = raw || MANAGED_TOOL_DENIAL_DEFAULT_PATTERN_SOURCES
+  if (cachedToolDenialRegex?.sources === sources) {
+    return cachedToolDenialRegex.regex
+  }
+  let regex: RegExp
+  try {
+    regex = new RegExp(sources, 'i')
+  } catch {
+    console.warn('[QwenAI] Invalid CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS regex, falling back to defaults')
+    regex = new RegExp(MANAGED_TOOL_DENIAL_DEFAULT_PATTERN_SOURCES, 'i')
+  }
+  cachedToolDenialRegex = { sources, regex }
+  return regex
+}
+
+/**
+ * A capability-denial answer claims the declared tools are unavailable (or
+ * that data is being fetched some other way) without a tool call. Length cap
+ * mirrors the progress-intent cap: substantive answers that actually complete
+ * the request are longer and stay deliverable.
+ */
+export function isToolDenialManagedAnswer(trimmedContent: string): boolean {
+  if (!trimmedContent || trimmedContent.length > MANAGED_PROGRESS_INTENT_MAX_CODE_POINTS) return false
+  const regex = managedToolDenialRegex()
+  if (!regex) return false
+  const firstParagraph = trimmedContent.split('\n\n')[0]
+  return regex.test(firstParagraph)
+}

@@ -11,6 +11,12 @@ export interface ResponsesToolLoopDetection {
   toolName: string
   repeatCount: number
   fingerprint: string
+  /**
+   * A corrective turn for this exact loop was already injected into the
+   * conversation and the loop still continued. The route escalates to a
+   * terminal error only then; the first detection gets the correction instead.
+   */
+  correctionAlreadyIssued: boolean
 }
 
 interface PendingToolCall {
@@ -102,6 +108,10 @@ export function detectResponsesToolLoop(
 
   for (const message of messages) {
     if (message.role === 'user' && hasMeaningfulText(message)) {
+      // The corrective turn is itself a user message; it must not reset loop
+      // tracking, or a persisted correction would make the same loop look
+      // fresh on the next request.
+      if (isCorrectionMessage(message)) continue
       pending.clear()
       completed = []
       continue
@@ -142,5 +152,47 @@ export function detectResponsesToolLoop(
     toolName: latest.name,
     repeatCount,
     fingerprint: latest.fingerprint.slice(0, 16),
+    correctionAlreadyIssued: correctionWasIssuedFor(messages, latest.fingerprint),
   }
+}
+
+/**
+ * Stable transport tag for the corrective turn the route injects after a
+ * first loop detection. It carries the loop fingerprint so a later pass can
+ * tell "this loop was already corrected once" from the history alone. The tag
+ * is protocol text, never client vocabulary.
+ */
+export const RESPONSES_TOOL_LOOP_CORRECTION_TAG = '[chat2api_tool_loop_correction'
+export function responsesToolLoopCorrectionMessage(
+  detection: Pick<ResponsesToolLoopDetection, 'toolName' | 'repeatCount' | 'fingerprint'>,
+): string {
+  return [
+    `${RESPONSES_TOOL_LOOP_CORRECTION_TAG} ${detection.fingerprint}]`,
+    `The tool call ${detection.toolName} has now returned the identical unchanged result ${detection.repeatCount} times in a row — repeating it again produces no new information.`,
+    'Do not emit that same call again. Instead, either invoke a DIFFERENT declared tool that makes real progress on the user request, or, if the request is actually finished, return the final answer now (ending with the required completion marker where the workflow contract demands it).',
+  ].join(' ')
+}
+
+function correctionWasIssuedFor(
+  messages: readonly ChatMessage[],
+  fingerprint: string,
+): boolean {
+  const needle = `${RESPONSES_TOOL_LOOP_CORRECTION_TAG} ${fingerprint.slice(0, 16)}]`
+  return messages.some((message) => {
+    if (message.role !== 'user' && message.role !== 'system') return false
+    if (typeof message.content === 'string') return message.content.includes(needle)
+    if (!Array.isArray(message.content)) return false
+    return message.content.some(part => (
+      part?.type === 'text' && typeof part.text === 'string' && part.text.includes(needle)
+    ))
+  })
+}
+
+function isCorrectionMessage(message: ChatMessage): boolean {
+  if (message.role !== 'user') return false
+  if (typeof message.content === 'string') return message.content.includes(RESPONSES_TOOL_LOOP_CORRECTION_TAG)
+  if (!Array.isArray(message.content)) return false
+  return message.content.some(part => (
+    part?.type === 'text' && typeof part.text === 'string' && part.text.includes(RESPONSES_TOOL_LOOP_CORRECTION_TAG)
+  ))
 }

@@ -9768,3 +9768,89 @@ test('Qwen AI thinking-only cap is cancelled when an answer starts', async () =>
   assert.equal(failure, undefined)
   assert.match(body, /final answer text/)
 })
+
+test('Qwen AI thinking-only cap resets on substantive thinking progress', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 5_000,
+    idleTimeoutMs: 10_000,
+    thinkingOnlyMaxMs: 100,
+    // Substantive deep thinking (digesting a large transcript) crosses the
+    // threshold repeatedly; bounded resets must keep the stream alive.
+    thinkingOnlyProgressCodePoints: 40,
+    thinkingOnlyProgressMaxResets: 8,
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  // Trickle that stays under the progress threshold: tiny deltas only.
+  const trickle = setInterval(() => {
+    upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'think',
+      status: 'typing',
+      content: 'x',
+    } }] })}\n\n`)
+  }, 30)
+
+  try {
+    // Outlive several base windows WITHOUT substantive progress: must expire.
+    await ended
+  } finally {
+    clearInterval(trickle)
+  }
+
+  assert.notEqual(failure, undefined)
+  assert.equal(failure.code, 'qwen_ai_semantic_empty')
+  upstream.destroy()
+})
+
+test('Qwen AI thinking-only cap survives substantive thinking then delivers the answer', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 10_000,
+    idleTimeoutMs: 10_000,
+    thinkingOnlyMaxMs: 120,
+    thinkingOnlyProgressCodePoints: 50,
+    thinkingOnlyProgressMaxResets: 8,
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  // Substantive thinking across MULTIPLE base windows (> 2 x capMs total)
+  // while crossing the progress threshold: windows keep resetting.
+  const deepThink = setInterval(() => {
+    upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'think',
+      status: 'typing',
+      content: 'analyzing the archived transcript section by section ',
+    } }] })}\n\n`)
+  }, 30)
+
+  await new Promise(resolve => setTimeout(resolve, 400))
+  clearInterval(deepThink)
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'typing',
+    content: 'the analyzed answer',
+  } }] })}\n\n`)
+  upstream.end('data: [DONE]\n\n')
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure, undefined, 'substantive thinking must not be culled as a runaway')
+  assert.match(body, /the analyzed answer/)
+})

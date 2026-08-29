@@ -5,7 +5,7 @@
  */
 
 import axios, { AxiosResponse } from 'axios'
-import { isProgressStyleManagedAnswer } from './qwenAiProgressIntent.ts'
+import { isProgressStyleManagedAnswer, isToolDenialManagedAnswer } from './qwenAiProgressIntent.ts'
 import { PassThrough } from 'stream'
 import { performance } from 'node:perf_hooks'
 import { createParser } from 'eventsource-parser'
@@ -81,6 +81,20 @@ const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDL
 // content, tool fragment, or image; expiry triggers semantic recovery (a
 // fresh managed-workflow continuation), not a hard failure. Zero disables.
 const QWEN_AI_THINKING_ONLY_MAX_MS = nonNegativeNumberFromEnv('CHAT2API_QWEN_AI_THINKING_ONLY_MAX_MS', 120000)
+// Substantive thinking (e.g. digesting a large archived transcript) can
+// legitimately exceed the base wall clock. The cap is PROGRESS-AWARE: each
+// time fresh thinking output accumulates this many code points, the window
+// resets, so only a near-silent trickle ever expires. The number of resets is
+// itself bounded so a runaway generator still terminates within
+// resets × capMs; zero makes the base cap a hard single window again.
+const QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS = positiveNumberFromEnv(
+  'CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS',
+  600,
+)
+const QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS = positiveNumberFromEnv(
+  'CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS',
+  8,
+)
 const QWEN_AI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
 const QWEN_AI_MANAGED_BRANCH_MAX_BYTES = positiveNumberFromEnv(
   'CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES',
@@ -178,6 +192,14 @@ type StreamHandlingOptions = {
    * Overrides CHAT2API_QWEN_AI_THINKING_ONLY_MAX_MS; zero disables.
    */
   thinkingOnlyMaxMs?: number
+  /**
+   * Progress-aware reset threshold (code points of fresh thinking output)
+   * for the thinking-only wall clock; each threshold crossing buys a new
+   * window, up to thinkingOnlyProgressMaxResets. Override the env defaults
+   * for tests; zero restores a hard single window.
+   */
+  thinkingOnlyProgressCodePoints?: number
+  thinkingOnlyProgressMaxResets?: number
   /** Withhold managed-tool frames until the response branch passes validation. */
   bufferManagedBranch?: boolean
   /** Accept a provider response that contains only thinking/summary text. */
@@ -2536,6 +2558,21 @@ function isDanglingManagedToolAnswer(
   // contract.
   const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
   if (!midWorkflow) {
+    // Capability denial is dangling in EVERY state: the managed contract just
+    // declared these tools, so claiming they are unavailable (or announcing a
+    // retrieval through an undeclared channel) without a tool call is a stall
+    // even on a first auto turn (observed at ~232k-token document transport:
+    // "I do not have access to the get_weather tool" + web search answer).
+    if (isToolDenialManagedAnswer(trimmedContent)) {
+      console.info('[QwenAI] Capability-denial answer without tool call triggers continuation', JSON.stringify({
+        requestId: plan.diagnostics?.requestId,
+        contentLength: trimmedContent.length,
+        protocol: plan.protocol,
+        workflowContinuation: plan.workflowContinuation,
+        toolChoiceMode: plan.toolChoiceMode,
+      }))
+      return true
+    }
     if (plan.toolChoiceMode === 'auto') {
       return false
     }
@@ -4053,6 +4090,9 @@ export class QwenAiAdapter {
           systemPromptMode,
           nativeSystemPromptMaxBytes,
           toolProtocolChannel,
+          declaredToolNames: request.managedToolCalling
+            ? (this.toolCallingPlan?.tools ?? []).map(tool => tool.name)
+            : [],
           signal: scope.signal,
           deadlineAt: request.deadlineAt,
         })
@@ -4357,6 +4397,9 @@ export class QwenAiAdapter {
           systemPromptMode: qwenAiSystemPromptModeFromEnv(),
           nativeSystemPromptMaxBytes: qwenAiNativeSystemMaxBytesFromEnv(),
           toolProtocolChannel: qwenAiToolProtocolChannelFromEnv(),
+          declaredToolNames: request.managedToolCalling
+            ? (this.toolCallingPlan?.tools ?? []).map(tool => tool.name)
+            : [],
           signal: request.signal,
           deadlineAt: request.deadlineAt,
         },
@@ -5263,6 +5306,11 @@ export class QwenAiStreamHandler {
     // recovery (a fresh managed-workflow continuation branch) instead of a
     // ten-minute wait that ends reasoning-only.
     let thinkingOnlyTimer: NodeJS.Timeout | undefined
+    // Progress-aware thinking-only wall-clock bookkeeping (see
+    // armThinkingOnlyTimer): code-point watermark of fresh thinking output and
+    // how many wall-clock windows substantive progress has purchased.
+    let thinkingOnlyProgressResets = 0
+    let thinkingOnlyProgressMark = 0
     let abortListenerAttached = false
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
@@ -5333,6 +5381,8 @@ export class QwenAiStreamHandler {
       deliveredAnswerText = ''
       sawUpstreamCompletion = false
       cancelThinkingOnlyTimer()
+      thinkingOnlyProgressResets = 0
+      thinkingOnlyProgressMark = 0
       idleRecoveryInFlight = false
       semanticRecoveryInFlight = false
       discardManagedBranchFrames()
@@ -5527,11 +5577,12 @@ export class QwenAiStreamHandler {
       thinkingOnlyTimer = undefined
     }
 
-    const handleThinkingOnlyExpired = (capMs: number) => {
+    const handleThinkingOnlyExpired = (capMs: number, progressResets: number) => {
       if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight || transientRecoveryInFlight) return
       thinkingOnlyTimer = undefined
       console.warn('[QwenAI] Thinking-only phase exceeded its wall clock; recovering', JSON.stringify({
         maxMs: capMs,
+        progressResets,
         reasoningChars: reasoningText.length,
         summaryChars: summaryText.length,
         upstreamEventCount,
@@ -5542,10 +5593,38 @@ export class QwenAiStreamHandler {
       recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
     }
 
+    // Progress-aware wall clock: armed at the first reasoning/summary output
+    // and reset each time substantive thinking accumulates, so legitimate deep
+    // thinking (digesting a large archived transcript) is not mistaken for a
+    // near-silent runaway trickle. Resets are bounded so a runaway generator
+    // still terminates.
     const armThinkingOnlyTimer = () => {
       const capMs = options.thinkingOnlyMaxMs ?? QWEN_AI_THINKING_ONLY_MAX_MS
-      if (capMs <= 0 || thinkingOnlyTimer || finalChunkSent) return
-      thinkingOnlyTimer = setTimeout(() => handleThinkingOnlyExpired(capMs), capMs)
+      const progressCodePoints = options.thinkingOnlyProgressCodePoints ?? QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS
+      const maxResets = options.thinkingOnlyProgressMaxResets ?? QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS
+      if (capMs <= 0 || finalChunkSent) return
+      const thinkingCodePoints = reasoningText.length + summaryText.length
+      if (!thinkingOnlyTimer) {
+        thinkingOnlyProgressMark = thinkingCodePoints
+        thinkingOnlyTimer = setTimeout(
+          () => handleThinkingOnlyExpired(capMs, thinkingOnlyProgressResets),
+          capMs,
+        )
+        return
+      }
+      if (
+        progressCodePoints > 0
+        && thinkingCodePoints - thinkingOnlyProgressMark >= progressCodePoints
+        && thinkingOnlyProgressResets < maxResets
+      ) {
+        thinkingOnlyProgressResets += 1
+        thinkingOnlyProgressMark = thinkingCodePoints
+        clearTimeout(thinkingOnlyTimer)
+        thinkingOnlyTimer = setTimeout(
+          () => handleThinkingOnlyExpired(capMs, thinkingOnlyProgressResets),
+          capMs,
+        )
+      }
     }
 
     const writeVisibleSse = (

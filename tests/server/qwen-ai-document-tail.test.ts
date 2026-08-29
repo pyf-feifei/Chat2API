@@ -239,3 +239,70 @@ test('complete-mode tail includes the final tool result on workflow-continuation
     assert.match(archived, /FINAL_TOOL_RESULT_SENTINEL_8e07/)
   })
 })
+
+test('document transport attests declared tool names inline', async () => {
+  await withEnv({
+    CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES: '0',
+    CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION: undefined,
+  }, async () => {
+    const uploader = createStubUploader()
+    const prepared = await prepareQwenAiMultimodalMessage(
+      [{ role: 'user', content: buildSingleMessageCorpus() }],
+      uploader as never,
+      {
+        transport: 'document',
+        managedToolCalling: true,
+        requestMaxBytes: 90 * 1024,
+        declaredToolNames: ['get_weather', 'read_file'],
+      },
+    )
+    assert.match(prepared.content, /declared these managed tools for this request, and they are available now: get_weather, read_file/)
+  })
+
+  await withEnv({
+    CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES: '0',
+    CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION: 'CUSTOM-ATTEST-3d7a says {tools} are live',
+  }, async () => {
+    const uploader = createStubUploader()
+    const prepared = await prepareQwenAiMultimodalMessage(
+      [{ role: 'user', content: buildSingleMessageCorpus() }],
+      uploader as never,
+      {
+        transport: 'document',
+        managedToolCalling: true,
+        requestMaxBytes: 90 * 1024,
+        declaredToolNames: ['shell'],
+      },
+    )
+    assert.match(prepared.content, /CUSTOM-ATTEST-3d7a says shell are live/)
+  })
+
+  await withEnv({
+    CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES: '0',
+    CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION: 'off',
+  }, async () => {
+    const uploader = createStubUploader()
+    const prepared = await prepareQwenAiMultimodalMessage(
+      [{ role: 'user', content: buildSingleMessageCorpus() }],
+      uploader as never,
+      {
+        transport: 'document',
+        managedToolCalling: true,
+        requestMaxBytes: 90 * 1024,
+        declaredToolNames: ['shell'],
+      },
+    )
+    assert.doesNotMatch(prepared.content, /declared these managed tools/)
+  })
+
+  // Empty declared names never produce a sentence (e.g. no managed tools).
+  await withEnv({ CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION: undefined }, async () => {
+    const uploader = createStubUploader()
+    const prepared = await prepareQwenAiMultimodalMessage(
+      [{ role: 'user', content: buildSingleMessageCorpus() }],
+      uploader as never,
+      { transport: 'document', managedToolCalling: true, requestMaxBytes: 90 * 1024 },
+    )
+    assert.doesNotMatch(prepared.content, /declared these managed tools/)
+  })
+})
