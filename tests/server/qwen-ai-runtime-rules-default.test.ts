@@ -52,6 +52,11 @@ test('runtime rules follow provider profile capabilities by default', () => {
   assert.match(qwenPrompt, /Never claim that an operation succeeded unless/)
   // Transcript-document rules ride the profile capability.
   assert.match(qwenPrompt, /attached transcript document/)
+  // Reading an attached transcript is preparation, not the turn deliverable.
+  assert.match(qwenPrompt, /preparation for the current turn, not the deliverable/)
+  // Provider-capability exclusion rides its own profile capability (distinct
+  // wording from managed_xml's own protocol-level exclusion sentence).
+  assert.match(qwenPrompt, /never invoke, rely on, or answer from undeclared provider-side tools/)
 
   const deepseekTurn = engine.transformRequest({
     request,
@@ -61,4 +66,15 @@ test('runtime rules follow provider profile capabilities by default', () => {
   const deepseekPrompt = String(deepseekTurn.messages[0].content)
   assert.match(deepseekPrompt, /Never claim that an operation succeeded unless/)
   assert.doesNotMatch(deepseekPrompt, /attached transcript document/)
+  // managed_xml keeps its own protocol-level exclusion wording; the
+  // profile-gated capability block must not add the qwen-ai wording there.
+  assert.doesNotMatch(deepseekPrompt, /never invoke, rely on, or answer from undeclared provider-side tools/)
+
+  const m365Turn = engine.transformRequest({
+    request,
+    provider: makeProvider('m365-copilot'),
+    actualModel: 'gpt-5.6-sol',
+  })
+  const m365Prompt = String(m365Turn.messages[0].content)
+  assert.doesNotMatch(m365Prompt, /undeclared provider-side tools/)
 })

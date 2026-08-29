@@ -3895,6 +3895,13 @@ export class RequestForwarder {
                   || recoveryCode === 'undeclared_native_tool_call'
                   || recoveryCode === 'malformed_tool_call'
                   || recoveryCode === 'missing_tool_call'
+                  // Semantic recovery codes mean the rejected branch was
+                  // prose-only narration over a live workflow: the replacement
+                  // prompt must demand the actual tool call, not re-offer the
+                  // "final answer with marker" alternative the model just
+                  // failed to take.
+                  || recoveryCode === 'qwen_ai_semantic_empty'
+                  || recoveryCode === 'qwen_ai_semantic_incomplete'
                 const workflowContinuationMessage = createToolWorkflowContinuationMessage({
                   activeUserRequest: extractLatestActiveUserRequest(providerRequest.messages),
                   completionProofMissing: recoveryCode === 'qwen_ai_semantic_incomplete'

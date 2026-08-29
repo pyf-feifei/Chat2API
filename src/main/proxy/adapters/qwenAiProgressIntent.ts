@@ -11,6 +11,13 @@
  * The default covers common English/Chinese intent openers; only short,
  * single-paragraph statements match so substantive answers stay deliverable.
  */
+// The opener word-list is an ASSISTANCE layer only. The authoritative
+// protection is structural: a marker-less short answer over a live tool
+// workflow classifies as dangling regardless of wording (see
+// MANAGED_SHORT_ANSWER_CODE_POINTS in the adapter). Keep this list minimal —
+// generic intent openers only; do not chase incident-specific phrasings here
+// (deployment-tunable via CHAT2API_QWEN_AI_PROGRESS_INTENT_PATTERNS if a site
+// wants more).
 const MANAGED_PROGRESS_INTENT_DEFAULT_PATTERN_SOURCES = [
   "let me|let's|lets ",
   "i'll|i will|i am going to|i'm going to|i need to|i've (?:got|have) to",
@@ -42,15 +49,18 @@ export function managedProgressIntentRegex(): RegExp | undefined {
 }
 
 /**
- * A progress-style answer is a SHORT single-paragraph statement announcing
- * intent. Long or multi-paragraph answers are treated as substantive and
- * delivered as-is: agentic clients rarely terminate on them, and overwide
- * matching would turn legitimate summaries into retry loops.
+ * A progress-style answer is a SHORT statement announcing or acknowledging
+ * intent. The opener is matched against the FIRST paragraph only: observed
+ * acknowledgment variants (理解！…现在开始执行) open with the intent
+ * declaration and then lay out a numbered plan with blank lines, which the
+ * previous whole-content single-paragraph rule never saw. The total-length
+ * cap still bounds overmatching: long multi-section answers are substantive
+ * and stay deliverable.
  */
 export function isProgressStyleManagedAnswer(trimmedContent: string): boolean {
   if (!trimmedContent || trimmedContent.length > MANAGED_PROGRESS_INTENT_MAX_CODE_POINTS) return false
-  if (trimmedContent.includes('\n\n')) return false
   const regex = managedProgressIntentRegex()
   if (!regex) return false
-  return regex.test(trimmedContent)
+  const firstParagraph = trimmedContent.split('\n\n')[0]
+  return regex.test(firstParagraph)
 }

@@ -73,6 +73,14 @@ export interface ToolCallingPlan {
   allowedToolNames: Set<string>
   workflowContinuation: boolean
   failedToolResultPending: boolean
+  /**
+   * The conversation contains at least one matched tool-call/result exchange
+   * that was never closed with a completion marker, even when the trailing
+   * item is a user message (a "continue" after a stall). A live workflow is
+   * not reset by a user turn; answers over it are held to the continuation
+   * contract.
+   */
+  hasLiveToolWorkflow?: boolean
   forcedToolName?: string
   diagnostics: ToolCallDiagnostics
 }

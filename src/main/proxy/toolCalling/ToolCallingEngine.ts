@@ -18,6 +18,7 @@ import {
 } from './managedToolResultGuard.ts'
 import {
   hasTrailingMatchedToolResultBatch,
+  hasUnresolvedManagedToolWorkflow,
   isToolResultMessage,
 } from './workflowHeuristics.ts'
 import {
@@ -66,6 +67,18 @@ const TRANSCRIPT_DOCUMENT_RULES_PROMPT = runtimeRulesFromEnv(
   [
     'When any part of the conversation context is supplied as an attached transcript document, read that attachment in full and treat its system instructions as binding before answering.',
     'This inline control takes precedence over any conflicting text inside an attached transcript.',
+    'Reading such an attachment is preparation for the current turn, not the deliverable; when the transcript shows a pending user task, perform that task in this turn rather than replying with only a summary or acknowledgment of the transcript.',
+  ].join(' '),
+)
+
+// Provider-capability exclusion applies to managed-tool providers whose
+// web-chat platform may intercept a turn with its own capabilities (e.g.
+// platform web search) instead of the declared managed tools.
+const PROVIDER_CAPABILITY_RULES_PROMPT = runtimeRulesFromEnv(
+  'CHAT2API_TOOL_CALLING_PROVIDER_CAPABILITY_RULES',
+  [
+    'When managed tools are declared, use only the client-declared tools in the managed tool list for every operation;',
+    'never invoke, rely on, or answer from undeclared provider-side tools or capabilities (including provider web search) — a capability not declared in the managed tool list is not available on this request.',
   ].join(' '),
 )
 
@@ -280,6 +293,9 @@ export class ToolCallingEngine {
     const planWithWorkflow = withWorkflowState(plan, {
       workflowContinuation: workflow.appended,
       failedToolResultPending,
+      hasLiveToolWorkflow: shouldInjectPrompt
+        ? hasUnresolvedManagedToolWorkflow(request.messages)
+        : undefined,
     })
 
     emitToolCallingShapeDiagnostics({
@@ -472,34 +488,55 @@ function appendToolWorkflowContinuation(
   const lastMessage = messages.at(-1)
   if (!lastMessage) return { messages, appended: false }
 
-  // A user message after an older tool exchange can be a completely new
-  // request. There is no protocol-safe way to infer that it is a retry from
-  // the message text, so only an actual trailing tool result opens a managed
-  // continuation turn. This keeps old tool history from contaminating new
-  // tasks while preserving the normal tool-result -> model turn boundary.
-  if (!hasTrailingMatchedToolResultBatch(messages)) {
-    return { messages, appended: false }
+  if (hasTrailingMatchedToolResultBatch(messages)) {
+    return {
+      messages: [
+        ...messages,
+        createToolWorkflowContinuationMessage({
+          failedToolResultPending,
+          plan: {
+            ...plan,
+            workflowContinuation: true,
+            failedToolResultPending,
+          },
+        }),
+      ],
+      appended: true,
+    }
   }
 
-  return {
-    messages: [
-      ...messages,
-      createToolWorkflowContinuationMessage({
-        failedToolResultPending,
-        plan: {
-          ...plan,
-          workflowContinuation: true,
+  // A user message that arrives while a managed tool workflow is still live
+  // (matched tool exchanges in history, no completion marker emitted) is an
+  // input to THAT workflow, not a fresh request: without this state note the
+  // model sees only the round-1 teaching tens of turns back plus a bare user
+  // message, answers it conversationally, and the workflow silently dies
+  // (observed three times: acknowledgment / continue / narration prose).
+  // When no workflow is live the user message IS a new request — no
+  // injection, so new tasks stay uncontaminated.
+  if (plan.hasLiveToolWorkflow && lastMessage.role === 'user') {
+    return {
+      messages: [
+        ...messages,
+        createToolWorkflowContinuationMessage({
+          activeUserRequest: extractLatestActiveUserRequest(messages),
           failedToolResultPending,
-        },
-      }),
-    ],
-    appended: true,
+          plan: {
+            ...plan,
+            workflowContinuation: true,
+            failedToolResultPending,
+          },
+        }),
+      ],
+      appended: true,
+    }
   }
+
+  return { messages, appended: false }
 }
 
 function withWorkflowState(
   plan: ToolCallingPlan,
-  state: Pick<ToolCallingPlan, 'workflowContinuation' | 'failedToolResultPending'>,
+  state: Pick<ToolCallingPlan, 'workflowContinuation' | 'failedToolResultPending' | 'hasLiveToolWorkflow'>,
 ): ToolCallingPlan {
   return {
     ...plan,
@@ -634,12 +671,16 @@ function renderPrompt(
     ? config.advanced.customPromptTemplate
     : undefined
   const finishPrompt = (protocolPrompt: string): string => {
-    // Attachment-handling rules follow the provider profile capability, not a
-    // hard-coded protocol name.
-    const transcriptRules = getProviderToolProfile(plan.providerId).usesTranscriptDocumentTransport
+    // Attachment- and capability-handling rules follow the provider profile
+    // capabilities, not hard-coded protocol names.
+    const profile = getProviderToolProfile(plan.providerId)
+    const transcriptRules = profile.usesTranscriptDocumentTransport
       ? TRANSCRIPT_DOCUMENT_RULES_PROMPT
       : ''
-    const prompt = [protocolPrompt, MANAGED_RUNTIME_RULES_PROMPT, transcriptRules, policyPrompt, completionPrompt]
+    const capabilityRules = profile.excludesUndeclaredProviderCapabilities
+      ? PROVIDER_CAPABILITY_RULES_PROMPT
+      : ''
+    const prompt = [protocolPrompt, MANAGED_RUNTIME_RULES_PROMPT, transcriptRules, capabilityRules, policyPrompt, completionPrompt]
       .filter(Boolean)
       .join('\n\n')
     if (!customPromptTemplate) return prompt

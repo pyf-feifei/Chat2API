@@ -85,6 +85,37 @@ export function hasTrailingMatchedToolResultBatch(messages: ChatMessage[]): bool
   return resultIds.every(resultId => callIdSet.has(resultId))
 }
 
+/**
+ * True when the conversation contains at least one assistant tool-call batch
+ * whose results have all been returned (a matched exchange exists), yet the
+ * workflow was never closed out with a completion marker. Such a workflow is
+ * still live: a later user "continue" message after a stall does not reset
+ * it. Client-agnostic — it reasons only over message structure.
+ */
+export function hasUnresolvedManagedToolWorkflow(messages: ChatMessage[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!isToolResultMessage(message)) continue
+
+    // Skip the whole contiguous result batch to find its call batch, then
+    // verify the call batch exists directly above it (strict pairing).
+    let batchStartIndex = index
+    while (batchStartIndex > 0 && isToolResultMessage(messages[batchStartIndex - 1])) {
+      batchStartIndex -= 1
+    }
+    const callMessage = messages[batchStartIndex - 1]
+    if (
+      callMessage
+      && callMessage.role === 'assistant'
+      && isToolCallMessage(callMessage)
+    ) {
+      return true
+    }
+    index = batchStartIndex
+  }
+  return false
+}
+
 function isStrictAssistantTextOnlyMessage(message: ChatMessage): boolean {
   if (message.role !== 'assistant') return false
   const candidate = message as ChatMessage & {

@@ -342,6 +342,23 @@ only compact tool control remains inline. The original client messages,
 completed tool results, and validation schemas are preserved. A body that still
 exceeds the target after this reduction is submitted to Qwen instead of being
 rejected locally with HTTP 413.
+In complete managed document mode the entire conversation (including the
+pending user message) moves to the transcript document. So the operative task
+stays visible without a file read, Chat2API keeps an inline tail excerpt of
+the archived transcript on the active turn:
+`CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES` (default `12288` bytes; `0`
+disables; invalid values fall back with a warning). The excerpt is clamped to
+the offload target's remaining headroom and always ends at the transcript's
+final events. Each transcript pointer instruction is env-overridable with
+`{filename}` substitution — `CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT`
+(non-managed), `..._HYBRID`, and `..._COMPLETE` (managed modes); the sentinel
+`off` removes that pointer sentence entirely (rollback/bisect only).
+For managed-tool providers whose platform may intercept a turn with its own
+capabilities (e.g. Qwen web search) instead of the declared tools,
+`CHAT2API_TOOL_CALLING_PROVIDER_CAPABILITY_RULES` (default: built-in exclusion
+text; `off` disables) instructs the model to use only client-declared tools.
+`CHAT2API_QWEN_AI_DEBUG_REQUEST=true` logs upstream request payload summaries
+for verifying the injected texts.
 `CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS` controls each compact
 inline tool description while the complete description remains in the tool
 reference attachment; `0` omits inline descriptions.

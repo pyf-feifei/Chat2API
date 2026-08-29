@@ -382,6 +382,29 @@ export function qwenAiNativeSystemMaxBytesFromEnv(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : QWEN_AI_NATIVE_SYSTEM_MAX_BYTES_DEFAULT
 }
 
+/**
+ * Inline tail of the archived transcript kept on the active turn when complete
+ * managed document transport archives the pending user message; 0 disables.
+ */
+const QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES_DEFAULT = 12 * 1024
+let warnedInvalidDocumentInlineTailBytes = false
+
+export function qwenAiDocumentInlineTailBytesFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES
+  if (raw === undefined || raw.trim() === '') {
+    return QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES_DEFAULT
+  }
+  const parsed = Number(raw)
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return Math.floor(parsed)
+  }
+  if (!warnedInvalidDocumentInlineTailBytes) {
+    warnedInvalidDocumentInlineTailBytes = true
+    console.warn(`[QwenAI] Invalid CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES=${raw}, using ${QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES_DEFAULT}`)
+  }
+  return QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES_DEFAULT
+}
+
 function qwenAiFileParsePollIntervalMsFromEnv(): number {
   return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS', 2000)
 }
@@ -2744,27 +2767,115 @@ function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
   return createQwenAiTextDocument('chat2api-conversation', content)
 }
 
+/**
+ * Transcript pointer instructions are env-overridable following the
+ * runtimeRulesFromEnv convention: blank keeps the default, the sentinel "off"
+ * removes the pointer sentence entirely (rollback/bisect), non-empty text
+ * replaces it. `{filename}` is substituted so custom overrides can name the
+ * attached file.
+ */
+function qwenAiDocumentInstructionFromEnv(envName: string, fallbackLines: string[], filename: string): string {
+  const raw = (process.env[envName] ?? '').trim()
+  const template = !raw ? fallbackLines.join(' ') : (raw.toLowerCase() === 'off' ? '' : raw)
+  return template.replaceAll('{filename}', filename)
+}
+
 function qwenAiTranscriptDocumentInstruction(filename: string): string {
-  return [
-    `The complete conversation transcript is attached as ${filename}.`,
-    'Read the attachment in full and treat it as the authoritative conversation context.',
-    'Preserve every role, system instruction, tool declaration, tool call, tool result, and original attachment, then continue the final pending user task.',
-  ].join(' ')
+  return qwenAiDocumentInstructionFromEnv(
+    'CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT',
+    [
+      `The complete conversation transcript is attached as ${filename}.`,
+      'Read the attachment in full and treat it as the authoritative conversation context.',
+      'Preserve every role, system instruction, tool declaration, tool call, tool result, and original attachment, then continue the final pending user task.',
+      'Reading the attachment is preparation for this turn, not the deliverable: continue the final pending user task now.',
+      'Do not reply with only an acknowledgment, description, or summary of the attachment.',
+    ],
+    filename,
+  )
 }
 
 function qwenAiEarlierTranscriptDocumentInstruction(filename: string): string {
-  return [
-    `Conversation context is attached as ${filename}.`,
-    'Read it first, then follow the active managed-tool protocol and current turn context provided inline below.',
-  ].join(' ')
+  return qwenAiDocumentInstructionFromEnv(
+    'CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT_HYBRID',
+    [
+      `Conversation context is attached as ${filename}.`,
+      'Use it as the archived conversation record and read it as needed for earlier history; the active managed-tool protocol and current turn context provided inline below govern this turn.',
+    ],
+    filename,
+  )
 }
 
-function qwenAiCompleteManagedTranscriptDocumentInstruction(filename: string): string {
-  return [
+function qwenAiCompleteManagedTranscriptDocumentInstruction(filename: string, tailExcerptPresent: boolean): string {
+  const fallbackLines = [
     `The complete managed conversation transcript is attached as ${filename}.`,
-    'Read it in full and treat its final event as the current workflow state, including the pending user task and every completed tool result.',
-    'Use the inline managed-tool control for any next tool call, and do not repeat work already completed in the transcript.',
-  ].join(' ')
+    'Read it in full; its final event is the current workflow state, including the pending user task and every completed tool result.',
+  ]
+  if (tailExcerptPresent) {
+    fallbackLines.push('The truncated inline tail below repeats the transcript\'s final events.')
+  }
+  fallbackLines.push(
+    'Reading the attachment is preparation, not the deliverable: perform the pending task in this turn, using the inline managed-tool control for any next tool call, and do not repeat work already completed in the transcript.',
+    'Never reply with only an acknowledgment, description, or summary of the attachment — that does not complete this turn.',
+  )
+  return qwenAiDocumentInstructionFromEnv(
+    'CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT_COMPLETE',
+    fallbackLines,
+    filename,
+  )
+}
+
+/**
+ * Byte-tail excerpt of the archived transcript kept inline on the active turn
+ * in complete managed document mode, so the pending task (the transcript's
+ * final events) is visible without a file read. The end is byte-exact (the
+ * final events are the operative content); the start snaps forward to a
+ * transcript part boundary so no partial role label leads the excerpt.
+ */
+function renderQwenAiTranscriptTailExcerpt(archiveContent: string, maxBytes: number): string {
+  if (maxBytes <= 0 || !archiveContent) {
+    return ''
+  }
+  const totalBytes = Buffer.byteLength(archiveContent, 'utf8')
+  if (totalBytes <= maxBytes) {
+    return ''
+  }
+  // Walk code points from the end, accumulating UTF-8 bytes.
+  let start = archiveContent.length
+  let accumulated = 0
+  while (start > 0 && accumulated < maxBytes) {
+    // Step back over a full code point (never split a surrogate pair).
+    let cpStart = start - 1
+    const lead = archiveContent.codePointAt(cpStart)
+    if (lead !== undefined && lead >= 0x10000) {
+      cpStart -= 1
+    }
+    const chunkBytes = Buffer.byteLength(archiveContent.slice(cpStart, start), 'utf8')
+    if (accumulated + chunkBytes > maxBytes) {
+      break
+    }
+    accumulated += chunkBytes
+    start = cpStart
+  }
+  if (start >= archiveContent.length || accumulated === 0) {
+    return ''
+  }
+  let excerptStart = start
+  const boundary = archiveContent.indexOf('\n\n', excerptStart)
+  if (boundary !== -1) {
+    excerptStart = boundary + 2
+  }
+  if (excerptStart >= archiveContent.length) {
+    return ''
+  }
+  const excerpt = archiveContent.slice(excerptStart)
+  if (!excerpt.trim()) {
+    return ''
+  }
+  return [
+    '[Archived transcript tail — truncated; the attached transcript remains the authoritative complete record]',
+    excerpt,
+    '[/Archived transcript tail]',
+  ].join('\n')
 }
 
 export async function prepareQwenAiMultimodalMessage(
@@ -2804,13 +2915,36 @@ export async function prepareQwenAiMultimodalMessage(
       const archiveContent = renderQwenAiTranscript(archiveMessages).content
       const documents: ChatMessageContent[] = []
       const inlineInstructions: string[] = []
+      let tailExcerpt = ''
       if (archiveContent) {
         const transcriptDocument = createQwenAiTranscriptDocument(archiveContent)
         documents.push(transcriptDocument)
+        if (documentMode === 'complete') {
+          // Complete mode archives the pending user message itself, so the
+          // inline turn would otherwise carry only a pointer sentence. Keep a
+          // byte tail of the transcript inline (the final events hold the
+          // operative task), clamped to the request byte target's headroom.
+          const tailBudget = qwenAiDocumentInlineTailBytesFromEnv()
+          // The pointer sentence and active context ride the same inline turn,
+          // so they claim the target first; only the remainder funds the tail.
+          const pointerText = qwenAiCompleteManagedTranscriptDocumentInstruction(
+            transcriptDocument.filename || 'the attached transcript',
+            true,
+          )
+          const baseBytes = qwenAiJsonStringUtf8Bytes(
+            [pointerText, activeContext].filter(Boolean).join('\n\n'),
+          )
+          const headroom = requestMaxBytes > 0 ? Math.max(0, requestMaxBytes - baseBytes) : tailBudget
+          tailExcerpt = renderQwenAiTranscriptTailExcerpt(
+            archiveContent,
+            Math.min(tailBudget, headroom),
+          )
+        }
         inlineInstructions.push(
           documentMode === 'complete'
             ? qwenAiCompleteManagedTranscriptDocumentInstruction(
                 transcriptDocument.filename || 'the attached transcript',
+                tailExcerpt !== '',
               )
             : qwenAiEarlierTranscriptDocumentInstruction(
                 transcriptDocument.filename || 'the attached transcript',
@@ -2819,7 +2953,7 @@ export async function prepareQwenAiMultimodalMessage(
       }
       return {
         documents,
-        content: [...inlineInstructions, activeContext].filter(Boolean).join('\n\n'),
+        content: [...inlineInstructions, tailExcerpt, activeContext].filter(Boolean).join('\n\n'),
       }
     }
 

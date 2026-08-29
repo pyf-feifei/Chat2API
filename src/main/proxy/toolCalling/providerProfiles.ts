@@ -12,6 +12,10 @@ export interface ProviderToolProfile {
   // True when the provider adapter may archive conversation history into an
   // attached transcript document, so transcript-handling rules apply.
   usesTranscriptDocumentTransport: boolean
+  // True when the provider platform exposes its own capabilities (e.g. web
+  // search) that can intercept a managed-tool turn instead of the declared
+  // client tools, so undeclared-capability exclusion rules apply.
+  excludesUndeclaredProviderCapabilities: boolean
   formatAssistantToolCalls(calls: Array<{ id: string; name: string; arguments: string }>): string
   formatToolResult(result: NormalizedToolResult): string
 }
@@ -39,6 +43,7 @@ const chat2ApiXmlHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   supportsNativeTools: false,
   preferredManagedProtocol: 'managed_xml',
   usesTranscriptDocumentTransport: false,
+  excludesUndeclaredProviderCapabilities: false,
   formatAssistantToolCalls(calls) {
     return managedXmlProtocol.formatAssistantToolCalls(calls)
   },
@@ -52,6 +57,7 @@ const qwenAiHermesHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   supportsNativeTools: false,
   preferredManagedProtocol: 'qwen_hermes',
   usesTranscriptDocumentTransport: true,
+  excludesUndeclaredProviderCapabilities: true,
   formatAssistantToolCalls(calls) {
     return qwenHermesProtocol.formatAssistantToolCalls(calls)
   },
@@ -68,6 +74,7 @@ const qwenAiNativeHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   supportsNativeTools: false,
   preferredManagedProtocol: 'qwen_native',
   usesTranscriptDocumentTransport: true,
+  excludesUndeclaredProviderCapabilities: true,
   formatAssistantToolCalls(calls) {
     return qwenNativeProtocol.formatAssistantToolCalls(calls)
   },
@@ -81,6 +88,7 @@ const m365FencedHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   supportsNativeTools: false,
   preferredManagedProtocol: 'm365_fenced',
   usesTranscriptDocumentTransport: false,
+  excludesUndeclaredProviderCapabilities: false,
   formatAssistantToolCalls(calls) {
     return m365FencedProtocol.formatAssistantToolCalls(calls)
   },

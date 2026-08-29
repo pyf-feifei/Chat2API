@@ -66,6 +66,21 @@ services:
       # This UTF-8 JSON target triggers document offload; it is not a request ceiling.
       # Set 0 to disable automatic offload.
       CHAT2API_QWEN_AI_REQUEST_MAX_BYTES: ${CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160}
+      # Inline tail (bytes) of the archived transcript kept on the active turn
+      # when complete managed document transport archives the pending user
+      # message, so the operative task stays visible without a file read.
+      # 0 disables; invalid values fall back to the default with a warning.
+      CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES: ${CHAT2API_QWEN_AI_DOCUMENT_INLINE_TAIL_BYTES:-12288}
+      # Override any transcript pointer instruction ({filename} substituted);
+      # "off" removes that pointer sentence entirely (rollback/bisect only).
+      CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT: ${CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT-}
+      CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT_HYBRID: ${CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT_HYBRID-}
+      CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT_COMPLETE: ${CHAT2API_QWEN_AI_TRANSCRIPT_POINTER_PROMPT_COMPLETE-}
+      # Managed-tool provider-capability exclusion (blocks platform web search
+      # answering instead of declared tools); "off" disables.
+      CHAT2API_TOOL_CALLING_PROVIDER_CAPABILITY_RULES: ${CHAT2API_TOOL_CALLING_PROVIDER_CAPABILITY_RULES-}
+      # Debug: log upstream request payload summaries (confirm injected texts).
+      CHAT2API_QWEN_AI_DEBUG_REQUEST: ${CHAT2API_QWEN_AI_DEBUG_REQUEST:-false}
       # Complete tool docs remain attached; zero omits only inline routing summaries.
       CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS: ${CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240}
       # Non-negative retry counts are bounded by the cumulative request deadline.

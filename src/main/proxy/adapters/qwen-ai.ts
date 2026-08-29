@@ -2441,6 +2441,15 @@ function createQwenAiWorkflowRecoveryTimeoutError(): QwenAiUpstreamError {
   return error
 }
 
+/**
+ * Over a live tool workflow, a marker-less answer at or below this length is
+ * treated as workflow narration (intent/progress prose) rather than a
+ * legitimate final summary; the managed workflow continuation re-prompts for
+ * a tool call or a completion-proved answer. Genuine final summaries of a
+ * mid-flight workflow carry substantive detail and exceed this floor.
+ */
+const MANAGED_SHORT_ANSWER_CODE_POINTS = 300
+
 function isDanglingManagedToolAnswer(
   content: string,
   plan?: ToolCallingPlan,
@@ -2468,6 +2477,44 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
+  // A live tool workflow is not reset by a user message. When the conversation
+  // history contains a matched tool-call/result exchange that was never
+  // followed by a completion marker, the workflow is still mid-flight even if
+  // the trailing item is a user "continue" message instead of a tool result
+  // (observed: user sends 继续任务 after a stall; the model answered with
+  // "继续执行管线…" prose and the loop died because every continuation gate
+  // anchored on a trailing tool-result batch). In that state progress-style
+  // prose is a dangling stall exactly like a continuation turn.
+  if (plan.hasLiveToolWorkflow) {
+    if (isProgressStyleManagedAnswer(trimmedContent)) {
+      console.info('[QwenAI] Progress-style answer over a live tool workflow triggers continuation', JSON.stringify({
+        requestId: plan.diagnostics?.requestId,
+        contentLength: trimmedContent.length,
+        protocol: plan.protocol,
+        workflowContinuation: plan.workflowContinuation,
+        toolChoiceMode: plan.toolChoiceMode,
+      }))
+      return true
+    }
+    // A SHORT marker-less answer over a live workflow is structurally a
+    // narration, not a terminal state: the legitimate endings are a tool call
+    // or a completion-proved final answer, and a genuine final summary of a
+    // mid-flight workflow is longer than a few sentences. This is the
+    // structural backstop so novel intent phrasings (observed: 我正在审视…
+    // 随后将… 整个过程确保…, 75 codepoints, no opener word in the table)
+    // cannot silently end the workflow.
+    if ([...trimmedContent].length <= MANAGED_SHORT_ANSWER_CODE_POINTS) {
+      console.info('[QwenAI] Short marker-less answer over a live tool workflow triggers continuation', JSON.stringify({
+        requestId: plan.diagnostics?.requestId,
+        contentLength: [...trimmedContent].length,
+        protocol: plan.protocol,
+        workflowContinuation: plan.workflowContinuation,
+        toolChoiceMode: plan.toolChoiceMode,
+      }))
+      return true
+    }
+  }
+
   // Intent statements without a tool call silently stop agentic workflows —
   // in ANY tool-choice mode. Recovery re-prompts for the actual tool call.
   if (isProgressStyleManagedAnswer(trimmedContent)) {
@@ -2481,24 +2528,42 @@ function isDanglingManagedToolAnswer(
     return true
   }
 
-  // In auto tool-choice mode a tool-less substantive answer is otherwise
-  // legitimate; only progress-style statements are recovered above.
-  if (plan.toolChoiceMode === 'auto') {
-    return false
+  // First-turn requests (including auto-mode ones) may legitimately answer
+  // directly without tools: no tool result has come back yet, so the model
+  // answering the request outright is a valid terminal state. A live workflow
+  // (matched exchanges in history, marker never emitted) counts as mid-flight
+  // here too — a user "continue" message after a stall does not restart the
+  // contract.
+  const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
+  if (!midWorkflow) {
+    if (plan.toolChoiceMode === 'auto') {
+      return false
+    }
+    if (trimmedContent.length > 0) {
+      return false
+    }
   }
 
-  // First-turn requests may legitimately answer directly without tools.
-  if (!plan.workflowContinuation && trimmedContent.length > 0) {
-    return false
-  }
-
-  // Continuation turns require the completion proof, but substantive
-  // marker-less answers are accepted to avoid wasteful retry loops.
+  // Continuation turns — the client just returned tool results, so the
+  // workflow is mid-flight and the taught contract (and the per-turn
+  // reminder) requires the turn to end with a tool call OR the completion
+  // marker. This holds in auto mode too: an auto-mode acknowledgment that
+  // neither calls a tool nor proves completion is exactly the silent
+  // workflow-stall failure (observed: "理解！完全遵守…现在开始执行管线"
+  // delivered as the final answer).
+  //
+  // Length escape only for plain continuation turns, where a genuine final
+  // summary occasionally omits the marker and re-prompting a long validated
+  // answer wastes upstream calls. Over a LIVE workflow (unresolved
+  // exchanges in history, user turn boundary) there is no legitimate
+  // marker-less terminal: an agentic loop answer that neither calls a tool
+  // nor proves completion is a dead end regardless of length (observed:
+  // 6.8k-char plan narration with zero tool calls delivered as final).
   if (
     requiresManagedWorkflowCompletionMarker(plan)
     && !hasManagedWorkflowCompletionMarker(content, plan)
   ) {
-    return trimmedContent.length <= 800
+    return plan.hasLiveToolWorkflow === true || trimmedContent.length <= 800
   }
 
   return false
