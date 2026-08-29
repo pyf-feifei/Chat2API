@@ -8,6 +8,7 @@ import type { Account, Provider } from '../../store/types'
 import type { ChatCompletionRequest } from '../types'
 import type { ManagedToolTranscriptMessage } from '../toolCalling/m365Transcript.ts'
 import { flattenManagedTranscript, flattenPlainTranscript } from '../toolCalling/m365Transcript.ts'
+import { sessionContinuations, type ContinuationTurn } from '../toolCalling/m365SessionContinuation.ts'
 import {
   decodeAccessTokenExp,
   DEFAULT_CLIENT_ID,
@@ -79,6 +80,33 @@ export class M365Adapter {
     if (latest) {
       this.account = latest
     }
+  }
+
+  /**
+   * Remember the served conversation so the next request that extends this
+   * history can continue the same upstream ChatHub conversation instead of
+   * replaying the transcript. Called only after a completed (non-error) turn;
+   * the streamed-text accumulation mirrors the non-stream result text.
+   */
+  recordServedConversation(
+    conversationId: string,
+    sessionId: string,
+    request: ChatCompletionRequest,
+    assistantText: string,
+  ): void {
+    const turns: ContinuationTurn[] = []
+    for (const msg of request.messages as Array<{ role?: string; content?: unknown }>) {
+      if (!msg || (msg.role !== 'user' && msg.role !== 'assistant')) continue
+      const text = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? String((msg.content as Array<{ type?: string; text?: string }>).find((p) => p?.type === 'text')?.text || '')
+          : ''
+      if (text) turns.push({ role: msg.role, text })
+    }
+    if (assistantText) turns.push({ role: 'assistant', text: assistantText })
+    if (turns.length === 0) return
+    sessionContinuations.record(this.account.id, conversationId, sessionId, turns)
   }
 
   getCredentials(): Account['credentials'] {
@@ -206,17 +234,36 @@ export class M365Adapter {
       && request.tools.length > 0,
     )
     const systemPrompt = this.extractSystemPrompt(request.messages)
-    // Multi-turn no-tools requests carry their history in the same
-    // role-labelled transcript shape; single-turn stays byte-identical to the
-    // legacy last-user-message form.
-    const plainText = this.extractLastUserMessage(request.messages)
-    const usePlainTranscript =
-      !useManaged && request.messages.length > 1 && Boolean(plainText)
-    const text = useManaged
-      ? flattenManagedTranscript(managed!.messages)
-      : usePlainTranscript
-        ? flattenPlainTranscript(request.messages as ManagedToolTranscriptMessage[])
-        : plainText
+    // Session continuation: when the incoming history extends a prior turn we
+    // already sent upstream (browser-verified wire shape — the second turn
+    // reuses the same conversationId/sessionId on the handshake URL and sends
+    // ONLY the new user text with isStartOfSession=false), replaying the
+    // whole transcript would start a fresh conversation every request.
+    const continuation = useManaged
+      ? undefined
+      : sessionContinuations.match(this.account.id, request.messages)
+    let text: string | null
+    let conversationId: string | undefined
+    let sessionId: string | undefined
+    let started: boolean | undefined
+    if (continuation) {
+      text = continuation.deltaText
+      conversationId = continuation.conversationId
+      sessionId = continuation.sessionId
+      started = false
+    } else {
+      // Multi-turn no-tools requests carry their history in the same
+      // role-labelled transcript shape; single-turn stays byte-identical to
+      // the legacy last-user-message form.
+      const plainText = this.extractLastUserMessage(request.messages)
+      const usePlainTranscript =
+        !useManaged && request.messages.length > 1 && Boolean(plainText)
+      text = useManaged
+        ? flattenManagedTranscript(managed!.messages)
+        : usePlainTranscript
+          ? flattenPlainTranscript(request.messages as ManagedToolTranscriptMessage[])
+          : plainText
+    }
 
     if (!text) {
       throw new Error('No user message found in request')
@@ -224,9 +271,15 @@ export class M365Adapter {
 
     return {
       text,
-      tone: 'magic',
-      conversationId: undefined,
-      sessionId: undefined,
+      // Managed tool calling needs the Assist persona: Magic (the default)
+      // confabulates answers instead of following the fenced-tool protocol
+      // (matches the cramt/m365-copilot-proxy observation of ~0% task
+      // compliance on Magic). Assist emits the fence reliably. Wire casing
+      // is Capitalized ('Assist'/'Magic').
+      tone: useManaged ? 'Assist' : 'magic',
+      conversationId,
+      sessionId,
+      started,
       attachments: this.extractAttachments(request.messages),
       tools: useManaged ? [] : (request.tools || []),
       toolChoice: useManaged ? undefined : request.tool_choice,

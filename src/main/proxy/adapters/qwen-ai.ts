@@ -65,6 +65,7 @@ import {
 } from './qwen-ai-native-tools'
 import { createQwenAiFeatureConfig } from './qwen-ai-feature-config'
 import {
+  applyQwenAiEffortToModelMode,
   normalizeQwenAiModelModeName,
   resolveQwenAiModelMode,
 } from '../../providers/qwen-ai-model-mode'
@@ -74,6 +75,12 @@ const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 840000)
 const QWEN_AI_RESPONSE_TIMEOUT_MS = nonNegativeNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', 0)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
+// Slow thinking-only trickles (one small reasoning delta every ~20s) refresh
+// the idle watchdog forever while the answer never starts. Cap the total time
+// a stream may spend producing ONLY thinking/summary output with no answer
+// content, tool fragment, or image; expiry triggers semantic recovery (a
+// fresh managed-workflow continuation), not a hard failure. Zero disables.
+const QWEN_AI_THINKING_ONLY_MAX_MS = nonNegativeNumberFromEnv('CHAT2API_QWEN_AI_THINKING_ONLY_MAX_MS', 120000)
 const QWEN_AI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
 const QWEN_AI_MANAGED_BRANCH_MAX_BYTES = positiveNumberFromEnv(
   'CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES',
@@ -164,6 +171,13 @@ type StreamHandlingOptions = {
   requestDeadlineAt?: number
   responseTimeoutMs?: number
   idleTimeoutMs?: number
+  /**
+   * Wall clock for the thinking-only phase (reasoning/summary output with no
+   * answer, tool fragment, or image yet). Slow thinking trickles refresh the
+   * idle watchdog indefinitely; expiring this cap triggers semantic recovery.
+   * Overrides CHAT2API_QWEN_AI_THINKING_ONLY_MAX_MS; zero disables.
+   */
+  thinkingOnlyMaxMs?: number
   /** Withhold managed-tool frames until the response branch passes validation. */
   bufferManagedBranch?: boolean
   /** Accept a provider response that contains only thinking/summary text. */
@@ -278,6 +292,9 @@ interface QwenAiWorkflowContinuationRequest {
   nativeSystemPrompt?: string
   enable_thinking?: boolean
   thinking_budget?: number
+  /** Client reasoning effort carried through to the thinking-mode mapping. */
+  reasoning_effort?: string | null
+  reasoningEffort?: string | null
   managedToolCalling?: boolean
   managedToolWorkflowContinuation?: boolean
   messageTransport?: QwenAiMessageTransport
@@ -3206,12 +3223,17 @@ export function resolveQwenAiFeatureMode(
   requestedModel: string,
   requestedThinking: boolean | undefined,
   capability: ProviderModelCapability | undefined,
-): { thinkingEnabled: boolean; autoThinking: boolean } {
+  reasoningEffort?: string | null,
+): { thinkingEnabled: boolean; autoThinking: boolean; thinkingMode?: 'Fast' | 'Auto' | 'Thinking' } {
   const modelMode = resolveQwenAiModelMode(requestedModel)
   if (modelMode.thinkingEnabled !== undefined) {
+    // Floating aliases (_Auto / bare qwen3.8-max) let an explicit client
+    // effort take over the mode; pinned suffixes (_Fast/_Thinking) win.
+    const effective = applyQwenAiEffortToModelMode(modelMode, reasoningEffort)
     return {
-      thinkingEnabled: modelMode.thinkingEnabled,
-      autoThinking: modelMode.autoThinking ?? modelMode.thinkingEnabled,
+      thinkingEnabled: effective.thinkingEnabled ?? true,
+      autoThinking: effective.autoThinking ?? effective.thinkingEnabled ?? true,
+      thinkingMode: effective.thinkingMode,
     }
   }
 
@@ -3985,10 +4007,12 @@ export class QwenAiAdapter {
         modelForThinking,
         request.enable_thinking,
         modelCapability,
+        request.reasoning_effort ?? request.reasoningEffort,
       )
       const featureConfig = createQwenAiFeatureConfig({
         thinkingEnabled: featureMode.thinkingEnabled,
         autoThinking: featureMode.autoThinking,
+        thinkingMode: featureMode.thinkingMode,
         thinkingBudget: request.thinking_budget,
       })
 
@@ -4234,10 +4258,12 @@ export class QwenAiAdapter {
       modelForThinking,
       request.enable_thinking,
       modelCapability,
+      request.reasoning_effort ?? request.reasoningEffort,
     )
     const featureConfig = createQwenAiFeatureConfig({
       thinkingEnabled: featureMode.thinkingEnabled,
       autoThinking: featureMode.autoThinking,
+      thinkingMode: featureMode.thinkingMode,
       thinkingBudget: request.thinking_budget,
     })
 
@@ -5165,6 +5191,13 @@ export class QwenAiStreamHandler {
     let requestDeadlineTimer: NodeJS.Timeout | undefined
     let responseTimer: NodeJS.Timeout | undefined
     let idleTimer: NodeJS.Timeout | undefined
+    // Wall clock for the thinking-only phase: armed at the first reasoning or
+    // summary output, cancelled as soon as any answer content, tool fragment,
+    // or image is produced. Slow reasoning trickles keep refreshing the idle
+    // watchdog indefinitely; this cap converts such a runaway into semantic
+    // recovery (a fresh managed-workflow continuation branch) instead of a
+    // ten-minute wait that ends reasoning-only.
+    let thinkingOnlyTimer: NodeJS.Timeout | undefined
     let abortListenerAttached = false
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
@@ -5234,6 +5267,7 @@ export class QwenAiStreamHandler {
       summarySourceText = ''
       deliveredAnswerText = ''
       sawUpstreamCompletion = false
+      cancelThinkingOnlyTimer()
       idleRecoveryInFlight = false
       semanticRecoveryInFlight = false
       discardManagedBranchFrames()
@@ -5256,6 +5290,10 @@ export class QwenAiStreamHandler {
       if (idleTimer) {
         clearTimeout(idleTimer)
         idleTimer = undefined
+      }
+      if (thinkingOnlyTimer) {
+        clearTimeout(thinkingOnlyTimer)
+        thinkingOnlyTimer = undefined
       }
     }
 
@@ -5416,6 +5454,33 @@ export class QwenAiStreamHandler {
       idleTimer = setTimeout(() => {
         void handleIdle()
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
+    }
+
+    const cancelThinkingOnlyTimer = () => {
+      if (!thinkingOnlyTimer) return
+      clearTimeout(thinkingOnlyTimer)
+      thinkingOnlyTimer = undefined
+    }
+
+    const handleThinkingOnlyExpired = (capMs: number) => {
+      if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight || transientRecoveryInFlight) return
+      thinkingOnlyTimer = undefined
+      console.warn('[QwenAI] Thinking-only phase exceeded its wall clock; recovering', JSON.stringify({
+        maxMs: capMs,
+        reasoningChars: reasoningText.length,
+        summaryChars: summaryText.length,
+        upstreamEventCount,
+      }))
+      // Treat the runaway like a reasoning-only terminal: the branch is
+      // semantically empty, so managed workflow continuation re-prompts on a
+      // fresh branch instead of failing the client request.
+      recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
+    }
+
+    const armThinkingOnlyTimer = () => {
+      const capMs = options.thinkingOnlyMaxMs ?? QWEN_AI_THINKING_ONLY_MAX_MS
+      if (capMs <= 0 || thinkingOnlyTimer || finalChunkSent) return
+      thinkingOnlyTimer = setTimeout(() => handleThinkingOnlyExpired(capMs), capMs)
     }
 
     const writeVisibleSse = (
@@ -5635,6 +5700,8 @@ export class QwenAiStreamHandler {
     const writeGuardedContent = (content: string, finishOnToolCall = true) => {
       if (!content || finalChunkSent) return
 
+      // Answer-channel output ends the thinking-only phase.
+      cancelThinkingOnlyTimer()
       this.content += content
 
       const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
@@ -5687,6 +5754,7 @@ export class QwenAiStreamHandler {
     const writeGuardedReasoning = (content: string) => {
       if (!content || finalChunkSent) return
       reasoningText += content
+      armThinkingOnlyTimer()
       if (options.reasoningOnlyAsContent) return
 
       if (!hasSentReasoning) {
@@ -5720,6 +5788,7 @@ export class QwenAiStreamHandler {
     const writeGuardedSummary = (content: string) => {
       if (!content || finalChunkSent) return
       summaryText += content
+      armThinkingOnlyTimer()
       if (options.reasoningOnlyAsContent) return
 
       if (!hasSentReasoning) {
@@ -5982,10 +6051,21 @@ export class QwenAiStreamHandler {
           if (reasoningFallback) {
             if (!initialChunkSent) sendInitialChunk()
             writeGuardedContent(reasoningFallback)
-            hasAnswerOrTool = true
-            console.info('[QwenAI] Accepted reasoning-only output in auto mode', JSON.stringify({
-              chars: reasoningFallback.length,
-            }))
+            // The parser flush already ran, so text held as a partial
+            // tool-protocol marker can no longer become visible. Accepting
+            // the turn here would end the stream with zero client-visible
+            // output (the Responses layer then fails it as
+            // reasoning_only_upstream_response). Treat it as semantically
+            // empty and recover via managed workflow continuation instead.
+            hasAnswerOrTool = Boolean(deliveredAnswerText.trim())
+            if (hasAnswerOrTool) {
+              console.info('[QwenAI] Accepted reasoning-only output in auto mode', JSON.stringify({
+                chars: reasoningFallback.length,
+              }))
+            } else {
+              recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
+              return
+            }
           }
         } else {
           recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
@@ -6146,6 +6226,7 @@ export class QwenAiStreamHandler {
             const generatedImageBatch = isQwenAiImageGenerationPhase(phase)
               ? this.ingestGeneratedImages(delta.extra)
               : { images: [], startingIndex: this.generatedImages.length }
+            if (generatedImageBatch.images.length > 0) cancelThinkingOnlyTimer()
 
             if (QWEN_AI_DEBUG_STREAM_LOGS) {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
@@ -6174,6 +6255,8 @@ export class QwenAiStreamHandler {
             const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
 
             if (nativeToolProgress.sawFragment) {
+              // Structured tool-call fragments are answer-phase progress.
+              cancelThinkingOnlyTimer()
               const invalidNativeToolArguments = this.getInvalidNativeToolArgumentIssues()
               const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
               if (completeUndeclaredNativeToolNames.length > 0 && this.responseId) {

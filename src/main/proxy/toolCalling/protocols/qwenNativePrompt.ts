@@ -82,3 +82,21 @@ export function renderQwenNativeRecoveryPrompt(tools: NormalizedToolDefinition[]
   ]
   return lines.join('\n')
 }
+
+export function renderQwenNativeContinuationReminder(tools: NormalizedToolDefinition[]): string {
+  const lines = [
+    'Managed tool workflow status: IN PROGRESS. The tool results above were just returned to you by the client, so the workflow has NOT reached a final answer yet.',
+    'This turn must end with exactly one of: (1) the next <function_calls> block for a distinct unfinished operation, or (2) your complete final answer ending with the exact marker <chat2api_workflow_complete/> as the final characters.',
+    'Do not answer with a plan, progress update, or a description of what you will do next — those are protocol violations on this turn and trigger a retry.',
+    'Declared function names (use only these): ' + serializeJson(tools.map((tool) => tool.name)),
+    'Exact call format:',
+    '<function_calls>',
+    '<invoke name="exact_function_name">',
+    '<parameter name="exact_parameter_name">',
+    'parameter_value',
+    '</parameter>',
+    '</invoke>',
+    '</function_calls>',
+  ]
+  return lines.join('\n')
+}

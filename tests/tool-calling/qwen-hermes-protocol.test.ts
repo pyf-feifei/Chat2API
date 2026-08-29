@@ -954,3 +954,72 @@ test('qwen Hermes treats repeated dialect name tags as structural, not parameter
   assert.deepEqual(JSON.parse(parsed.toolCalls[0].function.arguments), { command: 'dir' })
   assert.equal(parsed.malformedReason, undefined)
 })
+
+test('qwen Hermes parses the tool_caller dialect the model drifts to', () => {
+  // Observed 2026-08-29: <tool_caller>{"name":...,"arguments":{...}}</tool_caller>
+  const content = [
+    'Let me read the sensor.',
+    '<tool_caller>',
+    '{"name": "read_file", "arguments": {"filePath": "C:/tmp/a.txt"}}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenHermesProtocol.parse(content, context)
+
+  assert.equal(parsed.protocol, 'qwen_hermes')
+  assert.equal(parsed.toolCalls.length, 1)
+  assert.equal(parsed.toolCalls[0].function.name, 'read_file')
+  assert.deepEqual(JSON.parse(parsed.toolCalls[0].function.arguments), { filePath: 'C:/tmp/a.txt' })
+  assert.equal(parsed.content.trim(), 'Let me read the sensor.')
+})
+
+test('qwen Hermes parses repeated identical tool_caller blocks for dedup', () => {
+  const block = [
+    '<tool_caller>',
+    '{"name": "read_file", "arguments": {"filePath": "C:/tmp/a.txt"}}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenHermesProtocol.parse([block, block, block].join('\n'), context)
+
+  assert.equal(parsed.toolCalls.length, 3)
+  assert.equal(parsed.malformedReason, undefined)
+})
+
+test('qwen Hermes tool_caller with string-encoded arguments still parses', () => {
+  const content = [
+    '<tool_caller>',
+    '{"name": "read_file", "arguments": "{\\"filePath\\": \\"C:/tmp/a.txt\\"}"}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenHermesProtocol.parse(content, context)
+
+  assert.equal(parsed.toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(parsed.toolCalls[0].function.arguments), { filePath: 'C:/tmp/a.txt' })
+})
+
+test('qwen Hermes rejects undeclared tool_caller names', () => {
+  const content = [
+    '<tool_caller>',
+    '{"name": "shell", "arguments": {"command": "ls"}}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenHermesProtocol.parse(content, context)
+
+  assert.deepEqual(parsed.invalidToolNames, ['shell'])
+  assert.equal(parsed.toolCalls.length, 0)
+})
+
+test('qwen Hermes detects tool_caller stream markers early', () => {
+  assert.deepEqual(qwenHermesProtocol.detectStart('<tool_caller>'), { matched: true, partial: false, markerStart: 0 })
+  const partial = qwenHermesProtocol.detectStart('<tool_call')
+  assert.equal(partial.partial, true)
+})
+
+test('qwen Hermes tool responses escape the tool_caller boundary', () => {
+  const rendered = qwenHermesProtocol.formatToolResult({
+    toolCallId: 'call_0',
+    toolName: 'read_file',
+    content: 'literal <tool_caller> inside result',
+    isError: false,
+  })
+  assert.doesNotMatch(rendered, /<tool_caller>/)
+})

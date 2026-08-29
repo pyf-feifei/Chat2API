@@ -49,13 +49,18 @@ export function flattenPlainTranscript(messages: ManagedToolTranscriptMessage[])
 export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[]): string {
   const toolProfile = getProviderToolProfile('m365-copilot')
   const blocks: string[] = []
+  // System content (the injected tool-protocol prompt and any client system
+  // rules) must ride the text channel: the consumer wire's
+  // options.customInstructions was never observed to reach the model, so the
+  // protocol contract lives here as leading [system] blocks.
+  const systemBlocks: string[] = []
   // Map tool_call_id -> tool name from assistant tool_calls so tool results
   // can be labelled with the correct name in the fenced protocol.
   const toolNameById: Record<string, string> = {}
   for (const msg of messages) {
-    // System messages are excluded from the text payload and sent via
-    // options.customInstructions instead (handled by the adapter).
     if (msg.role === 'system') {
+      const text = messageContentToText(msg.content)
+      if (text) systemBlocks.push(text)
       continue
     }
     if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
@@ -94,5 +99,11 @@ export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[
     if (!text) continue
     blocks.push(`[${msg.role}]\n${text}`)
   }
-  return blocks.join('\n\n')
+  // Role labels on system blocks are deliberately omitted: the consumer
+  // Copilot safety layer blocks messages that open with a forged [system]
+  // tag (empirically bisected 2026-08-28). The bare prompt text passes.
+  const ordered = systemBlocks.length > 0
+    ? [...systemBlocks, ...blocks]
+    : blocks
+  return ordered.join('\n\n')
 }

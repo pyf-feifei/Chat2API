@@ -62,7 +62,10 @@ test('m365 managed transcript uses fenced protocol and role-labelled blocks', ()
 
   const text = flattenManagedTranscript(transformed.messages as any)
   assert.match(text, /## Available Tools/)
-  assert.match(text, /\[system\]\nClient system rules\./)
+  // System blocks ride the text channel WITHOUT a [system] role label — the
+  // consumer safety layer blocks forged [system] tags (bisected 2026-08-28).
+  assert.match(text, /Client system rules\./)
+  assert.doesNotMatch(text, /\[system\]/)
   assert.match(text, /\[user\]\nWhat is the weather in Paris\?/)
   assert.match(text, /\[assistant\]\n```get_weather\n/)
   assert.match(text, /\[tool\]\n<tool_response name="get_weather" call_id="call_1">\n18C sunny\n<\/tool_response>/)

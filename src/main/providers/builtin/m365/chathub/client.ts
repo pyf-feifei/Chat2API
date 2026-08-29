@@ -307,6 +307,7 @@ function buildConsumerChatPayload(
     requestId: string,
     firstTurn: boolean,
     customInstructions?: string,
+    tone?: string,
   ): string {
   // Mirrored from the m365.cloud.microsoft officeweb consumer client; the
   // ChatHub silently ignores invocations whose shape drifts too far.
@@ -355,7 +356,9 @@ function buildConsumerChatPayload(
         },
         plugins: [{ Id: 'BingWebSearch', Source: 'BuiltIn' }],
         isSbsSupported: true,
-        tone: 'Magic',
+        // Magic confabulates instead of following prompt-injected tool
+        // protocols; Assist complies (validated 2026-08-28).
+        tone: tone || 'Magic',
         renderReferencesBehindEOS: true,
         disconnectBehavior: 'continue',
       },
@@ -442,7 +445,7 @@ export class ChatHubClient {
               // frame; without it the hub silently drops the invocation.
               const payload =
                 (variant === 'consumer'
-                  ? buildConsumerChatPayload(request.text, sessionId, requestId, firstTurn, request.customInstructions)
+                  ? buildConsumerChatPayload(request.text, sessionId, requestId, firstTurn, request.customInstructions, tone)
                   : buildChatPayload(
                       request.text,
                       sessionId,

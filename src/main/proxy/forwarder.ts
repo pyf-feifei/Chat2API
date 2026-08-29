@@ -22,6 +22,7 @@ import { DeepSeekStreamHandler } from './adapters/deepseek-stream'
 import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
 import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
 import { M365Adapter } from './adapters/m365'
+import { isM365AuthIssue, isM365QuotaWall, m365FailureClassification } from './m365FailoverClassification'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
 import {
@@ -136,14 +137,6 @@ function qwenAiErrorNodes(error: unknown): QwenAiErrorNode[] {
   }
   visit(error, 0)
   return nodes
-}
-
-function isM365AuthIssue(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  if (/rate limit|too many requests|content policy|contentfilter|safetyblocked/i.test(message)) {
-    return false
-  }
-  return /401|403|unauthorized|access token|token expired|expired token|invalid_grant|aadsts/i.test(message)
 }
 
 function statusFromError(error: unknown): number | undefined {
@@ -2033,6 +2026,10 @@ export class RequestForwarder {
           success: false,
           status: 401,
           error: validation.error || 'Invalid M365 account credentials',
+          // A structurally-invalid credential set is this account's problem;
+          // another M365 account may still serve the request.
+          retryScope: 'next-account' as const,
+          accountFault: true,
           latency: Date.now() - startTime,
         }
       }
@@ -2050,6 +2047,13 @@ export class RequestForwarder {
         tone: transformedRequest.tone || 'magic',
         sessionId: transformedRequest.sessionId,
         conversationId: transformedRequest.conversationId,
+        // undefined on first turn (defaults true upstream), false when the
+        // adapter matched a continuation conversation.
+        started: transformedRequest.started,
+        // Managed-tool protocol prompt (and client system prompts) ride the
+        // customInstructions channel on the consumer wire; dropping it leaves
+        // the model without any tool contract.
+        customInstructions: transformedRequest.customInstructions,
         attachments: transformedRequest.attachments || [],
         tools: transformedRequest.tools || [],
         toolChoice: transformedRequest.toolChoice,
@@ -2077,6 +2081,7 @@ export class RequestForwarder {
         passThrough.on('error', () => {})
         let streamed = false
         let streamFinished = false
+        let streamedText = ''
         const onDelta = (delta: unknown): void => {
           // The ChatHub handler emits structured StreamEvents ({kind,text,…});
           // OpenAI clients expect plain string content chunks. When managed
@@ -2090,6 +2095,7 @@ export class RequestForwarder {
                 : ''
           if (!text) return
           streamed = true
+          streamedText += text
           const baseChunk = adapter.transformStreamChunk({ text }, actualModel)
           const outs = toolStreamParser
             ? toolStreamParser.push(text, baseChunk, !sentManagedRole)
@@ -2103,6 +2109,16 @@ export class RequestForwarder {
         const finishStream = (): void => {
           if (streamFinished) return
           streamFinished = true
+          // Quota walls stream as ordinary text; the 200 is already committed
+          // so account rotation is impossible here, but the client must see a
+          // typed error instead of the wall masquerading as an answer.
+          if (isM365QuotaWall(streamedText)) {
+            console.warn('[M365Copilot] daily chat limit surfaced mid-stream', JSON.stringify({
+              accountId: account.id,
+            }))
+            passThrough.destroy(new Error('M365 daily chat limit reached for this account'))
+            return
+          }
           const skeletonChunk = {
             id: `chatcmpl-${Date.now()}`,
             object: 'chat.completion.chunk',
@@ -2141,9 +2157,22 @@ export class RequestForwarder {
         }
         const startChat = (creds: { accessToken: string; oid: string; tid: string }) =>
           client.chat(creds, chatRequest, onDelta)
+        const recordContinuation = (result: { conversationId?: string; sessionId?: string; text?: string }): void => {
+          // Only remember turns that produced content, so failed/empty chats
+          // never poison the prefix-match for the next request.
+          if (!toolStreamParser && result.conversationId && result.sessionId && streamedText) {
+            adapter.recordServedConversation(
+              result.conversationId,
+              result.sessionId,
+              request,
+              streamedText,
+            )
+          }
+        }
         const runChat = async (): Promise<void> => {
           try {
-            await startChat(chatHubAccount)
+            const chatResult = await startChat(chatHubAccount)
+            recordContinuation(chatResult)
             finishStream()
           } catch (error) {
             if (!streamed && isM365AuthIssue(error)) {
@@ -2154,11 +2183,12 @@ export class RequestForwarder {
               adapter.invalidateAccessToken(chatHubAccount.accessToken)
               try {
                 const refreshed = await adapter.acquireCredentials(true)
-                await startChat({
+                const retryResult = await startChat({
                   accessToken: refreshed.accessToken,
                   oid: refreshed.oid,
                   tid: refreshed.tid,
                 })
+                recordContinuation(retryResult)
                 finishStream()
                 return
               } catch (retryError) {
@@ -2211,7 +2241,33 @@ export class RequestForwarder {
         )
       }
 
+      // Quota walls arrive as normal answer text ("You've reached your daily
+      // chat limit"), not as a transport error; classify them so the route
+      // rotates to another M365 account instead of returning the wall as an
+      // answer.
+      if (isM365QuotaWall(result.text)) {
+        return {
+          success: false,
+          status: 429,
+          error: 'M365 daily chat limit reached for this account',
+          retryable: true,
+          retryScope: 'next-account' as const,
+          accountFault: true,
+          latency: Date.now() - startTime,
+        }
+      }
       const body = adapter.transformResponse(result, actualModel)
+      if (!transformed.plan.shouldParseResponse) {
+        // Remember the served turn sequence so an extending request can
+        // continue this upstream conversation (managed-tool transcripts
+        // replay via prompt and don't participate).
+        adapter.recordServedConversation(
+          result.conversationId,
+          result.sessionId,
+          request,
+          result.text || '',
+        )
+      }
       if (transformed.plan.shouldParseResponse) {
         this.applyToolCallsToResponse(body, transformed)
       }
@@ -2225,12 +2281,16 @@ export class RequestForwarder {
     } catch (error) {
       const latency = Date.now() - startTime
       const message = error instanceof Error ? error.message : 'Unknown error'
-      const authIssue = isM365AuthIssue(error)
+      // Auth-class failures are account-scoped: rotate to the next M365
+      // account at the route boundary instead of failing the request.
+      const classified = m365FailureClassification(error)
       return {
         success: false,
-        status: authIssue ? 401 : undefined,
+        status: classified.status,
         error: message,
-        retryable: authIssue ? false : undefined,
+        retryable: classified.retryable,
+        retryScope: classified.retryScope,
+        accountFault: classified.accountFault,
         latency,
       }
     }
@@ -3546,6 +3606,8 @@ export class RequestForwarder {
           : providerRequest.reasoning_effort !== undefined
             ? Boolean(providerRequest.reasoning_effort)
             : undefined,
+        reasoning_effort: providerRequest.reasoning_effort,
+        reasoningEffort: providerRequest.reasoningEffort,
         thinking_budget: providerRequest.thinking_budget,
         managedToolCalling: transformed.plan.shouldParseResponse,
         managedToolWorkflowContinuation: transformed.plan.workflowContinuation,
@@ -3613,6 +3675,8 @@ export class RequestForwarder {
               : providerRequest.reasoning_effort !== undefined
                 ? Boolean(providerRequest.reasoning_effort)
                 : undefined,
+              reasoning_effort: providerRequest.reasoning_effort,
+              reasoningEffort: providerRequest.reasoningEffort,
             thinking_budget: providerRequest.thinking_budget,
             managedToolCalling: true,
             managedToolWorkflowContinuation: true,
@@ -3891,6 +3955,8 @@ export class RequestForwarder {
                     : providerRequest.reasoning_effort !== undefined
                       ? Boolean(providerRequest.reasoning_effort)
                       : undefined,
+                    reasoning_effort: providerRequest.reasoning_effort,
+                    reasoningEffort: providerRequest.reasoningEffort,
                   thinking_budget: providerRequest.thinking_budget,
                   managedToolCalling: true,
                   signal: recoverySignal || context?.signal,

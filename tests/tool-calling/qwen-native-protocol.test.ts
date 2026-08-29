@@ -382,3 +382,163 @@ test('native prompt renders with an empty tool list without crashing', () => {
   assert.match(prompt, /<tools>/)
   assert.match(prompt, /<function_calls>/)
 })
+
+test('native tolerates malformed close tags mirroring the name attribute', () => {
+  // Observed upstream drift: model emits </parameter name> instead of </parameter>.
+  const content = [
+    '<function_calls>',
+    '<invoke name="shell">',
+    '<parameter name="command">',
+    'echo XHIGH-TEST',
+    '</parameter name>',
+    '</invoke>',
+    '</function_calls>',
+  ].join('\n')
+
+  const strictTools = [
+    {
+      name: 'shell',
+      description: 'Run a shell command',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+      source: 'openai' as const,
+    },
+  ]
+  const parsed = qwenNativeProtocol.parse(content, { tools: strictTools, protocol: 'qwen_native' })
+  assert.equal(parsed.toolCalls.length, 1)
+  assert.equal(parsed.malformedReason, undefined)
+  assert.deepEqual(JSON.parse(parsed.toolCalls[0].function.arguments), { command: 'echo XHIGH-TEST' })
+})
+
+test('native keeps the canonical close tag authoritative when both forms appear', () => {
+  // A value legitimately containing "</parameter name" text must still parse
+  // when the stream later carries the exact canonical close.
+  const content = [
+    '<function_calls>',
+    '<invoke name="shell">',
+    '<parameter name="command">',
+    'echo ok',
+    '</parameter>',
+    '</invoke>',
+    '</function_calls>',
+  ].join('\n')
+  const shellTools = [
+    {
+      name: 'shell',
+      description: 'Run a shell command',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+      source: 'openai' as const,
+    },
+  ]
+  const parsed = qwenNativeProtocol.parse(content, { tools: shellTools, protocol: 'qwen_native' })
+  assert.equal(parsed.toolCalls.length, 1)
+  const args = JSON.parse(parsed.toolCalls[0].function.arguments)
+  assert.equal(Object.keys(args).length, 1)
+  assert.equal(args.command, 'echo ok')
+})
+
+test('native ends parameter values at corrupted close tags of any shape', () => {
+  // Observed drift variants: attribute mirror, pipe terminator, bare prefix.
+  const variants = ['</parameter name>', '</parameter|', '</parameter name']
+  const shellTools = [
+    {
+      name: 'shell',
+      description: 'Run a shell command',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+      source: 'openai' as const,
+    },
+  ]
+  for (const closeTag of variants) {
+    const content = [
+      '<function_calls>',
+      '<invoke name="shell">',
+      '<parameter name="command">',
+      'echo VARIANT',
+      closeTag,
+      '</invoke>',
+      '</function_calls>',
+    ].join('\n')
+    const parsed = qwenNativeProtocol.parse(content, { tools: shellTools, protocol: 'qwen_native' })
+    assert.equal(parsed.toolCalls.length, 1, `variant ${closeTag}`)
+    assert.equal(parsed.malformedReason, undefined, `variant ${closeTag}`)
+    assert.deepEqual(
+      JSON.parse(parsed.toolCalls[0].function.arguments),
+      { command: 'echo VARIANT' },
+      `variant ${closeTag}`,
+    )
+  }
+})
+
+test('native parses the tool_caller dialect the model drifts to', () => {
+  // Observed 2026-08-29: the platform model sometimes emits
+  // <tool_caller>{"name":...,"arguments":{...}}</tool_caller> from training
+  // memory instead of the taught <function_calls> format.
+  const content = [
+    'Let me read the sensor.',
+    '<tool_caller>',
+    '{"name": "read_file", "arguments": {"filePath": "C:/tmp/a.txt"}}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenNativeProtocol.parse(content, context)
+
+  assert.equal(parsed.protocol, 'qwen_native')
+  assert.equal(parsed.toolCalls.length, 1)
+  assert.equal(parsed.toolCalls[0].function.name, 'read_file')
+  assert.deepEqual(JSON.parse(parsed.toolCalls[0].function.arguments), { filePath: 'C:/tmp/a.txt' })
+  assert.equal(parsed.content.trim(), 'Let me read the sensor.')
+})
+
+test('native parses repeated identical tool_caller blocks and flags them for dedup', () => {
+  const block = [
+    '<tool_caller>',
+    '{"name": "read_file", "arguments": {"filePath": "C:/tmp/a.txt"}}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenNativeProtocol.parse([block, block, block].join('\n'), context)
+
+  // All three parse; the emission layer collapses identical calls.
+  assert.equal(parsed.toolCalls.length, 3)
+  assert.equal(parsed.malformedReason, undefined)
+})
+
+test('native rejects undeclared tool names in tool_caller blocks', () => {
+  const content = [
+    '<tool_caller>',
+    '{"name": "shell", "arguments": {"command": "ls"}}',
+    '</tool_caller>',
+  ].join('\n')
+  const parsed = qwenNativeProtocol.parse(content, context)
+
+  assert.deepEqual(parsed.invalidToolNames, ['shell'])
+  assert.equal(parsed.toolCalls.length, 0)
+})
+
+test('native detects tool_caller stream markers early', () => {
+  assert.deepEqual(qwenNativeProtocol.detectStart('<tool_caller>'), { matched: true, partial: false, markerStart: 0 })
+  const partial = qwenNativeProtocol.detectStart('<tool_call')
+  assert.equal(partial.partial, true)
+})
+
+test('native tool responses escape the tool_caller boundary', () => {
+  const rendered = qwenNativeProtocol.formatToolResult({
+    toolCallId: 'call_0',
+    toolName: 'read_file',
+    content: 'literal <tool_caller> inside result',
+    isError: false,
+  })
+  assert.doesNotMatch(rendered, /<tool_caller>/)
+})

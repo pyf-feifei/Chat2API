@@ -1,4 +1,4 @@
-import test from 'node:test'
+﻿import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ToolStreamParser } from '../../src/main/proxy/toolCalling/ToolStreamParser.ts'
 import { ManagedToolResultGuard } from '../../src/main/proxy/toolCalling/managedToolResultGuard.ts'
@@ -654,4 +654,48 @@ test('fenced Qwen Hermes examples remain ordinary streamed text', () => {
   assert.equal(chunks.length, 1)
   assert.equal(chunks[0].choices[0].delta.content, text)
   assert.deepEqual(parser.flush(baseChunk), [])
+})
+
+test('stream buffers incremental tool_caller deltas and emits one tool call, never content', () => {
+  // Regression for the observed leak: under hermes the <tool_call prefix
+  // briefly matched the tool_call marker, then "er>" arrived, the buffer was
+  // flushed as plain content, and the dialect call leaked as assistant text.
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  const chunks = [
+    ...parser.push('I will read it now. <tool_c', baseChunk, true),
+    ...parser.push('aller>\n{"name": "default_api:read_file", "arguments": {"filePath": "a.txt"}}\n</tool_c', baseChunk, false),
+    ...parser.push('aller>', baseChunk, false),
+  ]
+  const flush = parser.flush()
+
+  const allChunks = [...chunks, ...flush]
+  const contentText = allChunks
+    .map(chunk => chunk.choices?.[0]?.delta?.content)
+    .filter(Boolean)
+    .join('')
+  const toolChunks = allChunks.filter(chunk => {
+    const toolCalls = chunk.choices?.[0]?.delta?.tool_calls
+    return Array.isArray(toolCalls) && toolCalls.length > 0
+  })
+
+  assert.equal(toolChunks.length, 1)
+  assert.equal(toolChunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.match(contentText, /I will read it now\./)
+  assert.doesNotMatch(contentText, /tool_caller/)
+})
+
+test('stream collapses repeated identical tool_caller blocks to one call', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  const block = '<tool_caller>\n{"name": "default_api:read_file", "arguments": {"filePath": "a.txt"}}\n</tool_caller>'
+  const chunks = [
+    ...parser.push(`${block}\n${block}\n${block}`, baseChunk, true),
+    ...parser.flush(),
+  ]
+  const toolChunks = chunks.filter(chunk => {
+    const toolCalls = chunk.choices?.[0]?.delta?.tool_calls
+    return Array.isArray(toolCalls) && toolCalls.length > 0
+  })
+
+  assert.equal(toolChunks.length, 1)
+  assert.equal(toolChunks[0].choices[0].delta.tool_calls.length, 1)
 })

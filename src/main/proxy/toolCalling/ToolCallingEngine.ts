@@ -99,7 +99,7 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
 const SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT = [
   'The immediately preceding matched tool-result batch completed successfully, so those corresponding tool calls have already run.',
   'Use their returned results and do not repeat a completed call merely to satisfy the original request.',
-  'Call another tool only for a distinct unfinished operation or when a returned result explicitly shows that more work is required.',
+  'The workflow itself is still in progress: either invoke the next declared tool for a distinct unfinished operation, or, when the returned results verify that every requested operation is complete, return the final answer with the required completion marker.',
 ].join(' ')
 
 const MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT = [
@@ -126,6 +126,21 @@ export function createToolWorkflowContinuationMessage(options: {
   const recoveryPrompt = options.requireManagedToolCall && options.plan
     ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(options.plan.tools)
     : undefined
+  // Turn-local contract restatement for continuation turns. The teaching
+  // system prompt sits many turns back in provider-side session history; on
+  // long tool loops models lose sight of it, judge the workflow finished from
+  // their own prior plan, and end the loop with intent prose. The reminder
+  // states the workflow fact (tool results just returned) and re-anchors the
+  // wire format + declared tool names next to the active turn. Protocol-level
+  // and client-agnostic: rendered from the plan's protocol and tools only.
+  // Successful continuations only: a failed tool result keeps its deliberately
+  // relaxed contract (a final blocking-failure explanation without the
+  // completion marker stays legitimate there).
+  const continuationReminder = options.plan?.workflowContinuation
+    && options.plan.failedToolResultPending !== true
+    && options.plan.tools.length > 0
+    ? getToolProtocol(options.plan.protocol).renderContinuationReminder?.(options.plan.tools)
+    : undefined
   const completionPrompt = options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
     ? MANAGED_WORKFLOW_COMPLETION_PROMPT
     : undefined
@@ -149,6 +164,7 @@ export function createToolWorkflowContinuationMessage(options: {
           : SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT
         : undefined,
       recoveryPrompt,
+      continuationReminder,
       completionPrompt,
     ].filter((part): part is string => Boolean(part)).join('\n\n'),
   }

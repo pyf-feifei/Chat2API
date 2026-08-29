@@ -31,6 +31,26 @@ import {
 
 const runtimeRequire = createRequire(import.meta.url)
 
+// Transpile-and-load a real source module once; used for imports whose real
+// behavior the tests depend on (e.g. progress-intent detection).
+const realModuleCache = new Map()
+function loadRealModule(relativePath) {
+  if (realModuleCache.has(relativePath)) return realModuleCache.get(relativePath)
+  const source = fs.readFileSync(relativePath, 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      esModuleInterop: true,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', output)(runtimeRequire, module, module.exports)
+  const loaded = module.exports
+  realModuleCache.set(relativePath, loaded)
+  return loaded
+}
+
 function loadQwenAiStreamHandler(overrides = {}) {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
   const output = ts.transpileModule(source, {
@@ -47,6 +67,8 @@ function loadQwenAiStreamHandler(overrides = {}) {
       hasToolUse: overrides.hasToolUse || (() => false),
       parseToolUse: overrides.parseToolUse || (() => []),
     },
+    './qwenAiProgressIntent': loadRealModule('src/main/proxy/adapters/qwenAiProgressIntent.ts'),
+    './qwenAiProgressIntent.ts': loadRealModule('src/main/proxy/adapters/qwenAiProgressIntent.ts'),
     './qwen-ai-token-refresh': {
       QwenAiTokenRefresher: class {},
       hasQwenAiSessionCookie: cookies => /(?:^|;\s*)token=[^;]+/.test(cookies || ''),
@@ -9665,4 +9687,84 @@ test('Qwen AI response-id resume immediately preserves next-account auth and cap
       assert.equal(restartCalls, 0)
     })
   }
+})
+
+test('Qwen AI caps a thinking-only trickle and recovers instead of running forever', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 5_000,
+    idleTimeoutMs: 10_000,
+    thinkingOnlyMaxMs: 80,
+    allowReasoningOnlyOutput: true,
+    reasoningOnlyAsContent: true,
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  // Slow thinking trickle: deltas arrive faster than the idle timeout but no
+  // answer ever starts. Without the thinking-only cap this loops forever.
+  const trickle = setInterval(() => {
+    upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'think',
+      status: 'typing',
+      content: 'still thinking ',
+    } }] })}\n\n`)
+  }, 25)
+
+  try {
+    await ended
+  } finally {
+    clearInterval(trickle)
+  }
+
+  // The stream must terminate via the semantic-empty path, not hang.
+  assert.notEqual(failure, undefined)
+  assert.equal(failure.code, 'qwen_ai_semantic_empty')
+  upstream.destroy()
+})
+
+test('Qwen AI thinking-only cap is cancelled when an answer starts', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 5_000,
+    idleTimeoutMs: 10_000,
+    thinkingOnlyMaxMs: 120,
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'think',
+    status: 'typing',
+    content: 'brief thought ',
+  } }] })}\n\n`)
+  await new Promise(resolve => setTimeout(resolve, 40))
+  // Answer starts well before the cap fires.
+  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+    phase: 'answer',
+    status: 'typing',
+    content: 'final answer text',
+  } }] })}\n\n`)
+  // Outlive the cap: it must have been cancelled by the answer.
+  await new Promise(resolve => setTimeout(resolve, 200))
+  upstream.end('data: [DONE]\n\n')
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure, undefined)
+  assert.match(body, /final answer text/)
 })

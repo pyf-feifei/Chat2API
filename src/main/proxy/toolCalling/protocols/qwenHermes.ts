@@ -11,9 +11,12 @@ import {
   decodeXml,
   detectMarkers,
   escapeXmlAttribute,
+  findToolCallerStart,
   hasToolArgumentValidationIssues,
   parseJsonValue,
+  parseToolCallerBlock,
   stripFencedCodeBlocks,
+  TOOL_CALLER_START,
   toolNames,
 } from './shared.ts'
 
@@ -97,7 +100,7 @@ interface ParsedEnvelope {
 
 interface QwenManagedCallStart {
   index: number
-  kind: 'hermes_json_or_xml' | 'bare_xml' | 'mcp_dialect'
+  kind: 'hermes_json_or_xml' | 'bare_xml' | 'mcp_dialect' | 'tool_caller'
 }
 
 interface QwenXmlFunctionBoundary {
@@ -165,6 +168,21 @@ parameter_value
 Repeat the parameter block for every argument required by the selected function's JSON schema. Encode object and array values as JSON.`
   },
 
+  renderContinuationReminder(tools) {
+    return `Managed tool workflow status: IN PROGRESS. The tool results above were just returned to you by the client, so the workflow has NOT reached a final answer yet.
+This turn must end with exactly one of: (1) the next <tool_call> block for a distinct unfinished operation, or (2) your complete final answer ending with the exact marker <chat2api_workflow_complete/> as the final characters.
+Do not answer with a plan, progress update, or a description of what you will do next — those are protocol violations on this turn and trigger a retry.
+Declared function names (use only these): ${serializeHermesJson(tools.map((tool) => tool.name))}
+Exact call format:
+<tool_call>
+<function=exact_function_name>
+<parameter=exact_parameter_name>
+parameter_value
+</parameter>
+</function>
+</tool_call>`
+  },
+
   detectStart(buffer) {
     return detectQwenManagedStart(buffer)
   },
@@ -187,12 +205,14 @@ Repeat the parameter block for every argument required by the selected function'
         ? parseBareQwenXmlCall(parseable, callStart.index, toolDefinitions)
         : callStart.kind === 'mcp_dialect'
           ? parseToolCallsDialectBlock(parseable, callStart.index, toolDefinitions)
-          : parseWrappedQwenCall(
-              parseable,
-              callStart.index,
-              context.allowPartial === true,
-              toolDefinitions,
-            )
+          : callStart.kind === 'tool_caller'
+            ? parseToolCallerBlock(parseable, callStart.index)
+            : parseWrappedQwenCall(
+                parseable,
+                callStart.index,
+                context.allowPartial === true,
+                toolDefinitions,
+              )
 
       if (!parsedCall) {
         if (context.allowPartial) {
@@ -999,11 +1019,13 @@ function findNextQwenManagedCallStart(
   const wrapped = content.indexOf(TOOL_CALL_START, fromIndex)
   const functionCalls = content.indexOf(FUNCTION_CALLS_START, fromIndex)
   const dialect = content.indexOf(TOOL_CALLS_WRAPPER_START, fromIndex)
+  const toolCaller = findToolCallerStart(content, fromIndex)
   const bare = findNextBareFunctionStart(content, fromIndex)
   const candidates: Array<QwenManagedCallStart> = []
   if (wrapped !== -1) candidates.push({ index: wrapped, kind: 'hermes_json_or_xml' })
   if (functionCalls !== -1) candidates.push({ index: functionCalls, kind: 'hermes_json_or_xml' })
   if (dialect !== -1) candidates.push({ index: dialect, kind: 'mcp_dialect' })
+  if (toolCaller !== -1) candidates.push({ index: toolCaller, kind: 'tool_caller' })
   if (bare !== -1) candidates.push({ index: bare, kind: 'bare_xml' })
   if (candidates.length === 0) return undefined
   candidates.sort((a, b) => a.index - b.index)
@@ -1027,6 +1049,7 @@ function detectQwenManagedStart(buffer: string) {
   const wrapped = detectMarkers(buffer, [TOOL_CALL_START])
   const functionCalls = detectMarkers(buffer, [FUNCTION_CALLS_START])
   const dialect = detectMarkers(buffer, [TOOL_CALLS_WRAPPER_START])
+  const toolCaller = detectMarkers(buffer, [TOOL_CALLER_START])
   const completeBare = findNextBareFunctionStart(buffer, 0)
   if (completeBare !== -1) {
     if (wrapped.markerStart === undefined || completeBare < wrapped.markerStart) {
@@ -1035,7 +1058,7 @@ function detectQwenManagedStart(buffer: string) {
   }
 
   const partialBare = detectTrailingBareFunctionPrefix(buffer)
-  const allCandidates = [wrapped, functionCalls, dialect, partialBare].filter(
+  const allCandidates = [wrapped, functionCalls, dialect, toolCaller, partialBare].filter(
     (c2): c2 is NonNullable<typeof c2> => c2?.markerStart !== undefined
   )
   if (allCandidates.length === 0) return wrapped
@@ -1178,13 +1201,13 @@ function serializeHermesJson(value: unknown): string {
 }
 
 function escapeHermesJsonBoundaries(content: string): string {
-  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_response|tool_name)>/gi, boundary => (
+  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_caller|tool_response|tool_name)>/gi, boundary => (
     boundary.replace('<', '\\u003c').replace('>', '\\u003e')
   ))
 }
 
 function escapeHermesTextBoundaries(content: string): string {
-  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_response|tool_name)>/gi, boundary => (
+  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_caller|tool_response|tool_name)>/gi, boundary => (
     boundary.replace('<', '&lt;').replace('>', '&gt;')
   ))
 }

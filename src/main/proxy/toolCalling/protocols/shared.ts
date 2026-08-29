@@ -927,3 +927,89 @@ function uniqueStrings(values: string[]): string[] {
 export function genericToolResultBlock(result: NormalizedToolResult): string {
   return `[TOOL_RESULT for ${result.toolCallId}] ${result.content}`
 }
+
+/**
+ * Third wire dialect the Qwen platform model sometimes emits from training
+ * memory despite the taught protocol, observed 2026-08-29:
+ *
+ *   <tool_caller>
+ *   {"name": "read_sensor", "arguments": {"sensor_id": "S01"}}
+ *   </tool_caller>
+ *
+ * The grammar is protocol-agnostic (an XML tag wrapping a bare JSON envelope
+ * like Hermes' tool_call), so the parser lives here and both Qwen protocols
+ * consume it. Repeated identical blocks are expected; deduplication happens
+ * at the engine/stream emission layer like any other parsed batch.
+ */
+export const TOOL_CALLER_START = '<tool_caller>'
+export const TOOL_CALLER_END = '</tool_caller>'
+
+export interface ToolCallerEnvelope {
+  name: string
+  arguments: Record<string, unknown>
+}
+
+export interface ParsedToolCallerBlock {
+  end: number
+  rawText: string
+  envelopes: ToolCallerEnvelope[]
+}
+
+export function findToolCallerStart(content: string, fromIndex: number): number {
+  return content.indexOf(TOOL_CALLER_START, fromIndex)
+}
+
+export function parseToolCallerBlock(
+  content: string,
+  blockStart: number,
+): ParsedToolCallerBlock | undefined {
+  const bodyStart = blockStart + TOOL_CALLER_START.length
+  const endTag = content.indexOf(TOOL_CALLER_END, bodyStart)
+  if (endTag === -1) return undefined
+
+  const blockBody = content.slice(bodyStart, endTag)
+  const end = endTag + TOOL_CALLER_END.length
+  const envelopes: ToolCallerEnvelope[] = []
+
+  // One or more JSON objects may sit inside the wrapper; each balanced object
+  // is one envelope. Objects the model failed to close render as nothing here
+  // so the outer protocol's partial handling stays in charge.
+  let searchIndex = 0
+  while (searchIndex < blockBody.length) {
+    const objectStart = blockBody.indexOf('{', searchIndex)
+    if (objectStart === -1) break
+    const jsonText = extractBalancedJson(blockBody, objectStart)
+    if (!jsonText) break
+    searchIndex = objectStart + jsonText.length
+    try {
+      const parsed = JSON.parse(jsonText) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      const record = parsed as Record<string, unknown>
+      const name = typeof record.name === 'string' ? record.name.trim() : ''
+      if (!name) continue
+      const rawArguments = record.arguments
+      let args: Record<string, unknown>
+      if (rawArguments && typeof rawArguments === 'object' && !Array.isArray(rawArguments)) {
+        args = rawArguments as Record<string, unknown>
+      } else if (typeof rawArguments === 'string' && rawArguments.trim()) {
+        try {
+          const nested = JSON.parse(rawArguments)
+          args = nested && typeof nested === 'object' && !Array.isArray(nested)
+            ? nested as Record<string, unknown>
+            : {}
+        } catch {
+          args = {}
+        }
+      } else {
+        args = {}
+      }
+      envelopes.push({ name, arguments: args })
+    } catch {
+      // A malformed JSON object inside the wrapper is skipped; later objects
+      // may still be well-formed.
+    }
+  }
+
+  if (envelopes.length === 0) return undefined
+  return { end, rawText: content.slice(blockStart, end), envelopes }
+}

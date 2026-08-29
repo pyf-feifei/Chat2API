@@ -1,6 +1,8 @@
 export interface QwenAiFeatureConfigOptions {
   thinkingEnabled: boolean
   autoThinking: boolean
+  /** Upstream three-state enum mirroring the browser payload; omit to keep legacy shape. */
+  thinkingMode?: 'Fast' | 'Auto' | 'Thinking'
   thinkingBudget?: number
 }
 
@@ -14,6 +16,12 @@ export function createQwenAiFeatureConfig(
     research_mode: 'normal',
     auto_thinking: options.autoThinking,
     auto_search: false,
+  }
+
+  // Browser captures pair the enum with the booleans; send it alongside so the
+  // upstream sees the exact feature_config the web UI would have produced.
+  if (options.thinkingMode) {
+    featureConfig.thinking_mode = options.thinkingMode
   }
 
   if (options.thinkingEnabled) {

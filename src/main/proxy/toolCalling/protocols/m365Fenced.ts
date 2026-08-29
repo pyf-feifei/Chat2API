@@ -29,7 +29,7 @@ export const m365FencedProtocol: ToolProtocolAdapter = {
 
     return `## Available Tools
 
-You are the execution core of an automated agent. Your output is parsed by a program.
+You can call external tools through a structured text format that another program reads and executes on your behalf.
 
 The following tools are available. Tool names are case-sensitive. Use only the exact tool names listed below.
 
@@ -37,7 +37,7 @@ ${renderToolList(tools)}
 ${shellFraming}
 ## How to call a tool
 
-To act, output ONLY a single Markdown code fence whose info-string is the exact tool name - nothing before or after. A fenced block is an ACTION the runtime executes immediately against a live system; it is never an example or illustration.
+To use a tool, output ONLY a single Markdown code fence whose info-string is the exact tool name - nothing before or after. The fenced block requests an action to run; it is never an example or illustration.
 
 Format:
 ${FENCE}<tool_name>

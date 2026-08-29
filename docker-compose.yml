@@ -60,6 +60,9 @@ services:
       # Hold managed tool frames until their arguments pass terminal
       # validation. Context compaction strips tools and bypasses this path.
       CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-true}
+      # Managed tool protocol for qwen-ai. Default hermes; qwen_native opts
+      # into the <function_calls> wire format.
+      CHAT2API_QWEN_AI_MANAGED_PROTOCOL: ${CHAT2API_QWEN_AI_MANAGED_PROTOCOL:-qwen_hermes}
       # This UTF-8 JSON target triggers document offload; it is not a request ceiling.
       # Set 0 to disable automatic offload.
       CHAT2API_QWEN_AI_REQUEST_MAX_BYTES: ${CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160}

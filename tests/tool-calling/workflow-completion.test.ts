@@ -206,6 +206,66 @@ test('workflow continuation explains a missing completion proof without acceptin
   assert.match(content, /do not return the marker alone/i)
 })
 
+test('managed workflow continuations restate the protocol contract next to the tool results', () => {
+  for (const protocol of ['qwen_native', 'qwen_hermes'] as const) {
+    const plan = managedPlan({
+      protocol,
+      workflowContinuation: true,
+      tools: [
+        { name: 'workspace:read_file', parameters: {}, source: 'openai' },
+        { name: 'workspace:write_file', parameters: {}, source: 'openai' },
+      ],
+      allowedToolNames: new Set(['workspace:read_file', 'workspace:write_file']),
+    })
+    const continuation = createToolWorkflowContinuationMessage({ plan })
+    const content = String(continuation.content)
+
+    // Workflow fact is asserted, not left to model self-judgment.
+    assert.match(content, /Managed tool workflow status: IN PROGRESS/, `${protocol} states the workflow fact`)
+    assert.match(content, /tool results above were just returned/, `${protocol} anchors the fact to this turn`)
+    // Intent prose is explicitly a violation on the continuation turn.
+    assert.match(content, /plan, progress update, or a description/, `${protocol} forbids intent prose`)
+    // The declared tool names ride the reminder — no reliance on the distant
+    // teaching system prompt.
+    assert.match(content, /workspace:read_file/, `${protocol} lists tool names`)
+    assert.match(content, /workspace:write_file/, `${protocol} lists every tool name`)
+    // The wire format example is restated next to the tool results.
+    const formatTag = protocol === 'qwen_native' ? 'function_calls' : 'tool_call'
+    assert.match(content, new RegExp(`<${formatTag}>`), `${protocol} restates the call format`)
+  }
+})
+
+test('non-continuation managed turns do not carry the continuation reminder', () => {
+  const continuation = createToolWorkflowContinuationMessage({ plan: managedPlan() })
+  assert.doesNotMatch(String(continuation.content), /Managed tool workflow status/)
+})
+
+test('protocols without a continuation reminder still render a valid continuation message', () => {
+  const plan = managedPlan({ protocol: 'managed_xml', workflowContinuation: true })
+  const continuation = createToolWorkflowContinuationMessage({ plan })
+  assert.doesNotMatch(String(continuation.content), /Managed tool workflow status/)
+  assert.match(String(continuation.content), /Complete the active user request/)
+})
+
+test('failed-result continuations keep the relaxed no-marker contract', () => {
+  const plan = managedPlan({
+    protocol: 'qwen_native',
+    workflowContinuation: true,
+    failedToolResultPending: true,
+  })
+  const continuation = createToolWorkflowContinuationMessage({
+    failedToolResultPending: true,
+    plan,
+  })
+  const content = String(continuation.content)
+
+  // The failure path deliberately allows a final blocking-failure explanation
+  // without the completion marker; the reminder must not tighten that.
+  assert.doesNotMatch(content, /chat2api_workflow_complete/)
+  assert.doesNotMatch(content, /Managed tool workflow status: IN PROGRESS/)
+  assert.match(content, /otherwise explain the blocking failure/i)
+})
+
 test('active user request extraction skips tool results and excludes non-text parts', () => {
   const messages = [
     { role: 'user', content: 'OLD_TASK_A' },

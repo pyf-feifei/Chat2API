@@ -11,13 +11,17 @@ import {
   decodeXml,
   detectMarkers,
   escapeXmlAttribute,
+  findToolCallerStart,
   hasToolArgumentValidationIssues,
   parseJsonValue,
+  parseToolCallerBlock,
   stripFencedCodeBlocks,
+  TOOL_CALLER_START,
   toolNames,
 } from './shared.ts'
 import {
   renderQwenNativeFunctionCallsPrompt,
+  renderQwenNativeContinuationReminder,
   renderQwenNativeRecoveryPrompt,
 } from './qwenNativePrompt.ts'
 
@@ -45,8 +49,15 @@ export const qwenNativeProtocol: ToolProtocolAdapter = {
     return renderQwenNativeRecoveryPrompt(tools)
   },
 
+  renderContinuationReminder(tools) {
+    return renderQwenNativeContinuationReminder(tools)
+  },
+
   detectStart(buffer) {
-    return detectMarkers(buffer, [FUNCTION_CALLS_START])
+    // tool_caller is a platform dialect the model drifts to from training
+    // memory; without it in the marker list the stream parser would flush the
+    // block as plain content instead of buffering it as a tool protocol.
+    return detectMarkers(buffer, [FUNCTION_CALLS_START, TOOL_CALLER_START])
   },
 
   parse(content: string, context: ToolParseContext): ToolParseResult {
@@ -60,14 +71,28 @@ export const qwenNativeProtocol: ToolProtocolAdapter = {
     let searchIndex = 0
 
     while (searchIndex < parsable.length) {
-      const callStart = parsable.indexOf(FUNCTION_CALLS_START, searchIndex)
-      if (callStart === -1) break
+      // Both the taught <function_calls> format and the platform tool_caller
+      // dialect the model drifts to from training memory start a block; the
+      // earliest one in the remaining text wins.
+      const functionCallsStart = parsable.indexOf(FUNCTION_CALLS_START, searchIndex)
+      const toolCallerStart = findToolCallerStart(parsable, searchIndex)
+      const candidates = [
+        { index: functionCallsStart, isToolCaller: false },
+        { index: toolCallerStart, isToolCaller: true },
+      ].filter(candidate => candidate.index !== -1)
+      if (candidates.length === 0) break
+      candidates.sort((left, right) => left.index - right.index)
+      const callStart = candidates[0].index
 
-      const parsed = parseFunctionCallsBlock(parsable, callStart, toolDefinitions)
+      const parsed = candidates[0].isToolCaller
+        ? parseToolCallerBlock(parsable, callStart)
+        : parseFunctionCallsBlock(parsable, callStart, toolDefinitions)
       if (!parsed) {
         if (context.allowPartial) {
           rawMatches.push(parsable.slice(callStart))
-          malformedReason ??= 'qwen_native_function_calls_incomplete'
+          malformedReason ??= candidates[0].isToolCaller
+            ? 'qwen_native_tool_caller_incomplete'
+            : 'qwen_native_function_calls_incomplete'
         }
         break
       }
@@ -195,11 +220,13 @@ function parseFunctionCallsBlock(
       const paramValueStart = invokeBody.indexOf('>', paramNameEndQuote + 1)
       if (paramValueStart === -1) break
 
-      const paramValueEnd = invokeBody.indexOf(PARAMETER_CLOSE_TAG, paramValueStart + 1)
+      // Corrupted close tags (`</parameter name>`, `</parameter|`) end the
+      // value at the next tag-looking '<' instead of leaking into the value.
+      const paramValueEnd = findNativeParameterClose(invokeBody, paramValueStart + 1)
       let paramValue: string
       if (paramValueEnd !== -1) {
         paramValue = invokeBody.slice(paramValueStart + 1, paramValueEnd).trim()
-        paramSearchIdx = paramValueEnd + PARAMETER_CLOSE_TAG.length
+        paramSearchIdx = paramValueEnd
       } else {
         paramValue = invokeBody.slice(paramValueStart + 1).trim()
         paramSearchIdx = invokeBody.length
@@ -232,6 +259,24 @@ function parseHistoryArgs(argumentsJson: string): unknown {
   } catch {
     return argumentsJson
   }
+}
+
+/**
+ * Find the closing boundary of a parameter value. Observed upstream drift
+ * closes with corrupted tags (`</parameter name>`, `</parameter|`) — an
+ * enumerated whitelist cannot keep up. Structural rule instead: a parameter
+ * value never contains a raw '<' (payloads are XML-escaped), so the value
+ * ends at the next '<' that starts any tag-looking run. Falls back to the
+ * canonical close position for values that legitimately contain '<' as
+ * escaped text followed by more value.
+ */
+function findNativeParameterClose(body: string, fromIndex: number): number {
+  const exact = body.indexOf(PARAMETER_CLOSE_TAG, fromIndex)
+  const nextTag = body.indexOf('<', fromIndex)
+  if (nextTag === -1) return exact
+  // A next '<' that is not part of the canonical close ends the value there.
+  if (exact === -1 || nextTag < exact) return nextTag
+  return exact
 }
 
 function nativeParameterSchema(
@@ -287,7 +332,7 @@ function formatNativeToolResponse(result: NormalizedToolResult): string {
 }
 
 function escapeNativeTextBoundaries(content: string): string {
-  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_name|tool_response|function_calls|invoke|parameter)>/gi, boundary => (
+  return content.replace(/<\/?(?:tools|tool_call|tool_calls|tool_caller|tool_name|tool_response|function_calls|invoke|parameter)>/gi, boundary => (
     boundary.replace('<', '&lt;').replace('>', '&gt;')
   ))
 }
