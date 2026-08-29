@@ -30,6 +30,17 @@ interface AccountFailoverOptions {
     attempt: AccountFailoverAttempt,
     result: ForwardResult,
   ) => void | Promise<void>
+  /**
+   * Optional per-request stop rule consulted before rotating. Receives the
+   * current failure and the ordered history of earlier failures in this
+   * request, so callers can stop when the SAME rejection keeps coming back
+   * across accounts (a content/pattern rejection, not capacity — rotating
+   * only hammers the busy upstream harder).
+   */
+  shouldStopFailover?: (
+    result: ForwardResult,
+    history: readonly ForwardResult[],
+  ) => boolean
 }
 
 function nonNegativeInteger(value: number): number {
@@ -59,6 +70,9 @@ export function isNextAccountFailoverEligible(
     && signal?.aborted !== true
 }
 
+// The qwen busy-failover stop rule lives in qwenBusyFailover.ts so test
+// harnesses can import it without this module's accountStatus dependency.
+
 export async function forwardWithAccountFailover(
   options: AccountFailoverOptions,
 ): Promise<AccountFailoverOutcome> {
@@ -66,6 +80,7 @@ export async function forwardWithAccountFailover(
   let selection = options.initialSelection
   let failoverCount = 0
   let excludedAccountIds: ReadonlySet<string> = new Set()
+  const failureHistory: ForwardResult[] = []
 
   while (true) {
     const attempt = { selection, attempt: failoverCount + 1 }
@@ -75,9 +90,12 @@ export async function forwardWithAccountFailover(
     if (
       !isNextAccountFailoverEligible(result, options.signal)
       || failoverCount >= maxFailovers
+      || options.shouldStopFailover?.(result, failureHistory) === true
     ) {
       return { selection, result, failoverCount, excludedAccountIds }
     }
+
+    failureHistory.push(result)
 
     const nextExcludedAccountIds = new Set([
       ...excludedAccountIds,

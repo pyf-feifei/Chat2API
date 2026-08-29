@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+﻿import { randomUUID } from 'node:crypto'
 import { PassThrough, type Readable } from 'node:stream'
 import Router from '@koa/router'
 import type { Context, Next } from 'koa'
@@ -8,6 +8,8 @@ import {
 } from '../forwarder'
 import { loadBalancer } from '../loadbalancer'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
+import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
+import { slimQwenAiReplayImages } from '../replayImageSlimming'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import {
@@ -373,7 +375,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   if (toolLoop && !toolLoop.correctionAlreadyIssued) {
     // First detection: guide instead of killing the turn. A repeated
     // identical call with an identical result is a stalled model, not a bad
-    // request — inject a corrective note into this turn's delta so the model
+    // request 鈥?inject a corrective note into this turn's delta so the model
     // is told to switch tools or finish, and let the request proceed. The
     // note persists in the stored transcript; if the loop continues past it,
     // the next detection escalates to the 422 below.
@@ -940,20 +942,34 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   }
 
   try {
+    // Replays after an upstream-busy rejection carry a content-shaped
+    // rejection risk: the same embedded-image history tripped the upstream
+    // risk page on every account. Slim older embedded images on such retries
+    // so the replay is smaller than the rejected shape. The store keeps its
+    // own transcript copy, so slimming never mutates stored history.
+    let slimImagesOnNextAttempt = false
     const failoverPromise = forwardWithAccountFailover({
       initialSelection,
       maxFailovers,
       signal: abort.controller.signal,
-      forward: async ({ selection }) => requestForwarder.forwardChatCompletion(
-        chatRequest,
-        selection.account,
-        selection.provider,
-        selection.actualModel,
-        createProxyContext(
-          selection,
-          deferManagedStreamCommit,
-        ),
-      ),
+      forward: async ({ selection }) => {
+        const requestForAttempt = slimImagesOnNextAttempt
+          ? { ...chatRequest, messages: slimQwenAiReplayImages(chatRequest.messages) }
+          : chatRequest
+        return requestForwarder.forwardChatCompletion(
+          requestForAttempt,
+          selection.account,
+          selection.provider,
+          selection.actualModel,
+          createProxyContext(
+            selection,
+            deferManagedStreamCommit,
+          ),
+        )
+      },
+      shouldStopFailover: QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+        ? createQwenAiBusyFailoverStopRule()
+        : undefined,
       selectNext: excludedAccountIds => loadBalancer.selectAccount(
         chatRequest.model,
         config.loadBalanceStrategy,
@@ -963,6 +979,9 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         failoverSelectionConstraints,
       ),
       onFailedAttempt: ({ selection, attempt }, result) => {
+        if (result.errorCode === 'qwen_ai_upstream_busy') {
+          slimImagesOnNextAttempt = true
+        }
         if (QwenAiAdapter.isQwenAiProvider(selection.provider)) {
           qwenAiRequestGovernor.reportAccountFailover(selection.account.id, {
             requestId: responseId,

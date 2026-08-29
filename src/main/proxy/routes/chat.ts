@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Proxy Service Module - Chat Completions Route
  * Implements /v1/chat/completions route
  */
@@ -18,6 +18,8 @@ import {
   shouldDeferQwenAiManagedStreamCommit,
 } from '../forwarder'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
+import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
+import { slimQwenAiReplayImages } from '../replayImageSlimming'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
@@ -603,23 +605,34 @@ router.post('/completions', async (ctx: Context) => {
   const deferManagedStreamCommit = initialProviderIsQwenAi
     && shouldDeferQwenAiManagedStreamCommit(request)
 
-  const runWithAccountFailover = () => forwardWithAccountFailover({
-    initialSelection,
-    maxFailovers,
-    signal: clientSignal,
-    forward: async ({ selection }) => {
-      const attemptContext = createProxyContext(
-        selection,
-        deferManagedStreamCommit,
-      )
-      return requestForwarder.forwardChatCompletion(
-        request,
-        selection.account,
-        selection.provider,
-        selection.actualModel,
-        attemptContext,
-      )
-    },
+  const runWithAccountFailover = () => {
+    // Same replay-slimming rationale as the Responses route: after an
+    // upstream-busy rejection, rotate with a slimmed image history instead of
+    // re-sending the shape that just tripped the upstream risk page.
+    let slimImagesOnNextAttempt = false
+    return forwardWithAccountFailover({
+      initialSelection,
+      maxFailovers,
+      signal: clientSignal,
+      forward: async ({ selection }) => {
+        const attemptContext = createProxyContext(
+          selection,
+          deferManagedStreamCommit,
+        )
+        const requestForAttempt = slimImagesOnNextAttempt
+          ? { ...request, messages: slimQwenAiReplayImages(request.messages) }
+          : request
+        return requestForwarder.forwardChatCompletion(
+          requestForAttempt,
+          selection.account,
+          selection.provider,
+          selection.actualModel,
+          attemptContext,
+        )
+      },
+      shouldStopFailover: QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+        ? createQwenAiBusyFailoverStopRule()
+        : undefined,
     selectNext: excludedAccountIds => loadBalancer.selectAccount(
       request.model,
       config.loadBalanceStrategy,
@@ -629,6 +642,9 @@ router.post('/completions', async (ctx: Context) => {
       failoverSelectionConstraints,
     ),
     onFailedAttempt: ({ selection, attempt }, result) => {
+      if (result.errorCode === 'qwen_ai_upstream_busy') {
+        slimImagesOnNextAttempt = true
+      }
       if (QwenAiAdapter.isQwenAiProvider(selection.provider)) {
         qwenAiRequestGovernor.reportAccountFailover(selection.account.id, {
           requestId,
@@ -671,6 +687,7 @@ router.post('/completions', async (ctx: Context) => {
       })
     },
   })
+  }
 
   try {
     const failoverPromise = runWithAccountFailover()

@@ -1801,7 +1801,27 @@ function normalizeStsResponse(data: any): QwenStsInfo {
   }
 
   if (!sts.accessKeyId || !sts.accessKeySecret || !sts.bucket || !sts.endpoint || !sts.filePath || !sts.fileId) {
-    throw new Error('Qwen AI upload STS response is missing required fields')
+    // The upstream answers STS failures with HTTP 200 and an error body
+    // (observed: {"success":false,"data":{"code":"RateLimited","details":"401
+    // Unauthorized"}}). A plain 500-class throw would surface to the client as
+    // a dead 502; classify it as a retryable next-account fault instead so the
+    // forwarder can move the upload to a healthy account instead of stalling
+    // the client.
+    const upstreamCode = typeof source.code === 'string' ? source.code : ''
+    const upstreamDetails = typeof source.details === 'string' ? source.details : ''
+    const error = new Error(
+      `Qwen AI upload STS response is missing required fields${upstreamCode ? ` (upstream code: ${upstreamCode}${upstreamDetails ? `, ${upstreamDetails}` : ''})` : ''}`,
+    ) as QwenAiFileOperationError
+    error.status = 503
+    error.code = 'qwen_ai_upload_sts_unavailable'
+    error.retryable = true
+    // Upstream STS rejects with HTTP 200 + an error body; "RateLimited / 401"
+    // means the request was throttled upstream, not that this account's
+    // credential is bad. Mark it account-neutral so the forwarder replays the
+    // upload on another account instead of stalling the client with a 502.
+    error.accountFault = false
+    error.retryScope = 'next-account'
+    throw error
   }
 
   return sts

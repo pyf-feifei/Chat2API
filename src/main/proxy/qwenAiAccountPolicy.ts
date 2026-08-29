@@ -222,6 +222,10 @@ export function qwenAiAccountFailureDetails(
 
 const QWEN_AI_ACCOUNT_NEUTRAL_REPLAY_CODES = new Set([
   'qwen_ai_file_parse_timeout',
+  // Transient upstream STS unavailability (HTTP 200 + error body, e.g.
+  // {"code":"RateLimited","details":"401 Unauthorized"}) is not evidence the
+  // credential is bad; another account may upload the same file fine.
+  'qwen_ai_upload_sts_unavailable',
   'qwen_ai_queue_timeout',
   'chat_in_progress',
   'qwen_ai_upstream_busy',
