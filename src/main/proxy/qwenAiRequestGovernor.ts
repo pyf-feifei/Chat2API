@@ -837,6 +837,18 @@ export class QwenAiRequestGovernor {
       return result
     }
 
+    // An exhausted upload-STS rate limit is account-neutral, but the
+    // getstsToken limiter runs on a per-minute window: re-selecting this
+    // account on the very next request re-enters the saturated window and
+    // the retry storm keeps it saturated. Bench the account briefly so
+    // other accounts absorb the load while the window slides.
+    if (result.errorCode === 'qwen_ai_upload_sts_unavailable') {
+      const config = this.getConfig()
+      const cooldownMs = Math.max(config.accountMinIntervalMs, 60 * 1000)
+      this.openCooldown(accountId, cooldownMs, 'qwen_ai_upload_sts_rate_limited')
+      return withRetryAfterHeader(result, cooldownMs)
+    }
+
     if (result.accountFault === false) {
       return result
     }

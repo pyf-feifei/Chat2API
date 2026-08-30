@@ -172,6 +172,13 @@ services:
       CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS: ${CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:-540000}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}
+      # getstsToken is throttled per minute upstream. Pace STS requests
+      # process-wide (account rotation cannot fix a per-minute/per-IP limiter)
+      # and wait out a rate-limited window on the same account with
+      # exponential backoff before falling back to next-account failover.
+      QWEN_AI_STS_REQUEST_MIN_INTERVAL_MS: ${QWEN_AI_STS_REQUEST_MIN_INTERVAL_MS:-1500}
+      QWEN_AI_STS_RATE_LIMIT_MAX_RETRIES: ${QWEN_AI_STS_RATE_LIMIT_MAX_RETRIES:-3}
+      QWEN_AI_STS_RATE_LIMIT_BASE_DELAY_MS: ${QWEN_AI_STS_RATE_LIMIT_BASE_DELAY_MS:-15000}
       # Used only when managed stream validation is explicitly enabled.
       CHAT2API_VALIDATED_SSE_MAX_HOLD_MS: ${CHAT2API_VALIDATED_SSE_MAX_HOLD_MS:-60000}
     volumes:

@@ -18,6 +18,16 @@ const OSS_SINGLE_PUT_MAX_BYTES = positiveIntegerFromEnv('QWEN_AI_OSS_SINGLE_PUT_
 const OSS_UPLOAD_TIMEOUT_MS = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_TIMEOUT_MS', 5 * 60 * 1000)
 const OSS_UPLOAD_RETRY_MAX = positiveIntegerFromEnv('QWEN_AI_OSS_UPLOAD_RETRY_MAX', 3)
 const OSS_STS_REFRESH_INTERVAL_MS = positiveIntegerFromEnv('QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS', 4 * 60 * 1000)
+// getstsToken is throttled per minute upstream — the official web client's
+// own copy reads "Reached rate limited: too many requests per minute." and
+// it never auto-retries. Account rotation does not fix this: rotation re-
+// issues the same uploads on fresh accounts, feeding more calls into the
+// saturated window, and is useless outright when the limiter keys on the
+// deployment's egress IP. So STS requests are paced process-wide and a
+// rate-limited request waits out the window on the SAME account.
+const STS_REQUEST_MIN_INTERVAL_MS = positiveIntegerFromEnv('QWEN_AI_STS_REQUEST_MIN_INTERVAL_MS', 1500)
+const STS_RATE_LIMIT_MAX_RETRIES = positiveIntegerFromEnv('QWEN_AI_STS_RATE_LIMIT_MAX_RETRIES', 3)
+const STS_RATE_LIMIT_BASE_DELAY_MS = positiveIntegerFromEnv('QWEN_AI_STS_RATE_LIMIT_BASE_DELAY_MS', 15000)
 const QWEN_AI_FILE_CACHE_ENABLED = process.env.QWEN_AI_FILE_CACHE_ENABLED !== 'false'
 const QWEN_AI_FILE_CACHE_TTL_MS = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_TTL_MS', 47 * 60 * 60 * 1000)
 const QWEN_AI_FILE_CACHE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_MAX_ENTRIES', 512)
@@ -1781,6 +1791,35 @@ function extractPartUrl(part: ChatMessageContent): string {
   throw new Error(`Missing URL for ${part.type} content part`)
 }
 
+// Process-wide getstsToken pacer. Serialized through a promise chain so
+// concurrent uploads across ALL accounts share one dispatch rhythm; an
+// aborted waiter must not break the chain for callers queued behind it.
+let qwenAiStsLastDispatchAt = 0
+let qwenAiStsPacerTail: Promise<void> = Promise.resolve()
+
+function acquireQwenAiStsDispatchSlot(options: QwenAiFileOperationOptions): Promise<void> {
+  const slot = qwenAiStsPacerTail.then(async () => {
+    throwIfQwenAiFileOperationStopped(options)
+    const waitMs = qwenAiStsLastDispatchAt + STS_REQUEST_MIN_INTERVAL_MS - Date.now()
+    if (waitMs > 0) {
+      await delay(waitMs, options)
+    }
+    qwenAiStsLastDispatchAt = Date.now()
+  })
+  qwenAiStsPacerTail = slot.catch(() => {})
+  return slot
+}
+
+function isQwenAiStsRateLimited(data: any): boolean {
+  const source = data?.data || data || {}
+  if (source.code === 'RateLimited') {
+    return true
+  }
+  // Defensive: the details/message text is the contract the official web
+  // client keys its per-minute rate-limit copy on.
+  return /too many requests/i.test(String(source.details || source.message || ''))
+}
+
 function normalizeStsResponse(data: any): QwenStsInfo {
   const source = data?.data || data || {}
 
@@ -2568,27 +2607,45 @@ export class QwenAiFileUploader {
     options: QwenAiFileOperationOptions = {},
   ): Promise<QwenStsInfo> {
     throwIfQwenAiFileOperationStopped(options)
-    const response = await this.postJson(
-      `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
-      {
-        filename: file.filename,
-        filesize: String(file.sizeBytes),
-        filetype: file.coarseType,
-      },
-      () => ({
-        headers: this.getHeaders(),
-        timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
-        validateStatus: () => true,
-      }),
-      options,
-    )
+    let rateLimitRetries = 0
+    while (true) {
+      await acquireQwenAiStsDispatchSlot(options)
+      const response = await this.postJson(
+        `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
+        {
+          filename: file.filename,
+          filesize: String(file.sizeBytes),
+          filetype: file.coarseType,
+        },
+        () => ({
+          headers: this.getHeaders(),
+          timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
+          validateStatus: () => true,
+        }),
+        options,
+      )
 
-    throwIfQwenAiFileOperationStopped(options)
-    if (response.status >= 400) {
-      throw new Error(`Qwen AI upload STS request failed: HTTP ${response.status}`)
+      throwIfQwenAiFileOperationStopped(options)
+      if (response.status >= 400) {
+        throw new Error(`Qwen AI upload STS request failed: HTTP ${response.status}`)
+      }
+
+      if (!isQwenAiStsRateLimited(response.data) || rateLimitRetries >= STS_RATE_LIMIT_MAX_RETRIES) {
+        return normalizeStsResponse(response.data)
+      }
+
+      rateLimitRetries += 1
+      // Wait out the per-minute limiter window on the same account with
+      // exponential backoff (15s/30s/60s by default). The deadline and
+      // abort guards inside delay() keep the total wait bounded by the
+      // caller's request budget.
+      const delayMs = STS_RATE_LIMIT_BASE_DELAY_MS * (2 ** (rateLimitRetries - 1))
+      console.warn(
+        `[QwenAI][File] sts rate limited filename="${file.filename}" bytes=${file.sizeBytes} `
+        + `retry=${rateLimitRetries}/${STS_RATE_LIMIT_MAX_RETRIES} waitSeconds=${(delayMs / 1000).toFixed(1)}`,
+      )
+      await delay(delayMs, options)
     }
-
-    return normalizeStsResponse(response.data)
   }
 
   private async uploadToOss(
