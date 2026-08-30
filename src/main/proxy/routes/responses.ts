@@ -9,7 +9,7 @@ import {
 import { loadBalancer } from '../loadbalancer'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
-import { slimQwenAiReplayImages } from '../replayImageSlimming'
+import { slimQwenAiReplayImages, qwenAiImageSlimModeFromEnv, shouldSlimQwenAiAttemptImages } from '../replayImageSlimming'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import {
@@ -945,15 +945,19 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     // Replays after an upstream-busy rejection carry a content-shaped
     // rejection risk: the same embedded-image history tripped the upstream
     // risk page on every account. Slim older embedded images on such retries
-    // so the replay is smaller than the rejected shape. The store keeps its
-    // own transcript copy, so slimming never mutates stored history.
+    // so the replay is smaller than the rejected shape. In 'always' mode the
+    // first attempt is slimmed too, keeping ordinary turns below the
+    // per-minute getstsToken quota. The store keeps its own transcript copy,
+    // so slimming never mutates stored history.
+    const imageSlimMode = qwenAiImageSlimModeFromEnv()
     let slimImagesOnNextAttempt = false
     const failoverPromise = forwardWithAccountFailover({
       initialSelection,
       maxFailovers,
       signal: abort.controller.signal,
       forward: async ({ selection }) => {
-        const requestForAttempt = slimImagesOnNextAttempt
+        const requestForAttempt = QwenAiAdapter.isQwenAiProvider(selection.provider)
+            && shouldSlimQwenAiAttemptImages(imageSlimMode, slimImagesOnNextAttempt)
           ? { ...chatRequest, messages: slimQwenAiReplayImages(chatRequest.messages) }
           : chatRequest
         return requestForwarder.forwardChatCompletion(

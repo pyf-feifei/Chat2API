@@ -19,7 +19,7 @@ import {
 } from '../forwarder'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
-import { slimQwenAiReplayImages } from '../replayImageSlimming'
+import { slimQwenAiReplayImages, qwenAiImageSlimModeFromEnv, shouldSlimQwenAiAttemptImages } from '../replayImageSlimming'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
@@ -608,7 +608,10 @@ router.post('/completions', async (ctx: Context) => {
   const runWithAccountFailover = () => {
     // Same replay-slimming rationale as the Responses route: after an
     // upstream-busy rejection, rotate with a slimmed image history instead of
-    // re-sending the shape that just tripped the upstream risk page.
+    // re-sending the shape that just tripped the upstream risk page. In
+    // 'always' mode the first attempt is slimmed too, so long visual sessions
+    // never batch-trigger the per-minute getstsToken quota upstream.
+    const imageSlimMode = qwenAiImageSlimModeFromEnv()
     let slimImagesOnNextAttempt = false
     return forwardWithAccountFailover({
       initialSelection,
@@ -619,7 +622,8 @@ router.post('/completions', async (ctx: Context) => {
           selection,
           deferManagedStreamCommit,
         )
-        const requestForAttempt = slimImagesOnNextAttempt
+        const requestForAttempt = QwenAiAdapter.isQwenAiProvider(selection.provider)
+            && shouldSlimQwenAiAttemptImages(imageSlimMode, slimImagesOnNextAttempt)
           ? { ...request, messages: slimQwenAiReplayImages(request.messages) }
           : request
         return requestForwarder.forwardChatCompletion(

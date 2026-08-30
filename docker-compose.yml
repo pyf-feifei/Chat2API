@@ -170,6 +170,14 @@ services:
       # waiting on buffered upstream work. Zero disables these events.
       CHAT2API_ANTHROPIC_PING_INTERVAL_MS: ${CHAT2API_ANTHROPIC_PING_INTERVAL_MS:-15000}
       CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS: ${CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:-540000}
+      # Replays of long visual sessions re-attach every embedded image, and
+      # each attachment costs one getstsToken call against a per-minute
+      # upstream quota. 'on-busy' (default) slims older images only on
+      # rotation after an upstream-busy rejection; 'always' slims from the
+      # first attempt so ordinary turns never batch-trigger that quota;
+      # 'off' disables. KEEP_LAST counts image-bearing messages, not images.
+      CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES: ${CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES:-on-busy}
+      CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES: ${CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES:-1}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}
       # getstsToken is throttled per minute upstream. Pace STS requests

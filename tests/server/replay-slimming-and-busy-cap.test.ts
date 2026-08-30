@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { slimQwenAiReplayImages } from '../../src/main/proxy/replayImageSlimming.ts'
+import fs from 'node:fs'
+import {
+  slimQwenAiReplayImages,
+  qwenAiImageSlimModeFromEnv,
+  shouldSlimQwenAiAttemptImages,
+} from '../../src/main/proxy/replayImageSlimming.ts'
 import { createQwenAiBusyFailoverStopRule } from '../../src/main/proxy/qwenBusyFailover.ts'
 import type { ChatMessage } from '../../src/main/proxy/types.ts'
 
@@ -78,4 +83,72 @@ test('busy stop rule caps same-shape upstream-busy rotations', () => {
   } finally {
     delete process.env.CHAT2API_QWEN_AI_BUSY_FAILOVER_ROTATION_MAX
   }
+})
+
+test('image slim mode parses off / on-busy (default) / always from env', () => {
+  const saved = process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+  try {
+    delete process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+    assert.equal(qwenAiImageSlimModeFromEnv(), 'on-busy')
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'always'
+    assert.equal(qwenAiImageSlimModeFromEnv(), 'always')
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'off'
+    assert.equal(qwenAiImageSlimModeFromEnv(), 'off')
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = ' ALWAYS '
+    assert.equal(qwenAiImageSlimModeFromEnv(), 'always', 'case/whitespace tolerant')
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'bogus'
+    assert.equal(qwenAiImageSlimModeFromEnv(), 'on-busy', 'unknown values fall back to the reactive default')
+  } finally {
+    if (saved === undefined) delete process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+    else process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = saved
+  }
+})
+
+test('first-attempt slimming decision follows the mode, not the busy flag alone', () => {
+  // 'always' slims the very first attempt — before any upstream rejection —
+  // so a long visual session never batch-triggers the per-minute STS quota.
+  assert.equal(shouldSlimQwenAiAttemptImages('always', false), true)
+  assert.equal(shouldSlimQwenAiAttemptImages('always', true), true)
+  // Default stays reactive: untouched first attempt, slimmed rotation replay.
+  assert.equal(shouldSlimQwenAiAttemptImages('on-busy', false), false)
+  assert.equal(shouldSlimQwenAiAttemptImages('on-busy', true), true)
+  // 'off' never slims, even after a busy rejection.
+  assert.equal(shouldSlimQwenAiAttemptImages('off', false), false)
+  assert.equal(shouldSlimQwenAiAttemptImages('off', true), false)
+})
+
+test('slimming stays functional under always mode and disabled under off', () => {
+  const saved = process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+  const messages: ChatMessage[] = [
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,OLD' } }] },
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,NEW' } }] },
+  ]
+  try {
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'always'
+    const slimmed = slimQwenAiReplayImages(messages)
+    assert.deepEqual((slimmed[0].content as any[])[0], { type: 'text', text: '[image omitted from replayed history]' })
+    assert.equal((slimmed[1].content as any[])[0].image_url.url, 'data:image/png;base64,NEW')
+
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'off'
+    const untouched = slimQwenAiReplayImages(messages)
+    assert.equal((untouched[0].content as any[])[0].image_url.url, 'data:image/png;base64,OLD')
+  } finally {
+    if (saved === undefined) delete process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+    else process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = saved
+  }
+})
+
+test('both failover routes consult the slim mode on every attempt', () => {
+  const chatRoute = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
+  const responsesRoute = fs.readFileSync('src/main/proxy/routes/responses.ts', 'utf8')
+  for (const [name, source] of [['chat', chatRoute], ['responses', responsesRoute]] as const) {
+    assert.match(source, /qwenAiImageSlimModeFromEnv/, `${name} route reads the slim mode`)
+    assert.match(source, /shouldSlimQwenAiAttemptImages\(imageSlimMode, slimImagesOnNextAttempt\)/, `${name} route slims per attempt`)
+  }
+})
+
+test('docker-compose passes the image slimming knobs through', () => {
+  const source = fs.readFileSync('docker-compose.yml', 'utf8')
+  assert.match(source, /CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES/)
+  assert.match(source, /CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES/)
 })
