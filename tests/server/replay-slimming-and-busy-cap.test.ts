@@ -37,12 +37,55 @@ test('replay slimming keeps only the newest image-bearing message intact', () =>
   assert.equal(slimmed.length, messages.length)
   // oldest two image messages got placeholders, text preserved
   assert.deepEqual((slimmed[1].content as any[])[0].text, 'old screenshot analysis')
-  assert.deepEqual((slimmed[1].content as any[])[1], { type: 'text', text: '[image omitted from replayed history]' })
-  assert.deepEqual(slimmed[3].content, [{ type: 'text', text: '[image omitted from replayed history]' }])
+  assert.match((slimmed[1].content as any[])[1].text, /^\[image omitted from replayed history/)
+  assert.match((slimmed[3].content as any[])[0].text, /^\[image omitted from replayed history/)
   // newest untouched
   assert.equal((slimmed[4].content as any[])[1].image_url.url, 'data:image/png;base64,NEWEST')
   // original untouched
   assert.equal((messages[1].content as any[])[1].image_url.url, 'data:image/png;base64,OLD1')
+})
+
+test('replay slimming keeps the first N image-bearing messages as reference anchors', () => {
+  const img = (tag: string): ChatMessage => ({
+    role: 'user',
+    content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${tag}` } }],
+  })
+  // Shape of a visual-iteration session: the earliest attachments are the
+  // ground-truth prototype views, the newest ones are working renders.
+  const messages: ChatMessage[] = [
+    { role: 'user', content: 'reproduce this car' },
+    img('PROTOTYPE_SIDE'),
+    img('PROTOTYPE_FRONT'),
+    img('RENDER_V1'),
+    img('RENDER_V2'),
+    img('RENDER_V3'),
+    img('RENDER_V4'),
+  ]
+
+  const slimmed = slimQwenAiReplayImages(messages, { keepFirstImageMessages: 2, keepLastImageMessages: 2 })
+  const url = (index: number) => (slimmed[index].content as any[])[0].image_url?.url || ''
+  const text = (index: number) => (slimmed[index].content as any[])[0].text || ''
+
+  // reference anchors survive
+  assert.ok(url(1).endsWith('PROTOTYPE_SIDE'))
+  assert.ok(url(2).endsWith('PROTOTYPE_FRONT'))
+  // current working set survives
+  assert.ok(url(5).endsWith('RENDER_V3'))
+  assert.ok(url(6).endsWith('RENDER_V4'))
+  // middle iterations are placeholders
+  assert.match(text(3), /^\[image omitted from replayed history/)
+  assert.match(text(4), /^\[image omitted from replayed history/)
+  // original untouched
+  assert.ok(((messages[3].content as any[])[0].image_url.url).endsWith('RENDER_V1'))
+})
+
+test('replay slimming placeholder tells the model how to recover the image', () => {
+  const messages: ChatMessage[] = [
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,OLD' } }] },
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,NEW' } }] },
+  ]
+  const slimmed = slimQwenAiReplayImages(messages)
+  assert.match((slimmed[0].content as any[])[0].text, /view it again with your image tool/)
 })
 
 test('replay slimming is a no-op with only one image-bearing message', () => {
@@ -126,7 +169,7 @@ test('slimming stays functional under always mode and disabled under off', () =>
   try {
     process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'always'
     const slimmed = slimQwenAiReplayImages(messages)
-    assert.deepEqual((slimmed[0].content as any[])[0], { type: 'text', text: '[image omitted from replayed history]' })
+    assert.match((slimmed[0].content as any[])[0].text, /^\[image omitted from replayed history/)
     assert.equal((slimmed[1].content as any[])[0].image_url.url, 'data:image/png;base64,NEW')
 
     process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'off'
