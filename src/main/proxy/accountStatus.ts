@@ -45,6 +45,9 @@ export function markAccountErrorIfPermanent(
   providerId?: string,
 ): void {
   if (!accountId || !isPermanentAccountFault(result, providerId)) return
+  // Account failover logic is also unit-tested without the persistent store.
+  // Production bootstrap initializes it before requests can reach this path.
+  if (!storeManager.getStore()) return
   const account = storeManager.getAccountById(accountId, true)
   if (!account || account.status !== 'active') return
   const message = String(

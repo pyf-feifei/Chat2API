@@ -66,24 +66,25 @@ ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 # Managed-branch and upstream-busy recovery counts are deployment controls.
 # Their request deadlines remain authoritative; zero disables each path.
 ENV CHAT2API_QWEN_AI_RETRY_COUNT=1
-ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3
+ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=0
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
-ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3
+ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=1
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
-ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=4
+ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 # Semantic continuation branches also share an absolute wall-clock deadline.
 ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # Busy-chat admission is bounded separately from the long generation timeout.
-# Leave the generic retry-count override unset so ordinary semantic workflow
-# continuations retain deadline mode; Responses tool-result continuations use
-# the dedicated override below.
+# Retry the exact same continuation payload at most once by default; operators
+# can opt into deadline mode explicitly without changing client-specific code.
+ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_MODE=attempts
+ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=1
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 # Keep retained Responses tool-result continuations on the same provider chat
 # through short transient CHAT_IN_PROGRESS windows before account failover.
-ENV CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=4
+ENV CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=1
 ENV CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 # Responses clients consume typed events rather than SSE comments when

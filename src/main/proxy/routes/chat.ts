@@ -11,6 +11,7 @@ import {
   ChatCompletionResponse,
   ProxyContext,
   type AccountSelection,
+  type QwenAiLogicalRecoveryState,
 } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import {
@@ -41,6 +42,7 @@ import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../uti
 import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 import { classifyChatRequest } from '../requestIntent'
 import { createAssistantOutputBoundaryStream } from '../toolCalling/assistantOutputBoundary'
+import { stripManagedToolResultWrappers } from '../toolCalling/managedToolResultGuard'
 import {
   createQwenAiSessionRequestFingerprint,
   resolveQwenAiSessionBinding,
@@ -526,7 +528,16 @@ router.post('/completions', async (ctx: Context) => {
     }
   }
 
+  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
   const clientSignal = createClientAbortSignal(ctx)
+  const qwenAiLogicalRecoveryState: QwenAiLogicalRecoveryState | undefined = initialProviderIsQwenAi
+    ? {
+        resumeAttempts: 0,
+        workflowContinuationAttempts: 0,
+        freshChatRestartAttempts: 0,
+        accountNeutralReplayAttempts: 0,
+      }
+    : undefined
   const createProxyContext = (
     selection: AccountSelection,
     deferManagedStreamCommit = false,
@@ -543,6 +554,7 @@ router.post('/completions', async (ctx: Context) => {
       clientIP,
       signal: clientSignal,
       requestIntent: requestIntent.intent,
+      ...(qwenAiLogicalRecoveryState ? { qwenAiLogicalRecoveryState } : {}),
       ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
       ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
     }
@@ -579,7 +591,6 @@ router.post('/completions', async (ctx: Context) => {
   let context = createProxyContext(initialSelection)
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
 
-  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
   const failoverSelectionConstraints = initialProviderIsQwenAi
     && loadBalancer.hasCompleteQwenAiWebSession(initialSelection)
     ? {
@@ -1262,12 +1273,26 @@ router.post('/completions', async (ctx: Context) => {
       )
 
       if (result.body) {
+        const body = result.body as ChatCompletionResponse
+        const choices = Array.isArray(body.choices) ? body.choices : []
+        const sanitizedChoices = choices.map(choice => {
+          const message = choice?.message
+          if (!message || typeof message !== 'object') return choice
+          const content = typeof message.content === 'string'
+            ? stripManagedToolResultWrappers(message.content).content
+            : message.content
+          return {
+            ...choice,
+            message: { ...message, content },
+          }
+        })
+        const sanitizedBody = { ...body, choices: sanitizedChoices }
         // Check if we need to transform to Anthropic format
         if (isAnthropicToolFormat(request.tool_format)) {
-          ctx.body = transformResponseToAnthropic(result.body)
+          ctx.body = transformResponseToAnthropic(sanitizedBody)
           console.log('[Chat] Transformed response to Anthropic tool format')
         } else {
-          ctx.body = result.body
+          ctx.body = sanitizedBody
         }
       } else {
         ctx.body = {

@@ -263,7 +263,7 @@ export function AddAccountDialog({
     : []
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
-  const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi'].includes(provider.id)
+  const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi', 'zai'].includes(provider.id)
   const supportsM365OAuth = !!provider && provider.id === 'm365-copilot' && !isEditing && (isDockerWebAdmin || !!window.electronAPI?.m365OAuth)
   const [m365AccountType, setM365AccountType] = useState<'personal' | 'work'>('personal')
   const [m365DeviceSession, setM365DeviceSession] = useState<{
@@ -653,6 +653,7 @@ export function AddAccountDialog({
       'qwen-ai': 'https://chat.qwen.ai',
       qwen: 'https://www.qianwen.com',
       kimi: 'https://www.kimi.com',
+      zai: 'https://chat.z.ai',
     }
     await window.electronAPI?.app.openExternal(loginUrls[provider.id] || provider.apiEndpoint)
   }

@@ -44,6 +44,7 @@ import { normalizeToolCallingConfig } from '../../shared/toolCalling'
 import { AppLogManager } from '../appLogs/manager'
 import type { AppLogFilter } from '../appLogs/types'
 import { getRuntime } from '../runtime'
+import { ENCRYPTION_PREFIX } from '../runtime/types'
 import { NodeJsonStore } from './storage/nodeJsonStore'
 import { createElectronJsonStore } from './storage/electronJsonStore'
 import { mergeProviderModelCapabilities } from '../providers/modelSync'
@@ -521,6 +522,9 @@ class StoreManager {
    * @returns Encrypted string
    */
   encryptData(data: string): string {
+    if (!data || data.startsWith(ENCRYPTION_PREFIX)) {
+      return data
+    }
     try {
       const runtime = getRuntime()
       if (runtime.isEncryptionAvailable()) {

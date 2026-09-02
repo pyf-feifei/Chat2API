@@ -306,7 +306,7 @@ export function AddProviderDialog({
 
   const supportsOAuth = selectedProviderData && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(selectedProviderData.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
-  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai', 'kimi'].includes(selectedProviderData.id)
+  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai', 'kimi', 'zai'].includes(selectedProviderData.id)
   const oauthRefreshCredentialFields = selectedProviderData?.id === 'qwen-ai'
     ? selectedProviderData.credentialFields.filter(field => ['email', 'password'].includes(field.name))
     : []
@@ -588,6 +588,7 @@ export function AddProviderDialog({
       'qwen-ai': 'https://chat.qwen.ai',
       qwen: 'https://www.qianwen.com',
       kimi: 'https://www.kimi.com',
+      zai: 'https://chat.z.ai',
     }
     await window.electronAPI?.app.openExternal(loginUrls[selectedProviderData.id] || selectedProviderData.apiEndpoint)
   }

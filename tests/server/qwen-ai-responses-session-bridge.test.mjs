@@ -36,7 +36,9 @@ const qwenAiAccountPolicy = loadTypeScriptModule('src/main/proxy/qwenAiAccountPo
 const storeModule = loadTypeScriptModule('src/main/proxy/responses/store.ts', {
   '../qwenAiSessionBridge': sessionBridge,
 })
-const accountFailover = loadTypeScriptModule('src/main/proxy/accountFailover.ts')
+const accountFailover = loadTypeScriptModule('src/main/proxy/accountFailover.ts', {
+  './accountStatus': { markAccountErrorIfPermanent: async () => {} },
+})
 const workflowHeuristics = loadTypeScriptModule('src/main/proxy/toolCalling/workflowHeuristics.ts')
 const toolLoopGuard = loadTypeScriptModule('src/main/proxy/responses/toolLoopGuard.ts')
 const toolCallSessionStoreModule = loadTypeScriptModule(
@@ -427,6 +429,12 @@ function loadResponsesRouteHarness(options = {}) {
       forwardWithAccountFailover: accountFailover.forwardWithAccountFailover,
       resolveAccountFailoverLimit: accountFailover.resolveAccountFailoverLimit,
     },
+    './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
+    '..\\accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
     '../qwenAiDeferredStream': {
       createDeferredQwenAiFailoverStream: () => {
         throw new Error('The non-stream bridge harness must not create a deferred stream')
@@ -566,6 +574,7 @@ function loadResponsesRouteHarness(options = {}) {
             reasoning_effort: incoming.reasoning?.effort,
           },
           conversationMessages,
+          sidecarItems: [],
         }
       },
       chatCompletionToResponse: async (_completion, incoming, options) => ({
@@ -590,6 +599,7 @@ function loadResponsesRouteHarness(options = {}) {
           function: { name: item.name, arguments: item.arguments },
         }],
       })),
+      responseOutputToSidecarItems: () => [],
     },
     '../responses/store': {
       responsesConversationStore: {
@@ -631,12 +641,26 @@ function loadResponsesRouteHarness(options = {}) {
       estimateQwenAiRequestInputTokens: () => 1,
     },
     '../qwenAiSessionBridge': sessionBridge,
+    '../qwenBusyFailover': {
+      createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    '../replayImageSlimming': {
+      slimQwenAiReplayImages: messages => messages,
+      qwenAiImageSlimModeFromEnv: () => 'off',
+      shouldSlimQwenAiAttemptImages: () => false,
+    },
+    '../qwenAiDeferredStream': {
+      createDeferredQwenAiFailoverStream: () => { throw new Error('unexpected deferred stream') },
+    },
     '../qwenAiToolCallSessionStore': {
       getTrailingQwenAiToolResultBatch: toolCallSessionStoreModule.getTrailingQwenAiToolResultBatch,
       qwenAiToolCallSessionStore: toolCallSessions,
     },
     '../qwenAiAccountPolicy': qwenAiAccountPolicy,
     '../toolCalling/workflowHeuristics': workflowHeuristics,
+    '../toolCalling/assistantOutputBoundary': {
+      createAssistantOutputBoundaryStream: () => new PassThrough(),
+    },
     '../responses/image': {
       ResponseImageResolutionError: MockImageResolutionError,
       createResponseImageResolver: () => async value => value,
@@ -679,7 +703,7 @@ function createRouteContext(body) {
   }
 }
 
-test('Responses route rejects an unchanged repeated tool loop before forwarding', async () => {
+test('Responses route corrects a repeated tool loop once, then escalates unchanged continuation', async () => {
   const { handler, calls } = loadResponsesRouteHarness()
   const input = [{
     type: 'message',
@@ -704,15 +728,43 @@ test('Responses route rejects an unchanged repeated tool loop before forwarding'
     )
   }
 
-  const context = createRouteContext({
+  const firstContext = createRouteContext({
     model: 'Qwen3.8-Max_Auto',
     input,
   })
-  await handler(context)
+  await handler(firstContext)
 
-  assert.equal(context.status, 422)
-  assert.equal(context.body?.error?.code, 'repeated_tool_call_loop')
-  assert.equal(calls.forwards.length, 0)
+  assert.equal(calls.forwards.length, 1)
+  const firstStored = calls.stores.at(-1)
+  assert.ok(firstStored?.responseId)
+  assert.ok(firstStored?.messages.some(message => (
+    message.role === 'user'
+      && typeof message.content === 'string'
+      && message.content.includes('[chat2api_tool_loop_correction')
+  )))
+
+  const secondContext = createRouteContext({
+    model: 'Qwen3.8-Max_Auto',
+    previous_response_id: firstStored.responseId,
+    input: [
+      {
+        type: 'function_call',
+        call_id: 'call_exec_4',
+        name: 'exec_command',
+        arguments: '{"cmd":"rg route","yield_time_ms":10000}',
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_exec_4',
+        output: 'same command output',
+      },
+    ],
+  })
+  await handler(secondContext)
+
+  assert.equal(secondContext.status, 422)
+  assert.equal(secondContext.body?.error?.code, 'repeated_tool_call_loop')
+  assert.equal(calls.forwards.length, 1)
 })
 
 test('Responses route saves a real Qwen binding then pins continuation to the same account with only tool-result delta', async () => {
@@ -1361,6 +1413,25 @@ function loadForwarderForBridgeTests(overrides = {}) {
     './adapters/m365': {
       M365Adapter: adapterWithMatcher('isM365Provider'),
     },
+    './m365FailoverClassification': {
+      isM365AuthIssue: () => false,
+      isM365QuotaWall: () => false,
+      m365FailureClassification: () => ({ status: undefined, retryable: undefined, retryScope: undefined, accountFault: undefined }),
+    },
+    './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
+    './qwenBusyFailover': {
+      createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    './replayImageSlimming': {
+      slimQwenAiReplayImages: messages => messages,
+      qwenAiImageSlimModeFromEnv: () => 'off',
+      shouldSlimQwenAiAttemptImages: () => false,
+    },
+    './qwenAiDeferredStream': {
+      createDeferredQwenAiFailoverStream: () => { throw new Error('unexpected deferred stream') },
+    },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
       ZaiStreamHandler: StreamHandler,
@@ -1418,6 +1489,25 @@ function loadForwarderForBridgeTests(overrides = {}) {
     },
     './requestIntent': {
       classifyChatRequest: () => ({ intent: 'normal', textChars: 0 }),
+    },
+    './m365FailoverClassification': {
+      isM365AuthIssue: () => false,
+      isM365QuotaWall: () => false,
+      m365FailureClassification: () => ({ status: undefined, retryable: undefined, retryScope: undefined, accountFault: undefined }),
+    },
+    './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
+    './qwenBusyFailover': {
+      createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    './replayImageSlimming': {
+      slimQwenAiReplayImages: messages => messages,
+      qwenAiImageSlimModeFromEnv: () => 'off',
+      shouldSlimQwenAiAttemptImages: () => false,
+    },
+    './qwenAiDeferredStream': {
+      createDeferredQwenAiFailoverStream: () => { throw new Error('unexpected deferred stream') },
     },
     './qwenAiCompactionBoundary': {
       estimateQwenAiRequestInputTokens: () => 1,

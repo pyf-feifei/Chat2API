@@ -281,6 +281,23 @@ export interface ModelsResponse {
 /**
  * Proxy Request Context
  */
+export interface QwenAiLogicalRecoveryState {
+  /** Request-wide response-id resume attempts consumed across account branches. */
+  resumeAttempts: number
+  /** Request-wide managed workflow continuation turns consumed. */
+  workflowContinuationAttempts: number
+  /** Request-wide same-account fresh-chat replays consumed. */
+  freshChatRestartAttempts: number
+  /** Remaining no-progress recovery budget, initialized by the first recovery. */
+  recoveryBudgetRemainingMs?: number
+  /** Absolute workflow recovery deadline shared by account branches. */
+  workflowRecoveryDeadlineAt?: number
+  /** Whether that deadline is the outer request deadline. */
+  workflowRecoveryBoundedByRequestDeadline?: boolean
+  /** Private semantic branch replay attempts consumed across accounts. */
+  accountNeutralReplayAttempts: number
+}
+
 export interface ProxyContext {
   requestId: string
   providerId?: string
@@ -293,6 +310,8 @@ export interface ProxyContext {
   signal?: AbortSignal
   /** Internal request intent detected before provider forwarding. */
   requestIntent?: 'normal' | 'context_compaction'
+  /** Mutable recovery budget shared by all Qwen account attempts in this request. */
+  qwenAiLogicalRecoveryState?: QwenAiLogicalRecoveryState
   /**
    * The HTTP route already owns a keep-alive stream, so a managed Qwen branch
    * can remain private until terminal validation and account failover finish.

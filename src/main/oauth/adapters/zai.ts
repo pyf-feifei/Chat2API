@@ -15,7 +15,7 @@ import {
 } from '../types'
 
 const ZAI_API_BASE = 'https://chat.z.ai'
-const X_FE_VERSION = 'prod-fe-1.1.37'
+const X_FE_VERSION = 'prod-fe-1.1.92'
 const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 
 const FAKE_HEADERS = {
@@ -116,8 +116,17 @@ export class ZaiAdapter extends BaseOAuthAdapter {
             error: 'Guest account not allowed, please login with a real account',
           }
         }
+
+        // Check JWT expiry
+        if (payload.exp && Date.now() >= payload.exp * 1000) {
+          return {
+            valid: false,
+            error: 'Token has expired, please re-login to get a fresh token',
+          }
+        }
         
         if (payload && payload.id) {
+          const expiresIn = payload.exp ? Math.round((payload.exp * 1000 - Date.now()) / 1000) : undefined
           return {
             valid: true,
             tokenType: 'access',
@@ -139,6 +148,28 @@ export class ZaiAdapter extends BaseOAuthAdapter {
     return {
       valid: false,
       error: 'Token is invalid',
+    }
+  }
+
+  /**
+   * Refresh token via in-app browser login
+   * Z.ai uses JWT from browser cookies - no refresh_token endpoint exists.
+   * This opens an in-app browser for the user to re-login and extracts the new cookie token.
+   */
+  async refreshToken(credentials: Record<string, string>): Promise<CredentialInfo | null> {
+    try {
+      const { inAppLoginManager } = await import('../inAppLogin')
+      const result = await inAppLoginManager.startLogin({
+        providerId: this.config.providerId || 'zai',
+        providerType: 'zai',
+        timeout: 120000,
+      })
+      if (result.success && result.credentials?.token) {
+        return { token: result.credentials.token }
+      }
+      return null
+    } catch {
+      return null
     }
   }
 }

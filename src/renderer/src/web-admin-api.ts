@@ -490,6 +490,35 @@ ${buildBrowserImportFallbackBlock()}
 })();`
 }
 
+function buildZaiImportScript(session: BrowserImportSession): string {
+  const completeUrl = `${window.location.origin}${MANAGEMENT_BASE}/browser-import/complete`
+  return `(() => {
+  const importId = ${JSON.stringify(session.id)};
+  const providerId = 'zai';
+  const completeUrl = ${JSON.stringify(completeUrl)};
+  const readCookie = (name) => {
+    const prefix = name + '=';
+    const entry = (document.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix));
+    if (!entry) return '';
+    const value = entry.slice(prefix.length);
+    try {
+      return decodeURIComponent(value);
+    } catch (error) {
+      return value;
+    }
+  };
+  const token = localStorage.getItem('token') || readCookie('token') || '';
+  const cookies = document.cookie || '';
+  const payload = {
+    importId,
+    providerId,
+    credentials: { token, cookies },
+    error: token ? '' : 'No token was found in chat.z.ai localStorage or cookie. Log in first, then run this script again.',
+  };
+${buildBrowserImportFallbackBlock()}
+})();`
+}
+
 function buildBrowserImportScript(session: BrowserImportSession): string {
   if (session.providerId === 'qwen-ai') {
     return buildQwenAiImportScript(session)
@@ -500,7 +529,10 @@ function buildBrowserImportScript(session: BrowserImportSession): string {
   if (session.providerId === 'kimi') {
     return buildKimiImportScript(session)
   }
-  throw new Error('Browser-assisted import is only available for Qwen and Kimi providers in Docker.')
+  if (session.providerId === 'zai') {
+    return buildZaiImportScript(session)
+  }
+  throw new Error('Browser-assisted import is only available for Qwen, Kimi and Z.ai providers in Docker.')
 }
 
 const defaultUpdateStatus = {

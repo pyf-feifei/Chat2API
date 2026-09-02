@@ -121,6 +121,19 @@ function loadRequestForwarder(overrides = {}) {
     './adapters/m365': {
       M365Adapter: adapterWithMatcher('isM365Provider'),
     },
+    './m365FailoverClassification': {
+      isM365AuthIssue: () => false,
+      isM365QuotaWall: () => false,
+      m365FailureClassification: () => ({
+        status: undefined,
+        retryable: undefined,
+        retryScope: undefined,
+        accountFault: undefined,
+      }),
+    },
+    './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
       ZaiStreamHandler: StreamHandler,
@@ -710,7 +723,7 @@ test('an explicit retry count does not enable ordinary Qwen stream retries', asy
   }
 })
 
-test('Qwen upstream busy retries the same account and can recover within the request budget', async () => {
+test('Qwen upstream busy retries only when explicitly configured', async () => {
   const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
   const forwarder = new RequestForwarder()
   const attempts = []
@@ -742,22 +755,14 @@ test('Qwen upstream busy retries the same account and can recover within the req
     { signal: new AbortController().signal },
   )
 
-  assert.equal(result.success, true)
-  assert.equal(attempts.length, 2)
-  assert.deepEqual(attempts.map(item => item.attempt), [1, 2])
-  assert.deepEqual(
-    attempts.map(item => item.qwenAiMessageTransport),
-    ['inline', 'document'],
-    'only a real upstream-busy result should switch the complete request to document transport',
-  )
-  assert.deepEqual(
-    attempts.map(item => item.qwenAiRecoveryBypassAccountInterval),
-    [false, true],
-    'the one transport fallback must not wait behind the completed inline attempt account interval',
-  )
+  assert.equal(result.success, false)
+  assert.equal(result.errorCode, 'qwen_ai_upstream_busy')
+  assert.equal(attempts.length, 1)
+  assert.deepEqual(attempts.map(item => item.attempt), [1])
+  assert.deepEqual(attempts.map(item => item.qwenAiMessageTransport), ['inline'])
+  assert.deepEqual(attempts.map(item => item.qwenAiRecoveryBypassAccountInterval), [false])
   assert.ok(attempts.every(item => item.qwenAiRequestTimeoutMs > 0))
-  assert.ok(attempts[1].qwenAiRequestTimeoutMs <= attempts[0].qwenAiRequestTimeoutMs)
-  assert.deepEqual(delays, [1000])
+  assert.deepEqual(delays, [])
 })
 
 test('Qwen upstream busy recovery honors the configured retry count', async () => {
@@ -843,7 +848,7 @@ test('Qwen semantic recovery exhaustion derives next-account replay at the forwa
   assert.equal(attempts, 1)
 })
 
-test('Qwen managed-tool busy retry switches to hybrid document transport', async () => {
+test('Qwen managed-tool busy stays on the first upstream attempt by default', async () => {
   const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
   const forwarder = new RequestForwarder()
   const attempts = []
@@ -879,16 +884,12 @@ test('Qwen managed-tool busy retry switches to hybrid document transport', async
     { signal: new AbortController().signal },
   )
 
-  assert.equal(result.success, true)
-  assert.equal(attempts.length, 2)
-  assert.deepEqual(
-    attempts.map(item => item.qwenAiMessageTransport),
-    ['inline', 'document'],
-  )
-  assert.deepEqual(
-    attempts.map(item => item.qwenAiRecoveryBypassAccountInterval),
-    [false, true],
-  )
+  assert.equal(result.success, false)
+  assert.equal(result.errorCode, 'qwen_ai_upstream_busy')
+  assert.equal(result.accountFault, false)
+  assert.equal(attempts.length, 1)
+  assert.deepEqual(attempts.map(item => item.qwenAiMessageTransport), ['inline'])
+  assert.deepEqual(attempts.map(item => item.qwenAiRecoveryBypassAccountInterval), [false])
 })
 
 test('Qwen large managed-tool request stays inline until the provider reports busy', async () => {
@@ -961,7 +962,10 @@ test('Qwen upstream busy stops at the cumulative request budget', async () => {
 })
 
 test('Qwen upstream busy retry stops immediately when the client aborts', async () => {
-  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '1'
+  try {
+    const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
   const forwarder = new RequestForwarder()
   const controller = new AbortController()
   let attempts = 0
@@ -989,8 +993,12 @@ test('Qwen upstream busy retry stops immediately when the client aborts', async 
     { signal: controller.signal },
   )
 
-  assert.equal(result.status, 499)
-  assert.equal(attempts, 1)
+    assert.equal(result.status, 499)
+    assert.equal(attempts, 1)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
 })
 
 test('Qwen request deadline stays absolute across governor queue time and account attempts', async (t) => {
@@ -1069,9 +1077,16 @@ test('Qwen request deadline stays absolute across governor queue time and accoun
   })
   forwarder.applyToolCallsToResponse = () => {}
   const firstStartedAt = now
+  const sharedRecoveryState = {
+    resumeAttempts: 0,
+    workflowContinuationAttempts: 0,
+    freshChatRestartAttempts: 0,
+    accountNeutralReplayAttempts: 0,
+  }
   const context = {
     signal: new AbortController().signal,
     startTime: firstStartedAt,
+    qwenAiLogicalRecoveryState: sharedRecoveryState,
   }
   const first = await forwarder.forwardChatCompletion(
     { model: 'model-1', messages: [], stream: true },
@@ -1085,6 +1100,7 @@ test('Qwen request deadline stays absolute across governor queue time and accoun
   assert.equal(adapterRequests[0].timeoutMs, 70)
   assert.equal(adapterRequests[0].deadlineAt, firstStartedAt + 100)
   assert.equal(resumableOptions[0].workflowRecoveryDeadlineAt, firstStartedAt + 100)
+  assert.equal(resumableOptions[0].recoveryState, sharedRecoveryState)
   assert.equal(streamHandlingOptions[0].requestDeadlineAt, firstStartedAt + 100)
 
   const second = await forwarder.forwardChatCompletion(
@@ -1118,6 +1134,7 @@ test('Qwen request deadline stays absolute across governor queue time and accoun
   assert.equal(governorOptions[0].recoveryBypassAccountInterval, false)
   assert.equal(governorOptions[1].recoveryBypassAccountInterval, true)
   assert.equal(resumableOptions[1].workflowRecoveryDeadlineAt, firstStartedAt + 100)
+  assert.equal(resumableOptions[1].recoveryState, sharedRecoveryState)
   assert.equal(nonStreamHandlingOptions[0].requestDeadlineAt, firstStartedAt + 100)
 
   governorAdvanceMs = 50
@@ -1790,6 +1807,7 @@ test('Qwen AI forwarder keeps only structural recovery cases tool-only', async (
       assert.equal(
         continuationMessageOptions[0].completionProofMissing,
         scenario.recoveryCode === 'qwen_ai_semantic_incomplete'
+          && scenario.name !== 'failed tool result'
           && !scenario.requireManagedToolCall,
       )
       assert.equal(chatCompletionCalls.length, scenario.freshChat ? 2 : 1)
@@ -1949,7 +1967,9 @@ test('Qwen AI forwarder continues auto semantic-empty recovery without replaying
   assert.equal(continuationCalls.length, 1)
   assert.equal(continuationCalls[0].chatId, 'initial-chat')
   assert.equal(continuationCalls[0].parentId, 'semantic-empty-response')
-  assert.equal(continuationCalls[0].content, anchoredCompletionCapableRecovery.content)
+  assert.match(continuationCalls[0].content, /create the requested artifact/)
+  assert.match(continuationCalls[0].content, /entire next response must be one managed tool-call XML block/i)
+  assert.doesNotMatch(continuationCalls[0].content, /OLD_TASK_A|OLD_ANSWER_A|ATTACHMENT_MUST_NOT_LEAK|data:image/)
   assert.equal(continuationCalls[0].messages, undefined)
 
   await new Promise(resolve => setImmediate(resolve))
@@ -2094,7 +2114,7 @@ test('Qwen AI forwarder continues semantic recovery without replaying an unflagg
   assert.equal(continuationCalls[0].parentId, 'active-workflow-response')
   assert.equal(continuationCalls[0].messages, undefined)
   assert.match(continuationCalls[0].content, /ACTIVE_TASK_B_SENTINEL/)
-  assert.match(continuationCalls[0].content, /preceding assistant branch was rejected.*omitted/i)
+  assert.doesNotMatch(continuationCalls[0].content, /preceding assistant branch was rejected.*omitted/i)
   assert.doesNotMatch(continuationCalls[0].content, /OLD_TASK_A/)
   assert.doesNotMatch(continuationCalls[0].content, /OLD_ANSWER_A/)
   assert.doesNotMatch(continuationCalls[0].content, /ATTACHMENT_MUST_NOT_LEAK|data:image/)

@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
 import { createWindow, getMainWindow, loadUrl, loadFile, openDevTools } from './window/manager'
@@ -90,6 +91,8 @@ async function initializeApp(): Promise<void> {
 }
 
 async function setupApp(): Promise<void> {
+  await storeManager.initialize()
+
   // Keep the Electron development proxy separate from the Docker deployment.
   // The Docker Chat2API instance owns 8080; dev runs on 8081 by default.
   if (process.env.NODE_ENV === 'development' && process.env.CHAT2API_DEV_PORT) {

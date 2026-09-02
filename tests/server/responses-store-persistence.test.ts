@@ -27,16 +27,23 @@ test('Responses conversation persistence restores a delta lineage after restart'
       now: () => 1_000,
     })
     const rootMessages = [{ role: 'user' as const, content: 'root' }]
+    const rootSidecarItems = [{ direction: 'input' as const, item: { type: 'reasoning', encrypted_content: 'opaque-root' } }]
     const deltaMessages = [
       { role: 'assistant' as const, content: 'answer' },
       { role: 'user' as const, content: 'follow-up' },
     ]
-    assert.equal(first.set('resp_root', rootMessages), true)
+    assert.equal(first.set('resp_root', rootMessages, undefined, { sidecarItems: rootSidecarItems }), true)
+    const deltaSidecarItems = [{ direction: 'output' as const, item: { type: 'future_item', value: 2 } }]
     assert.equal(first.set(
       'resp_child',
       [...rootMessages, ...deltaMessages],
       binding,
-      { parentResponseId: 'resp_root', deltaMessages },
+      {
+        parentResponseId: 'resp_root',
+        sidecarItems: [...rootSidecarItems, ...deltaSidecarItems],
+        deltaMessages,
+        deltaSidecarItems,
+      },
     ), true)
 
     const records = readFileSync(persistencePath, 'utf8')
@@ -55,6 +62,7 @@ test('Responses conversation persistence restores a delta lineage after restart'
     })
     assert.deepEqual(restored.getConversation('resp_child'), {
       messages: [...rootMessages, ...deltaMessages],
+      sidecarItems: [...rootSidecarItems, ...deltaSidecarItems],
       qwenAiSessionBinding: binding,
     })
 
@@ -65,6 +73,7 @@ test('Responses conversation persistence restores a delta lineage after restart'
       now: () => 1_002,
     })
     assert.equal(bindingCleared.getConversation('resp_child')?.qwenAiSessionBinding, undefined)
+    assert.deepEqual(bindingCleared.getConversation('resp_child')?.sidecarItems, [...rootSidecarItems, ...deltaSidecarItems])
   } finally {
     rmSync(directory, { recursive: true, force: true })
   }

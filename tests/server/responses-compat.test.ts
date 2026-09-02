@@ -5,6 +5,8 @@ import test from 'node:test'
 import {
   chatCompletionToResponse,
   responseOutputToChatMessages,
+  responseOutputToSidecarItems,
+  responsesInputToChatProjection,
   responsesRequestToChatCompletion,
   type ResponseCreateRequest,
 } from '../../src/main/proxy/responses/compat.ts'
@@ -546,6 +548,71 @@ test('Responses preserves minimal and xhigh reasoning effort values', () => {
     input: 'reason',
     reasoning: { effort: 'unsupported' },
   }).chatRequest.reasoning_effort, undefined)
+})
+
+test('non-stream reasoning is exposed before the answer and never invents encrypted content', async () => {
+  const response = await chatCompletionToResponse({
+    model: 'test',
+    choices: [{
+      message: {
+        role: 'assistant',
+        reasoning_content: 'private analysis',
+        content: 'final answer',
+      },
+      finish_reason: 'stop',
+    }],
+  }, { model: 'test', input: 'hello', reasoning: { effort: 'high' } }, {
+    id: 'resp_reasoning_nonstream',
+    model: 'test',
+    createdAt: 123,
+  })
+
+  assert.equal(response.status, 'completed')
+  assert.deepEqual(response.output.map(item => item.type), ['reasoning', 'message'])
+  assert.equal(response.output[0].summary[0].text, 'private analysis')
+  assert.equal(response.output[1].content[0].text, 'final answer')
+  assert.equal('encrypted_content' in response.output[0], false)
+})
+
+test('non-stream reasoning-only output is a failed Responses result', async () => {
+  const response = await chatCompletionToResponse({
+    model: 'test',
+    choices: [{
+      message: { role: 'assistant', reasoning_content: 'still thinking' },
+      finish_reason: 'stop',
+    }],
+  }, { model: 'test', input: 'hello' }, {
+    id: 'resp_reasoning_only',
+    model: 'test',
+    createdAt: 123,
+  })
+
+  assert.equal(response.status, 'failed')
+  assert.equal(response.error?.code, 'reasoning_only_upstream_response')
+  assert.deepEqual(response.output.map(item => item.type), ['reasoning'])
+})
+
+test('Responses projection preserves reasoning and unknown items without leaking them upstream', () => {
+  const reasoning = {
+    type: 'reasoning',
+    id: 'rs_prior',
+    summary: [{ type: 'summary_text', text: 'prior analysis' }],
+    encrypted_content: 'opaque-value',
+  }
+  const unknown = { type: 'future_item', payload: { value: 1 } }
+  const projection = responsesInputToChatProjection({
+    model: 'test',
+    input: [reasoning, unknown, { role: 'user', content: 'continue' }],
+  }.input)
+
+  assert.deepEqual(projection.sidecarItems.map(item => item.item), [reasoning, unknown, { role: 'user', content: 'continue' }])
+  assert.equal(JSON.stringify(projection.messages).includes('prior analysis'), false)
+  assert.equal(JSON.stringify(projection.messages).includes('opaque-value'), false)
+  assert.equal(projection.messages.at(-1)?.content, 'continue')
+
+  const sidecarOutput = responseOutputToSidecarItems([reasoning, unknown])
+  assert.deepEqual(sidecarOutput.map(item => item.direction), ['output', 'output'])
+  assert.deepEqual(sidecarOutput[0].item, reasoning)
 })
 
 test('non-stream truncation and content filtering produce incomplete Responses', async () => {

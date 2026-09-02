@@ -9,6 +9,7 @@ import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
+import { storeManager } from '../../store/store'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
@@ -18,14 +19,17 @@ import {
   createBaseChunk,
   ToolCallState 
 } from '../utils/streamToolHandler'
+import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
+
+const TOKEN_EXPIRY_WARNING_MS = 5 * 60 * 1000 // 5 minutes
 
 const ZAI_API_BASE = 'https://chat.z.ai'
-const X_FE_VERSION = 'prod-fe-1.1.37'
+const X_FE_VERSION = 'prod-fe-1.1.92'
 const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 
 const FAKE_HEADERS = {
   Accept: '*/*',
-  'Accept-Encoding': 'gzip, deflate, br, zstd',
+  'Accept-Encoding': 'identity',
   'Accept-Language': 'zh-CN',
   'Cache-Control': 'no-cache',
   Origin: ZAI_API_BASE,
@@ -96,6 +100,7 @@ interface ChatCompletionRequest {
   reasoning_effort?: 'low' | 'medium' | 'high' | boolean
   chatId?: string
   parentMessageId?: string
+  files?: any[]
 }
 
 function uuid(separator: boolean = true): string {
@@ -127,12 +132,76 @@ export class ZaiAdapter {
     return credentials.captcha_verify_param || credentials.captchaVerifyParam || undefined
   }
 
+  private decodeJwtPayload(token: string): Record<string, any> | null {
+    try {
+      const parts = token.split('.')
+      if (parts.length < 2) return null
+      let payload = parts[1]
+      const padding = payload.length % 4
+      if (padding > 0) {
+        payload += '='.repeat(4 - padding)
+      }
+      payload = payload.replace(/-/g, '+').replace(/_/g, '/')
+      return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'))
+    } catch {
+      return null
+    }
+  }
+
+  private isTokenExpired(token: string): boolean {
+    const payload = this.decodeJwtPayload(token)
+    if (!payload || !payload.exp) return false
+    return Date.now() >= payload.exp * 1000
+  }
+
+  private getTokenRemainingMs(token: string): number | null {
+    const payload = this.decodeJwtPayload(token)
+    if (!payload || !payload.exp) return null
+    return payload.exp * 1000 - Date.now()
+  }
+
   private async ensureToken(): Promise<string> {
     const token = this.getToken()
-    if (token) {
-      return token
+    if (!token) {
+      throw new Error('Z.ai token not configured, please add token in account settings')
     }
-    throw new Error('Z.ai token not configured, please add token in account settings')
+
+    if (this.isTokenExpired(token)) {
+      console.log('[Z.ai] Token expired, attempting auto-refresh...')
+      const refreshed = await this.attemptTokenRefresh()
+      if (refreshed) return refreshed
+      throw new Error('Z.ai token has expired. Please re-login via the app to refresh your token.')
+    }
+
+    const remainingMs = this.getTokenRemainingMs(token)
+    if (remainingMs !== null && remainingMs < TOKEN_EXPIRY_WARNING_MS) {
+      console.log(`[Z.ai] Token expiring soon (${Math.round(remainingMs / 1000)}s remaining)`)
+    }
+
+    return token
+  }
+
+  private async attemptTokenRefresh(): Promise<string | null> {
+    try {
+      const { inAppLoginManager } = await import('../../oauth/inAppLogin')
+      const result = await inAppLoginManager.startLogin({
+        providerId: this.account.providerId || 'zai',
+        providerType: 'zai',
+        timeout: 120000,
+      })
+      if (result.success && result.credentials?.token) {
+        const newToken = result.credentials.token
+        storeManager.updateAccount(this.account.id, {
+          credentials: { ...this.account.credentials, token: newToken },
+        })
+        console.log('[Z.ai] Token refreshed successfully via in-app login')
+        return newToken
+      }
+      console.log('[Z.ai] In-app login did not return a valid token:', result.error)
+    } catch (error) {
+      console.log('[Z.ai] Auto-refresh failed (likely running in Docker/headless mode):', error instanceof Error ? error.message : error)
+    }
+    return null
   }
 
   private extractLastUserMessage(messages: ZaiMessage[]): string {
@@ -196,10 +265,10 @@ export class ZaiAdapter {
     const windowIndex = Math.floor(r / (5 * 60 * 1000))
     
     // Layer1: A = HMAC(secret, window_index) -> hex string
-    const derivedKeyHex = crypto.createHmac('sha256', secret).update(String(windowIndex)).digest('hex')
+    const derivedKey = crypto.createHmac('sha256', secret).update(String(windowIndex)).digest()
     
     // Layer2: k = HMAC(A_hex, canonical_string) -> hex string
-    const signature = crypto.createHmac('sha256', derivedKeyHex).update(canonicalString).digest('hex')
+    const signature = crypto.createHmac('sha256', derivedKey).update(canonicalString).digest('hex')
 
     return signature
   }
@@ -212,9 +281,10 @@ export class ZaiAdapter {
     console.log('[Z.ai] Creating chat with model:', model)
     
     const requestBody = {
+      bot_id: '',
       chat: {
         id: '',
-        title: '新聊天',
+        title: 'New Chat',
         models: [model],
         params: {},
         history: {
@@ -250,21 +320,32 @@ export class ZaiAdapter {
       },
     }
     
-    const response = await axios.post(
+    const makeRequest = async (tok: string) => axios.post(
       `${ZAI_API_BASE}/api/v1/chats/new`,
       requestBody,
       {
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${tok}`,
           'Content-Type': 'application/json',
           ...FAKE_HEADERS,
-          'Cookie': `token=${token}`,
+          'Cookie': `token=${tok}`,
           Referer: `${ZAI_API_BASE}/`,
         },
         timeout: 15000,
         validateStatus: () => true,
       }
     )
+
+    let response = await makeRequest(token)
+
+    if ((response.status === 401 || response.status === 403)) {
+      console.log(`[Z.ai] createChat auth error (${response.status}), attempting token refresh...`)
+      const newToken = await this.attemptTokenRefresh()
+      if (newToken) {
+        this.token = newToken
+        response = await makeRequest(newToken)
+      }
+    }
 
     if (response.status !== 200 && response.status !== 201) {
       console.error('[Z.ai] Create chat response:', response.status, response.data)
@@ -357,6 +438,18 @@ export class ZaiAdapter {
       'GLM-5v-Turbo': 'GLM-5v-Turbo',
       'GLM-5': 'glm-5',
       'GLM-4.7': 'glm-4.7',
+      'GLM-5.3-Flash': 'x-preview-l',
+      'x-preview-l': 'x-preview-l',
+      'GLM-5.3': 'glm-5.3',
+      'glm-5.3': 'glm-5.3',
+      'GLM-5.2': 'glm-5.2',
+      'glm-5.2': 'glm-5.2',
+      'GLM-4.6V': 'glm-4.6v',
+      'glm-4.6v': 'glm-4.6v',
+      'GLM-4.5': '0727-360B-API',
+      '0727-360B-API': '0727-360B-API',
+      'GLM-4.5-Air': '0727-106B-API',
+      '0727-106B-API': '0727-106B-API',
     }
     const mappedModel = modelMapping[request.model] || modelMapping[request.model.toLowerCase()] || request.model
     
@@ -392,6 +485,46 @@ export class ZaiAdapter {
       }
     }
     
+    // Process file attachments from messages
+    const fileUploader = new ZaiFileUploader(token)
+    const uploadedFileRefs: any[] = []
+    for (let msgIdx = 0; msgIdx < processedMessages.length; msgIdx++) {
+      const msg = processedMessages[msgIdx]
+      if (msg.role !== 'user') continue
+      const fileParts = collectFileParts(msg.content)
+      if (fileParts.length === 0) continue
+      // Extract text content from this message
+      const textContent = typeof msg.content === 'string'
+        ? msg.content
+        : (Array.isArray(msg.content)
+            ? msg.content.filter((p: any) => p.type === 'text').map((p: any) => p.text || '').join('')
+            : '')
+      // Upload each file and create references
+      for (const part of fileParts) {
+        try {
+          const normalizedFile = await extractFileFromContent(part)
+          if (!normalizedFile) continue
+          const uploadedFile = await fileUploader.uploadFile(normalizedFile)
+          const fileRef = fileUploader.createFileReference(uploadedFile, messageId)
+          uploadedFileRefs.push(fileRef)
+          console.log('[Z.ai] File uploaded and referenced:', uploadedFile.filename)
+        } catch (err) {
+          console.error('[Z.ai] Failed to upload file:', err)
+        }
+      }
+      // Strip file/image parts from message content, keep only text
+      if (Array.isArray(msg.content)) {
+        const textParts = msg.content.filter((p: any) => p.type === 'text')
+        if (textParts.length === 0 && textContent) {
+          processedMessages[msgIdx] = { ...msg, content: textContent }
+        } else if (textParts.length > 0) {
+          processedMessages[msgIdx] = { ...msg, content: textParts }
+        } else {
+          processedMessages[msgIdx] = { ...msg, content: textContent || '' }
+        }
+      }
+    }
+
     const signaturePrompt = this.extractLastUserMessage(processedMessages)
     
     // Always create a new chat (single-turn mode only)
@@ -471,12 +604,33 @@ export class ZaiAdapter {
       requestBody.captcha_verify_param = captchaVerifyParam
     }
 
+    // Add uploaded file references to request body
+    if (uploadedFileRefs.length > 0) {
+      requestBody.files = uploadedFileRefs
+      console.log('[Z.ai] Attached', uploadedFileRefs.length, 'file(s) to request')
+    }
+
     console.log('[Z.ai] Sending chat request...')
     console.log('[Z.ai] Model:', request.model)
     console.log('[Z.ai] ChatId:', chatId)
     console.log('[Z.ai] MessageId (current_user_message_id):', messageId)
     console.log('[Z.ai] ParentMessageId:', parentMessageId || '(none)')
 
+    const response = await this.sendRequestWithRetry(requestBody, token, chatId, signature, timestamp, requestId, userId)
+
+    return { response, chatId, requestId }
+  }
+
+  private async sendRequestWithRetry(
+    requestBody: Record<string, any>,
+    token: string,
+    chatId: string,
+    signature: string,
+    timestamp: number,
+    requestId: string,
+    userId: string,
+    isRetry: boolean = false,
+  ): Promise<AxiosResponse> {
     const queryParams = new URLSearchParams({
       timestamp: String(timestamp),
       requestId,
@@ -538,6 +692,17 @@ export class ZaiAdapter {
     )
 
     console.log('[Z.ai] Response status:', response.status)
+
+    if ((response.status === 401 || response.status === 403) && !isRetry) {
+      console.log(`[Z.ai] Auth error (${response.status}), attempting token refresh...`)
+      const newToken = await this.attemptTokenRefresh()
+      if (newToken) {
+        this.token = newToken
+        return this.sendRequestWithRetry(requestBody, newToken, chatId, signature, timestamp, requestId, userId, true)
+      }
+      console.log('[Z.ai] Token refresh failed, returning auth error')
+    }
+
     if (response.status !== 200) {
       console.log('[Z.ai] Request body:', JSON.stringify(requestBody, null, 2))
       console.log('[Z.ai] Signature:', signature)
@@ -558,7 +723,7 @@ export class ZaiAdapter {
       }
     }
 
-    return { response, chatId, requestId }
+    return response
   }
 
   static isZaiProvider(provider: Provider): boolean {

@@ -5,6 +5,7 @@ import {
   createManagedToolResultWrapperLeakError,
   ManagedToolResultGuard,
 } from './managedToolResultGuard.ts'
+import type { ToolProtocolId } from './types.ts'
 
 const ASSISTANT_TEXT_FIELDS = [
   'content',
@@ -33,7 +34,9 @@ interface GuardEntry {
  * Only visible assistant text fields are inspected; structured tool arguments
  * remain data and are never scanned as assistant prose.
  */
-export function createAssistantOutputBoundaryStream(): Transform {
+export function createAssistantOutputBoundaryStream(
+  protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml',
+): Transform {
   const decoder = new StringDecoder('utf8')
   const guards = new Map<string, GuardEntry>()
   let output: Transform
@@ -124,7 +127,7 @@ export function createAssistantOutputBoundaryStream(): Transform {
           let entry = guards.get(key)
           if (!entry) {
             entry = {
-              guard: new ManagedToolResultGuard(null),
+              guard: new ManagedToolResultGuard(protectedToolCallProtocol),
               template: {
                 event: { ...event },
                 envelope: { ...envelope },

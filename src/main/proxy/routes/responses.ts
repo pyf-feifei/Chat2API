@@ -20,13 +20,19 @@ import {
 import { modelMapper } from '../modelMapper'
 import { proxyStatusManager } from '../status'
 import { streamHandler } from '../stream'
-import type { AccountSelection, ChatMessage, ProxyContext } from '../types'
+import type {
+  AccountSelection,
+  ChatMessage,
+  ProxyContext,
+  QwenAiLogicalRecoveryState,
+} from '../types'
 import { storeManager } from '../../store/store'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 import {
   chatCompletionToResponse,
   responseOutputToChatMessages,
+  responseOutputToSidecarItems,
   responsesRequestToChatCompletion,
   ResponsesCompatibilityError,
   type ResponseCreateRequest,
@@ -35,6 +41,7 @@ import { responsesConversationStore } from '../responses/store'
 import { responsesSessionLock } from '../responses/sessionLock'
 import { detectResponsesToolLoop, responsesToolLoopCorrectionMessage } from '../responses/toolLoopGuard'
 import { createResponsesStreamTransform } from '../responses/stream'
+import { createAssistantOutputBoundaryStream } from '../toolCalling/assistantOutputBoundary'
 import { classifyChatRequest } from '../requestIntent'
 import { estimateQwenAiRequestInputTokens } from '../qwenAiCompactionBoundary'
 import {
@@ -289,6 +296,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   const request = ctx.request.body as ResponseCreateRequest
   const config = storeManager.getConfig()
 
+  const responseStateEnabled = request?.store !== false
   const responseInputItems = Array.isArray(request?.input) ? request.input : []
   const toolResultItems = responseInputItems.filter(isResponseToolResultInputItem)
   if (toolResultItems.length > 0) {
@@ -302,10 +310,10 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   }
 
   const previousResponseId = typeof request?.previous_response_id === 'string'
-    && request.previous_response_id
-    ? request.previous_response_id
+    ? request.previous_response_id.trim() || undefined
     : undefined
   let previousMessages: ChatMessage[] = []
+  let previousSidecarItems = [] as import('../responses/compat').ResponsesSidecarItem[]
   let previousQwenAiSessionBinding: QwenAiSessionBinding | undefined
   if (previousResponseId) {
     const stored = responsesConversationStore.getConversation(previousResponseId)
@@ -320,6 +328,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       return
     }
     previousMessages = stored.messages
+    previousSidecarItems = stored.sidecarItems ?? []
     previousQwenAiSessionBinding = stored.qwenAiSessionBinding
   }
 
@@ -417,7 +426,8 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   }
 
   const qwenAiToolCallSessionEnabled = config.qwenAiSessionMode !== 'legacy'
-  const managedToolResponsesRequest = qwenAiToolCallSessionEnabled
+  const managedToolResponsesRequest = responseStateEnabled
+    && qwenAiToolCallSessionEnabled
     && requestIntent.intent !== 'context_compaction'
     && Boolean(chatRequest.tools?.length)
     && chatRequest.tool_choice !== 'none'
@@ -529,7 +539,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     consumeQwenAiToolCallClaim(reason)
   }
 
-  if (previousQwenAiSessionBinding) {
+  if (previousQwenAiSessionBinding && responseStateEnabled) {
     const bindingAccount = storeManager.getAccountById(previousQwenAiSessionBinding.accountId)
     const bindingProvider = storeManager.getProviderById(previousQwenAiSessionBinding.providerId)
     const bindingOwnershipMatches = bindingAccount?.providerId === bindingProvider?.id
@@ -629,6 +639,15 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     initialUsesQwenAiContinuation = false
   }
 
+  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+  const qwenAiLogicalRecoveryState: QwenAiLogicalRecoveryState | undefined = initialProviderIsQwenAi
+    ? {
+        resumeAttempts: 0,
+        workflowContinuationAttempts: 0,
+        freshChatRestartAttempts: 0,
+        accountNeutralReplayAttempts: 0,
+      }
+    : undefined
   const qwenAiSessionBridgeForSelection = (
     selection: AccountSelection,
   ): QwenAiSessionBridge | undefined => {
@@ -673,6 +692,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       clientIP: clientIp(ctx),
       signal: abort.controller.signal,
       requestIntent: requestIntent.intent,
+      ...(qwenAiLogicalRecoveryState ? { qwenAiLogicalRecoveryState } : {}),
       ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
       ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
     }
@@ -681,7 +701,6 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   let qwenAiStream: QwenAiOutputStream | undefined
   proxyStatusManager.recordRequestStart(chatRequest.model, provider.id, account.id)
 
-  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
   const failoverSelectionConstraints = initialProviderIsQwenAi
     && loadBalancer.hasCompleteQwenAiWebSession(initialSelection)
     ? {
@@ -875,18 +894,29 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     output: Array<Record<string, any>>,
     qwenAiSessionState?: QwenAiSessionState,
   ) => {
+    if (request.store === false) {
+      consumeQwenAiToolCallClaim('store_disabled')
+      return
+    }
     const appendedMessages = [
       ...translated.conversationMessages.slice(previousMessages.length),
       ...responseOutputToChatMessages(output),
     ]
+    const appendedSidecarItems = [
+      ...translated.sidecarItems,
+      ...responseOutputToSidecarItems(output),
+    ]
+    const sidecarItems = [...previousSidecarItems, ...appendedSidecarItems]
     const transcript = [
       ...previousMessages,
       ...appendedMessages,
     ]
     const toolCallIds = responseOutputToolCallIds(output)
-    const qwenAiSessionBinding = managedToolResponsesRequest && toolCallIds.length > 0
-      ? resolveQwenAiSessionBinding(qwenAiSessionState)
-      : undefined
+    const qwenAiSessionBinding = request.store === false
+      ? undefined
+      : managedToolResponsesRequest && toolCallIds.length > 0
+        ? resolveQwenAiSessionBinding(qwenAiSessionState)
+        : undefined
     if (
       initialUsesQwenAiContinuation
       && qwenAiSessionBinding
@@ -930,7 +960,9 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       qwenAiSessionBinding,
       {
         ...(previousResponseId ? { parentResponseId: previousResponseId } : {}),
+        sidecarItems,
         deltaMessages: appendedMessages,
+        deltaSidecarItems: appendedSidecarItems,
       },
     )
     if (!stored) {
@@ -1116,6 +1148,11 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
           undefined,
           { requireDoneMarker: true },
         ))
+      // Apply the same assistant-visible output boundary used by the Chat
+      // route before converting Chat Completions SSE into Responses events.
+      // This is deliberately route/protocol agnostic: structured tool call
+      // arguments remain untouched by the boundary implementation.
+      const assistantStream = createAssistantOutputBoundaryStream(null)
       const responsesStream = createResponsesStreamTransform({
         request,
         responseId,
@@ -1204,6 +1241,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       // response event.
       let rawStreamEnded = false
       let chatStreamEnded = chatStream === rawStream
+      let assistantStreamEnded = false
       let sourceFailureTriggered = false
       const sourceClose = (ended: () => boolean) => {
         if (ended()) return
@@ -1220,8 +1258,11 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         chatStream.once('end', () => { chatStreamEnded = true })
         chatStream.once('close', () => sourceClose(() => chatStreamEnded))
       }
+      assistantStream.once('end', () => { assistantStreamEnded = true })
+      assistantStream.once('close', () => sourceClose(() => assistantStreamEnded))
       rawStream.once('error', sourceError)
       if (chatStream !== rawStream) chatStream.once('error', sourceError)
+      assistantStream.once('error', sourceError)
       responsesStream.once('error', (error: Error) => {
         const imageResolutionFailure = error instanceof ResponseImageResolutionError
         recordFailure(
@@ -1234,6 +1275,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         )
         destroyStream(rawStream)
         if (chatStream !== rawStream) destroyStream(chatStream)
+        destroyStream(assistantStream)
         destroyStream(clientStream)
       })
       responsesStream.once('end', abort.cleanup)
@@ -1242,12 +1284,14 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         recordFailure(cancellation, 499, true, true)
         destroyStream(rawStream)
         if (chatStream !== rawStream) destroyStream(chatStream)
+        destroyStream(assistantStream)
         destroyStream(responsesStream)
         destroyStream(clientStream)
       }, { once: true })
 
       responsesStream.pipe(clientStream)
-      chatStream.pipe(responsesStream)
+      assistantStream.pipe(responsesStream)
+      chatStream.pipe(assistantStream)
       ctx.body = clientStream
       return
     }
@@ -1270,6 +1314,17 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       createdAt,
       imageResolver,
     })
+    if (response.status === 'failed') {
+      const error = Object.assign(
+        new Error(response.error?.message ?? 'Upstream Responses output was not usable.'),
+        { code: response.error?.code ?? 'invalid_upstream_response' },
+      )
+      recordFailure(error, 502, false)
+      abort.cleanup()
+      ctx.set('Content-Type', 'application/json')
+      ctx.body = response
+      return
+    }
     storeConversation(
       response.output,
       response.status === 'completed' ? result.qwenAiSessionState : undefined,

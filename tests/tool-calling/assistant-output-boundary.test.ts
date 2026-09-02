@@ -93,3 +93,35 @@ test('assistant output boundary rejects a distinctive partial wrapper at EOF', a
     ),
   )
 })
+
+test('assistant output boundary rejects generic tool-call-results wrappers', async () => {
+  const source = Readable.from([
+    frame({ content: 'before <tool_call_results id="call_fixture">result' }),
+    frame({ content: '</tool_call_results> after' }),
+    frame({}, 'stop'),
+    'data: [DONE]\\n\\n',
+  ])
+  const boundary = createAssistantOutputBoundaryStream()
+  source.pipe(boundary)
+
+  await assert.rejects(
+    collect(boundary),
+    (error: Error & { code?: string, param?: string }) => (
+      error.code === 'managed_tool_result_wrapper_leak'
+      && error.param === 'content'
+    ),
+  )
+})
+
+test('assistant output boundary preserves a legal tool-call tag', async () => {
+  const source = Readable.from([
+    frame({ content: '<tool_call><function=read_fixture></function></tool_call>' }),
+    frame({}, 'tool_calls'),
+    'data: [DONE]\\n\\n',
+  ])
+  const boundary = createAssistantOutputBoundaryStream()
+  source.pipe(boundary)
+
+  const output = await collect(boundary)
+  assert.match(output, /<tool_call>/)
+})

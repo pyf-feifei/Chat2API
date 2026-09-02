@@ -12,6 +12,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import type { ChatMessage, ChatMessageContent } from '../types'
 import type { QwenAiSessionBinding } from '../qwenAiSessionBridge'
+import type { ResponsesSidecarItem } from './compat'
 
 export interface ResponsesConversationStoreOptions {
   ttlMs?: number
@@ -26,10 +27,13 @@ export interface ResponsesConversationStoreOptions {
 export interface ResponsesConversationSetOptions {
   parentResponseId?: string
   deltaMessages?: ChatMessage[]
+  sidecarItems?: ResponsesSidecarItem[]
+  deltaSidecarItems?: ResponsesSidecarItem[]
 }
 
 interface StoredConversation {
   messages: ChatMessage[]
+  sidecarItems: ResponsesSidecarItem[]
   qwenAiSessionBinding?: QwenAiSessionBinding
   bytes: number
   expiresAt: number
@@ -38,6 +42,7 @@ interface StoredConversation {
 
 export interface StoredResponsesConversation {
   messages: ChatMessage[]
+  sidecarItems?: ResponsesSidecarItem[]
   qwenAiSessionBinding?: QwenAiSessionBinding
 }
 
@@ -48,6 +53,7 @@ interface PersistedSetRecord {
   mode: 'checkpoint' | 'delta'
   parentResponseId?: string
   messages: ChatMessage[]
+  sidecarItems?: ResponsesSidecarItem[]
   qwenAiSessionBinding?: QwenAiSessionBinding
   expiresAt: number
   persistenceDepth: number
@@ -121,11 +127,21 @@ function cloneQwenAiSessionBinding(
   return binding ? { ...binding } : undefined
 }
 
+function cloneSidecarItems(items: ResponsesSidecarItem[] | undefined): ResponsesSidecarItem[] {
+  return (items ?? []).map(entry => ({
+    direction: entry.direction,
+    item: typeof entry.item === 'object' && entry.item !== null
+      ? JSON.parse(JSON.stringify(entry.item))
+      : entry.item,
+  }))
+}
+
 function estimateConversationBytes(
   messages: ChatMessage[],
+  sidecarItems: ResponsesSidecarItem[],
   qwenAiSessionBinding: QwenAiSessionBinding | undefined,
 ): number {
-  return Buffer.byteLength(JSON.stringify({ messages, qwenAiSessionBinding }), 'utf8')
+  return Buffer.byteLength(JSON.stringify({ messages, sidecarItems, qwenAiSessionBinding }), 'utf8')
 }
 
 function defaultPersistencePath(): string | undefined {
@@ -190,6 +206,7 @@ export class ResponsesConversationStore {
     ])
     return {
       messages: cloneMessages(entry.messages),
+      ...(entry.sidecarItems.length > 0 ? { sidecarItems: cloneSidecarItems(entry.sidecarItems) } : {}),
       qwenAiSessionBinding: cloneQwenAiSessionBinding(entry.qwenAiSessionBinding),
     }
   }
@@ -203,17 +220,24 @@ export class ResponsesConversationStore {
     this.ensurePersistenceInitialized()
     this.pruneExpired()
     const cloned = cloneMessages(messages)
+    const clonedSidecarItems = cloneSidecarItems(options.sidecarItems ?? options.deltaSidecarItems)
     const clonedBinding = cloneQwenAiSessionBinding(qwenAiSessionBinding)
-    const bytes = estimateConversationBytes(cloned, clonedBinding)
+    const bytes = estimateConversationBytes(cloned, clonedSidecarItems, clonedBinding)
     if (bytes > this.maxEntryBytes || bytes > this.maxTotalBytes) return false
 
     const parent = options.parentResponseId
       ? this.entries.get(options.parentResponseId)
       : undefined
+    const sidecarDeltaProvided = options.sidecarItems !== undefined
+      && options.deltaSidecarItems !== undefined
     const canPersistDelta = Boolean(
       parent
       && options.deltaMessages
-      && cloned.length === parent!.messages.length + options.deltaMessages.length,
+      && cloned.length === parent!.messages.length + options.deltaMessages.length
+      && (
+        !sidecarDeltaProvided
+        || clonedSidecarItems.length === parent!.sidecarItems.length + options.deltaSidecarItems!.length
+      ),
     )
     const nextDepth = canPersistDelta ? parent!.persistenceDepth + 1 : 0
     const expiresAt = this.now() + this.ttlMs
@@ -239,6 +263,7 @@ export class ResponsesConversationStore {
 
     const entry: StoredConversation = {
       messages: cloned,
+      sidecarItems: clonedSidecarItems,
       ...(clonedBinding ? { qwenAiSessionBinding: clonedBinding } : {}),
       bytes,
       expiresAt,
@@ -253,6 +278,9 @@ export class ResponsesConversationStore {
     const persistedMessages = useCheckpoint
       ? cloned
       : cloneMessages(options.deltaMessages ?? [])
+    const persistedSidecarItems = useCheckpoint
+      ? clonedSidecarItems
+      : cloneSidecarItems(options.deltaSidecarItems)
     this.appendRecord({
       version: 1,
       operation: 'set',
@@ -262,6 +290,7 @@ export class ResponsesConversationStore {
         ? { parentResponseId: options.parentResponseId }
         : {}),
       messages: persistedMessages,
+      sidecarItems: persistedSidecarItems,
       ...(clonedBinding ? { qwenAiSessionBinding: clonedBinding } : {}),
       expiresAt,
       persistenceDepth,
@@ -281,7 +310,8 @@ export class ResponsesConversationStore {
 
     const nextEntry: StoredConversation = {
       messages: entry.messages,
-      bytes: estimateConversationBytes(entry.messages, undefined),
+      sidecarItems: entry.sidecarItems,
+      bytes: estimateConversationBytes(entry.messages, entry.sidecarItems, undefined),
       expiresAt: entry.expiresAt,
       persistenceDepth: entry.persistenceDepth,
     }
@@ -359,7 +389,8 @@ export class ResponsesConversationStore {
       if (!entry) return
       const nextEntry: StoredConversation = {
         messages: entry.messages,
-        bytes: estimateConversationBytes(entry.messages, undefined),
+        sidecarItems: entry.sidecarItems,
+        bytes: estimateConversationBytes(entry.messages, entry.sidecarItems, undefined),
         expiresAt: entry.expiresAt,
         persistenceDepth: entry.persistenceDepth,
       }
@@ -378,13 +409,19 @@ export class ResponsesConversationStore {
     const messages = record.mode === 'delta'
       ? [...cloneMessages(parent!.messages), ...cloneMessages(record.messages)]
       : cloneMessages(record.messages)
+    const recordSidecarItems = cloneSidecarItems(record.sidecarItems)
+    const parentSidecarItems = parent ? cloneSidecarItems(parent.sidecarItems) : []
+    const sidecarItems = record.mode === 'delta'
+      ? [...parentSidecarItems, ...recordSidecarItems]
+      : recordSidecarItems
     const binding = cloneQwenAiSessionBinding(record.qwenAiSessionBinding)
-    const bytes = estimateConversationBytes(messages, binding)
+    const bytes = estimateConversationBytes(messages, sidecarItems, binding)
     if (bytes > this.maxEntryBytes || bytes > this.maxTotalBytes) return
 
     this.removeEntry(record.responseId, false)
     const entry: StoredConversation = {
       messages,
+      sidecarItems,
       ...(binding ? { qwenAiSessionBinding: binding } : {}),
       bytes,
       expiresAt: record.expiresAt,
@@ -427,6 +464,7 @@ export class ResponsesConversationStore {
         responseId,
         mode: 'checkpoint',
         messages: entry.messages,
+        sidecarItems: entry.sidecarItems,
         ...(entry.qwenAiSessionBinding
           ? { qwenAiSessionBinding: entry.qwenAiSessionBinding }
           : {}),

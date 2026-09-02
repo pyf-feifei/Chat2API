@@ -3,8 +3,7 @@ import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, resolve } from 'path'
 import type { RuntimeAdapter } from './types.ts'
-
-const ENCRYPTION_PREFIX = 'c2a:v1:'
+import { ENCRYPTION_PREFIX } from './types.ts'
 
 function getEncryptionKey(): Buffer | null {
   const secret = process.env.CHAT2API_STORAGE_ENCRYPTION_KEY

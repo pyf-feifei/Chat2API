@@ -10,7 +10,7 @@ import { PassThrough } from 'stream'
 import { performance } from 'node:perf_hooks'
 import { createParser } from 'eventsource-parser'
 import { Account, Provider } from '../../store/types'
-import type { ChatMessage } from '../types'
+import type { ChatMessage, QwenAiLogicalRecoveryState } from '../types'
 import type { ProviderModelCapability } from '../../../shared/types'
 import { hasToolUse, parseToolUse } from '../promptToolUse'
 import {
@@ -104,7 +104,7 @@ const QWEN_AI_DEBUG_PAYLOAD_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_PAYLOADS =
 const QWEN_AI_DEBUG_STREAM_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_STREAM === 'true'
 const QWEN_AI_DEBUG_REQUEST_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_REQUEST === 'true'
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS = 60_000
-const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS = 5
+const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS = 1
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS = 1_000
 // Busy-chat admission is a short provider-state wait, not the generation
 // timeout. Keep the default bounded while allowing deployments to tune it.
@@ -113,7 +113,7 @@ const QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS = 1_000
 // Retained Responses tool-result continuations are followed immediately by
 // a client request. Keep transient busy states on the retained chat instead
 // of forcing a full-history replay on another account.
-const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 4
+const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 1
 // Recovery time is shared by response-id resumes and managed workflow
 // continuations. It pauses while a replacement stream is producing output,
 // so a valid long generation is not cut off by this guard.
@@ -143,6 +143,7 @@ export type QwenAiOutputStream = PassThrough & {
 }
 
 const DEFAULT_HEADERS = {
+  'Accept-Encoding': 'identity',
   Accept: 'application/json',
   'Accept-Language': 'zh-CN,zh;q=0.9',
   'Content-Type': 'application/json',
@@ -215,6 +216,8 @@ type QwenAiRecoveryCallback = (error: Error, onResume?: () => void) => Promise<b
 
 type QwenAiResumableStreamOptions = {
   signal?: AbortSignal
+  /** Request-scoped recovery counters shared across account failover attempts. */
+  recoveryState?: QwenAiLogicalRecoveryState
   getResponseId: () => string
   /** Classify parsed branch state before a source end becomes a transport failure. */
   getSemanticRecoveryError?: () => Error | undefined
@@ -375,7 +378,7 @@ export function qwenAiSerializedPayloadBytes(payload: unknown): number {
 export function qwenAiStreamResumeAttemptsFromEnv(): number {
   return Math.min(
     10,
-    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS', 3),
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS', 1),
   )
 }
 
@@ -389,11 +392,11 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
 export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
   if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
-    return 4
+    return 1
   }
 
   const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) return 4
+  if (!Number.isSafeInteger(value) || value < 0) return 1
   return value
 }
 
@@ -684,28 +687,48 @@ export function createQwenAiResumableStream(
   let activeRecovery: Promise<boolean> | undefined
   let recoveryResumed = false
   let recoveryResumeCallbacks: Array<() => void> = []
-  let attempts = 0
-  let workflowContinuationAttempts = 0
-  let freshChatRestartAttempts = 0
+  const recoveryState = options.recoveryState
+  let attempts = recoveryState?.resumeAttempts ?? 0
+  let workflowContinuationAttempts = recoveryState?.workflowContinuationAttempts ?? 0
+  let freshChatRestartAttempts = recoveryState?.freshChatRestartAttempts ?? 0
+  // A recovery phase transition must not reopen the transport budget for the
+  // same logical request. `attempts` is intentionally monotonic across resume,
+  // fresh-chat, and workflow-continuation branches; these counters only track
+  // their independently bounded phase limits.
   let transientFreshChatRecoveryEligible = false
   let staleSessionRecoveryEligible = false
   let settled = false
   let settledError: Error | undefined
   const configuredRecoveryBudgetMs = options.recoveryBudgetMs ?? qwenAiRecoveryBudgetMsFromEnv()
-  let recoveryBudgetRemainingMs = Number.isFinite(configuredRecoveryBudgetMs)
-    ? Math.max(0, configuredRecoveryBudgetMs)
-    : qwenAiRecoveryBudgetMsFromEnv()
+  let recoveryBudgetRemainingMs = recoveryState?.recoveryBudgetRemainingMs
+    ?? (Number.isFinite(configuredRecoveryBudgetMs)
+      ? Math.max(0, configuredRecoveryBudgetMs)
+      : qwenAiRecoveryBudgetMsFromEnv())
+  if (recoveryState && recoveryState.recoveryBudgetRemainingMs === undefined) {
+    recoveryState.recoveryBudgetRemainingMs = recoveryBudgetRemainingMs
+  }
   let recoveryBudgetStartedAt: number | undefined
   let recoveryBudgetTimer: NodeJS.Timeout | undefined
   let recoveryBudgetController: AbortController | undefined
   let recoveryBudgetClientAbort: (() => void) | undefined
   let recoveryBudgetExpired = false
   let recoveryBudgetEffectiveTimerMs = 0
+  const syncRecoveryState = () => {
+    if (!recoveryState) return
+    recoveryState.resumeAttempts = attempts
+    recoveryState.workflowContinuationAttempts = workflowContinuationAttempts
+    recoveryState.freshChatRestartAttempts = freshChatRestartAttempts
+    recoveryState.recoveryBudgetRemainingMs = recoveryBudgetRemainingMs
+  }
+  syncRecoveryState()
   const configuredWorkflowRecoveryTimeoutMs = options.workflowRecoveryTimeoutMs
     ?? qwenAiWorkflowRecoveryTimeoutMsFromEnv()
   const workflowRecoveryTimeoutMs = Number.isFinite(configuredWorkflowRecoveryTimeoutMs)
     ? Math.max(0, configuredWorkflowRecoveryTimeoutMs)
     : qwenAiWorkflowRecoveryTimeoutMsFromEnv()
+  // Keep the outer request deadline separate from the shared workflow
+  // deadline. The latter is created only when workflow recovery begins and
+  // must never be treated as a new request deadline on a later account.
   const workflowRecoveryRequestDeadlineAt = Number.isFinite(options.workflowRecoveryDeadlineAt)
     ? Math.max(0, options.workflowRecoveryDeadlineAt || 0)
     : undefined
@@ -760,6 +783,7 @@ export function createQwenAiResumableStream(
       recoveryBudgetClientAbort = undefined
     }
     recoveryBudgetController = undefined
+    syncRecoveryState()
     if (abortInFlight && controller && !controller.signal.aborted) {
       controller.abort()
     }
@@ -787,6 +811,12 @@ export function createQwenAiResumableStream(
   }
 
   const startRecoveryBudget = (): AbortSignal | undefined => {
+    if (recoveryState?.recoveryBudgetRemainingMs !== undefined) {
+      recoveryBudgetRemainingMs = Math.min(
+        recoveryBudgetRemainingMs,
+        Math.max(0, recoveryState.recoveryBudgetRemainingMs),
+      )
+    }
     if (recoveryBudgetStartedAt !== undefined) return recoveryBudgetController?.signal
     if (recoveryBudgetRemainingMs <= 0) return undefined
 
@@ -866,20 +896,43 @@ export function createQwenAiResumableStream(
   }
 
   const startWorkflowRecoveryDeadline = (): AbortSignal | undefined => {
+    // A workflow timer belongs to this stream instance. Reusing it must not
+    // recalculate the remaining duration from the original start timestamp.
     if (workflowRecoveryStartedAt !== undefined) {
       return workflowRecoveryController?.signal
     }
-    const requestRemainingMs = workflowRecoveryRequestDeadlineAt === undefined
-      ? Number.POSITIVE_INFINITY
-      : Math.max(0, workflowRecoveryRequestDeadlineAt - Date.now())
-    workflowRecoveryBoundedByRequestDeadline = requestRemainingMs <= workflowRecoveryTimeoutMs
-    workflowRecoveryEffectiveTimeoutMs = Math.min(
-      workflowRecoveryTimeoutMs,
-      requestRemainingMs,
-    )
-    if (workflowRecoveryEffectiveTimeoutMs <= 0) {
-      workflowRecoveryExpired = true
-      return undefined
+
+    const now = Date.now()
+    const sharedWorkflowDeadline = recoveryState?.workflowRecoveryDeadlineAt
+    if (sharedWorkflowDeadline !== undefined) {
+      const effectiveDeadline = workflowRecoveryRequestDeadlineAt === undefined
+        ? sharedWorkflowDeadline
+        : Math.min(sharedWorkflowDeadline, workflowRecoveryRequestDeadlineAt)
+      workflowRecoveryBoundedByRequestDeadline = recoveryState?.workflowRecoveryBoundedByRequestDeadline === true
+        || (workflowRecoveryRequestDeadlineAt !== undefined
+          && workflowRecoveryRequestDeadlineAt <= sharedWorkflowDeadline)
+      workflowRecoveryEffectiveTimeoutMs = Math.max(0, effectiveDeadline - now)
+      if (workflowRecoveryEffectiveTimeoutMs <= 0) {
+        workflowRecoveryExpired = true
+        return undefined
+      }
+    } else {
+      const requestRemainingMs = workflowRecoveryRequestDeadlineAt === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, workflowRecoveryRequestDeadlineAt - now)
+      workflowRecoveryBoundedByRequestDeadline = requestRemainingMs <= workflowRecoveryTimeoutMs
+      workflowRecoveryEffectiveTimeoutMs = Math.min(
+        workflowRecoveryTimeoutMs,
+        requestRemainingMs,
+      )
+      if (workflowRecoveryEffectiveTimeoutMs <= 0) {
+        workflowRecoveryExpired = true
+        return undefined
+      }
+      if (recoveryState) {
+        recoveryState.workflowRecoveryDeadlineAt = now + workflowRecoveryEffectiveTimeoutMs
+        recoveryState.workflowRecoveryBoundedByRequestDeadline = workflowRecoveryBoundedByRequestDeadline
+      }
     }
 
     workflowRecoveryStartedAt = performance.now()
@@ -895,8 +948,19 @@ export function createQwenAiResumableStream(
 
   const assertWorkflowRecoveryDeadline = () => {
     if (workflowRecoveryExpired) throw effectiveWorkflowRecoveryTimeoutError()
+    const sharedWorkflowDeadline = recoveryState?.workflowRecoveryDeadlineAt
+    const effectiveDeadline = sharedWorkflowDeadline === undefined
+      ? workflowRecoveryRequestDeadlineAt
+      : workflowRecoveryRequestDeadlineAt === undefined
+        ? sharedWorkflowDeadline
+        : Math.min(sharedWorkflowDeadline, workflowRecoveryRequestDeadlineAt)
+    if (effectiveDeadline !== undefined && Date.now() >= effectiveDeadline) {
+      workflowRecoveryExpired = true
+      throw effectiveWorkflowRecoveryTimeoutError()
+    }
     if (
-      workflowRecoveryStartedAt !== undefined
+      effectiveDeadline === undefined
+      && workflowRecoveryStartedAt !== undefined
       && performance.now() - workflowRecoveryStartedAt >= workflowRecoveryEffectiveTimeoutMs
     ) {
       workflowRecoveryExpired = true
@@ -1075,6 +1139,7 @@ export function createQwenAiResumableStream(
       if (!responseId || !options.resume) break
 
       attempts += 1
+      syncRecoveryState()
       if (!(await waitForRetry(recoverySignal))) {
         if (recoveryBudgetExpired) failRecovery(effectiveRecoveryBudgetError())
         failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
@@ -1200,6 +1265,7 @@ export function createQwenAiResumableStream(
       }
 
       freshChatRestartAttempts += 1
+      syncRecoveryState()
       ensureRecoveryBudget()
       try {
         console.warn('[QwenAI] Replaying in a fresh chat on the same account after private upstream failure', JSON.stringify({
@@ -1238,7 +1304,9 @@ export function createQwenAiResumableStream(
         sourceComplete = false
         terminalMarkerSeen = false
         completionScan = ''
-        attempts = 0
+        // Keep `attempts` monotonic across branch replacement. A fresh chat
+        // is still part of this logical request, so it must not reopen the
+        // response-id resume budget after an earlier attempt.
         pauseRecoveryBudget()
         recoveryInFlight = false
         options.onFreshChatRestart?.()
@@ -1290,6 +1358,7 @@ export function createQwenAiResumableStream(
         releaseLinkedRecoverySignal()
         linkedRecoverySignalCleanup = linkedRecoverySignal.cleanup
         workflowContinuationAttempts += 1
+        syncRecoveryState()
         ensureRecoveryBudget()
         if (!(await waitForRetry(linkedRecoverySignal.signal))) {
           if (workflowRecoveryExpired) {
@@ -1360,7 +1429,8 @@ export function createQwenAiResumableStream(
           completionScan = ''
           // A fresh user turn has a new response branch. Pause only the
           // no-progress budget; the workflow wall-clock deadline stays active.
-          attempts = 0
+          // Keep the outer request's transport-attempt count monotonic so a
+          // semantic continuation cannot reopen an already-spent resume slot.
           pauseRecoveryBudget()
           recoveryInFlight = false
           options.onWorkflowContinuation?.()
@@ -1404,7 +1474,15 @@ export function createQwenAiResumableStream(
     }
     const transportError = normalizeQwenAiStreamFailure(lastError)
     if (semanticRecoveryEligible && isQwenAiSemanticRecoveryError(transportError)) {
-      markQwenAiNextAccountReplay(transportError)
+      const canReplaySemanticBranch = !recoveryState
+        || recoveryState.accountNeutralReplayAttempts < 1
+      if (canReplaySemanticBranch) {
+        if (recoveryState) recoveryState.accountNeutralReplayAttempts += 1
+        markQwenAiNextAccountReplay(transportError)
+      } else {
+        transportError.accountFault = false
+        delete transportError.retryScope
+      }
     }
     // Network and upstream 5xx failures are account-neutral. Preserve the
     // provider's 4xx classification (auth, risk control, or capacity) so the
@@ -2494,8 +2572,22 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
+  // A completion marker followed by more assistant text is not a proof. Treat
+  // it as a malformed workflow turn even in auto mode; otherwise the model's
+  // marker-plus-prose branch is delivered as a successful ordinary answer.
+  if (/<chat2api_workflow_complete(?:\/>|>)[\s\S]*\S/.test(content)) {
+    return true
+  }
+
   const trimmedContent = content.trim()
   if (!trimmedContent) {
+    return false
+  }
+
+  // A failed tool result explicitly changes the turn contract: the model may
+  // explain the failure or choose a retry without fabricating a completion
+  // proof. Do not classify that ordinary prose by its wording alone.
+  if (plan.failedToolResultPending === true) {
     return false
   }
 
@@ -2558,6 +2650,13 @@ function isDanglingManagedToolAnswer(
   // contract.
   const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
   if (!midWorkflow) {
+    // A malformed managed block is a protocol failure even in auto mode. It
+    // cannot be delivered as ordinary prose because doing so loses the tool
+    // turn and leaves the client waiting for a result that never arrives.
+    if (parsed.rawMatches.length > 0 && parsed.malformedReason) {
+      return true
+    }
+
     // Capability denial is dangling in EVERY state: the managed contract just
     // declared these tools, so claiming they are unavailable (or announcing a
     // retrieval through an undeclared channel) without a tool call is a stall
@@ -4474,7 +4573,10 @@ export class QwenAiAdapter {
     // separate from the timeout for a long-running accepted generation.
     const baseRetryDelayMs = configuredRetryDelayMs
     const retryBudgetMs = qwenAiChatInProgressRetryBudgetMsFromEnv()
-    const continuationDeadline = Date.now() + retryBudgetMs
+    const configuredContinuationDeadline = Date.now() + retryBudgetMs
+    const continuationDeadline = request.deadlineAt === undefined
+      ? configuredContinuationDeadline
+      : Math.min(configuredContinuationDeadline, request.deadlineAt)
     let chatInProgressRetries = 0
     let lastChatInProgressError: QwenAiUpstreamError | undefined
 
@@ -6172,7 +6274,10 @@ export class QwenAiStreamHandler {
         !hasAnswerOrTool && (reasoningText.trim() || summaryText.trim()),
       )
       if (!hasAnswerOrTool && this.content.trim()) {
-        if (this.toolCallingPlan?.toolChoiceMode === 'auto') {
+        if (
+          this.toolCallingPlan?.toolChoiceMode === 'auto'
+          && this.toolCallingPlan.failedToolResultPending !== true
+        ) {
           // Auto mode treats a tool-less answer as legitimate; deliver the
           // buffered text instead of failing the stream.
           const bufferedAnswer = this.content.trim()
@@ -6190,7 +6295,10 @@ export class QwenAiStreamHandler {
       if (hasReasoningOnlyOutput) {
         // In auto tool-choice mode, reasoning-only output is a legitimate response.
         // Deliver it as content instead of triggering a retry.
-        if (this.toolCallingPlan?.toolChoiceMode === 'auto') {
+        if (
+          this.toolCallingPlan?.toolChoiceMode === 'auto'
+          && this.toolCallingPlan.failedToolResultPending !== true
+        ) {
           const reasoningFallback = summaryText.trim() || reasoningText.trim()
           if (reasoningFallback) {
             if (!initialChunkSent) sendInitialChunk()
@@ -6754,10 +6862,8 @@ export class QwenAiStreamHandler {
         )
         if (completionProof.complete) {
           if (!completionProof.content.trim()) {
-            if (this.toolCallingPlan?.toolChoiceMode !== 'auto') {
-              recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
-              return
-            }
+            recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+            return
           }
           choice.message.content = completionProof.content
         }
@@ -6770,7 +6876,10 @@ export class QwenAiStreamHandler {
               chars: finalReasoning.length,
               asContent: options.reasoningOnlyAsContent === true,
             }))
-          } else if (this.toolCallingPlan?.toolChoiceMode === 'auto') {
+          } else if (
+            this.toolCallingPlan?.toolChoiceMode === 'auto'
+            && this.toolCallingPlan.failedToolResultPending !== true
+          ) {
             // In auto tool-choice mode, reasoning-only output is legitimate.
             choice.message.content = finalReasoning
             console.info('[QwenAI] Accepted reasoning-only output in auto mode (non-stream)', JSON.stringify({

@@ -215,16 +215,17 @@ CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL=native
 CHAT2API_COMPACTION_DETECTION=off
 CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 CHAT2API_QWEN_AI_RETRY_COUNT=1
-CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=3
-CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=4
+CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=0
+CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
-# Leave blank/unset for deadline mode; set a non-negative integer for an
-# explicit retry cap (0 disables busy-chat recovery).
-CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
+# Default to one exact-payload busy-chat retry. Set MODE=deadline to opt into
+# budget-based polling, or ATTEMPTS=0 to disable the retry.
+CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_MODE=attempts
+CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=1
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
-CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=4
+CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=1
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 # Emit typed response.in_progress events during otherwise silent Responses
@@ -304,7 +305,7 @@ not become model output and do not reset the Qwen meaningful-progress timer;
 set the value to `0` only when another layer owns transport keep-alives.
 If Qwen closes a response socket before its terminal event, Chat2API can ask
 Qwen to continue the same response using its `chat_id` and `response_id`.
-`CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` (default `3`) bounds those
+`CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` (default `1`) bounds those
 continuations and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` (default `1000`)
 controls the pause between attempts. Set the attempts value to `0` to disable
 this transport recovery. It never resubmits the original prompt and is not
@@ -366,7 +367,7 @@ When a managed-tool response reaches a semantic terminal without a tool call,
 Chat2API can start bounded corrective user turns in the same Qwen chat instead of
 replaying that completed response branch or the original transcript. A fresh
 chat replay is reserved for an undeclared provider-native tool call. The
-`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is `4`; `0` disables
+`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is `1`; `0` disables
 semantic recovery and positive values are bounded by the absolute workflow
 recovery deadline.
 The new turn is parented to Qwen's latest `response_id` and does not resend the
@@ -379,11 +380,12 @@ payload until `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS` is spent
 `QWEN_AI_REQUEST_TIMEOUT_MS`; once a generation is accepted, the same
 cumulative request deadline remains in force. Leave
 Bound Claude tool-result continuations use the dedicated
-`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=4` setting and retry
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=1` setting and retry
 the same retained provider chat before surfacing a busy response. The generic
-`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` remains blank by default,
-which preserves deadline mode for ordinary semantic workflow continuations.
-Set it to a positive value when explicit polling is desired.
+`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_MODE=attempts` and
+`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=1` defaults bound ordinary
+semantic continuation admission to one exact-payload retry. Set the mode to
+`deadline` only when budget-based polling is explicitly desired.
 `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`
 (default `1000` ms) sets the initial delay. Each retry uses only the remaining
 admission budget, and an exhausted busy result briefly cools the account without
@@ -391,7 +393,7 @@ invalidating its credentials. The response is recognized by the provider code
 only, so an ordinary JSON error remains a non-stream `502`, and cancellation
 stops the wait without another request.
 Retained Responses tool-result continuations use
-`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS` (default `4`) to retry
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS` (default `1`) to retry
 the exact same parent continuation. If all retries are exhausted, Chat2API
 marks the result eligible for the existing account failover layer. A healthy
 second account then receives a complete transcript replay; the old provider

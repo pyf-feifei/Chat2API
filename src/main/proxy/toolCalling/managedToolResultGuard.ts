@@ -2,8 +2,34 @@ import type { ToolProtocolId } from './types.ts'
 
 const TOOL_RESULT_START = '<|CHAT2API|tool_result'
 const TOOL_RESULT_END = '</|CHAT2API|tool_result>'
+// Provider-facing transcripts may expose their tool-result envelope under a
+// generic name. Keep these markers in the shared boundary registry rather than
+// branching on a client or model name.
+const TOOL_RESULT_STARTS = [
+  TOOL_RESULT_START,
+  '<tool_call_results',
+  '<tool_response>',
+] as const
+const TOOL_RESULT_ENDS = [
+  TOOL_RESULT_END,
+  '</tool_call_results>',
+  '</tool_response>',
+] as const
 const DISTINCTIVE_PARTIAL_RESULT = '<|CHAT2API|tool_r'
 const MARKDOWN_FENCE = '```'
+
+const GENERIC_TOOL_CALL_STARTS = [
+  '<tool_call>',
+  '<tool_call ',
+  '<tool_call_start|>',
+  '<function_call>',
+  '<function_calls>',
+  '<function name=',
+  '<|tool_calls>',
+  '<tool_calls>',
+  '[function_calls]',
+  '<antml:function_calls>',
+] as const
 
 const PROTECTED_TOOL_CALL_MARKERS: Partial<Record<
   ToolProtocolId,
@@ -84,9 +110,11 @@ export class ManagedToolResultGuard {
   private buffer = ''
   private state: GuardState = 'text'
   private resumeStateAfterToolResult: 'text' | 'fenced' = 'text'
+  private activeToolResultEnd = TOOL_RESULT_END
   private wrapperLeakDetected = false
   private readonly toolCallStarts: readonly string[]
   private readonly toolCallEnds: readonly string[]
+  private readonly rejectUnprotectedToolCalls: boolean
   private readonly bufferUntilFlush: boolean
 
   constructor(protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml') {
@@ -95,6 +123,7 @@ export class ManagedToolResultGuard {
       : undefined
     this.toolCallStarts = markers?.starts ?? []
     this.toolCallEnds = markers?.ends ?? []
+    this.rejectUnprotectedToolCalls = protectedToolCallProtocol === null
     // Responses-style calls are JSON rather than a delimited text protocol.
     // Hold the candidate until it can be parsed structurally so a literal
     // wrapper inside `arguments` is not mistaken for top-level assistant text.
@@ -133,12 +162,21 @@ export class ManagedToolResultGuard {
     let content = ''
     let suppressed = false
 
+    if (this.rejectUnprotectedToolCalls) {
+      const candidate = findEarliestMarker(this.buffer, GENERIC_TOOL_CALL_STARTS)
+      if (candidate) {
+        this.wrapperLeakDetected = true
+        this.buffer = ''
+        return { content, suppressed: true }
+      }
+    }
+
     while (this.buffer) {
       if (this.state === 'tool_result') {
         suppressed = true
-        const endIndex = this.buffer.indexOf(TOOL_RESULT_END)
+        const endIndex = this.buffer.indexOf(this.activeToolResultEnd)
         if (endIndex !== -1) {
-          this.buffer = this.buffer.slice(endIndex + TOOL_RESULT_END.length)
+          this.buffer = this.buffer.slice(endIndex + this.activeToolResultEnd.length)
           this.state = this.resumeStateAfterToolResult
           continue
         }
@@ -149,7 +187,7 @@ export class ManagedToolResultGuard {
           break
         }
 
-        const retained = longestSuffixPrefixLength(this.buffer, [TOOL_RESULT_END])
+        const retained = longestSuffixPrefixLength(this.buffer, TOOL_RESULT_ENDS)
         this.buffer = retained > 0 ? this.buffer.slice(-retained) : ''
         break
       }
@@ -157,9 +195,10 @@ export class ManagedToolResultGuard {
       if (this.state === 'fenced') {
         const fenceIndex = this.buffer.indexOf(MARKDOWN_FENCE)
         const toolResultIndex = findToolResultStart(this.buffer, final)
-        if (toolResultIndex !== undefined && (fenceIndex === -1 || toolResultIndex < fenceIndex)) {
-          content += this.buffer.slice(0, toolResultIndex)
-          this.buffer = this.buffer.slice(toolResultIndex + TOOL_RESULT_START.length)
+        if (toolResultIndex !== undefined && (fenceIndex === -1 || toolResultIndex.index < fenceIndex)) {
+          content += this.buffer.slice(0, toolResultIndex.index)
+          this.buffer = this.buffer.slice(toolResultIndex.index + toolResultIndex.marker.length)
+          this.activeToolResultEnd = toolResultIndex.end
           this.resumeStateAfterToolResult = 'fenced'
           this.state = 'tool_result'
           this.wrapperLeakDetected = true
@@ -190,7 +229,7 @@ export class ManagedToolResultGuard {
 
         const retained = longestSuffixPrefixLength(this.buffer, [
           MARKDOWN_FENCE,
-          TOOL_RESULT_START,
+          ...TOOL_RESULT_STARTS,
         ])
         const visibleLength = this.buffer.length - retained
         content += this.buffer.slice(0, visibleLength)
@@ -232,6 +271,7 @@ export class ManagedToolResultGuard {
         this.buffer = this.buffer.slice(start.index + start.marker.length)
 
         if (start.kind === 'tool_result') {
+          this.activeToolResultEnd = start.end ?? TOOL_RESULT_END
           this.resumeStateAfterToolResult = 'text'
           this.state = 'tool_result'
           this.wrapperLeakDetected = true
@@ -262,7 +302,7 @@ export class ManagedToolResultGuard {
       const retained = longestSuffixPrefixLength(this.buffer, [
         ...this.toolCallStarts,
         MARKDOWN_FENCE,
-        TOOL_RESULT_START,
+        ...TOOL_RESULT_STARTS,
       ])
       const visibleLength = this.buffer.length - retained
       content += this.buffer.slice(0, visibleLength)
@@ -297,17 +337,17 @@ function findNextTopLevelStart(
   content: string,
   final: boolean,
   toolCallStarts: readonly string[],
-): { index: number; marker: string; kind: 'fence' | 'tool_call' | 'tool_result' } | undefined {
+): { index: number; marker: string; kind: 'fence' | 'tool_call' | 'tool_result'; end?: string } | undefined {
   const toolCall = findEarliestMarker(content, toolCallStarts)
-  const toolResultIndex = findToolResultStart(content, final)
+  const toolResult = findToolResultStart(content, final)
   const fenceIndex = content.indexOf(MARKDOWN_FENCE)
 
   if (
-    toolResultIndex !== undefined
-    && (!toolCall || toolResultIndex < toolCall.index)
-    && (fenceIndex === -1 || toolResultIndex < fenceIndex)
+    toolResult
+    && (!toolCall || toolResult.index < toolCall.index)
+    && (fenceIndex === -1 || toolResult.index < fenceIndex)
   ) {
-    return { index: toolResultIndex, marker: TOOL_RESULT_START, kind: 'tool_result' }
+    return { ...toolResult, kind: 'tool_result' }
   }
   if (fenceIndex !== -1 && (!toolCall || fenceIndex < toolCall.index)) {
     return { index: fenceIndex, marker: MARKDOWN_FENCE, kind: 'fence' }
@@ -318,22 +358,32 @@ function findNextTopLevelStart(
   return undefined
 }
 
-function findToolResultStart(content: string, final: boolean): number | undefined {
-  let searchIndex = 0
-  while (searchIndex < content.length) {
-    const index = content.indexOf(TOOL_RESULT_START, searchIndex)
-    if (index === -1) return undefined
+function findToolResultStart(
+  content: string,
+  final: boolean,
+): { index: number; marker: string; end: string } | undefined {
+  let selected: { index: number; marker: string; end: string } | undefined
+  for (let markerIndex = 0; markerIndex < TOOL_RESULT_STARTS.length; markerIndex += 1) {
+    const marker = TOOL_RESULT_STARTS[markerIndex]
+    let searchIndex = 0
+    while (searchIndex < content.length) {
+      const index = content.indexOf(marker, searchIndex)
+      if (index === -1) break
 
-    const boundaryIndex = index + TOOL_RESULT_START.length
-    if (boundaryIndex === content.length) {
-      return final ? index : undefined
+      const boundaryIndex = index + marker.length
+      if (
+        (boundaryIndex === content.length && final)
+        || /[\s>]/.test(content[boundaryIndex] ?? '')
+      ) {
+        if (!selected || index < selected.index) {
+          selected = { index, marker, end: TOOL_RESULT_ENDS[markerIndex] }
+        }
+        break
+      }
+      searchIndex = boundaryIndex
     }
-    if (/[\s>]/.test(content[boundaryIndex])) {
-      return index
-    }
-    searchIndex = boundaryIndex
   }
-  return undefined
+  return selected
 }
 
 function findEarliestMarker(
@@ -362,10 +412,16 @@ function longestSuffixPrefixLength(content: string, markers: readonly string[]):
 }
 
 function findDistinctivePartialResultSuffix(content: string): number {
-  const maximum = Math.min(content.length, TOOL_RESULT_START.length)
-  for (let length = maximum; length >= DISTINCTIVE_PARTIAL_RESULT.length; length -= 1) {
-    const suffix = content.slice(-length)
-    if (TOOL_RESULT_START.startsWith(suffix)) return content.length - length
+  const candidates = [
+    { marker: TOOL_RESULT_START, minimum: DISTINCTIVE_PARTIAL_RESULT.length },
+    { marker: TOOL_RESULT_STARTS[1], minimum: '<tool_call_'.length },
+  ]
+  for (const candidate of candidates) {
+    const maximum = Math.min(content.length, candidate.marker.length)
+    for (let length = maximum; length >= candidate.minimum; length -= 1) {
+      const suffix = content.slice(-length)
+      if (candidate.marker.startsWith(suffix)) return content.length - length
+    }
   }
   return -1
 }

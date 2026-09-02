@@ -682,9 +682,13 @@ function qwenAiRetryCountFromEnv(recoverManagedToolStream: boolean): number {
 
 function qwenAiBusyRetryCountFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
-  if (raw === undefined || raw.trim() === '') return 3
+  // A busy response is an upstream capacity signal. Do not regenerate the
+  // same request on this account by default; the account failover boundary
+  // owns capacity rotation. Deployments can opt into a bounded retry count.
+  const fallback = 0
+  if (raw === undefined || raw.trim() === '') return fallback
   const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) return 3
+  if (!Number.isSafeInteger(value) || value < 0) return fallback
   return value
 }
 
@@ -3859,6 +3863,7 @@ export class RequestForwarder {
       }
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
+        recoveryState: context?.qwenAiLogicalRecoveryState,
         workflowRecoveryDeadlineAt,
         getResponseId: () => handler.getResponseId(),
         getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
@@ -3888,13 +3893,15 @@ export class RequestForwarder {
                 const currentChatId = activeChatId || chatId
 
                 const recoveryCode = errorCodeFromError(recoveryError)
-                const requireManagedToolCall = transformed.plan.toolChoiceMode === 'required'
-                  || transformed.plan.toolChoiceMode === 'forced'
-                  || recoveryCode === 'qwen_ai_wrapper_leak'
-                  || recoveryCode === 'qwen_ai_invalid_tool_arguments'
-                  || recoveryCode === 'undeclared_native_tool_call'
-                  || recoveryCode === 'malformed_tool_call'
-                  || recoveryCode === 'missing_tool_call'
+                const requireManagedToolCall = transformed.plan.failedToolResultPending !== true
+                  && (
+                    transformed.plan.toolChoiceMode === 'required'
+                    || transformed.plan.toolChoiceMode === 'forced'
+                    || recoveryCode === 'qwen_ai_wrapper_leak'
+                    || recoveryCode === 'qwen_ai_invalid_tool_arguments'
+                    || recoveryCode === 'undeclared_native_tool_call'
+                    || recoveryCode === 'malformed_tool_call'
+                    || recoveryCode === 'missing_tool_call'
                   // Semantic recovery codes mean the rejected branch was
                   // prose-only narration over a live workflow: the replacement
                   // prompt must demand the actual tool call, not re-offer the
@@ -3902,9 +3909,11 @@ export class RequestForwarder {
                   // failed to take.
                   || recoveryCode === 'qwen_ai_semantic_empty'
                   || recoveryCode === 'qwen_ai_semantic_incomplete'
+                  )
                 const workflowContinuationMessage = createToolWorkflowContinuationMessage({
                   activeUserRequest: extractLatestActiveUserRequest(providerRequest.messages),
                   completionProofMissing: recoveryCode === 'qwen_ai_semantic_incomplete'
+                    && transformed.plan.failedToolResultPending !== true
                     && !requireManagedToolCall,
                   failedToolResultPending: transformed.plan.failedToolResultPending,
                   requireManagedToolCall,
@@ -3967,6 +3976,7 @@ export class RequestForwarder {
                   thinking_budget: providerRequest.thinking_budget,
                   managedToolCalling: true,
                   signal: recoverySignal || context?.signal,
+                  deadlineAt: options.requestDeadlineAt,
                 })
               },
               onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),

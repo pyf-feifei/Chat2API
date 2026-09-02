@@ -51,6 +51,7 @@ export interface ResponseCreateRequest {
   top_p?: number | null
   user?: string | null
   metadata?: Record<string, string> | null
+  include?: string[] | null
   previous_response_id?: string | null
   store?: boolean | null
   truncation?: 'auto' | 'disabled' | string | null
@@ -61,6 +62,24 @@ export interface ResponseCreateRequest {
   } | null
   text?: Record<string, any> | null
   [key: string]: unknown
+}
+
+/**
+ * A JSON Responses item retained for protocol-level continuation. It is kept
+ * separate from ChatMessage because generic Chat Completions providers cannot
+ * represent opaque reasoning/compaction items without changing their meaning.
+ */
+export type ResponsesRawItem = string | Record<string, any>
+
+export interface ResponsesSidecarItem {
+  direction: 'input' | 'output'
+  item: ResponsesRawItem
+}
+
+export interface ResponsesChatProjection {
+  chatRequest: ResponsesChatCompletionRequest
+  conversationMessages: ChatMessage[]
+  sidecarItems: ResponsesSidecarItem[]
 }
 
 export interface InternalImageGenerationConfig {
@@ -351,17 +370,24 @@ function appendFunctionCall(
   return [...messages, { role: 'assistant', content: null, tool_calls: [toolCall] }]
 }
 
-export function responsesInputToChatMessages(
+export function responsesInputToChatProjection(
   input: ResponseCreateRequest['input'],
-): ChatMessage[] {
+): { messages: ChatMessage[]; sidecarItems: ResponsesSidecarItem[] } {
   if (typeof input === 'string') {
-    return [{ role: 'user', content: input }]
+    return {
+      messages: [{ role: 'user', content: input }],
+      sidecarItems: [{ direction: 'input', item: input }],
+    }
   }
   if (!Array.isArray(input)) {
     throw new ResponsesCompatibilityError('input must be a string or an array.', 'input')
   }
 
   let messages: ChatMessage[] = []
+  const sidecarItems: ResponsesSidecarItem[] = input.map(item => ({
+    direction: 'input',
+    item: item && typeof item === 'object' ? JSON.parse(JSON.stringify(item)) : item,
+  }))
   let pendingAttachmentMessages: ChatMessage[] = []
   const flushAttachments = () => {
     if (pendingAttachmentMessages.length === 0) return
@@ -449,14 +475,21 @@ export function responsesInputToChatMessages(
     // remaining concrete message and tool-result items.
     if (item.type === 'image_generation_call') return
 
-    throw new ResponsesCompatibilityError(
-      `Unsupported input item type: ${String(item.type ?? 'unknown')}`,
-      `input[${index}].type`,
-    )
+    // Preserve provider-specific and future Responses items for protocol-level
+    // continuation without leaking them into a generic Chat Completions prompt.
+    // The raw item remains in the sidecar; only representable items are projected
+    // into ChatMessage above.
+    return
   })
 
   flushAttachments()
-  return messages
+  return { messages, sidecarItems }
+}
+
+export function responsesInputToChatMessages(
+  input: ResponseCreateRequest['input'],
+): ChatMessage[] {
+  return responsesInputToChatProjection(input).messages
 }
 
 function toChatTools(tools: ResponseCreateRequest['tools']): ChatCompletionTool[] | undefined {
@@ -595,7 +628,7 @@ function textFormatToChatResponseFormat(text: ResponseCreateRequest['text']): Re
 export function responsesRequestToChatCompletion(
   request: ResponseCreateRequest,
   previousMessages: ChatMessage[] = [],
-): { chatRequest: ResponsesChatCompletionRequest; conversationMessages: ChatMessage[] } {
+): ResponsesChatProjection {
   if (!request || typeof request !== 'object') {
     throw new ResponsesCompatibilityError('Request body must be a JSON object.', null)
   }
@@ -603,7 +636,8 @@ export function responsesRequestToChatCompletion(
     throw new ResponsesCompatibilityError('Missing required field: model', 'model')
   }
 
-  const inputMessages = responsesInputToChatMessages(request.input)
+  const inputProjection = responsesInputToChatProjection(request.input)
+  const inputMessages = inputProjection.messages
   const conversationMessages = [...previousMessages, ...inputMessages]
   if (conversationMessages.length === 0) {
     throw new ResponsesCompatibilityError('input must contain at least one message.', 'input')
@@ -669,7 +703,11 @@ export function responsesRequestToChatCompletion(
     ...protocolExtensions,
   }
 
-  return { chatRequest, conversationMessages }
+  return {
+    chatRequest,
+    conversationMessages,
+    sidecarItems: inputProjection.sidecarItems,
+  }
 }
 
 export function defaultResponseImageResolver(image: ChatResponseImage): ResolvedResponseImage {
@@ -756,14 +794,16 @@ export function createResponseObject(
     output: options.output ?? [],
     parallel_tool_calls: request.parallel_tool_calls ?? true,
     previous_response_id: typeof request.previous_response_id === 'string'
-      ? request.previous_response_id
+      ? request.previous_response_id.trim() || null
       : null,
     reasoning: {
       effort: typeof request.reasoning?.effort === 'string' ? request.reasoning.effort : null,
       summary: typeof request.reasoning?.summary === 'string' ? request.reasoning.summary : null,
     },
     service_tier: typeof request.service_tier === 'string' ? request.service_tier : 'default',
-    store: request.store ?? false,
+    // The bridge keeps bounded state unless the caller explicitly opts out.
+    // This matches the continuation behavior implemented by the route.
+    store: request.store !== false,
     temperature: typeof request.temperature === 'number' ? request.temperature : null,
     text: request.text && typeof request.text === 'object'
       ? { ...request.text }
@@ -817,13 +857,29 @@ export async function chatCompletionToResponse(
     : choice.finish_reason === 'content_filter'
       ? 'content_filter'
       : undefined
-  const outputStatus = incompleteReason ? 'incomplete' : 'completed'
+  const reasoningContent = typeof message.reasoning_content === 'string'
+    ? message.reasoning_content
+    : ''
   const text = chatMessageText(message)
   const toolCalls = normalizeToolCalls(message)
   const images = extractChatResponseImages(message.images)
+  const hasVisibleOutput = text.length > 0 || toolCalls.length > 0 || images.length > 0
+  const hasReasoningOutput = reasoningContent.trim().length > 0
+  const reasoningOnly = !incompleteReason && !hasVisibleOutput && hasReasoningOutput
+  const emptyOutput = !incompleteReason && !hasVisibleOutput && !hasReasoningOutput
+  const outputStatus = incompleteReason ? 'incomplete' : 'completed'
   const output: Array<Record<string, any>> = []
 
-  if (text.length > 0 || (toolCalls.length === 0 && images.length === 0)) {
+  if (hasReasoningOutput) {
+    output.push({
+      id: `rs_${options.id.slice(5)}`,
+      type: 'reasoning',
+      status: reasoningOnly ? 'failed' : outputStatus,
+      summary: [{ type: 'summary_text', text: reasoningContent }],
+    })
+  }
+
+  if (text.length > 0 || (!hasVisibleOutput && !hasReasoningOutput)) {
     output.push({
       id: `msg_${options.id.slice(5)}`,
       type: 'message',
@@ -866,15 +922,38 @@ export async function chatCompletionToResponse(
     })
   })
 
+  const status: ResponseObject['status'] = incompleteReason
+    ? 'incomplete'
+    : reasoningOnly
+      ? 'failed'
+      : emptyOutput
+        ? 'failed'
+        : 'completed'
+  const error = reasoningOnly
+    ? { code: 'reasoning_only_upstream_response', message: 'Upstream returned reasoning without an answer, tool call, or image.' }
+    : emptyOutput
+      ? { code: 'empty_upstream_response', message: 'Upstream returned no answer, tool call, image, or reasoning.' }
+      : null
+
   return createResponseObject(request, {
     id: options.id,
     model: typeof chatCompletion.model === 'string' ? chatCompletion.model : options.model,
     createdAt: options.createdAt,
-    status: incompleteReason ? 'incomplete' : 'completed',
+    status,
     output,
     usage: chatUsageToResponseUsage(chatCompletion.usage),
+    error,
     incompleteDetails: incompleteReason ? { reason: incompleteReason } : null,
   })
+}
+
+export function responseOutputToSidecarItems(
+  output: Array<Record<string, any>>,
+): ResponsesSidecarItem[] {
+  return output.map(item => ({
+    direction: 'output' as const,
+    item: JSON.parse(JSON.stringify(item)),
+  }))
 }
 
 export function responseOutputToChatMessages(output: Array<Record<string, any>>): ChatMessage[] {

@@ -1,3 +1,5 @@
+export const ENCRYPTION_PREFIX = 'c2a:v1:'
+
 export interface RuntimeAdapter {
   kind: 'electron' | 'node'
   getDataDir(): string
