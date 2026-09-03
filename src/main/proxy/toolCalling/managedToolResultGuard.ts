@@ -7,14 +7,24 @@ const TOOL_RESULT_END = '</|CHAT2API|tool_result>'
 // branching on a client or model name.
 const TOOL_RESULT_STARTS = [
   TOOL_RESULT_START,
+  '<tool_call_result',
   '<tool_call_results',
+  '<function_results',
+  '<tool_result',
   '<tool_response>',
 ] as const
 const TOOL_RESULT_ENDS = [
   TOOL_RESULT_END,
+  '</tool_call_result>',
   '</tool_call_results>',
+  '</function_results>',
+  '</tool_result>',
   '</tool_response>',
 ] as const
+// Some clients render a tool result as a function-result envelope and close
+// the outer block with this legacy parameter-results tag.
+const LEGACY_TOOL_RESULT_ENDS = ['</parameter_results>'] as const
+const ALL_TOOL_RESULT_ENDS = [...TOOL_RESULT_ENDS, ...LEGACY_TOOL_RESULT_ENDS] as const
 const DISTINCTIVE_PARTIAL_RESULT = '<|CHAT2API|tool_r'
 const MARKDOWN_FENCE = '```'
 
@@ -163,6 +173,12 @@ export class ManagedToolResultGuard {
     let suppressed = false
 
     if (this.rejectUnprotectedToolCalls) {
+      const resultCandidate = findToolResultStart(this.buffer, final)
+      if (resultCandidate) {
+        this.wrapperLeakDetected = true
+        this.buffer = ''
+        return { content, suppressed: true }
+      }
       const candidate = findEarliestMarker(this.buffer, GENERIC_TOOL_CALL_STARTS)
       if (candidate) {
         this.wrapperLeakDetected = true
@@ -180,6 +196,15 @@ export class ManagedToolResultGuard {
           this.state = this.resumeStateAfterToolResult
           continue
         }
+        // The provider/client wrapper can close with a legacy generic marker
+        // whose name is not paired with the opening marker. Drop through the
+        // same protected-result state until any registered closing boundary.
+        const genericEnd = findEarliestMarker(this.buffer, ALL_TOOL_RESULT_ENDS)
+        if (genericEnd) {
+          this.buffer = this.buffer.slice(genericEnd.index + genericEnd.marker.length)
+          this.state = this.resumeStateAfterToolResult
+          continue
+        }
 
         if (final) {
           this.buffer = ''
@@ -187,7 +212,7 @@ export class ManagedToolResultGuard {
           break
         }
 
-        const retained = longestSuffixPrefixLength(this.buffer, TOOL_RESULT_ENDS)
+        const retained = longestSuffixPrefixLength(this.buffer, ALL_TOOL_RESULT_ENDS)
         this.buffer = retained > 0 ? this.buffer.slice(-retained) : ''
         break
       }
@@ -427,7 +452,7 @@ function findDistinctivePartialResultSuffix(content: string): number {
 }
 
 function managedWrapperOccursOnlyInCodexToolArguments(content: string): boolean {
-  if (!content.includes(TOOL_RESULT_START)) return false
+  if (!TOOL_RESULT_STARTS.some(marker => content.includes(marker))) return false
 
   let parsed: unknown
   try {
@@ -441,7 +466,7 @@ function managedWrapperOccursOnlyInCodexToolArguments(content: string): boolean 
 
   const inspect = (value: unknown, insideToolArguments: boolean): void => {
     if (typeof value === 'string') {
-      if (!value.includes(TOOL_RESULT_START)) return
+      if (!TOOL_RESULT_STARTS.some(marker => value.includes(marker))) return
       if (insideToolArguments) allowedOccurrence = true
       else disallowedOccurrence = true
       return
@@ -454,15 +479,27 @@ function managedWrapperOccursOnlyInCodexToolArguments(content: string): boolean 
 
     const record = value as Record<string, unknown>
     const isFunctionCall = record.type === 'function_call'
+      || record.type === 'function'
+      || isRecord(record.function)
+    const isFunctionPayload = typeof record.name === 'string'
+      && Object.prototype.hasOwnProperty.call(record, 'arguments')
     for (const [key, item] of Object.entries(record)) {
       if (key.includes(TOOL_RESULT_START)) {
         if (insideToolArguments) allowedOccurrence = true
         else disallowedOccurrence = true
       }
-      inspect(item, insideToolArguments || (isFunctionCall && key === 'arguments'))
+      inspect(
+        item,
+        insideToolArguments
+          || (key === 'arguments' && (isFunctionCall || isFunctionPayload)),
+      )
     }
   }
 
   inspect(parsed, false)
   return allowedOccurrence && !disallowedOccurrence
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }

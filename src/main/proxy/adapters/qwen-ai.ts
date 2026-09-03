@@ -51,6 +51,7 @@ import {
   getToolArgumentValidationIssues,
   normalizeArguments,
 } from '../toolCalling/protocols/shared'
+import { consumeQwenAiAccountNeutralReplaySlot } from '../qwenAiAccountPolicy'
 import {
   getToolStreamValidationFailure,
   type ToolStreamValidationFailure,
@@ -1474,10 +1475,8 @@ export function createQwenAiResumableStream(
     }
     const transportError = normalizeQwenAiStreamFailure(lastError)
     if (semanticRecoveryEligible && isQwenAiSemanticRecoveryError(transportError)) {
-      const canReplaySemanticBranch = !recoveryState
-        || recoveryState.accountNeutralReplayAttempts < 1
+      const canReplaySemanticBranch = consumeQwenAiAccountNeutralReplaySlot(recoveryState)
       if (canReplaySemanticBranch) {
-        if (recoveryState) recoveryState.accountNeutralReplayAttempts += 1
         markQwenAiNextAccountReplay(transportError)
       } else {
         transportError.accountFault = false

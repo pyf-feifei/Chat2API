@@ -293,7 +293,7 @@ test('adapter registry passes the Qwen profile key for a custom provider id', ()
   assert.equal(capturedInput.provider.id, 'custom-qwen-instance')
 })
 
-function createHarness(results) {
+function createHarness(results, context = { signal: new AbortController().signal }) {
   const RequestForwarder = loadRequestForwarder()
   const forwarder = new RequestForwarder()
   const attempts = []
@@ -311,7 +311,7 @@ function createHarness(results) {
     { id: 'account-1' },
     { id: 'provider-1', apiEndpoint: 'https://provider.invalid' },
     'model-1',
-    { signal: new AbortController().signal },
+    context,
   )
 
   return { attempts, execute }
@@ -581,6 +581,105 @@ test('outer Qwen forwarding preserves account-neutral failures from results and 
   }
 })
 
+test('outer Qwen fallback does not infer replay scope without local recovery exhaustion', async () => {
+  for (const initialAttempts of [0, 1]) {
+    const context = {
+      signal: new AbortController().signal,
+      qwenAiLogicalRecoveryState: {
+        resumeAttempts: 0,
+        workflowContinuationAttempts: 0,
+        freshChatRestartAttempts: 0,
+        accountNeutralReplayAttempts: initialAttempts,
+      },
+    }
+    const { attempts, execute } = createHarness([{
+      success: false,
+      status: 422,
+      error: 'semantic output was incomplete',
+      errorCode: 'qwen_ai_semantic_incomplete',
+      retryable: false,
+      accountFault: false,
+    }], context)
+
+    const result = await execute({
+      model: 'model-1',
+      messages: [],
+      stream: true,
+    })
+
+    assert.equal(result.success, false)
+    assert.equal(attempts.length, 1)
+    assert.equal(result.retryScope, undefined)
+    assert.equal(
+      context.qwenAiLogicalRecoveryState.accountNeutralReplayAttempts,
+      initialAttempts,
+    )
+  }
+})
+
+test('outer Qwen fallback does not double-consume an adapter-owned replay scope', async () => {
+  const context = {
+    signal: new AbortController().signal,
+    qwenAiLogicalRecoveryState: {
+      resumeAttempts: 0,
+      workflowContinuationAttempts: 1,
+      freshChatRestartAttempts: 0,
+      accountNeutralReplayAttempts: 0,
+    },
+  }
+  const { attempts, execute } = createHarness([{
+    success: false,
+    status: 502,
+    error: 'semantic output was incomplete',
+    errorCode: 'qwen_ai_semantic_incomplete',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  }], context)
+
+  const result = await execute({ model: 'model-1', messages: [], stream: true })
+
+  assert.equal(result.retryScope, 'next-account')
+  assert.equal(context.qwenAiLogicalRecoveryState.accountNeutralReplayAttempts, 0)
+  assert.equal(attempts.length, 1)
+})
+
+test('outer Qwen explicit account-fault scopes bypass the semantic replay slot', async () => {
+  for (const failure of [
+    {
+      success: false,
+      status: 401,
+      error: 'token expired',
+      errorCode: 'AUTH_EXPIRED',
+      retryable: false,
+      accountFault: true,
+    },
+    {
+      success: false,
+      status: 429,
+      error: 'provider capacity limit',
+      errorCode: 'qwen_ai_capacity_limit',
+      retryable: false,
+      accountFault: true,
+    },
+  ]) {
+    const context = {
+      signal: new AbortController().signal,
+      qwenAiLogicalRecoveryState: {
+        resumeAttempts: 0,
+        workflowContinuationAttempts: 1,
+        freshChatRestartAttempts: 0,
+        accountNeutralReplayAttempts: 1,
+      },
+    }
+    const { execute } = createHarness([failure], context)
+    const result = await execute({ model: 'model-1', messages: [], stream: true })
+
+    assert.equal(result.retryScope, 'next-account')
+    assert.equal(context.qwenAiLogicalRecoveryState.accountNeutralReplayAttempts, 1)
+  }
+})
+
 test('outer Qwen forwarding preserves parse-stage next-account classification', async () => {
   const parseTimeout = Object.assign(new Error('Qwen AI file parse timed out'), {
     status: 504,
@@ -846,6 +945,50 @@ test('Qwen semantic recovery exhaustion derives next-account replay at the forwa
   assert.equal(result.accountFault, false)
   assert.equal(result.retryScope, 'next-account')
   assert.equal(attempts, 1)
+})
+
+test('Qwen initial neutral semantic failure does not acquire replay scope', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+  const forwarder = new RequestForwarder()
+  const recoveryState = {
+    resumeAttempts: 0,
+    workflowContinuationAttempts: 0,
+    freshChatRestartAttempts: 0,
+    accountNeutralReplayAttempts: 0,
+  }
+  forwarder.doForward = async () => ({
+    success: false,
+    status: 422,
+    error: 'Qwen AI completed without finishing the managed workflow',
+    errorCode: 'qwen_ai_semantic_incomplete',
+    retryable: false,
+    accountFault: false,
+  })
+
+  const result = await forwarder.forwardChatCompletion(
+    {
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'continue the task' }],
+      stream: true,
+      tools: [{
+        type: 'function',
+        function: { name: 'read_file', parameters: { type: 'object' } },
+      }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    {
+      signal: new AbortController().signal,
+      qwenAiLogicalRecoveryState: recoveryState,
+    },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.errorCode, 'qwen_ai_semantic_incomplete')
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, undefined)
+  assert.equal(recoveryState.accountNeutralReplayAttempts, 0)
 })
 
 test('Qwen managed-tool busy stays on the first upstream attempt by default', async () => {

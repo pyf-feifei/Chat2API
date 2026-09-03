@@ -79,6 +79,7 @@ import {
 } from './qwenAiCompactionBoundary'
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
+  consumeQwenAiAccountNeutralReplaySlot,
   qwenAiAccountFailureDetails,
   qwenAiAccountNeutralReplayScopeAfterRecovery,
   qwenAiSafeExplicitRetryScope,
@@ -1677,7 +1678,13 @@ export class RequestForwarder {
       return createQwenAiRequestTimeoutResult(startTime)
     }
 
-    const recoveryExhaustedRetryScope = isQwenAiProvider
+    // A neutral replay scope is granted only after a request-scoped Qwen
+    // bridge has exhausted its own recovery. Direct first-attempt semantic
+    // failures must remain on the current account; legacy callers without
+    // shared state retain the historical policy behavior.
+    const recoveryState = context.qwenAiLogicalRecoveryState
+    const recoveryExhaustedRetryCandidate = isQwenAiProvider
+      && (!recoveryState || recoveryState.accountNeutralReplayAttempts > 0)
       && !context.signal?.aborted
       && lastStatus !== 499
       ? qwenAiAccountNeutralReplayScopeAfterRecovery({
@@ -1686,6 +1693,12 @@ export class RequestForwarder {
           accountFault: lastAccountFault,
         })
       : undefined
+    const recoveryExhaustedRetryScope = lastRetryScope
+      || (recoveryExhaustedRetryCandidate
+        && !recoveryState
+        && consumeQwenAiAccountNeutralReplaySlot(undefined)
+        ? recoveryExhaustedRetryCandidate
+        : undefined)
 
     return {
       success: false,

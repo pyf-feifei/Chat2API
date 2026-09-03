@@ -1,3 +1,5 @@
+import type { QwenAiLogicalRecoveryState } from './types'
+
 /**
  * Classify a Qwen failure at the account boundary.
  *
@@ -218,6 +220,23 @@ export function qwenAiAccountFailureDetails(
     accountFault,
     retryScope: qwenAiAccountRetryScope({ ...classification, accountFault }),
   }
+}
+
+/**
+ * Consume the single request-wide account-neutral semantic replay allowance.
+ *
+ * The state is shared by the adapter and outer account failover for one HTTP
+ * request. This operation stays synchronous so the compare-and-increment is
+ * one event-loop turn and cannot be split by an await. Untagged callers keep
+ * the pre-state behavior and may request one replay without a shared budget.
+ */
+export function consumeQwenAiAccountNeutralReplaySlot(
+  state?: QwenAiLogicalRecoveryState,
+): boolean {
+  if (!state) return true
+  if (state.accountNeutralReplayAttempts >= 1) return false
+  state.accountNeutralReplayAttempts += 1
+  return true
 }
 
 const QWEN_AI_ACCOUNT_NEUTRAL_REPLAY_CODES = new Set([

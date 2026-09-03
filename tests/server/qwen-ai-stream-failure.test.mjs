@@ -23,6 +23,7 @@ import {
   normalizeQwenAiModelModeName as realNormalizeQwenAiModelModeName,
   resolveQwenAiModelMode as realResolveQwenAiModelMode,
 } from '../../src/main/providers/qwen-ai-model-mode.ts'
+import { consumeQwenAiAccountNeutralReplaySlot as realConsumeQwenAiAccountNeutralReplaySlot } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 import {
   hasManagedWorkflowCompletionMarker as realHasManagedWorkflowCompletionMarker,
   parseManagedWorkflowCompletionProof as realParseManagedWorkflowCompletionProof,
@@ -130,6 +131,10 @@ function loadQwenAiStreamHandler(overrides = {}) {
     },
     '../toolCalling/streamValidationPolicy': {
       getToolStreamValidationFailure: overrides.getToolStreamValidationFailure || (() => undefined),
+    },
+    '../qwenAiAccountPolicy': {
+      consumeQwenAiAccountNeutralReplaySlot: overrides.consumeQwenAiAccountNeutralReplaySlot
+        || realConsumeQwenAiAccountNeutralReplaySlot,
     },
     '../toolCalling/protocols/shared': {
       normalizeArguments: overrides.normalizeArguments || ((value, tool) => {

@@ -113,6 +113,25 @@ test('assistant output boundary rejects generic tool-call-results wrappers', asy
   )
 })
 
+test('assistant output boundary rejects malformed tool-call-result output with legacy close tags', async () => {
+  const source = Readable.from([
+    frame({ content: 'Let me inspect the docs. <tool_call_result>\\n<function_results>\\n<result>hidden</result>\\n<parameter name="output">docs\\n</parameter_results>\\n' }),
+    frame({ content: '**Done**' }),
+    frame({}, 'stop'),
+    'data: [DONE]\\n\\n',
+  ])
+  const boundary = createAssistantOutputBoundaryStream(null)
+  source.pipe(boundary)
+
+  await assert.rejects(
+    collect(boundary),
+    (error: Error & { code?: string, param?: string }) => (
+      error.code === 'managed_tool_result_wrapper_leak'
+      && error.param === 'content'
+    ),
+  )
+})
+
 test('assistant output boundary preserves a legal tool-call tag', async () => {
   const source = Readable.from([
     frame({ content: '<tool_call><function=read_fixture></function></tool_call>' }),

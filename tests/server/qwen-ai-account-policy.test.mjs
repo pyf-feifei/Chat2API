@@ -20,6 +20,7 @@ function loadPolicy() {
 }
 
 const {
+  consumeQwenAiAccountNeutralReplaySlot,
   isQwenAiAccountFault,
   isQwenAiAccountNeutralFailure,
   qwenAiAccountNeutralReplayScopeAfterRecovery,
@@ -116,6 +117,25 @@ test('cyclic error graphs are bounded and remain classifiable', () => {
 
   assert.equal(isQwenAiAccountFault(error), true)
   assert.equal(qwenAiAccountRetryScope(error), 'next-account')
+})
+
+test('request-wide account-neutral replay slot is consumed at most once', () => {
+  const state = {
+    resumeAttempts: 0,
+    workflowContinuationAttempts: 0,
+    freshChatRestartAttempts: 0,
+    accountNeutralReplayAttempts: 0,
+  }
+
+  assert.equal(consumeQwenAiAccountNeutralReplaySlot(state), true)
+  assert.equal(state.accountNeutralReplayAttempts, 1)
+  assert.equal(consumeQwenAiAccountNeutralReplaySlot(state), false)
+  assert.equal(state.accountNeutralReplayAttempts, 1)
+
+  state.accountNeutralReplayAttempts = 4
+  assert.equal(consumeQwenAiAccountNeutralReplaySlot(state), false)
+  assert.equal(state.accountNeutralReplayAttempts, 4)
+  assert.equal(consumeQwenAiAccountNeutralReplaySlot(), true)
 })
 
 test('account-neutral recovery failures retain or derive a bounded pool replay scope', () => {
