@@ -76,26 +76,6 @@ const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 840000)
 const QWEN_AI_RESPONSE_TIMEOUT_MS = nonNegativeNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', 0)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
-// Slow thinking-only trickles (one small reasoning delta every ~20s) refresh
-// the idle watchdog forever while the answer never starts. Cap the total time
-// a stream may spend producing ONLY thinking/summary output with no answer
-// content, tool fragment, or image; expiry triggers semantic recovery (a
-// fresh managed-workflow continuation), not a hard failure. Zero disables.
-const QWEN_AI_THINKING_ONLY_MAX_MS = nonNegativeNumberFromEnv('CHAT2API_QWEN_AI_THINKING_ONLY_MAX_MS', 120000)
-// Substantive thinking (e.g. digesting a large archived transcript) can
-// legitimately exceed the base wall clock. The cap is PROGRESS-AWARE: each
-// time fresh thinking output accumulates this many code points, the window
-// resets, so only a near-silent trickle ever expires. The number of resets is
-// itself bounded so a runaway generator still terminates within
-// resets × capMs; zero makes the base cap a hard single window again.
-const QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS = positiveNumberFromEnv(
-  'CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS',
-  600,
-)
-const QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS = positiveNumberFromEnv(
-  'CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS',
-  8,
-)
 const QWEN_AI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
 const QWEN_AI_MANAGED_BRANCH_MAX_BYTES = positiveNumberFromEnv(
   'CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES',
@@ -187,21 +167,6 @@ type StreamHandlingOptions = {
   requestDeadlineAt?: number
   responseTimeoutMs?: number
   idleTimeoutMs?: number
-  /**
-   * Wall clock for the thinking-only phase (reasoning/summary output with no
-   * answer, tool fragment, or image yet). Slow thinking trickles refresh the
-   * idle watchdog indefinitely; expiring this cap triggers semantic recovery.
-   * Overrides CHAT2API_QWEN_AI_THINKING_ONLY_MAX_MS; zero disables.
-   */
-  thinkingOnlyMaxMs?: number
-  /**
-   * Progress-aware reset threshold (code points of fresh thinking output)
-   * for the thinking-only wall clock; each threshold crossing buys a new
-   * window, up to thinkingOnlyProgressMaxResets. Override the env defaults
-   * for tests; zero restores a hard single window.
-   */
-  thinkingOnlyProgressCodePoints?: number
-  thinkingOnlyProgressMaxResets?: number
   /** Withhold managed-tool frames until the response branch passes validation. */
   bufferManagedBranch?: boolean
   /** Accept a provider response that contains only thinking/summary text. */
@@ -4745,6 +4710,7 @@ export class QwenAiStreamHandler {
   private summaryToolResultGuard: ManagedToolResultGuard
   private wrapperLeakDetected = false
   private wrapperLeakLogged = false
+  private pendingSemanticRecoveryError?: QwenAiUpstreamError
   private readonly promptTokens: number
 
   constructor(
@@ -4924,6 +4890,7 @@ export class QwenAiStreamHandler {
   }
 
   private resetManagedResponseArtifacts(): void {
+    this.pendingSemanticRecoveryError = undefined
     this.content = ''
     this.generatedImages = []
     this.generatedImageKeys = new Set<string>()
@@ -5400,18 +5367,6 @@ export class QwenAiStreamHandler {
     let requestDeadlineTimer: NodeJS.Timeout | undefined
     let responseTimer: NodeJS.Timeout | undefined
     let idleTimer: NodeJS.Timeout | undefined
-    // Wall clock for the thinking-only phase: armed at the first reasoning or
-    // summary output, cancelled as soon as any answer content, tool fragment,
-    // or image is produced. Slow reasoning trickles keep refreshing the idle
-    // watchdog indefinitely; this cap converts such a runaway into semantic
-    // recovery (a fresh managed-workflow continuation branch) instead of a
-    // ten-minute wait that ends reasoning-only.
-    let thinkingOnlyTimer: NodeJS.Timeout | undefined
-    // Progress-aware thinking-only wall-clock bookkeeping (see
-    // armThinkingOnlyTimer): code-point watermark of fresh thinking output and
-    // how many wall-clock windows substantive progress has purchased.
-    let thinkingOnlyProgressResets = 0
-    let thinkingOnlyProgressMark = 0
     let abortListenerAttached = false
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
@@ -5481,9 +5436,7 @@ export class QwenAiStreamHandler {
       summarySourceText = ''
       deliveredAnswerText = ''
       sawUpstreamCompletion = false
-      cancelThinkingOnlyTimer()
-      thinkingOnlyProgressResets = 0
-      thinkingOnlyProgressMark = 0
+      this.pendingSemanticRecoveryError = undefined
       idleRecoveryInFlight = false
       semanticRecoveryInFlight = false
       discardManagedBranchFrames()
@@ -5506,10 +5459,6 @@ export class QwenAiStreamHandler {
       if (idleTimer) {
         clearTimeout(idleTimer)
         idleTimer = undefined
-      }
-      if (thinkingOnlyTimer) {
-        clearTimeout(thinkingOnlyTimer)
-        thinkingOnlyTimer = undefined
       }
     }
 
@@ -5641,8 +5590,23 @@ export class QwenAiStreamHandler {
         `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
       )
 
+      // A semantic defect observed before a terminal marker is held until
+      // either the provider terminates or the idle watchdog proves that the
+      // active source has stopped making progress. The latter is safe to
+      // replace because recoverFromIdle detaches the stalled source first.
+      if (this.pendingSemanticRecoveryError && options.recoverFromSemanticEmpty) {
+        const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+        this.pendingSemanticRecoveryError = undefined
+        recoverFromSemanticEmpty(pendingSemanticRecoveryError, true)
+        return
+      }
+      if (this.currentBranchHasWrapperLeak()) {
+        failStream(createQwenAiWrapperLeakError())
+        return
+      }
+
       if (!options.recoverFromIdle) {
-        failStream(idleError)
+        failStream(this.currentBranchHasWrapperLeak() ? createQwenAiWrapperLeakError() : idleError)
         return
       }
 
@@ -5670,62 +5634,6 @@ export class QwenAiStreamHandler {
       idleTimer = setTimeout(() => {
         void handleIdle()
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
-    }
-
-    const cancelThinkingOnlyTimer = () => {
-      if (!thinkingOnlyTimer) return
-      clearTimeout(thinkingOnlyTimer)
-      thinkingOnlyTimer = undefined
-    }
-
-    const handleThinkingOnlyExpired = (capMs: number, progressResets: number) => {
-      if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight || transientRecoveryInFlight) return
-      thinkingOnlyTimer = undefined
-      console.warn('[QwenAI] Thinking-only phase exceeded its wall clock; recovering', JSON.stringify({
-        maxMs: capMs,
-        progressResets,
-        reasoningChars: reasoningText.length,
-        summaryChars: summaryText.length,
-        upstreamEventCount,
-      }))
-      // Treat the runaway like a reasoning-only terminal: the branch is
-      // semantically empty, so managed workflow continuation re-prompts on a
-      // fresh branch instead of failing the client request.
-      recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
-    }
-
-    // Progress-aware wall clock: armed at the first reasoning/summary output
-    // and reset each time substantive thinking accumulates, so legitimate deep
-    // thinking (digesting a large archived transcript) is not mistaken for a
-    // near-silent runaway trickle. Resets are bounded so a runaway generator
-    // still terminates.
-    const armThinkingOnlyTimer = () => {
-      const capMs = options.thinkingOnlyMaxMs ?? QWEN_AI_THINKING_ONLY_MAX_MS
-      const progressCodePoints = options.thinkingOnlyProgressCodePoints ?? QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS
-      const maxResets = options.thinkingOnlyProgressMaxResets ?? QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS
-      if (capMs <= 0 || finalChunkSent) return
-      const thinkingCodePoints = reasoningText.length + summaryText.length
-      if (!thinkingOnlyTimer) {
-        thinkingOnlyProgressMark = thinkingCodePoints
-        thinkingOnlyTimer = setTimeout(
-          () => handleThinkingOnlyExpired(capMs, thinkingOnlyProgressResets),
-          capMs,
-        )
-        return
-      }
-      if (
-        progressCodePoints > 0
-        && thinkingCodePoints - thinkingOnlyProgressMark >= progressCodePoints
-        && thinkingOnlyProgressResets < maxResets
-      ) {
-        thinkingOnlyProgressResets += 1
-        thinkingOnlyProgressMark = thinkingCodePoints
-        clearTimeout(thinkingOnlyTimer)
-        thinkingOnlyTimer = setTimeout(
-          () => handleThinkingOnlyExpired(capMs, thinkingOnlyProgressResets),
-          capMs,
-        )
-      }
     }
 
     const writeVisibleSse = (
@@ -5758,8 +5666,22 @@ export class QwenAiStreamHandler {
       return true
     }
 
-    const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
+    const recoverFromSemanticEmpty = (error: QwenAiUpstreamError, allowBeforeTerminal = false): void => {
       if (finalChunkSent || semanticRecoveryInFlight) return
+      const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
+      const deferUntilTerminal = !sawUpstreamCompletion
+        && !allowBeforeTerminal
+        && !isQwenAiStaleSessionError(error)
+        && error.code !== 'qwen_ai_response_ended'
+        && error.code !== 'qwen_ai_upstream_busy'
+      if (deferUntilTerminal) {
+        if (!recover) {
+          failStream(error)
+        } else {
+          this.pendingSemanticRecoveryError = error
+        }
+        return
+      }
 
       if (error.code === 'qwen_ai_wrapper_leak' && visibleFrameCommitted) {
         failStream(error)
@@ -5783,7 +5705,6 @@ export class QwenAiStreamHandler {
         return
       }
 
-      const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
       if (!recover) {
         failStream(error)
         return
@@ -5811,6 +5732,7 @@ export class QwenAiStreamHandler {
       // continuation own the next terminal marker instead of treating this
       // one as definitive.
       sawUpstreamCompletion = false
+      this.pendingSemanticRecoveryError = undefined
       console.warn('[QwenAI] Recovering semantically incomplete stream response:', error.code)
 
       const onResume = () => {
@@ -5945,8 +5867,6 @@ export class QwenAiStreamHandler {
     const writeGuardedContent = (content: string, finishOnToolCall = true) => {
       if (!content || finalChunkSent) return
 
-      // Answer-channel output ends the thinking-only phase.
-      cancelThinkingOnlyTimer()
       this.content += content
 
       const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
@@ -5999,7 +5919,6 @@ export class QwenAiStreamHandler {
     const writeGuardedReasoning = (content: string) => {
       if (!content || finalChunkSent) return
       reasoningText += content
-      armThinkingOnlyTimer()
       if (options.reasoningOnlyAsContent) return
 
       if (!hasSentReasoning) {
@@ -6033,7 +5952,6 @@ export class QwenAiStreamHandler {
     const writeGuardedSummary = (content: string) => {
       if (!content || finalChunkSent) return
       summaryText += content
-      armThinkingOnlyTimer()
       if (options.reasoningOnlyAsContent) return
 
       if (!hasSentReasoning) {
@@ -6399,7 +6317,13 @@ export class QwenAiStreamHandler {
             lastUpstreamEventType = 'done'
             console.log('[QwenAI] Received [DONE] signal')
             sawUpstreamCompletion = true
-            finishAnswer('stop')
+            const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+            this.pendingSemanticRecoveryError = undefined
+            if (pendingSemanticRecoveryError) {
+              recoverFromSemanticEmpty(pendingSemanticRecoveryError)
+            } else {
+              finishAnswer('stop')
+            }
             return
           }
 
@@ -6423,7 +6347,7 @@ export class QwenAiStreamHandler {
             }
             throw parseError
           }
-          const envelopeError = createQwenAiStreamEnvelopeError(data, event.data, event.event)
+            const envelopeError = createQwenAiStreamEnvelopeError(data, event.data, event.event)
           if (envelopeError) {
             if (
               isQwenAiStaleSessionError(envelopeError)
@@ -6474,10 +6398,19 @@ export class QwenAiStreamHandler {
             const status = delta.status
             let content = delta.content || ''
             let summaryDiff = ''
+            const providerAnswerFinished = status === 'finished'
+              && (phase === 'answer' || phase === null)
+            const providerImageFinished = status === 'finished'
+              && isQwenAiImageGenerationPhase(phase)
+            if (providerAnswerFinished || providerImageFinished) {
+              // Record terminal provider evidence before validating managed
+              // output. A malformed terminal frame may need recovery, but it
+              // must never submit that recovery while Qwen is still running.
+              sawUpstreamCompletion = true
+            }
             const generatedImageBatch = isQwenAiImageGenerationPhase(phase)
               ? this.ingestGeneratedImages(delta.extra)
               : { images: [], startingIndex: this.generatedImages.length }
-            if (generatedImageBatch.images.length > 0) cancelThinkingOnlyTimer()
 
             if (QWEN_AI_DEBUG_STREAM_LOGS) {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
@@ -6507,14 +6440,13 @@ export class QwenAiStreamHandler {
 
             if (nativeToolProgress.sawFragment) {
               // Structured tool-call fragments are answer-phase progress.
-              cancelThinkingOnlyTimer()
               const invalidNativeToolArguments = this.getInvalidNativeToolArgumentIssues()
               const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
               if (completeUndeclaredNativeToolNames.length > 0 && this.responseId) {
                 recoverFromSemanticEmpty(createQwenAiUndeclaredNativeToolError(completeUndeclaredNativeToolNames))
                 return
               }
-              if (status === 'finished') {
+              if (providerAnswerFinished || providerImageFinished) {
                 if (invalidNativeToolArguments.length > 0) {
                   recoverFromSemanticEmpty(createQwenAiInvalidNativeToolArgumentsError(invalidNativeToolArguments))
                   return
@@ -6587,9 +6519,21 @@ export class QwenAiStreamHandler {
               // terminal delta and then closes without a literal [DONE].
               // Managed frames stay private until this point, so it is safe
               // to validate and atomically commit the completed branch now.
-              finishAnswer(delta.finish_reason || 'stop')
+              const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+              this.pendingSemanticRecoveryError = undefined
+              if (pendingSemanticRecoveryError) {
+                recoverFromSemanticEmpty(pendingSemanticRecoveryError)
+              } else {
+                finishAnswer(delta.finish_reason || 'stop')
+              }
             } else if (imageGenerationFinished) {
-              finishAnswer(delta.finish_reason || 'stop')
+              const imagePendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+              this.pendingSemanticRecoveryError = undefined
+              if (imagePendingSemanticRecoveryError) {
+                recoverFromSemanticEmpty(imagePendingSemanticRecoveryError)
+              } else {
+                finishAnswer(delta.finish_reason || 'stop')
+              }
             }
           }
         } catch (err) {
@@ -6615,7 +6559,13 @@ export class QwenAiStreamHandler {
         if (sawUpstreamCompletion && !bufferManagedBranch) {
           finishAnswer('stop')
         } else {
-          failStream(createQwenAiStreamFailure('Qwen AI response stream ended before an upstream completion signal'))
+          const pendingSemanticRecoveryError = this.getPendingSemanticRecoveryError()
+          if (pendingSemanticRecoveryError) {
+            this.pendingSemanticRecoveryError = undefined
+            recoverFromSemanticEmpty(pendingSemanticRecoveryError, true)
+          } else {
+            failStream(createQwenAiStreamFailure('Qwen AI response stream ended before an upstream completion signal'))
+          }
         }
       }
     })
@@ -6627,7 +6577,13 @@ export class QwenAiStreamHandler {
         if (sawUpstreamCompletion && !bufferManagedBranch) {
           finishAnswer('stop')
         } else {
-          failStream(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
+          const pendingSemanticRecoveryError = this.getPendingSemanticRecoveryError()
+          if (pendingSemanticRecoveryError) {
+            this.pendingSemanticRecoveryError = undefined
+            recoverFromSemanticEmpty(pendingSemanticRecoveryError, true)
+          } else {
+            failStream(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
+          }
         }
       }
     })
@@ -6697,6 +6653,7 @@ export class QwenAiStreamHandler {
         data.choices[0].finish_reason = 'stop'
         sawAnswerFinish = false
         sawUpstreamCompletion = false
+        this.pendingSemanticRecoveryError = undefined
         idleRecoveryInFlight = false
         semanticRecoveryInFlight = false
         parser?.reset()
@@ -6926,6 +6883,11 @@ export class QwenAiStreamHandler {
           `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
         )
 
+        if (this.currentBranchHasWrapperLeak()) {
+          rejectOnce(createQwenAiWrapperLeakError())
+          return
+        }
+
         if (!options.recoverFromIdle) {
           rejectOnce(idleError)
           return
@@ -6957,6 +6919,10 @@ export class QwenAiStreamHandler {
 
       const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
         if (resolved || semanticRecoveryInFlight) return
+        if (!sawUpstreamCompletion) {
+          this.pendingSemanticRecoveryError = error
+          return
+        }
 
         const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
         if (!recover) {
@@ -7073,7 +7039,13 @@ export class QwenAiStreamHandler {
             if (event.data === '[DONE]') {
               refreshIdleTimer()
               sawUpstreamCompletion = true
-              finishNonStream()
+              const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+              this.pendingSemanticRecoveryError = undefined
+              if (pendingSemanticRecoveryError) {
+                recoverFromSemanticEmpty(pendingSemanticRecoveryError)
+              } else {
+                finishNonStream()
+              }
               return
             }
 
@@ -7224,7 +7196,13 @@ export class QwenAiStreamHandler {
               }
 
               if (shouldFinishAnswer) {
-                finishNonStream()
+                const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+                this.pendingSemanticRecoveryError = undefined
+                if (pendingSemanticRecoveryError) {
+                  recoverFromSemanticEmpty(pendingSemanticRecoveryError)
+                } else {
+                  finishNonStream()
+                }
               }
             }
           } catch (err) {
@@ -7245,7 +7223,19 @@ export class QwenAiStreamHandler {
       const finishFromClose = () => {
         if (resolved || semanticRecoveryInFlight) return
         if (!sawUpstreamCompletion) {
-          rejectOnce(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
+          const pendingSemanticRecoveryError = this.getPendingSemanticRecoveryError()
+          if (!pendingSemanticRecoveryError) {
+            rejectOnce(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
+            return
+          }
+          this.pendingSemanticRecoveryError = undefined
+          recoverFromSemanticEmpty(pendingSemanticRecoveryError, true)
+          return
+        }
+        const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
+        this.pendingSemanticRecoveryError = undefined
+        if (pendingSemanticRecoveryError) {
+          recoverFromSemanticEmpty(pendingSemanticRecoveryError)
           return
         }
         finishNonStream()
@@ -7261,6 +7251,14 @@ export class QwenAiStreamHandler {
    * transport interruption, so semantic failures continue on a fresh branch.
    */
   getPendingSemanticRecoveryError(): Error | undefined {
+    if (this.pendingSemanticRecoveryError) {
+      return this.pendingSemanticRecoveryError
+    }
+
+    if (this.currentBranchHasWrapperLeak()) {
+      return createQwenAiWrapperLeakError()
+    }
+
     const undeclaredToolNames = this.getCompleteUndeclaredNativeToolNames()
     if (undeclaredToolNames.length > 0) {
       return createQwenAiUndeclaredNativeToolError(undeclaredToolNames)

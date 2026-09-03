@@ -3352,6 +3352,113 @@ test('Qwen AI response timeout zero disables the absolute deadline for stream an
   assert.equal(result.choices[0].message.content, 'non-stream complete')
 })
 
+test('Qwen AI defers semantic recovery until the active branch reaches terminal output', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    providerId: 'qwen-ai',
+    protocol: 'qwen_hermes',
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  let continuationCalls = 0
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async parentId => {
+      continuationCalls += 1
+      assert.equal(parentId, 'preterminal-semantic-response')
+      setImmediate(() => resumed.end([
+        `data: ${JSON.stringify({ 'response.created': {
+          response_id: 'preterminal-semantic-corrected',
+          response_index: 0,
+        } })}\n\n`,
+        `data: ${JSON.stringify({
+          response_id: 'preterminal-semantic-corrected',
+          choices: [{ delta: {
+            phase: 'answer',
+            status: 'finished',
+            content: 'corrected answer',
+          } }],
+        })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join('')))
+      return { data: resumed }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  bridge.on('error', () => {})
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 500,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.write([
+    `data: ${JSON.stringify({ 'response.created': {
+      response_id: 'preterminal-semantic-response',
+      response_index: 0,
+    } })}\n\n`,
+    `data: ${JSON.stringify({
+      response_id: 'preterminal-semantic-response',
+      choices: [{ delta: {
+        phase: 'answer',
+        status: 'typing',
+        function_call: {
+          name: 'provider_internal_tool',
+          arguments: '{}',
+        },
+      } }],
+    })}\n\n`,
+  ].join(''))
+  await new Promise(resolve => setTimeout(resolve, 25))
+  assert.equal(continuationCalls, 0)
+  assert.equal(failure, undefined)
+
+  initial.write(`data: ${JSON.stringify({
+    response_id: 'preterminal-semantic-response',
+    choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      function_call: {
+        name: 'provider_internal_tool',
+        arguments: '{}',
+      },
+    } }],
+  })}\n\n`)
+  await new Promise(resolve => setTimeout(resolve, 25))
+  initial.end()
+
+  await ended
+  assert.equal(continuationCalls, 1)
+  assert.equal(failure, undefined)
+  assert.match(Buffer.concat(chunks).toString(), /corrected answer/)
+})
+
 test('Qwen AI stream waits for terminal output before rejecting an undeclared native tool call', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
@@ -9921,7 +10028,7 @@ test('Qwen AI response-id resume immediately preserves next-account auth and cap
   }
 })
 
-test('Qwen AI caps a thinking-only trickle and recovers instead of running forever', async () => {
+test('Qwen AI keeps an active thinking stream on its first generation', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
   const upstream = new PassThrough()
   upstream.on('error', () => {})
@@ -9929,49 +10036,9 @@ test('Qwen AI caps a thinking-only trickle and recovers instead of running forev
   const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
   const output = await handler.handleStream(upstream, {
     responseTimeoutMs: 5_000,
-    idleTimeoutMs: 10_000,
-    thinkingOnlyMaxMs: 80,
-    allowReasoningOnlyOutput: true,
-    reasoningOnlyAsContent: true,
-  })
-  const chunks = []
-  let failure
-  output.on('data', chunk => chunks.push(chunk))
-  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
-  const ended = once(output, 'end')
-
-  // Slow thinking trickle: deltas arrive faster than the idle timeout but no
-  // answer ever starts. Without the thinking-only cap this loops forever.
-  const trickle = setInterval(() => {
-    upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
-      phase: 'think',
-      status: 'typing',
-      content: 'still thinking ',
-    } }] })}\n\n`)
-  }, 25)
-
-  try {
-    await ended
-  } finally {
-    clearInterval(trickle)
-  }
-
-  // The stream must terminate via the semantic-empty path, not hang.
-  assert.notEqual(failure, undefined)
-  assert.equal(failure.code, 'qwen_ai_semantic_empty')
-  upstream.destroy()
-})
-
-test('Qwen AI thinking-only cap is cancelled when an answer starts', async () => {
-  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
-  const upstream = new PassThrough()
-  upstream.on('error', () => {})
-
-  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
-  const output = await handler.handleStream(upstream, {
-    responseTimeoutMs: 5_000,
-    idleTimeoutMs: 10_000,
-    thinkingOnlyMaxMs: 120,
+    idleTimeoutMs: 100,
+    // An active provider stream must not be replaced by a same-chat
+    // continuation before it terminates.
   })
   const chunks = []
   let failure
@@ -9980,109 +10047,19 @@ test('Qwen AI thinking-only cap is cancelled when an answer starts', async () =>
   const ended = once(output, 'end')
 
   upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
-    phase: 'think',
+    phase: 'thinking_summary',
     status: 'typing',
-    content: 'brief thought ',
+    extra: { summary_thought: { content: ['still thinking'] } },
   } }] })}\n\n`)
-  await new Promise(resolve => setTimeout(resolve, 40))
-  // Answer starts well before the cap fires.
-  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
+  await new Promise(resolve => setTimeout(resolve, 60))
+  upstream.end(`data: ${JSON.stringify({ choices: [{ delta: {
     phase: 'answer',
-    status: 'typing',
-    content: 'final answer text',
-  } }] })}\n\n`)
-  // Outlive the cap: it must have been cancelled by the answer.
-  await new Promise(resolve => setTimeout(resolve, 200))
-  upstream.end('data: [DONE]\n\n')
+    status: 'finished',
+    content: 'first generation answer',
+  } }] })}\n\ndata: [DONE]\n\n`)
 
   await ended
   const body = Buffer.concat(chunks).toString()
   assert.equal(failure, undefined)
-  assert.match(body, /final answer text/)
-})
-
-test('Qwen AI thinking-only cap resets on substantive thinking progress', async () => {
-  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
-  const upstream = new PassThrough()
-  upstream.on('error', () => {})
-
-  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
-  const output = await handler.handleStream(upstream, {
-    responseTimeoutMs: 5_000,
-    idleTimeoutMs: 10_000,
-    thinkingOnlyMaxMs: 100,
-    // Substantive deep thinking (digesting a large transcript) crosses the
-    // threshold repeatedly; bounded resets must keep the stream alive.
-    thinkingOnlyProgressCodePoints: 40,
-    thinkingOnlyProgressMaxResets: 8,
-  })
-  const chunks = []
-  let failure
-  output.on('data', chunk => chunks.push(chunk))
-  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
-  const ended = once(output, 'end')
-
-  // Trickle that stays under the progress threshold: tiny deltas only.
-  const trickle = setInterval(() => {
-    upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
-      phase: 'think',
-      status: 'typing',
-      content: 'x',
-    } }] })}\n\n`)
-  }, 30)
-
-  try {
-    // Outlive several base windows WITHOUT substantive progress: must expire.
-    await ended
-  } finally {
-    clearInterval(trickle)
-  }
-
-  assert.notEqual(failure, undefined)
-  assert.equal(failure.code, 'qwen_ai_semantic_empty')
-  upstream.destroy()
-})
-
-test('Qwen AI thinking-only cap survives substantive thinking then delivers the answer', async () => {
-  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
-  const upstream = new PassThrough()
-  upstream.on('error', () => {})
-
-  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
-  const output = await handler.handleStream(upstream, {
-    responseTimeoutMs: 10_000,
-    idleTimeoutMs: 10_000,
-    thinkingOnlyMaxMs: 120,
-    thinkingOnlyProgressCodePoints: 50,
-    thinkingOnlyProgressMaxResets: 8,
-  })
-  const chunks = []
-  let failure
-  output.on('data', chunk => chunks.push(chunk))
-  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
-  const ended = once(output, 'end')
-
-  // Substantive thinking across MULTIPLE base windows (> 2 x capMs total)
-  // while crossing the progress threshold: windows keep resetting.
-  const deepThink = setInterval(() => {
-    upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
-      phase: 'think',
-      status: 'typing',
-      content: 'analyzing the archived transcript section by section ',
-    } }] })}\n\n`)
-  }, 30)
-
-  await new Promise(resolve => setTimeout(resolve, 400))
-  clearInterval(deepThink)
-  upstream.write(`data: ${JSON.stringify({ choices: [{ delta: {
-    phase: 'answer',
-    status: 'typing',
-    content: 'the analyzed answer',
-  } }] })}\n\n`)
-  upstream.end('data: [DONE]\n\n')
-
-  await ended
-  const body = Buffer.concat(chunks).toString()
-  assert.equal(failure, undefined, 'substantive thinking must not be culled as a runaway')
-  assert.match(body, /the analyzed answer/)
+  assert.match(body, /first generation answer/)
 })

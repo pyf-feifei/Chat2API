@@ -79,11 +79,6 @@ services:
       # Managed-tool provider-capability exclusion (blocks platform web search
       # answering instead of declared tools); "off" disables.
       CHAT2API_TOOL_CALLING_PROVIDER_CAPABILITY_RULES: ${CHAT2API_TOOL_CALLING_PROVIDER_CAPABILITY_RULES-}
-      # Progress-aware thinking-only wall clock: substantive thinking output
-      # (code points) resets the window, bounded by the reset count; zero
-      # progress restores the hard single-window cap.
-      CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS: ${CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_CODE_POINTS:-600}
-      CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS: ${CHAT2API_QWEN_AI_THINKING_ONLY_PROGRESS_MAX_RESETS:-8}
       # Capability-denial answer detection ("tool not available" prose without
       # a tool call triggers continuation retry); "off" disables.
       CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS: ${CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS-}
