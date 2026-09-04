@@ -117,6 +117,11 @@ function loadRequestForwarder(overrides = {}) {
       qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
       resolveQwenAiNativeContinuationSystemPrompt: () => '',
+      qwenAiTranscriptTransportPolicyFromEnv: () => ({
+        enabled: false,
+        documentExtension: 'txt',
+        inlineFallback: true,
+      }),
     },
     './adapters/m365': {
       M365Adapter: adapterWithMatcher('isM365Provider'),
@@ -132,6 +137,9 @@ function loadRequestForwarder(overrides = {}) {
       }),
     },
     './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
+    './accountStatus.ts': {
       markAccountErrorIfPermanent: async () => {},
     },
     './adapters/zai': {

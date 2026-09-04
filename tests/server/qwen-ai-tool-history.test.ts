@@ -431,6 +431,55 @@ test('Qwen AI does not infer document transport from transcript byte size', asyn
   assert.ok(prepared.content.includes(longText))
 })
 
+test('Qwen AI transcript transport policy supports md documents', async () => {
+  const uploads: any[] = []
+  const prepared = await prepareQwenAiMultimodalMessage(
+    [{ role: 'user' as const, content: 'MD_TRANSCRIPT_SENTINEL' }],
+    {
+      uploadPart: async (part: any) => {
+        uploads.push(part)
+        return { file: { id: `uploaded-${uploads.length}` } }
+      },
+    } as any,
+    {
+      transport: 'document',
+      transcriptTransportPolicy: { uploadEnabled: true, extension: 'md' },
+    },
+  )
+
+  assert.equal(prepared.transport, 'document')
+  assert.equal(uploads.length, 1)
+  assert.match(uploads[0].filename, /^chat2api-conversation-[a-f0-9]{16}\.md$/)
+  assert.equal(uploads[0].mime_type, 'text/markdown')
+  assert.match(uploads[0].file_url.url, /^data:text\/markdown;base64,/)
+})
+
+test('Qwen AI disabled transcript upload keeps complete content inline', async () => {
+  const longText = `DISABLED_TRANSCRIPT_SENTINEL:${'x'.repeat(180_000)}:DISABLED_TRANSCRIPT_END`
+  let uploads = 0
+  const prepared = await prepareQwenAiMultimodalMessage(
+    [{ role: 'user' as const, content: longText }],
+    {
+      uploadPart: async () => {
+        uploads += 1
+        return { file: { id: 'unexpected-upload' } }
+      },
+    } as any,
+    {
+      transport: 'document',
+      managedToolCalling: true,
+      requestMaxBytes: 90 * 1024,
+      transcriptTransportPolicy: { uploadEnabled: false, extension: 'md' },
+    },
+  )
+
+  assert.equal(prepared.transport, 'inline')
+  assert.equal(prepared.managedDocumentMode, undefined)
+  assert.equal(uploads, 0)
+  assert.ok(prepared.content.includes(longText))
+  assert.doesNotMatch(prepared.content, /complete managed conversation transcript is attached/i)
+})
+
 test('Qwen AI preserves all audio-turn text while uploading audio bytes separately', async () => {
   const systemInstruction = 'system-sentinel-73bd10'
   const activeText = 'active-user-sentinel-c6205a'

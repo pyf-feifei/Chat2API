@@ -144,3 +144,70 @@ test('assistant output boundary preserves a legal tool-call tag', async () => {
   const output = await collect(boundary)
   assert.match(output, /<tool_call>/)
 })
+
+test('Responses non-stream boundary rejects malformed provider tool-call XML', async () => {
+  const { guardAssistantOutputCompletion } = await import(
+    '../../src/main/proxy/toolCalling/assistantOutputBoundary.ts'
+  )
+  const completion = {
+    id: 'chatcmpl-malformed',
+    object: 'chat.completion',
+    created: 1,
+    model: 'upstream',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant' as const,
+        content: [
+          '<tool_call=\n',
+          '<function>exec_command>\n',
+          '<parameter cmd="Get-ChildItem">\n',
+          'actual command body\n',
+          '</parameter>\n',
+          '</function\n</tool_call=>\n',
+        ].join(''),
+      },
+      finish_reason: 'stop' as const,
+    }],
+  }
+  assert.throws(
+    () => guardAssistantOutputCompletion(completion, null),
+    (error: Error & { code?: string, param?: string, status?: number }) => (
+      error.status === 502
+      && error.code === 'managed_tool_result_wrapper_leak'
+      && error.param === 'choices[0].message.content'
+    ),
+  )
+})
+
+test('Responses non-stream boundary preserves a structured call alongside literal marker text', async () => {
+  const { guardAssistantOutputCompletion } = await import(
+    '../../src/main/proxy/toolCalling/assistantOutputBoundary.ts'
+  )
+  const completion = {
+    id: 'chatcmpl-mixed',
+    object: 'chat.completion',
+    created: 1,
+    model: 'upstream',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant' as const,
+        content: 'Here is the call:',
+        tool_calls: [{
+          id: 'call_x',
+          type: 'function' as const,
+          function: {
+            name: 'apply_patch',
+            arguments: JSON.stringify({ note: 'use <tool_call> literal' }),
+          },
+        }],
+      },
+      finish_reason: 'tool_calls' as const,
+    }],
+  }
+  const guarded = guardAssistantOutputCompletion(completion, null) as typeof completion
+  assert.equal(guarded.choices[0].message?.content, 'Here is the call:')
+  assert.equal(guarded.choices[0].message?.tool_calls?.[0]?.function.arguments,
+    JSON.stringify({ note: 'use <tool_call> literal' }))
+})

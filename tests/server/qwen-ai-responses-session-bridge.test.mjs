@@ -38,6 +38,7 @@ const storeModule = loadTypeScriptModule('src/main/proxy/responses/store.ts', {
 })
 const accountFailover = loadTypeScriptModule('src/main/proxy/accountFailover.ts', {
   './accountStatus': { markAccountErrorIfPermanent: async () => {} },
+  './accountStatus.ts': { markAccountErrorIfPermanent: async () => {} },
 })
 const workflowHeuristics = loadTypeScriptModule('src/main/proxy/toolCalling/workflowHeuristics.ts')
 const toolLoopGuard = loadTypeScriptModule('src/main/proxy/responses/toolLoopGuard.ts')
@@ -432,6 +433,9 @@ function loadResponsesRouteHarness(options = {}) {
     './accountStatus': {
       markAccountErrorIfPermanent: async () => {},
     },
+    './accountStatus.ts': {
+      markAccountErrorIfPermanent: async () => {},
+    },
     '..\\accountStatus': {
       markAccountErrorIfPermanent: async () => {},
     },
@@ -660,6 +664,7 @@ function loadResponsesRouteHarness(options = {}) {
     '../toolCalling/workflowHeuristics': workflowHeuristics,
     '../toolCalling/assistantOutputBoundary': {
       createAssistantOutputBoundaryStream: () => new PassThrough(),
+      guardAssistantOutputCompletion: completion => completion,
     },
     '../responses/image': {
       ResponseImageResolutionError: MockImageResolutionError,
@@ -1421,6 +1426,9 @@ function loadForwarderForBridgeTests(overrides = {}) {
     './accountStatus': {
       markAccountErrorIfPermanent: async () => {},
     },
+    './accountStatus.ts': {
+      markAccountErrorIfPermanent: async () => {},
+    },
     './qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
     },
@@ -1496,6 +1504,9 @@ function loadForwarderForBridgeTests(overrides = {}) {
       m365FailureClassification: () => ({ status: undefined, retryable: undefined, retryScope: undefined, accountFault: undefined }),
     },
     './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
+    './accountStatus.ts': {
       markAccountErrorIfPermanent: async () => {},
     },
     './qwenBusyFailover': {

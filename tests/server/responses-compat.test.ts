@@ -770,6 +770,23 @@ test('text streaming emits the official typed event sequence and complete respon
   assert.equal(events.at(-1).response.usage.total_tokens, 3)
 })
 
+test('text streaming dedupes cumulative retransmitted answer deltas', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"Hello world"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ])
+
+  const textDeltas = events
+    .filter(event => event.type === 'response.output_text.delta')
+    .map(event => event.delta)
+  assert.deepEqual(textDeltas, ['Hel', 'lo', ' world'])
+  const completed = events.at(-1).response
+  assert.equal(completed.output[0].content[0].text, 'Hello world')
+})
+
 test('Responses streaming emits typed progress during a quiet managed hold', async () => {
   const transform = createResponsesStreamTransform({
     request: { model: 'test-model', input: 'hello', stream: true },

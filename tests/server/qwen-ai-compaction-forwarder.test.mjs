@@ -302,6 +302,7 @@ function loadRequestForwarder(overrides = {}) {
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
+      qwenAiTranscriptTransportPolicyFromEnv: () => ({}),
       resolveQwenAiNativeContinuationSystemPrompt: () => '',
     },
     './adapters/m365': { M365Adapter: class { static isM365Provider() { return false } } },
@@ -437,6 +438,19 @@ function loadRequestForwarder(overrides = {}) {
     },
     './sessionManager': {
       sessionManager: { shouldDeleteAfterChat: () => true },
+    },
+    './accountStatus.ts': {
+      markAccountErrorIfPermanent: () => {},
+    },
+    './m365FailoverClassification': {
+      isM365AuthIssue: () => false,
+      isM365QuotaWall: () => false,
+      m365FailureClassification: () => ({
+        status: undefined,
+        retryable: undefined,
+        retryScope: undefined,
+        accountFault: undefined,
+      }),
     },
     './services/contextManagementService': {
       createContextManagementService: () => ({

@@ -201,16 +201,24 @@ export class ChatCompletionsToResponsesStream extends Transform {
     this.start()
     this.finalized = true
     this.stopProgressTimer()
-    const responseError = {
+    const responseError: { code: string; message: string; retryable?: boolean } = {
       code: typeof (error as Error & { code?: unknown }).code === 'string'
         ? (error as Error & { code: string }).code
         : 'upstream_error',
       message: error.message,
     }
+    // Surface an explicit non-retryable classification so SDK-side retry
+    // policies can stop instead of treating every stream failure as
+    // transport-level "reconnect and replay" work.
+    const retryable = (error as Error & { retryable?: unknown }).retryable
+    if (typeof retryable === 'boolean') {
+      responseError.retryable = retryable
+    }
     this.enqueueEvent('error', {
       code: responseError.code,
       message: responseError.message,
       param: null,
+      ...(typeof retryable === 'boolean' ? { retryable } : {}),
     })
     const response = createResponseObject(this.request, {
       id: this.responseId,
@@ -399,6 +407,15 @@ export class ChatCompletionsToResponsesStream extends Transform {
   }
 
   private appendText(delta: string): void {
+    // Qwen occasionally retransmits a cumulative answer snapshot instead of
+    // appending: a longer frame that starts with everything already emitted.
+    // Only that prefix-extension shape is deduplicated; an identical duplicate
+    // or a fresh fragment still appends, so providers streaming legitimate
+    // repeated chunks keep their byte stream intact.
+    if (this.text.length > 0 && delta.length > this.text.length && delta.startsWith(this.text)) {
+      delta = delta.slice(this.text.length)
+    }
+    if (!delta) return
     this.ensureTextStarted()
     this.text += delta
     this.enqueueEvent('response.output_text.delta', {

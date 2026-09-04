@@ -75,6 +75,55 @@ const TEXT_DOCUMENT_EXTENSIONS = new Set([
   '.yml',
 ])
 
+export type QwenAiTranscriptExtension = 'txt' | 'md'
+
+export interface QwenAiTranscriptTransportPolicy {
+  uploadEnabled: boolean
+  extension: QwenAiTranscriptExtension
+}
+
+let warnedInvalidTranscriptUploadEnabled = false
+let warnedInvalidTranscriptExtension = false
+
+function qwenAiBooleanEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const normalized = raw.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false
+  return fallback
+}
+
+export function qwenAiTranscriptTransportPolicyFromEnv(): QwenAiTranscriptTransportPolicy {
+  const rawEnabled = process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED
+  const uploadEnabled = qwenAiBooleanEnv(
+    'CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED',
+    true,
+  )
+  if (
+    rawEnabled !== undefined
+    && rawEnabled.trim() !== ''
+    && !['1', 'true', 'yes', 'on', 'enabled', '0', 'false', 'no', 'off', 'disabled']
+      .includes(rawEnabled.trim().toLowerCase())
+    && !warnedInvalidTranscriptUploadEnabled
+  ) {
+    warnedInvalidTranscriptUploadEnabled = true
+    console.warn(`[QwenAI] Unknown CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=${rawEnabled}, using "true"`)
+  }
+
+  const rawExtension = process.env.CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION
+  const normalizedExtension = String(rawExtension ?? '').trim().toLowerCase().replace(/^\./, '')
+  let extension: QwenAiTranscriptExtension = 'txt'
+  if (normalizedExtension === 'txt' || normalizedExtension === 'md') {
+    extension = normalizedExtension
+  } else if (normalizedExtension && !warnedInvalidTranscriptExtension) {
+    warnedInvalidTranscriptExtension = true
+    console.warn(`[QwenAI] Unknown CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=${rawExtension}, using "txt"`)
+  }
+
+  return { uploadEnabled, extension }
+}
+
 const COMMON_QUERY_TERMS = new Set([
   'about',
   'above',
@@ -195,6 +244,8 @@ export interface QwenAiFileOperationOptions {
 
 export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperationOptions {
   transport?: QwenAiMessageTransport
+  /** Controls whether Chat2API's synthetic transcript document is uploaded. */
+  transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   managedToolCalling?: boolean
   workflowContinuation?: boolean
   /** Force the managed document layout. Undefined starts hybrid and escalates when needed. */
@@ -2834,21 +2885,38 @@ export class QwenAiFileUploader {
   }
 }
 
-function createQwenAiTextDocument(prefix: string, content: string): ChatMessageContent {
+function transcriptFormat(policy: QwenAiTranscriptTransportPolicy): {
+  extension: QwenAiTranscriptExtension
+  mimeType: 'text/plain' | 'text/markdown'
+} {
+  return policy.extension === 'md'
+    ? { extension: 'md', mimeType: 'text/markdown' }
+    : { extension: 'txt', mimeType: 'text/plain' }
+}
+
+function createQwenAiTextDocument(
+  prefix: string,
+  content: string,
+  policy: QwenAiTranscriptTransportPolicy,
+): ChatMessageContent {
   const data = Buffer.from(content, 'utf8')
   const contentHash = createHash('sha256').update(data).digest('hex')
+  const format = transcriptFormat(policy)
   return {
     type: 'file',
-    filename: `${prefix}-${contentHash.slice(0, 16)}.txt`,
-    mime_type: 'text/plain',
+    filename: `${prefix}-${contentHash.slice(0, 16)}.${format.extension}`,
+    mime_type: format.mimeType,
     file_url: {
-      url: `data:text/plain;base64,${data.toString('base64')}`,
+      url: `data:${format.mimeType};base64,${data.toString('base64')}`,
     },
   }
 }
 
-function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
-  return createQwenAiTextDocument('chat2api-conversation', content)
+function createQwenAiTranscriptDocument(
+  content: string,
+  policy: QwenAiTranscriptTransportPolicy,
+): ChatMessageContent {
+  return createQwenAiTextDocument('chat2api-conversation', content, policy)
 }
 
 /**
@@ -2995,8 +3063,12 @@ export async function prepareQwenAiMultimodalMessage(
   const transcriptUtf8Bytes = qwenAiJsonStringUtf8Bytes(userContent)
   const requestedTransport = options.transport ?? 'inline'
   const requestMaxBytes = Math.max(0, Math.floor(options.requestMaxBytes ?? 0))
-  const shouldUseDocument = requestedTransport === 'document'
+  const transcriptTransportPolicy = options.transcriptTransportPolicy
+    ?? qwenAiTranscriptTransportPolicyFromEnv()
+  const shouldUseDocument = transcriptTransportPolicy.uploadEnabled && (
+    requestedTransport === 'document'
     || (requestMaxBytes > 0 && transcriptUtf8Bytes > requestMaxBytes)
+  )
   let generatedDocuments: ChatMessageContent[] = []
   let inlineContent = userContent
   let managedDocumentMode: QwenAiManagedDocumentMode | undefined
@@ -3017,7 +3089,7 @@ export async function prepareQwenAiMultimodalMessage(
       const inlineInstructions: string[] = []
       let tailExcerpt = ''
       if (archiveContent) {
-        const transcriptDocument = createQwenAiTranscriptDocument(archiveContent)
+        const transcriptDocument = createQwenAiTranscriptDocument(archiveContent, transcriptTransportPolicy)
         documents.push(transcriptDocument)
         if (documentMode === 'complete') {
           // Complete mode archives the pending user message itself, so the
@@ -3076,7 +3148,7 @@ export async function prepareQwenAiMultimodalMessage(
     generatedDocuments = managedDocument.documents
     inlineContent = managedDocument.content
   } else if (shouldUseDocument) {
-    const transcriptDocument = createQwenAiTranscriptDocument(userContent)
+    const transcriptDocument = createQwenAiTranscriptDocument(userContent, transcriptTransportPolicy)
     generatedDocuments.push(transcriptDocument)
     inlineContent = qwenAiTranscriptDocumentInstruction(
       transcriptDocument.filename || 'the attached transcript',

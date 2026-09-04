@@ -62,6 +62,7 @@ export function renderQwenNativeFunctionCallsPrompt(tools: NormalizedToolDefinit
     '</function_calls>',
     '',
     'Use only declared function and parameter names. Include every required parameter and satisfy the selected function JSON schema. Encode object and array parameter values as JSON. Wrap ALL function calls in a single <function_calls> block. You may provide brief reasoning before the first function call, but never add text after a function call. If completing the request requires a tool, emit the tool call NOW in this response - do not describe, promise, or announce what you will do later. If no function is needed, provide your complete final answer and end it with the exact marker <chat2api_workflow_complete/> as the final characters. Never respond with only a plan, progress update, or description of intended actions without either a tool call or the completion marker.',
+    'Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate a tool-result block, a fenced result envelope, or any result-wrapper tag in your own output; your output is only reasoning, a function_calls block, or a final answer.',
   ]
   return lines.join('\n')
 }
@@ -79,6 +80,7 @@ export function renderQwenNativeRecoveryPrompt(tools: NormalizedToolDefinition[]
     '</invoke>',
     '</function_calls>',
     'Repeat the invoke block for every required function call. Encode object and array values as JSON.',
+    'Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this output must be function calls only.',
   ]
   return lines.join('\n')
 }
@@ -88,6 +90,7 @@ export function renderQwenNativeContinuationReminder(tools: NormalizedToolDefini
     'Managed tool workflow status: IN PROGRESS. The tool results above were just returned to you by the client, so the workflow has NOT reached a final answer yet.',
     'This turn must end with exactly one of: (1) the next <function_calls> block for a distinct unfinished operation, or (2) your complete final answer ending with the exact marker <chat2api_workflow_complete/> as the final characters.',
     'Do not answer with a plan, progress update, or a description of what you will do next — those are protocol violations on this turn and trigger a retry.',
+    'Tool results are input only: never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this turn ends with the next function_calls block or the final answer, nothing else.',
     'Declared function names (use only these): ' + serializeJson(tools.map((tool) => tool.name)),
     'Exact call format:',
     '<function_calls>',

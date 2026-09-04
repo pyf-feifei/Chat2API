@@ -7,8 +7,8 @@
  * active. Transient failures (rate limits, content policy, 5xx, transport)
  * never change the status.
  */
-import { storeManager } from '../store/store'
-import type { ForwardResult } from './types'
+import { storeManager } from '../store/store.ts'
+import type { ForwardResult } from './types.ts'
 
 const TRANSIENT_FAULT_TEXT =
   /content (policy|filter)|safety system|rate ?limit|too many requests|quota|insufficient balance|busy|chat in progress|timeout|timed out|connection|socket|network|econnreset|econnrefused|enotfound|eai_again|internal (server )?error|bad gateway|service unavailable|gateway timeout|temporary|transient|overloaded/i

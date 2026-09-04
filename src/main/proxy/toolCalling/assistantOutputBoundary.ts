@@ -15,6 +15,14 @@ const ASSISTANT_TEXT_FIELDS = [
   'summary',
 ] as const
 
+const VISIBLE_ASSISTANT_BLOCK_TYPES = new Set([
+  'text',
+  'output_text',
+  'reasoning',
+  'thinking',
+  'summary',
+])
+
 type AssistantTextField = typeof ASSISTANT_TEXT_FIELDS[number]
 type AssistantContainer = 'delta' | 'message'
 
@@ -27,6 +35,86 @@ interface GuardEntry {
     container: AssistantContainer
     field: AssistantTextField
   }
+}
+
+/**
+ * Validates assistant-visible text in a completed Chat Completions body.
+ * Structured tool-call arguments are deliberately not traversed: marker-like
+ * strings there are data, not assistant protocol output.
+ */
+export function guardAssistantOutputCompletion<T extends Record<string, any>>(
+  completion: T,
+  protectedToolCallProtocol: ToolProtocolId | null = null,
+): T {
+  const choices = Array.isArray(completion.choices) ? completion.choices : []
+  const guardedChoices = choices.map((choice: any, choiceIndex: number) => {
+    if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return choice
+    const guardedChoice = { ...choice }
+    for (const containerName of ['message', 'delta'] as const) {
+      const value = guardedChoice[containerName]
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+      const container = { ...value }
+      for (const field of ASSISTANT_TEXT_FIELDS) {
+        if (typeof container[field] === 'string') {
+          container[field] = guardAssistantText(
+            container[field],
+            `choices[${choiceIndex}].${containerName}.${field}`,
+            protectedToolCallProtocol,
+          )
+        } else if (field === 'content' && Array.isArray(container[field])) {
+          container[field] = guardAssistantContentParts(
+            container[field],
+            `choices[${choiceIndex}].${containerName}.content`,
+            protectedToolCallProtocol,
+          )
+        }
+      }
+      guardedChoice[containerName] = container
+    }
+    return guardedChoice
+  })
+  return { ...completion, choices: guardedChoices } as T
+}
+
+function guardAssistantContentParts(
+  parts: unknown[],
+  fieldPrefix: string,
+  protectedToolCallProtocol: ToolProtocolId | null,
+): unknown[] {
+  return parts.map((part, index) => {
+    if (typeof part === 'string') {
+      return guardAssistantText(part, `${fieldPrefix}[${index}]`, protectedToolCallProtocol)
+    }
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return part
+    const record = part as Record<string, unknown>
+    const type = typeof record.type === 'string' ? record.type : undefined
+    if (type && !VISIBLE_ASSISTANT_BLOCK_TYPES.has(type)) return part
+    const guarded = { ...record }
+    for (const key of ['text', 'content'] as const) {
+      if (typeof guarded[key] === 'string') {
+        guarded[key] = guardAssistantText(
+          guarded[key],
+          `${fieldPrefix}[${index}].${key}`,
+          protectedToolCallProtocol,
+        )
+      }
+    }
+    return guarded
+  })
+}
+
+function guardAssistantText(
+  value: string,
+  field: string,
+  protectedToolCallProtocol: ToolProtocolId | null,
+): string {
+  const guard = new ManagedToolResultGuard(protectedToolCallProtocol)
+  const streamed = guard.push(value)
+  const flushed = guard.flush()
+  if (guard.hasDetectedWrapperLeak()) {
+    throw createManagedToolResultWrapperLeakError(field)
+  }
+  return streamed.content + flushed.content
 }
 
 /**

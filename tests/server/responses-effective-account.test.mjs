@@ -13,8 +13,8 @@ import {
 const runtimeRequire = createRequire(import.meta.url)
 const QWEN_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
-function loadAccountFailoverModule() {
-  const source = fs.readFileSync('src/main/proxy/accountFailover.ts', 'utf8')
+function loadWithLocalModules(relativePath, localModules = {}) {
+  const source = fs.readFileSync(relativePath, 'utf8')
   const output = ts.transpileModule(source, {
     compilerOptions: {
       esModuleInterop: true,
@@ -23,24 +23,30 @@ function loadAccountFailoverModule() {
     },
   }).outputText
   const module = { exports: {} }
-  new Function('require', 'module', 'exports', output)(runtimeRequire, module, module.exports)
+  const testRequire = specifier => {
+    if (Object.prototype.hasOwnProperty.call(localModules, specifier)) {
+      return localModules[specifier]
+    }
+    return runtimeRequire(specifier)
+  }
+  new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
   return module.exports
+}
+
+function loadAccountFailoverModule() {
+  return loadWithLocalModules(
+    'src/main/proxy/accountFailover.ts',
+    {
+      './accountStatus': { markAccountErrorIfPermanent: async () => {} },
+      './accountStatus.ts': { markAccountErrorIfPermanent: async () => {} },
+    },
+  )
 }
 
 const accountFailoverModule = loadAccountFailoverModule()
 
 function loadDeferredStreamModule() {
-  const source = fs.readFileSync('src/main/proxy/qwenAiDeferredStream.ts', 'utf8')
-  const output = ts.transpileModule(source, {
-    compilerOptions: {
-      esModuleInterop: true,
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-    },
-  }).outputText
-  const module = { exports: {} }
-  new Function('require', 'module', 'exports', output)(runtimeRequire, module, module.exports)
-  return module.exports
+  return loadWithLocalModules('src/main/proxy/qwenAiDeferredStream.ts')
 }
 
 const deferredStreamModule = loadDeferredStreamModule()
@@ -291,6 +297,7 @@ function loadResponsesRoute(createResult, options = {}) {
           tool_choice: request.tool_choice,
         },
         conversationMessages: [],
+        sidecarItems: [],
       }),
       chatCompletionToResponse: async (_completion, _request, options) => ({
         id: options.id,
@@ -298,6 +305,7 @@ function loadResponsesRoute(createResult, options = {}) {
         output: [],
       }),
       responseOutputToChatMessages: () => [],
+      responseOutputToSidecarItems: () => [],
     },
     '../responses/store': {
       responsesConversationStore: {
@@ -362,6 +370,18 @@ function loadResponsesRoute(createResult, options = {}) {
       hasTrailingMatchedToolResultBatch: () => false,
     },
     '../qwenAiAccountPolicy': { isQwenAiAccountFault, qwenAiAccountRetryScope },
+    '../qwenBusyFailover': {
+      createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    '../replayImageSlimming': {
+      slimQwenAiReplayImages: messages => messages,
+      qwenAiImageSlimModeFromEnv: () => 'off',
+      shouldSlimQwenAiAttemptImages: () => false,
+    },
+    '../toolCalling/assistantOutputBoundary': {
+      createAssistantOutputBoundaryStream: () => new PassThrough(),
+      guardAssistantOutputCompletion: completion => completion,
+    },
   }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) {

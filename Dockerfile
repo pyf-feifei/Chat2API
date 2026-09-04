@@ -60,6 +60,11 @@ ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 # Start document offload before a large Qwen Web request reaches its model context.
 # This is a transport target, not a local client request limit; zero disables it.
 ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
+# Controls Chat2API-generated transcript documents only; false keeps the full
+# transcript inline while preserving original user attachment uploads.
+ENV CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=true
+# Synthetic transcript format: txt (default) or md.
+ENV CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=txt
 # Bound inline Hermes routing summaries while complete tool documentation stays
 # in the account-scoped reference attachment. Zero omits inline descriptions.
 ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240

@@ -23,15 +23,20 @@ import {
   QWEN_AI_DOCUMENT_EVIDENCE_MARKER,
   prepareQwenAiMultimodalMessage,
   qwenAiNativeSystemMaxBytesFromEnv,
+  qwenAiTranscriptTransportPolicyFromEnv,
   qwenAiSystemPromptModeFromEnv,
   qwenAiToolProtocolChannelFromEnv,
   type QwenAiDirectUploadInput,
   type QwenAiDirectUploadStartResult,
   type QwenAiManagedDocumentMode,
   type QwenAiMessageTransport,
+  type QwenAiTranscriptTransportPolicy,
 } from './qwen-ai-files'
 
-export { resolveQwenAiNativeContinuationSystemPrompt } from './qwen-ai-files'
+export {
+  resolveQwenAiNativeContinuationSystemPrompt,
+  qwenAiTranscriptTransportPolicyFromEnv,
+} from './qwen-ai-files'
 import { createBaseChunk } from '../utils/streamToolHandler'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
@@ -260,6 +265,8 @@ interface ChatCompletionRequest {
   timeoutMs?: number
   /** Selects how the complete converted conversation reaches Qwen. */
   messageTransport?: QwenAiMessageTransport
+  /** Snapshot of the synthetic transcript transport policy for this request. */
+  transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
 }
 
 interface QwenAiWorkflowContinuationRequest {
@@ -289,6 +296,8 @@ interface QwenAiWorkflowContinuationRequest {
   managedToolCalling?: boolean
   managedToolWorkflowContinuation?: boolean
   messageTransport?: QwenAiMessageTransport
+  /** Snapshot of the synthetic transcript transport policy for this request. */
+  transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   /** Per-call override for same-chat CHAT_IN_PROGRESS retries. */
   chatInProgressRetryAttempts?: number
   signal?: AbortSignal
@@ -364,6 +373,24 @@ export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
   const value = Number(raw)
   if (!Number.isSafeInteger(value) || value < 0) return 1
   return value
+}
+
+/**
+ * Replacement branches spent on leaked managed tool-result wrappers within one
+ * logical request. A wrapper leak is deterministic, so a replay that leaks
+ * again is unlikely to improve; keep the default at one fast replacement and
+ * bound the total so one client request cannot burn the whole workflow budget
+ * on repeated leaks.
+ */
+export function qwenAiWrapperLeakRecoveryAttemptsFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS
+  if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
+    return 1
+  }
+
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) return 1
+  return Math.min(value, 2)
 }
 
 /**
@@ -643,6 +670,10 @@ export function createQwenAiResumableStream(
     0,
     Math.floor(configuredWorkflowContinuationAttempts),
   )
+  const wrapperLeakRecoveryAttemptLimit = Math.max(
+    0,
+    Math.floor(qwenAiWrapperLeakRecoveryAttemptsFromEnv()),
+  )
 
   let source = initialStream
   let sourceGeneration = 0
@@ -657,6 +688,7 @@ export function createQwenAiResumableStream(
   let attempts = recoveryState?.resumeAttempts ?? 0
   let workflowContinuationAttempts = recoveryState?.workflowContinuationAttempts ?? 0
   let freshChatRestartAttempts = recoveryState?.freshChatRestartAttempts ?? 0
+  let wrapperLeakRecoveryAttempts = recoveryState?.wrapperLeakRecoveryAttempts ?? 0
   // A recovery phase transition must not reopen the transport budget for the
   // same logical request. `attempts` is intentionally monotonic across resume,
   // fresh-chat, and workflow-continuation branches; these counters only track
@@ -684,6 +716,7 @@ export function createQwenAiResumableStream(
     recoveryState.resumeAttempts = attempts
     recoveryState.workflowContinuationAttempts = workflowContinuationAttempts
     recoveryState.freshChatRestartAttempts = freshChatRestartAttempts
+    recoveryState.wrapperLeakRecoveryAttempts = wrapperLeakRecoveryAttempts
     recoveryState.recoveryBudgetRemainingMs = recoveryBudgetRemainingMs
   }
   syncRecoveryState()
@@ -1307,6 +1340,16 @@ export function createQwenAiResumableStream(
       && workflowContinuationAttempts < workflowContinuationAttemptLimit
     ) {
       const parentResponseId = options.getResponseId().trim()
+      // A leaked wrapper is a literal protocol violation, so a replacement
+      // branch that leaks again is the same deterministic failure. Bound the
+      // wrapper-specific replay count below the general continuation budget
+      // so repeated leaks cannot keep the request in a slow replacement loop.
+      if (
+        isQwenAiWrapperLeakError(lastError)
+        && wrapperLeakRecoveryAttempts >= wrapperLeakRecoveryAttemptLimit
+      ) {
+        failRecovery(normalizeQwenAiStreamFailure(lastError))
+      }
       if (parentResponseId) {
         const workflowRecoverySignal = startWorkflowRecoveryDeadline()
         if (!workflowRecoverySignal) {
@@ -1324,6 +1367,9 @@ export function createQwenAiResumableStream(
         releaseLinkedRecoverySignal()
         linkedRecoverySignalCleanup = linkedRecoverySignal.cleanup
         workflowContinuationAttempts += 1
+        if (isQwenAiWrapperLeakError(lastError)) {
+          wrapperLeakRecoveryAttempts += 1
+        }
         syncRecoveryState()
         ensureRecoveryBudget()
         if (!(await waitForRetry(linkedRecoverySignal.signal))) {
@@ -2853,6 +2899,10 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
     || isQwenAiStaleSessionError(error)
 }
 
+function isQwenAiWrapperLeakError(error: unknown): boolean {
+  return isObjectValue(error) && (error as { code?: unknown }).code === 'qwen_ai_wrapper_leak'
+}
+
 function createQwenAiToolValidationError(
   failure: ToolStreamValidationFailure,
 ): QwenAiUpstreamError {
@@ -4135,6 +4185,8 @@ export class QwenAiAdapter {
         { providerId: this.provider.id, accountId: this.account.id },
       )
       const requestMaxBytes = qwenAiRequestMaxBytesFromEnv()
+      const transcriptTransportPolicy = request.transcriptTransportPolicy
+        ?? qwenAiTranscriptTransportPolicyFromEnv()
       // Image generation rides the same payload builder but is an unverified
       // surface for the undocumented system_message field — keep it flattened.
       const systemPromptMode = imageGeneration ? 'flattened' : qwenAiSystemPromptModeFromEnv()
@@ -4149,6 +4201,7 @@ export class QwenAiAdapter {
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
           managedDocumentMode,
+          transcriptTransportPolicy,
           requestMaxBytes,
           systemPromptMode,
           nativeSystemPromptMaxBytes,
@@ -4161,7 +4214,9 @@ export class QwenAiAdapter {
         })
       )
       let preparedUserMessage = await scope.wait(
-        prepareUserMessage(request.messageTransport),
+        prepareUserMessage(
+          transcriptTransportPolicy.uploadEnabled ? request.messageTransport : 'inline',
+        ),
       )
 
       const fid = uuid()
@@ -4231,7 +4286,8 @@ export class QwenAiAdapter {
       // request ceiling. Qwen's document transport can preserve the complete
       // context while reducing the completion JSON before its first POST.
       if (
-        requestMaxBytes > 0
+        transcriptTransportPolicy.uploadEnabled
+        && requestMaxBytes > 0
         && payloadBytes > requestMaxBytes
         && preparedUserMessage.transport !== 'document'
       ) {
@@ -4242,7 +4298,8 @@ export class QwenAiAdapter {
       }
 
       if (
-        requestMaxBytes > 0
+        transcriptTransportPolicy.uploadEnabled
+        && requestMaxBytes > 0
         && payloadBytes > requestMaxBytes
         && request.managedToolCalling
         && preparedUserMessage.managedDocumentMode !== 'complete'
@@ -4282,6 +4339,8 @@ export class QwenAiAdapter {
         fileCount: preparedUserMessage.files.length,
         requestedMessageTransport: request.messageTransport ?? 'inline',
         messageTransport: preparedUserMessage.transport,
+        transcriptUploadEnabled: transcriptTransportPolicy.uploadEnabled,
+        transcriptExtension: transcriptTransportPolicy.extension,
         managedDocumentMode: preparedUserMessage.managedDocumentMode,
         managedToolCalling: request.managedToolCalling === true,
         thinkingEnabled: featureMode.thinkingEnabled,
@@ -4454,6 +4513,8 @@ export class QwenAiAdapter {
         uploader,
         {
           transport: request.messageTransport,
+          transcriptTransportPolicy: request.transcriptTransportPolicy
+            ?? qwenAiTranscriptTransportPolicyFromEnv(),
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
           requestMaxBytes: qwenAiRequestMaxBytesFromEnv(),
@@ -5669,9 +5730,14 @@ export class QwenAiStreamHandler {
     const recoverFromSemanticEmpty = (error: QwenAiUpstreamError, allowBeforeTerminal = false): void => {
       if (finalChunkSent || semanticRecoveryInFlight) return
       const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
+      // A leaked wrapper is a deterministic literal protocol violation: unlike
+      // provisional semantic defects, no later delta can retract it. Holding
+      // the defective branch alive only parks the failure behind minutes of
+      // provider generation, so a wrapper leak replaces the branch at once.
       const deferUntilTerminal = !sawUpstreamCompletion
         && !allowBeforeTerminal
         && !isQwenAiStaleSessionError(error)
+        && error.code !== 'qwen_ai_wrapper_leak'
         && error.code !== 'qwen_ai_response_ended'
         && error.code !== 'qwen_ai_upstream_busy'
       if (deferUntilTerminal) {

@@ -258,8 +258,19 @@ function loadChatRoute({
         delete: () => {},
       },
     },
-    '../toolCalling/assistantOutputBoundary': { createAssistantOutputBoundaryStream },
+    '../toolCalling/assistantOutputBoundary': {
+      createAssistantOutputBoundaryStream,
+      guardAssistantOutputCompletion: completion => completion,
+    },
     '../qwenAiAccountPolicy': { isQwenAiAccountFault, qwenAiAccountRetryScope },
+    '../qwenBusyFailover': {
+      createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    '../replayImageSlimming': {
+      slimQwenAiReplayImages: messages => messages,
+      qwenAiImageSlimModeFromEnv: () => 'off',
+      shouldSlimQwenAiAttemptImages: () => false,
+    },
   }
   const testRequire = specifier => {
     if (specifier in localModules) return localModules[specifier]

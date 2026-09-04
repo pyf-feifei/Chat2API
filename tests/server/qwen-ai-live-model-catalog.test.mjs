@@ -52,22 +52,25 @@ test('Qwen3.8-Max aliases resolve two independent switches and normalize upstrea
   } = loadTypeScriptModule('src/main/providers/qwen-ai-model-mode.ts')
 
   const cases = [
-    ['Qwen3.8-Max', true, false, false],
-    ['Qwen3.8-Max_Fast', false, false, true],
-    ['Qwen3.8-Max_Auto', true, true, true],
-    ['Qwen3.8-Max_Thinking', true, false, true],
-    ['Qwen3.8-Max_TeT_AtT', true, true, true],
-    ['Qwen3.8-Max_TeF_AtT', false, true, true],
-    ['Qwen3.8-Max_TeT_AtF', true, false, true],
-    ['Qwen3.8-Max_TeF_AtF', false, false, true],
+    // [model, thinkingEnabled, autoThinking, thinkingMode, isExplicit, precedence]
+    ['Qwen3.8-Max', true, true, 'Auto', false, 'floating'],
+    ['Qwen3.8-Max_Fast', false, false, 'Fast', true, 'pinned'],
+    ['Qwen3.8-Max_Auto', true, true, 'Auto', true, 'floating'],
+    ['Qwen3.8-Max_Thinking', true, false, 'Thinking', true, 'pinned'],
+    ['Qwen3.8-Max_TeT_AtT', true, true, 'Auto', true, 'pinned'],
+    ['Qwen3.8-Max_TeF_AtT', false, true, 'Fast', true, 'pinned'],
+    ['Qwen3.8-Max_TeT_AtF', true, false, 'Thinking', true, 'pinned'],
+    ['Qwen3.8-Max_TeF_AtF', false, false, 'Fast', true, 'pinned'],
   ]
 
-  for (const [model, thinkingEnabled, autoThinking, isExplicit] of cases) {
+  for (const [model, thinkingEnabled, autoThinking, thinkingMode, isExplicit, precedence] of cases) {
     assert.deepEqual(resolveQwenAiModelMode(model), {
       baseModel: 'Qwen3.8-Max',
       thinkingEnabled,
       autoThinking,
+      thinkingMode,
       isExplicit,
+      precedence,
     }, model)
     assert.equal(normalizeQwenAiModelModeName(model), 'Qwen3.8-Max', model)
   }

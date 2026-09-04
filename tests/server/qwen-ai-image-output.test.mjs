@@ -60,6 +60,11 @@ function loadQwenAiModule() {
       qwenAiSystemPromptModeFromEnv: () => 'flattened',
       qwenAiNativeSystemMaxBytesFromEnv: () => 0,
       qwenAiToolProtocolChannelFromEnv: () => 'inline',
+      qwenAiTranscriptTransportPolicyFromEnv: () => ({
+        enabled: false,
+        documentExtension: 'txt',
+        inlineFallback: true,
+      }),
     },
     '../utils/streamToolHandler': {
       createBaseChunk: (id, model, created) => ({
@@ -95,6 +100,24 @@ function loadQwenAiModule() {
     '../toolCalling/protocols/shared': {
       normalizeArguments: value => value,
       getToolArgumentValidationIssues: () => ({ missingRequired: [], unexpected: [] }),
+    },
+    '../qwenAiAccountPolicy': {
+      consumeQwenAiAccountNeutralReplaySlot: () => true,
+    },
+    '../qwenAiAccountPolicy.ts': {
+      consumeQwenAiAccountNeutralReplaySlot: () => true,
+    },
+    '../qwenAiProgressIntent.ts': {
+      isProgressStyleManagedAnswer: () => false,
+      isToolDenialManagedAnswer: () => false,
+    },
+    './qwenAiProgressIntent': {
+      isProgressStyleManagedAnswer: () => false,
+      isToolDenialManagedAnswer: () => false,
+    },
+    './qwenAiProgressIntent.ts': {
+      isProgressStyleManagedAnswer: () => false,
+      isToolDenialManagedAnswer: () => false,
     },
     './qwen-ai-native-tools': {
       isCompleteJsonText: () => true,

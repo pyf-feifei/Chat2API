@@ -64,8 +64,14 @@ services:
       # into the <function_calls> wire format.
       CHAT2API_QWEN_AI_MANAGED_PROTOCOL: ${CHAT2API_QWEN_AI_MANAGED_PROTOCOL:-qwen_hermes}
       # This UTF-8 JSON target triggers document offload; it is not a request ceiling.
-      # Set 0 to disable automatic offload.
+      # Set 0 to disable automatic offload. Transcript upload can be disabled
+      # independently below, which keeps the complete transcript inline.
       CHAT2API_QWEN_AI_REQUEST_MAX_BYTES: ${CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160}
+      # Controls Chat2API-generated transcript documents only; original user
+      # attachments remain supported. Set false to send the transcript inline.
+      CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED: ${CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED:-true}
+      # Synthetic transcript format: txt (default) or md.
+      CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION: ${CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION:-txt}
       # Inline tail (bytes) of the archived transcript kept on the active turn
       # when complete managed document transport archives the pending user
       # message, so the operative task stays visible without a file read.

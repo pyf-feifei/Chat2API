@@ -335,14 +335,22 @@ each request it is also clamped to the remaining `QWEN_AI_REQUEST_TIMEOUT_MS`
 Before the first Qwen completion POST, Chat2API measures the serialized UTF-8
 JSON body. `CHAT2API_QWEN_AI_REQUEST_MAX_BYTES` defaults to `92160` bytes as a
 document-offload target, not a local client request limit (`0` disables
-automatic offload). An oversized request first moves archived history and
-complete managed tool documentation to Qwen documents while retaining the
-active task and tool exchange inline. If that hybrid layout is still above the
-target, the complete managed conversation moves to the transcript document and
-only compact tool control remains inline. The original client messages,
-completed tool results, and validation schemas are preserved. A body that still
-exceeds the target after this reduction is submitted to Qwen instead of being
-rejected locally with HTTP 413.
+automatic offload). `CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED` defaults to
+`true` and controls only Chat2API-generated conversation transcript documents;
+set it to `false` to keep the complete transcript inline. This does not disable
+uploads of original user attachments. When transcript upload is enabled, an
+oversized request first moves archived history and complete managed tool
+documentation to Qwen documents while retaining the active task and tool
+exchange inline. If that hybrid layout is still above the target, the complete
+managed conversation moves to the transcript document and only compact tool
+control remains inline. The original client messages, completed tool results,
+and validation schemas are preserved. `CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION`
+accepts `txt` (default) or `md`; these use `text/plain` and `text/markdown`
+respectively. A body that still exceeds the target after this reduction is
+submitted to Qwen instead of being rejected locally with HTTP 413. With
+transcript upload disabled, the body may remain above the offload target and is
+still submitted directly as text, subject to Qwen's own request and context
+limits.
 In complete managed document mode the entire conversation (including the
 pending user message) moves to the transcript document. So the operative task
 stays visible without a file read, Chat2API keeps an inline tail excerpt of

@@ -89,6 +89,7 @@ function loadQwenAiStreamHandler(overrides = {}) {
       qwenAiSystemPromptModeFromEnv: () => 'flattened',
       qwenAiNativeSystemMaxBytesFromEnv: () => 0,
       qwenAiToolProtocolChannelFromEnv: () => 'inline',
+      qwenAiTranscriptTransportPolicyFromEnv: () => ({ uploadEnabled: true, extension: 'txt' }),
     },
     '../utils/streamToolHandler': {
       createBaseChunk: (id, model, created) => ({
@@ -6011,7 +6012,9 @@ test('Qwen AI escalates an over-target managed document and still submits it ups
 
 test('Qwen AI request payload budget can be disabled through configuration', async () => {
   const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  const previousUploadEnabled = process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED
   process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = '0'
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED = 'true'
   const seenBudgets = []
   let postCalls = 0
   const responseStream = new PassThrough()
@@ -6056,6 +6059,66 @@ test('Qwen AI request payload budget can be disabled through configuration', asy
     responseStream.destroy()
     if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
     else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+    if (previousUploadEnabled === undefined) delete process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED
+    else process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED = previousUploadEnabled
+  }
+})
+
+test('Qwen AI disables document escalation when transcript upload is disabled', async () => {
+  const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  const previousUploadEnabled = process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED
+  process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = '1024'
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED = 'false'
+  const preparationTransports = []
+  let postCalls = 0
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      qwenAiTranscriptTransportPolicyFromEnv: () => ({ uploadEnabled: false, extension: 'txt' }),
+      prepareQwenAiMultimodalMessage: async (_messages, _uploader, options) => {
+        preparationTransports.push(options.transport)
+        return {
+          content: 'x'.repeat(8_000),
+          files: [],
+          transport: options.transcriptTransportPolicy?.uploadEnabled === false ? 'inline' : 'document',
+          transcriptUtf8Bytes: 8_002,
+          inlineUtf8Bytes: 8_002,
+        }
+      },
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'disabled-transcript-upload-chat'
+    adapter.postWithRefreshRetry = async () => {
+      postCalls += 1
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    await adapter.chatCompletion({
+      model: 'client-configured-model',
+      messages: [{ role: 'user', content: 'active request' }],
+      messageTransport: 'document',
+      transcriptTransportPolicy: { uploadEnabled: false, extension: 'txt' },
+      managedToolCalling: true,
+    })
+    assert.deepEqual(preparationTransports, ['inline'])
+    assert.equal(postCalls, 1)
+  } finally {
+    responseStream.destroy()
+    if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+    else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+    if (previousUploadEnabled === undefined) delete process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED
+    else process.env.CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED = previousUploadEnabled
   }
 })
 
@@ -8651,6 +8714,207 @@ test('Qwen AI managed stream discards a tool-result wrapper leak before continui
 
 const MANAGED_TOOL_RESULT_WRAPPER = '<|CHAT2API|tool_result tool_call_id="call_fake"><![CDATA[fabricated wrapper result]]></|CHAT2API|tool_result>'
 
+test('Qwen AI replaces a wrapper-leak branch immediately instead of parking it until terminal output', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: declaredNativeToolFragments,
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    wrapperLeakManagedPlan('immediate wrapper replacement test'),
+  )
+  handler.setChatId('immediate-wrapper-chat')
+  const continuationErrorCodes = []
+  let continuationStarted
+  const continuationReady = new Promise(resolve => { continuationStarted = resolve })
+  let continuationBeforeTerminal = false
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => { throw new Error('wrapper recovery must use workflow continuation') },
+    continueWorkflow: async (_parentId, recoveryError) => {
+      continuationErrorCodes.push(recoveryError?.code)
+      // The leaked branch is still mid-generation: it has sent typing deltas
+      // but no finished/[DONE] terminal marker yet.
+      continuationBeforeTerminal = !initial.writableEnded
+      continuationStarted()
+      setImmediate(() => {
+        continued.end([
+          `data: ${JSON.stringify({ 'response.created': { response_id: 'immediate-corrected', response_index: 0 } })}\n\n`,
+          `data: ${JSON.stringify({ response_id: 'immediate-corrected', choices: [{ delta: {
+            phase: 'answer',
+            status: 'finished',
+            tool_calls: [{
+              id: 'immediate-corrected-call',
+              function: { name: 'declared_tool', arguments: '{"verified":true}' },
+            }],
+          } }] })}\n\ndata: [DONE]\n\n`,
+        ].join(''))
+      })
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  // The wrapper marker completes on this typing delta, but no terminal frame is
+  // ever written to the leaked source branch.
+  initial.write([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'leaked-immediate', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'leaked-immediate', choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      content: `preface ${MANAGED_TOOL_RESULT_WRAPPER} trailing prose`,
+    } }] })}\n\n`,
+  ].join(''))
+
+  await continuationReady
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(continuationErrorCodes, ['qwen_ai_wrapper_leak'])
+  assert.equal(continuationBeforeTerminal, true)
+  assert.equal(failure, undefined)
+  assert.doesNotMatch(body, /CHAT2API\|tool_result|fabricated wrapper result|trailing prose/)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.doesNotMatch(body, /event: error/)
+})
+
+test('Qwen AI fails fast once the wrapper-leak recovery budget is spent', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: declaredNativeToolFragments,
+  })
+  const initial = new PassThrough()
+  const relapsed = new PassThrough()
+  initial.on('error', () => {})
+  relapsed.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    wrapperLeakManagedPlan('wrapper budget exhaustion test'),
+  )
+  handler.setChatId('wrapper-budget-chat')
+  const continuationCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => { throw new Error('wrapper recovery must use workflow continuation') },
+    continueWorkflow: async (_parentId, recoveryError) => {
+      continuationCalls.push(recoveryError?.code)
+      setImmediate(() => {
+        relapsed.write([
+          `data: ${JSON.stringify({ 'response.created': { response_id: 'relapsed-branch', response_index: 0 } })}\n\n`,
+          `data: ${JSON.stringify({ response_id: 'relapsed-branch', choices: [{ delta: {
+            phase: 'answer',
+            status: 'typing',
+            content: `relapsed ${MANAGED_TOOL_RESULT_WRAPPER} again`,
+          } }] })}\n\n`,
+        ].join(''))
+      })
+      return { data: relapsed }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.write([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'leaked-budget', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'leaked-budget', choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      content: `first ${MANAGED_TOOL_RESULT_WRAPPER} leak`,
+    } }] })}\n\n`,
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  // One replacement branch is attempted; the relapse must not buy another.
+  assert.deepEqual(continuationCalls, ['qwen_ai_wrapper_leak'])
+  assert.equal(failure?.code, 'qwen_ai_wrapper_leak')
+  assert.equal(failure?.status, 422)
+  assert.match(body, /event: error/)
+  assert.match(body, /"retryable":false/)
+})
+
+test('Qwen AI wrapper-leak recovery budget honors deployment configuration', () => {
+  const { qwenAiWrapperLeakRecoveryAttemptsFromEnv } = loadQwenAiStreamHandler()
+  const previous = process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS
+
+  try {
+    const cases = [
+      { raw: undefined, expected: 1 },
+      { raw: '', expected: 1 },
+      { raw: 'auto', expected: 1 },
+      { raw: '0', expected: 0 },
+      { raw: '2', expected: 2 },
+      { raw: '5', expected: 2 },
+      { raw: '-1', expected: 1 },
+      { raw: 'not-a-number', expected: 1 },
+    ]
+    for (const { raw, expected } of cases) {
+      if (raw === undefined) {
+        delete process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS
+      } else {
+        process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS = raw
+      }
+      assert.equal(
+        qwenAiWrapperLeakRecoveryAttemptsFromEnv(),
+        expected,
+        `raw=${raw}`,
+      )
+    }
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS
+    } else {
+      process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS = previous
+    }
+  }
+})
+
+test('Qwen AI managed tool prompts forbid reproducing result wrappers', () => {
+  const tools = [{ name: 'declared_tool', parameters: {}, source: 'openai' }]
+  const suppression = /tool results are input only/i
+
+  assert.match(realGetToolProtocol('qwen_hermes').renderPrompt(tools), suppression)
+  assert.match(realGetToolProtocol('qwen_hermes').renderRecoveryPrompt(tools), suppression)
+  assert.match(realGetToolProtocol('qwen_hermes').renderContinuationReminder(tools), suppression)
+})
+
+
+
 function wrapperLeakManagedPlan(reason, shouldParseResponse = true) {
   return {
     mode: 'managed',
@@ -8923,6 +9187,7 @@ test('Qwen AI blocks tool-result wrappers in live reasoning content', async () =
   assert.equal(failure?.status, 422)
   assert.equal(failure?.code, 'qwen_ai_wrapper_leak')
   assert.match(body, /event: error/)
+  assert.match(body, /"retryable":false/)
 })
 
 test('Qwen AI detects a wrapper introduced by a rewritten cumulative summary', async () => {

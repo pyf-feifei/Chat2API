@@ -1,5 +1,5 @@
-import type { AccountSelection, ForwardResult } from './types'
-import { markAccountErrorIfPermanent } from './accountStatus'
+import type { AccountSelection, ForwardResult } from './types.ts'
+import { markAccountErrorIfPermanent } from './accountStatus.ts'
 
 export interface AccountFailoverAttempt {
   selection: AccountSelection

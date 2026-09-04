@@ -24,8 +24,9 @@ test('Qwen AI resolves explicit model modes before translated client thinking pa
   assert.match(source, /resolveQwenAiFeatureMode/)
   assert.match(source, /resolveQwenAiModelMode\(requestedModel\)/)
   assert.match(source, /if \(modelMode\.thinkingEnabled !== undefined\)/)
-  assert.match(source, /thinkingEnabled:\s*modelMode\.thinkingEnabled/)
-  assert.match(source, /autoThinking:\s*modelMode\.autoThinking \?\? modelMode\.thinkingEnabled/)
+  assert.match(source, /thinkingEnabled:\s*effective\.thinkingEnabled/)
+  assert.match(source, /autoThinking:\s*effective\.autoThinking \?\? effective\.thinkingEnabled/)
+  assert.match(source, /applyQwenAiEffortToModelMode\(modelMode, reasoningEffort\)/)
 })
 
 test('load balancer avoids a failed Qwen AI account on the next selection', () => {

@@ -67,6 +67,21 @@ test('Qwen AI document upload waits for parse completion with a bounded timeout'
   assert.doesNotMatch(source, /const PARSE_POLL_ATTEMPTS = 5/)
 })
 
+test('Qwen AI transcript transport exposes upload and format controls', () => {
+  const filesSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
+  const composeSource = fs.readFileSync('docker-compose.yml', 'utf8')
+  const dockerfileSource = fs.readFileSync('Dockerfile', 'utf8')
+
+  assert.match(filesSource, /CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED/)
+  assert.match(filesSource, /CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION/)
+  assert.match(filesSource, /text\/markdown/)
+  assert.match(filesSource, /transcriptTransportPolicy\.uploadEnabled/)
+  assert.match(composeSource, /CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED/)
+  assert.match(composeSource, /CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION/)
+  assert.match(dockerfileSource, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=true/)
+  assert.match(dockerfileSource, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=txt/)
+})
+
 test('Qwen AI long text documents add generic evidence excerpts near the user request', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
 
@@ -318,6 +333,8 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-600000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-840000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED:-true\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION:-txt\}/)
   assert.match(source, /CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:\s*\$\{CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240\}/)
   assert.match(source, /CHAT2API_QWEN_AI_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_RETRY_COUNT:-1\}/)
   assert.match(source, /CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-0\}/)
@@ -349,6 +366,8 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=true/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=txt/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RETRY_COUNT=1/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=0/)

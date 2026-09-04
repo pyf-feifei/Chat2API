@@ -41,7 +41,10 @@ import { responsesConversationStore } from '../responses/store'
 import { responsesSessionLock } from '../responses/sessionLock'
 import { detectResponsesToolLoop, responsesToolLoopCorrectionMessage } from '../responses/toolLoopGuard'
 import { createResponsesStreamTransform } from '../responses/stream'
-import { createAssistantOutputBoundaryStream } from '../toolCalling/assistantOutputBoundary'
+import {
+  createAssistantOutputBoundaryStream,
+  guardAssistantOutputCompletion,
+} from '../toolCalling/assistantOutputBoundary'
 import { classifyChatRequest } from '../requestIntent'
 import { estimateQwenAiRequestInputTokens } from '../qwenAiCompactionBoundary'
 import {
@@ -646,6 +649,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         workflowContinuationAttempts: 0,
         freshChatRestartAttempts: 0,
         accountNeutralReplayAttempts: 0,
+        wrapperLeakRecoveryAttempts: 0,
       }
     : undefined
   const qwenAiSessionBridgeForSelection = (
@@ -1308,7 +1312,11 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     }
-    const response = await chatCompletionToResponse(result.body ?? fallbackCompletion, request, {
+    const guardedBody = guardAssistantOutputCompletion(
+      result.body ?? fallbackCompletion,
+      null,
+    )
+    const response = await chatCompletionToResponse(guardedBody, request, {
       id: responseId,
       model: actualModel,
       createdAt,

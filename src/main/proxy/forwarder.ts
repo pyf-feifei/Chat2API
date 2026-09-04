@@ -36,11 +36,15 @@ import {
   isQwenAiTransientTransportError,
   qwenAiRequestTimeoutMsFromEnv,
   qwenAiResponsesContinuationRetryAttemptsFromEnv,
+  qwenAiTranscriptTransportPolicyFromEnv,
   resolveQwenAiNativeContinuationSystemPrompt,
   type QwenAiOutputStream,
   createQwenAiResumableStream,
 } from './adapters/qwen-ai'
-import type { QwenAiMessageTransport } from './adapters/qwen-ai-files'
+import type {
+  QwenAiMessageTransport,
+  QwenAiTranscriptTransportPolicy,
+} from './adapters/qwen-ai-files'
 import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
@@ -60,7 +64,7 @@ import {
 } from './qwenAiRequestGovernor'
 import { BufferedSseError, bufferValidatedSseStream } from './utils/validatedSseStream'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from './utils/errors'
-import { markAccountErrorIfPermanent } from './accountStatus'
+import { markAccountErrorIfPermanent } from './accountStatus.ts'
 import { sessionManager } from './sessionManager'
 import {
   createContextManagementService,
@@ -916,6 +920,8 @@ type QwenAiForwardOptions = {
   requestDeadlineAt?: number
   /** Complete-message transport selected from an observed upstream response. */
   messageTransport?: QwenAiMessageTransport
+  /** Snapshot of the synthetic transcript upload policy for this request. */
+  transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
 }
 
 /**
@@ -992,6 +998,7 @@ type ForwardAttemptOptions = {
   qwenAiRequestTimeoutMs?: number
   qwenAiRequestDeadlineAt?: number
   qwenAiMessageTransport?: QwenAiMessageTransport
+  qwenAiTranscriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   attempt?: number
 }
 
@@ -1324,6 +1331,9 @@ export class RequestForwarder {
     let qwenAiBusyRetries = 0
     let nextRetryDelayMs = 0
     let qwenAiMessageTransport: QwenAiMessageTransport = 'inline'
+    const qwenAiTranscriptTransportPolicy = isQwenAiProvider
+      ? qwenAiTranscriptTransportPolicyFromEnv()
+      : undefined
 
     const scheduleQwenAiBusyRetry = (result: ForwardResult): boolean => {
       if (
@@ -1508,6 +1518,7 @@ export class RequestForwarder {
               : Math.max(1, qwenAiRequestDeadline - Date.now()),
             qwenAiRequestDeadlineAt: qwenAiRequestDeadline,
             qwenAiMessageTransport,
+            qwenAiTranscriptTransportPolicy,
             attempt: attempt + 1,
           },
         )
@@ -2569,6 +2580,7 @@ export class RequestForwarder {
             requestTimeoutMs: options.qwenAiRequestTimeoutMs,
             requestDeadlineAt: options.qwenAiRequestDeadlineAt,
             messageTransport: options.qwenAiMessageTransport,
+            transcriptTransportPolicy: options.qwenAiTranscriptTransportPolicy,
           },
         )
       }
@@ -2590,6 +2602,7 @@ export class RequestForwarder {
         requestTimeoutMs: options.qwenAiRequestTimeoutMs,
         requestDeadlineAt: options.qwenAiRequestDeadlineAt,
         messageTransport: options.qwenAiMessageTransport,
+        transcriptTransportPolicy: options.qwenAiTranscriptTransportPolicy,
       }),
       {
         signal: context.signal,
@@ -2644,7 +2657,7 @@ export class RequestForwarder {
     context: ProxyContext | undefined,
     plan: ReturnType<typeof planQwenAiCompactionChunks>,
     capability?: ReturnType<typeof findQwenAiModelCapability>,
-    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'requestDeadlineAt' | 'messageTransport'> = {},
+    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'requestDeadlineAt' | 'messageTransport' | 'transcriptTransportPolicy'> = {},
   ): Promise<ForwardResult> {
     const result = await this.executeQwenAiCompactionInChunks(
       request,
@@ -2686,7 +2699,7 @@ export class RequestForwarder {
     context: ProxyContext | undefined,
     plan: ReturnType<typeof planQwenAiCompactionChunks>,
     capability?: ReturnType<typeof findQwenAiModelCapability>,
-    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'requestDeadlineAt' | 'messageTransport'> = {},
+    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'requestDeadlineAt' | 'messageTransport' | 'transcriptTransportPolicy'> = {},
   ): Promise<ForwardResult> {
     const elapsed = () => Date.now() - startTime
     const failure = (
@@ -2968,6 +2981,7 @@ export class RequestForwarder {
                   requestTimeoutMs: options.requestTimeoutMs,
                   requestDeadlineAt: options.requestDeadlineAt,
                   messageTransport: options.messageTransport,
+                  transcriptTransportPolicy: options.transcriptTransportPolicy,
                 },
               ),
               {
@@ -3561,6 +3575,7 @@ export class RequestForwarder {
           requestTimeoutMs: options.requestTimeoutMs,
           requestDeadlineAt: options.requestDeadlineAt,
           messageTransport: options.messageTransport,
+          transcriptTransportPolicy: options.transcriptTransportPolicy,
         },
       )
     }
@@ -3635,6 +3650,7 @@ export class RequestForwarder {
           ? options.requestTimeoutMs
           : Math.max(1, options.requestDeadlineAt - Date.now()),
         messageTransport: options.messageTransport,
+        transcriptTransportPolicy: options.transcriptTransportPolicy,
       })
       const sessionBridge = context?.qwenAiSessionBridge
       const continuation = sessionBridge?.continuation
@@ -3702,6 +3718,7 @@ export class RequestForwarder {
             // which becomes an expensive document upload for long sessions.
             chatInProgressRetryAttempts: qwenAiResponsesContinuationRetryAttemptsFromEnv(),
             messageTransport: options.messageTransport,
+            transcriptTransportPolicy: options.transcriptTransportPolicy,
             signal: context?.signal,
             deadlineAt: options.requestDeadlineAt,
           })
@@ -3979,13 +3996,15 @@ export class RequestForwarder {
                   originalModel: providerRequest.model,
                   content: workflowContinuationContent,
                   nativeSystemPrompt: resolveQwenAiNativeContinuationSystemPrompt(transformed.messages),
+                  messageTransport: options.messageTransport,
+                  transcriptTransportPolicy: options.transcriptTransportPolicy,
                   enable_thinking: providerRequest.enable_thinking !== undefined
                     ? providerRequest.enable_thinking
                     : providerRequest.reasoning_effort !== undefined
                       ? Boolean(providerRequest.reasoning_effort)
                       : undefined,
-                    reasoning_effort: providerRequest.reasoning_effort,
-                    reasoningEffort: providerRequest.reasoningEffort,
+                  reasoning_effort: providerRequest.reasoning_effort,
+                  reasoningEffort: providerRequest.reasoningEffort,
                   thinking_budget: providerRequest.thinking_budget,
                   managedToolCalling: true,
                   signal: recoverySignal || context?.signal,

@@ -296,6 +296,8 @@ export interface QwenAiLogicalRecoveryState {
   workflowRecoveryBoundedByRequestDeadline?: boolean
   /** Private semantic branch replay attempts consumed across accounts. */
   accountNeutralReplayAttempts: number
+  /** Replacement branches spent on leaked managed tool-result wrappers. */
+  wrapperLeakRecoveryAttempts: number
 }
 
 export interface ProxyContext {

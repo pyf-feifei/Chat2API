@@ -41,6 +41,63 @@ const GENERIC_TOOL_CALL_STARTS = [
   '<antml:function_calls>',
 ] as const
 
+// These markers are only treated as protocol failures at an output boundary.
+// They are deliberately not used by the input-history sanitizer, where the
+// same strings may be ordinary documentation or user-provided data.
+const UNPROTECTED_TOOL_MARKUP_STARTS = [
+  ...GENERIC_TOOL_CALL_STARTS,
+  '<tool_call=',
+  '<function>',
+  '<function ',
+  '<function=',
+  '<parameter>',
+  '<parameter ',
+  '<parameter=',
+  '<invoke>',
+  '<invoke ',
+  '<invoke=',
+  '</tool_call>',
+  '</function>',
+  '</parameter>',
+  '</invoke>',
+] as const
+
+// Qwen Hermes protects a valid call envelope, a line-delimited
+// `<function=name>` call, and the platform dialects the model drifts to
+// (`<tool_calls>`, `<tool_caller>`, `<function_calls>`). A serialized call
+// always opens with one of these malformed opener shapes; closers are left
+// to the parser so valid dialect blocks are never shadowed.
+const MALFORMED_QWEN_TOOL_MARKUP_STARTS = [
+  '<tool_call=',
+  '<function>',
+  '<function ',
+  '<parameter>',
+  '<parameter ',
+  '<invoke>',
+  '<invoke ',
+  '<invoke=',
+] as const
+
+const UNPROTECTED_TOOL_MARKUP_PREFIXES = [
+  ...UNPROTECTED_TOOL_MARKUP_STARTS,
+  '<tool_call',
+  '<function',
+  '<parameter',
+  '<invoke',
+  '</tool_call',
+  '</function',
+  '</parameter',
+  '</invoke',
+] as const
+
+const MALFORMED_QWEN_TOOL_MARKUP_PREFIXES = [
+  ...MALFORMED_QWEN_TOOL_MARKUP_STARTS,
+  '<tool_call',
+  '<function',
+  '<parameter',
+  '<invoke',
+] as const
+
 const PROTECTED_TOOL_CALL_MARKERS: Partial<Record<
   ToolProtocolId,
   { starts: readonly string[]; ends: readonly string[] }
@@ -125,6 +182,7 @@ export class ManagedToolResultGuard {
   private readonly toolCallStarts: readonly string[]
   private readonly toolCallEnds: readonly string[]
   private readonly rejectUnprotectedToolCalls: boolean
+  private readonly rejectMalformedProtectedToolCalls: boolean
   private readonly bufferUntilFlush: boolean
 
   constructor(protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml') {
@@ -134,6 +192,7 @@ export class ManagedToolResultGuard {
     this.toolCallStarts = markers?.starts ?? []
     this.toolCallEnds = markers?.ends ?? []
     this.rejectUnprotectedToolCalls = protectedToolCallProtocol === null
+    this.rejectMalformedProtectedToolCalls = protectedToolCallProtocol === 'qwen_hermes'
     // Responses-style calls are JSON rather than a delimited text protocol.
     // Hold the candidate until it can be parsed structurally so a literal
     // wrapper inside `arguments` is not mistaken for top-level assistant text.
@@ -179,7 +238,7 @@ export class ManagedToolResultGuard {
         this.buffer = ''
         return { content, suppressed: true }
       }
-      const candidate = findEarliestMarker(this.buffer, GENERIC_TOOL_CALL_STARTS)
+      const candidate = findEarliestUnprotectedMarkup(this.buffer)
       if (candidate) {
         this.wrapperLeakDetected = true
         this.buffer = ''
@@ -188,6 +247,16 @@ export class ManagedToolResultGuard {
     }
 
     while (this.buffer) {
+      if (this.rejectMalformedProtectedToolCalls && this.state === 'text') {
+        const malformed = findEarliestMalformedQwenMarkup(this.buffer, final)
+        const protectedStart = findEarliestMarker(this.buffer, this.toolCallStarts)
+        if (malformed && (!protectedStart || malformed.index < protectedStart.index)) {
+          this.wrapperLeakDetected = true
+          this.buffer = ''
+          return { content, suppressed: true }
+        }
+      }
+
       if (this.state === 'tool_result') {
         suppressed = true
         const endIndex = this.buffer.indexOf(this.activeToolResultEnd)
@@ -326,6 +395,11 @@ export class ManagedToolResultGuard {
 
       const retained = longestSuffixPrefixLength(this.buffer, [
         ...this.toolCallStarts,
+        ...(this.rejectUnprotectedToolCalls
+          ? UNPROTECTED_TOOL_MARKUP_PREFIXES
+          : this.rejectMalformedProtectedToolCalls
+            ? MALFORMED_QWEN_TOOL_MARKUP_PREFIXES
+            : []),
         MARKDOWN_FENCE,
         ...TOOL_RESULT_STARTS,
       ])
@@ -381,6 +455,40 @@ function findNextTopLevelStart(
     return { ...toolCall, kind: 'tool_call' }
   }
   return undefined
+}
+
+function findEarliestUnprotectedMarkup(
+  content: string,
+): { index: number; marker: string } | undefined {
+  return findEarliestMarker(content, UNPROTECTED_TOOL_MARKUP_STARTS)
+}
+
+function findEarliestMalformedQwenMarkup(
+  content: string,
+  final: boolean,
+): { index: number; marker: string } | undefined {
+  const candidates = MALFORMED_QWEN_TOOL_MARKUP_STARTS.flatMap(marker => {
+    const index = content.indexOf(marker)
+    if (index === -1) return []
+    const after = content[index + marker.length]
+    if (!final && after === undefined) return []
+    return [{ index, marker }]
+  })
+
+  // `<function=name>` is valid Hermes only as a line-delimited bare call.
+  // Inline forms are provider markup emitted as assistant prose and must not
+  // cross this boundary as visible text.
+  let searchIndex = 0
+  while (searchIndex < content.length) {
+    const index = content.indexOf('<function=', searchIndex)
+    if (index === -1) break
+    const lineStart = content.lastIndexOf('\n', index - 1) + 1
+    const indentation = content.slice(lineStart, index)
+    if (!/^ {0,3}$/.test(indentation)) candidates.push({ index, marker: '<function=' })
+    searchIndex = index + '<function='.length
+  }
+
+  return candidates.sort((a, b) => a.index - b.index)[0]
 }
 
 function findToolResultStart(

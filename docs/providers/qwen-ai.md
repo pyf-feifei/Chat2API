@@ -57,6 +57,31 @@
 | Qwen3-Omni-Flash | qwen3-omni-flash-2025-12-01 | Omni |
 | Qwen2.5-Max | qwen-max-latest | 低版本 |
 
+## 超长会话传输
+
+超出 `CHAT2API_QWEN_AI_REQUEST_MAX_BYTES`（默认 `92160` 字节）的会话默认会把 Chat2API 生成的完整 transcript 作为文件上传，以减小 Qwen completion 请求体。可在 Docker 环境中配置：
+
+```env
+CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=true
+CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=txt
+```
+
+`CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION` 支持 `txt`（默认，MIME 为 `text/plain`）或 `md`（MIME 为 `text/markdown`）。`CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=false` 会关闭 Chat2API 生成的 transcript 文件上传，强制把完整会话直接放在文本请求中；这不会关闭用户原始图片、音频、视频或其他附件的上传。关闭上传后，请求体可能超过 offload target，并受 Qwen 自身的请求体和上下文限制影响。`.md` 的服务端解析行为可能与 `.txt` 不同，遇到兼容性问题时建议恢复使用 `txt`。
+
+## 管理工具结果包装泄漏恢复
+
+个别模型（尤其在长思考的 managed tool calling 会话中）会把 Chat2API 的内部 tool-result 包装语法复述进 assistant 输出。代理会在 delta 级检测并剥离这些泄漏文本，并按如下策略恢复：
+
+- 泄漏一旦确认（字面协议违规，不会被后续输出撤销），立即替换当前生成分支，而不是等 provider 终端标记——单次尝试从数分钟降到一次重放的耗时。
+- 替换分支若再次泄漏，则快速失败（422 `qwen_ai_wrapper_leak`，`retryable:false` 一并透传给客户端），避免慢速重放循环耗尽整个恢复预算。
+- 每个逻辑请求的泄漏重放次数可用环境变量调节：
+
+```env
+CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=1
+```
+
+取值为 `0`（禁用泄漏重放，检测即失败）、`1`（默认）或 `2`（上限）；其他值回退为 `1`。
+
 ## 适配状态
 
 已适配：国际版网页对话、流式对话、非流式对话、多轮会话、账号级清理对话记录、思考模式后缀、模型别名。

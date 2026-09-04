@@ -41,7 +41,13 @@ const toolCallSessionStoreModule = loadTypeScriptModule(
   'src/main/proxy/qwenAiToolCallSessionStore.ts',
   { './toolCalling/workflowHeuristics': workflowHeuristics },
 )
-const accountFailover = loadTypeScriptModule('src/main/proxy/accountFailover.ts')
+const accountFailover = loadTypeScriptModule(
+  'src/main/proxy/accountFailover.ts',
+  {
+    './accountStatus': { markAccountErrorIfPermanent: async () => {} },
+    './accountStatus.ts': { markAccountErrorIfPermanent: async () => {} },
+  },
+)
 
 const tools = [{
   type: 'function',
@@ -213,6 +219,20 @@ function loadChatRouteHarness(options = {}) {
       forwardWithAccountFailover: accountFailover.forwardWithAccountFailover,
       resolveAccountFailoverLimit: accountFailover.resolveAccountFailoverLimit,
     },
+    '../qwenBusyFailover': {
+      createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    '../replayImageSlimming': {
+      slimQwenAiReplayImages: messages => messages,
+      qwenAiImageSlimModeFromEnv: () => 'off',
+      shouldSlimQwenAiAttemptImages: () => false,
+    },
+    './accountStatus': {
+      markAccountErrorIfPermanent: async () => {},
+    },
+    './accountStatus.ts': {
+      markAccountErrorIfPermanent: async () => {},
+    },
     '../qwenAiDeferredStream': {
       createDeferredQwenAiFailoverStream: () => new PassThrough(),
     },
@@ -267,6 +287,7 @@ function loadChatRouteHarness(options = {}) {
     },
     '../toolCalling/assistantOutputBoundary': {
       createAssistantOutputBoundaryStream: () => new PassThrough(),
+      guardAssistantOutputCompletion: completion => completion,
     },
     '../qwenAiSessionBridge': sessionBridge,
     '../qwenAiToolCallSessionStore': {

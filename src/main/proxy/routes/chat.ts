@@ -41,8 +41,10 @@ import {
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 import { classifyChatRequest } from '../requestIntent'
-import { createAssistantOutputBoundaryStream } from '../toolCalling/assistantOutputBoundary'
-import { stripManagedToolResultWrappers } from '../toolCalling/managedToolResultGuard'
+import {
+  createAssistantOutputBoundaryStream,
+  guardAssistantOutputCompletion,
+} from '../toolCalling/assistantOutputBoundary'
 import {
   createQwenAiSessionRequestFingerprint,
   resolveQwenAiSessionBinding,
@@ -536,6 +538,7 @@ router.post('/completions', async (ctx: Context) => {
         workflowContinuationAttempts: 0,
         freshChatRestartAttempts: 0,
         accountNeutralReplayAttempts: 0,
+        wrapperLeakRecoveryAttempts: 0,
       }
     : undefined
   const createProxyContext = (
@@ -1274,19 +1277,7 @@ router.post('/completions', async (ctx: Context) => {
 
       if (result.body) {
         const body = result.body as ChatCompletionResponse
-        const choices = Array.isArray(body.choices) ? body.choices : []
-        const sanitizedChoices = choices.map(choice => {
-          const message = choice?.message
-          if (!message || typeof message !== 'object') return choice
-          const content = typeof message.content === 'string'
-            ? stripManagedToolResultWrappers(message.content).content
-            : message.content
-          return {
-            ...choice,
-            message: { ...message, content },
-          }
-        })
-        const sanitizedBody = { ...body, choices: sanitizedChoices }
+        const sanitizedBody = guardAssistantOutputCompletion(body)
         // Check if we need to transform to Anthropic format
         if (isAnthropicToolFormat(request.tool_format)) {
           ctx.body = transformResponseToAnthropic(sanitizedBody)
