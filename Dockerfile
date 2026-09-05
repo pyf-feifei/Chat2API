@@ -69,14 +69,20 @@ ENV CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=txt
 # in the account-scoped reference attachment. Zero omits inline descriptions.
 ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 # Managed-branch and upstream-busy recovery counts are deployment controls.
-# Their request deadlines remain authoritative; zero disables each path.
+# Their request deadlines remain authoritative; zero disables each path. A
+# busy RGV587 window usually clears within seconds, so the default retries
+# the same account once with backoff before account rotation.
 ENV CHAT2API_QWEN_AI_RETRY_COUNT=1
-ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=0
+ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
-ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=1
+ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=2
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
 ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
+# A dangling same-chat continuation escalates once to a fresh-chat replay.
+ENV CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
+# One leaked tool-result wrapper is replaced once before fast-failing.
+ENV CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=1
 ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 # Semantic continuation branches also share an absolute wall-clock deadline.
 ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000

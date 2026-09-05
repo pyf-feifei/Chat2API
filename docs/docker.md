@@ -215,8 +215,17 @@ CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL=native
 CHAT2API_COMPACTION_DETECTION=off
 CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 CHAT2API_QWEN_AI_RETRY_COUNT=1
-CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=0
+# RGV587/overload busy windows usually clear within seconds: retry the same
+# account once with exponential backoff before account rotation. 0 rotates
+# immediately (old policy).
+CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+# Transport-level 502/aborted-stream resume attempts on the same account.
+CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=2
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
+# A dangling same-chat continuation escalates once to a fresh-chat replay.
+CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
+# One leaked tool-result wrapper is replaced once before fast-failing.
+CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=1
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # Default to one exact-payload busy-chat retry. Set MODE=deadline to opt into
