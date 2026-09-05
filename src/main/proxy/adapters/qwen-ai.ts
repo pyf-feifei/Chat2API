@@ -394,6 +394,25 @@ export function qwenAiWrapperLeakRecoveryAttemptsFromEnv(): number {
 }
 
 /**
+ * Same-chat semantic-continuation replay escalations per logical request. When
+ * a managed workflow continuation itself ends in another dangling semantic
+ * answer, replaying the clean request once in a fresh chat gives the model a
+ * brand-new branch (no poisoned narration history) before giving up. A
+ * dangling answer is behavioural, not deterministic like a wrapper leak, so
+ * the escalation is bounded independently and defaults to one.
+ */
+export function qwenAiSemanticFreshChatEscalationsFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS
+  if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
+    return 1
+  }
+
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) return 1
+  return Math.min(value, 2)
+}
+
+/**
  * Qwen may reject a same-chat follow-up while the previous response is still
  * being finalized. These are retries of the exact same continuation payload,
  * not new turns. Keep the budget configurable and bounded so an upstream
@@ -674,6 +693,10 @@ export function createQwenAiResumableStream(
     0,
     Math.floor(qwenAiWrapperLeakRecoveryAttemptsFromEnv()),
   )
+  const semanticFreshChatEscalationLimit = Math.max(
+    0,
+    Math.floor(qwenAiSemanticFreshChatEscalationsFromEnv()),
+  )
 
   let source = initialStream
   let sourceGeneration = 0
@@ -689,6 +712,7 @@ export function createQwenAiResumableStream(
   let workflowContinuationAttempts = recoveryState?.workflowContinuationAttempts ?? 0
   let freshChatRestartAttempts = recoveryState?.freshChatRestartAttempts ?? 0
   let wrapperLeakRecoveryAttempts = recoveryState?.wrapperLeakRecoveryAttempts ?? 0
+  let semanticFreshChatEscalations = recoveryState?.semanticFreshChatEscalations ?? 0
   // A recovery phase transition must not reopen the transport budget for the
   // same logical request. `attempts` is intentionally monotonic across resume,
   // fresh-chat, and workflow-continuation branches; these counters only track
@@ -717,6 +741,7 @@ export function createQwenAiResumableStream(
     recoveryState.workflowContinuationAttempts = workflowContinuationAttempts
     recoveryState.freshChatRestartAttempts = freshChatRestartAttempts
     recoveryState.wrapperLeakRecoveryAttempts = wrapperLeakRecoveryAttempts
+    recoveryState.semanticFreshChatEscalations = semanticFreshChatEscalations
     recoveryState.recoveryBudgetRemainingMs = recoveryBudgetRemainingMs
   }
   syncRecoveryState()
@@ -1466,6 +1491,84 @@ export function createQwenAiResumableStream(
             failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
           }
         }
+      }
+    }
+
+    // A same-chat continuation that itself ends in another dangling semantic
+    // answer leaves the chat history holding the rejected narration branch.
+    // Replaying the clean request once in a fresh chat gives the model a new
+    // branch without that poisoned context; this is an escalation of the
+    // same-chat budget above, bounded independently and env-configurable so a
+    // deployment can disable it. Unlike the wrapper-leak cap this remains open
+    // for behavioural (non-deterministic) semantic failures.
+    if (
+      !settled
+      && semanticRecoveryEligible
+      && workflowContinuationAttempts >= workflowContinuationAttemptLimit
+      && semanticFreshChatEscalations < semanticFreshChatEscalationLimit
+      && options.restartFreshChat
+    ) {
+      const escalationError = normalizeQwenAiStreamFailure(lastError)
+      semanticFreshChatEscalations += 1
+      syncRecoveryState()
+      ensureRecoveryBudget()
+      try {
+        console.warn('[QwenAI] Escalating exhausted same-chat semantic recovery to a fresh chat', JSON.stringify({
+          attempt: semanticFreshChatEscalations,
+          maxAttempts: semanticFreshChatEscalationLimit,
+          recoveryCode: (escalationError as { code?: unknown }).code ?? undefined,
+        }))
+        const restarted = await options.restartFreshChat(escalationError, recoverySignal)
+        const nextStream = restarted?.data ?? restarted
+
+        if (recoveryBudgetExpired) {
+          destroyReadableStream(nextStream)
+          failRecovery(effectiveRecoveryBudgetError())
+        }
+        try {
+          assertRecoveryBudget()
+        } catch (error) {
+          destroyReadableStream(nextStream)
+          failRecovery(error instanceof Error ? error : effectiveRecoveryBudgetError())
+        }
+        if (settled || options.signal?.aborted || checkComplete()) {
+          destroyReadableStream(nextStream)
+          if (!settled) {
+            const lateEscalationError = takeCompletionCheckError()
+            if (lateEscalationError) fail(lateEscalationError)
+            else finish()
+          }
+          return false
+        }
+        if (!nextStream || typeof nextStream.on !== 'function') {
+          throw new Error('Qwen AI semantic fresh-chat escalation did not return a stream')
+        }
+
+        source = nextStream
+        sourceGeneration += 1
+        sourceHandled = false
+        sourceComplete = false
+        terminalMarkerSeen = false
+        completionScan = ''
+        // The escalated branch is a fresh generation; pause the no-progress
+        // budget while it produces output, and keep every attempt counter
+        // monotonic so the escalation cannot reopen spent budgets.
+        pauseRecoveryBudget()
+        recoveryInFlight = false
+        options.onFreshChatRestart?.()
+        onResume?.()
+        attachSource(nextStream, sourceGeneration)
+        return true
+      } catch (error) {
+        if (settled) {
+          if (settledError) throw settledError
+          return false
+        }
+        const escalationFailure = error instanceof Error ? error : new Error(String(error))
+        if (isClientCancellationError(escalationFailure) || options.signal?.aborted) {
+          failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        }
+        failRecovery(normalizeQwenAiStreamFailure(escalationFailure))
       }
     }
 

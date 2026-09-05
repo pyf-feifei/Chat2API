@@ -8913,6 +8913,152 @@ test('Qwen AI managed tool prompts forbid reproducing result wrappers', () => {
   assert.match(realGetToolProtocol('qwen_hermes').renderContinuationReminder(tools), suppression)
 })
 
+test('Qwen AI escalates an exhausted same-chat semantic continuation to a fresh chat', async () => {
+  const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+  let branch = 0
+  const continuationCalls = []
+  const freshChatCalls = []
+  const danglingSemantic = () => Object.assign(
+    new Error('dangling answer over a live managed tool workflow'),
+    { code: 'qwen_ai_semantic_incomplete' },
+  )
+
+  const output = createQwenAiResumableStream(initial, {
+    getResponseId: () => `response-semantic-${branch}`,
+    getSemanticRecoveryError: () => (branch < 2 ? danglingSemantic() : undefined),
+    continueWorkflow: async parentResponseId => {
+      continuationCalls.push(parentResponseId)
+      branch += 1
+      const next = new PassThrough()
+      next.on('error', () => {})
+      setImmediate(() => {
+        next.end(branch < 2
+          ? 'data: provider narration branch\n\n'
+          : 'data: final tool-call branch\n\ndata: [DONE]\n\n')
+      })
+      return { data: next }
+    },
+    restartFreshChat: async recoveryError => {
+      freshChatCalls.push(recoveryError?.code)
+      branch += 1
+      const next = new PassThrough()
+      next.on('error', () => {})
+      setImmediate(() => {
+        next.end('data: escalated clean branch\n\ndata: [DONE]\n\n')
+      })
+      return { data: next }
+    },
+    maxAttempts: 0,
+    delayMs: 0,
+    recoveryBudgetMs: 1_000,
+  })
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const ended = once(output, 'end')
+  output.once('error', error => {
+    assert.fail(`expected the escalated branch to complete, got failure: ${error?.code}`)
+  })
+
+  initial.end('data: provider narration 0\n\n')
+  await ended
+
+  // The same-chat continuation ran once and dangled; the escalation replayed
+  // the request in a fresh chat, and that branch completed the stream.
+  assert.deepEqual(continuationCalls, ['response-semantic-0'])
+  assert.deepEqual(freshChatCalls, ['qwen_ai_semantic_incomplete'])
+  const body = Buffer.concat(chunks).toString()
+  assert.ok(body.includes('escalated clean branch'))
+})
+
+test('Qwen AI fails when the semantic fresh-chat escalation also dangles', async () => {
+  const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+  let branch = 0
+  const continuationCalls = []
+  const freshChatCalls = []
+  const danglingSemantic = () => Object.assign(
+    new Error('dangling answer over a live managed tool workflow'),
+    { code: 'qwen_ai_semantic_incomplete' },
+  )
+
+  const output = createQwenAiResumableStream(initial, {
+    getResponseId: () => `response-semantic-exhaust-${branch}`,
+    getSemanticRecoveryError: () => danglingSemantic(),
+    continueWorkflow: async parentResponseId => {
+      continuationCalls.push(parentResponseId)
+      branch += 1
+      const next = new PassThrough()
+      next.on('error', () => {})
+      setImmediate(() => next.end('data: provider narration again\n\n'))
+      return { data: next }
+    },
+    restartFreshChat: async recoveryError => {
+      freshChatCalls.push(recoveryError?.code)
+      branch += 1
+      const next = new PassThrough()
+      next.on('error', () => {})
+      setImmediate(() => next.end('data: escalated narration\n\n'))
+      return { data: next }
+    },
+    maxAttempts: 0,
+    delayMs: 0,
+    recoveryBudgetMs: 1_000,
+  })
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const failed = once(output, 'error')
+
+  initial.end('data: provider narration start\n\n')
+  const [error] = await failed
+
+  // The escalation budget is exactly one fresh chat; a second dangling branch
+  // there fails fast with the semantic code instead of looping.
+  assert.deepEqual(continuationCalls, ['response-semantic-exhaust-0'])
+  assert.deepEqual(freshChatCalls, ['qwen_ai_semantic_incomplete'])
+  assert.equal(error?.code, 'qwen_ai_semantic_incomplete')
+  assert.equal(error.accountFault, false)
+  assert.equal(output.destroyed, true)
+})
+
+test('Qwen AI semantic fresh-chat escalation honors deployment configuration', () => {
+  const { qwenAiSemanticFreshChatEscalationsFromEnv } = loadQwenAiStreamHandler()
+  const previous = process.env.CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS
+
+  try {
+    const cases = [
+      { raw: undefined, expected: 1 },
+      { raw: '', expected: 1 },
+      { raw: 'auto', expected: 1 },
+      { raw: '0', expected: 0 },
+      { raw: '2', expected: 2 },
+      { raw: '5', expected: 2 },
+      { raw: '-1', expected: 1 },
+      { raw: 'not-a-number', expected: 1 },
+    ]
+    for (const { raw, expected } of cases) {
+      if (raw === undefined) {
+        delete process.env.CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS
+      } else {
+        process.env.CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS = raw
+      }
+      assert.equal(
+        qwenAiSemanticFreshChatEscalationsFromEnv(),
+        expected,
+        `raw=${raw}`,
+      )
+    }
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS
+    } else {
+      process.env.CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS = previous
+    }
+  }
+})
+
 
 
 function wrapperLeakManagedPlan(reason, shouldParseResponse = true) {

@@ -539,6 +539,7 @@ router.post('/completions', async (ctx: Context) => {
         freshChatRestartAttempts: 0,
         accountNeutralReplayAttempts: 0,
         wrapperLeakRecoveryAttempts: 0,
+        semanticFreshChatEscalations: 0,
       }
     : undefined
   const createProxyContext = (

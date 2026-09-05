@@ -298,6 +298,8 @@ export interface QwenAiLogicalRecoveryState {
   accountNeutralReplayAttempts: number
   /** Replacement branches spent on leaked managed tool-result wrappers. */
   wrapperLeakRecoveryAttempts: number
+  /** Fresh-chat escalations after the same-chat semantic continuation budget was exhausted. */
+  semanticFreshChatEscalations: number
 }
 
 export interface ProxyContext {

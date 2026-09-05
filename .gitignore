@@ -112,3 +112,5 @@ index.bundle.js
 
 # Local Codex helper scratch files
 .codex-*.txt
+test_180k.py
+test_context.py

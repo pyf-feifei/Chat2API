@@ -82,6 +82,19 @@ CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=1
 
 取值为 `0`（禁用泄漏重放，检测即失败）、`1`（默认）或 `2`（上限）；其他值回退为 `1`。
 
+## 同会话语义续写耗尽后的全新会话升级
+
+managed tool calling 中，模型偶尔会在工具循环进行到一半时输出"叙事性"文本（说明它打算做什么）而不是工具调用（dangling answer）。代理会先在同一会话里发送 workflow continuation 提示要求它给出真正的工具调用；若续写分支本身仍是 dangling answer（同会话预算 `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` 默认 1 次已耗尽），代理会升级为：
+
+- 在**同一账号的全新 chat** 里重放完整干净请求（不带被拒绝的叙事分支历史），给模型一次无污染上下文的机会；
+- 升级次数独立计数，每个逻辑请求默认 1 次，用环境变量调节：
+
+```env
+CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
+```
+
+取值为 `0`（禁用升级，同会话预算耗尽即按 422 `qwen_ai_semantic_incomplete` 快速失败）、`1`（默认）或 `2`（上限）；其他值回退为 `1`。升级分支若再次 dangling，则快速失败并把 `retryable` 标志透传给客户端。wrapper 泄漏不适用此升级（泄漏是确定性违规，已有更紧的独立预算）。
+
 ## 适配状态
 
 已适配：国际版网页对话、流式对话、非流式对话、多轮会话、账号级清理对话记录、思考模式后缀、模型别名。
