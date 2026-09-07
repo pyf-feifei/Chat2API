@@ -15,13 +15,27 @@ export function qwenAiBusyFailoverRotationMaxFromEnv(): number | undefined {
   return Number.isSafeInteger(value) && value >= 0 ? value : 2
 }
 
+export interface QwenAiBusyFailoverStopOptions {
+  /**
+   * Called exactly once when the rule decides rotation must stop — the point
+   * where an all-busy history is beyond the rotation cap and the payload is
+   * being rejected upstream rather than throttled for one account. The busy
+   * chain's account ids are collected by the caller's forward closure; this
+   * hook signals that they constitute a storm worth reporting to the governor.
+   */
+  onRotationStopped?: () => void
+}
+
 export function createQwenAiBusyFailoverStopRule(
   maxRotations = qwenAiBusyFailoverRotationMaxFromEnv(),
+  hooks: QwenAiBusyFailoverStopOptions = {},
 ): ((result: ForwardResult, history: readonly ForwardResult[]) => boolean) | undefined {
   if (maxRotations === undefined) return undefined
   return (result, history) => {
     if (result.errorCode !== 'qwen_ai_upstream_busy') return false
     if (!history.every(prior => prior.errorCode === 'qwen_ai_upstream_busy')) return false
-    return history.length > maxRotations
+    const shouldStop = history.length > maxRotations
+    if (shouldStop) hooks.onRotationStopped?.()
+    return shouldStop
   }
 }

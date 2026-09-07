@@ -82,6 +82,27 @@ CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=1
 
 取值为 `0`（禁用泄漏重放，检测即失败）、`1`（默认）或 `2`（上限）；其他值回退为 `1`。
 
+## 内容决定型失败的账号轮换上限与 busy 风暴治理
+
+内容决定型 422 失败（dangling answer、wrapper 泄漏、工具调用参数违规等）由**请求内容**决定，不随账号变化——2026-09-07 的线上事故中，同一个 49K-token 请求在 5 个不同账号上全部 422 `qwen_ai_semantic_incomplete`，轮换只是重复烧账号。两个治理机制：
+
+**账号轮换上限**：当同一逻辑请求的当前失败与全部历史均为内容决定型失败时停止轮换，把终态 422 交给客户端（`retryable:false` 已透传，客户端会调整策略而不是盲目重放）。状态化路由（chat/responses）的共享重放预算本来就把轮换限到一次，此规则把同一保证扩展到 anthropic 路由（未线程化恢复状态）与未来回归。默认 `0` 表示只允许一次共享重放（2 个账号）；模型行为存在账号相关性（另一账号的私有分支可能成功），需要更宽的部署可调高：
+
+```env
+CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX=0
+```
+
+取值为 `0`（默认，2 个账号封顶）、`1`（3 个账号封顶）等；`off` 禁用上限。计数语义与 busy 停止规则一致（上限 N = 至多 N+1 次轮换）。混合历史（busy → semantic 等）不触发——容量失败仍按自己的预算轮换。
+
+**busy 风暴治理**：RGV587 风控页会伪装成容量 busy（验证信封 + "被挤爆"文案同时出现，被归类为 `qwen_ai_upstream_busy`，账号中立），单账号闪断由同账号 busy 重试（`CHAT2API_QWEN_AI_BUSY_RETRY_COUNT`）处理；但当**同一逻辑请求内 ≥N 个不同账号**全部 busy 时即为风暴（IP 级风控或真过载），此时上报 governor：风暴链上的每个账号进入有界冷却（凭证保持健康，到期自动恢复），事件汇入既有的全局风控熔断与半开探活——后续客户端重连会收到 429 `qwen_ai_global_risk_circuit` 或带 `Retry-After` 的终态响应而主动退避，而不是每条重连都全量重放 49K-token 内容去敲打风控闸门：
+
+```env
+CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD=2
+CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
+```
+
+阈值取 `1` 即"任何停止点上的 busy 都上报"；冷却下限不低于账号节奏间隔。真实容量事件被误判时，全局熔断的半开探活会在节奏间隔后放行一个请求、首个成功即关闭熔断，分钟级自愈。阈值应 ≤ busy 轮换上限 + 1（默认 2 ≤ 3），保证风暴在停止点或之前必被上报；两者为独立旋钮，部署可自行调整但不应打破该耦合。
+
 ## 同会话语义续写耗尽后的全新会话升级
 
 managed tool calling 中，模型偶尔会在工具循环进行到一半时输出"叙事性"文本（说明它打算做什么）而不是工具调用（dangling answer）。代理会先在同一会话里发送 workflow continuation 提示要求它给出真正的工具调用；若续写分支本身仍是 dangling answer（同会话预算 `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` 默认 1 次已耗尽），代理会升级为：

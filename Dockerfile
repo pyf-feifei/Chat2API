@@ -74,6 +74,13 @@ ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 # the same account once with backoff before account rotation.
 ENV CHAT2API_QWEN_AI_RETRY_COUNT=1
 ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+# Content-determined 422s follow the request, not the account: cap account
+# rotation ('off' disables). Busy across >= threshold distinct accounts in
+# one logical request is a storm: cool those accounts for the configured
+# window and feed the existing global risk circuit + recovery probe.
+ENV CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX=0
+ENV CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD=2
+ENV CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=2

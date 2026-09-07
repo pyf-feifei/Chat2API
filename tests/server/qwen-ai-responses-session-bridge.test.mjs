@@ -648,6 +648,10 @@ function loadResponsesRouteHarness(options = {}) {
     '../qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
     },
+    '../qwenContentFailover': {
+      createQwenAiContentFailoverStopRule: () => () => false,
+      combineQwenAiFailoverStopRules: rule => rule ?? (() => false),
+    },
     '../replayImageSlimming': {
       slimQwenAiReplayImages: messages => messages,
       qwenAiImageSlimModeFromEnv: () => 'off',
@@ -1432,6 +1436,10 @@ function loadForwarderForBridgeTests(overrides = {}) {
     './qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
     },
+    './qwenContentFailover': {
+      createQwenAiContentFailoverStopRule: () => () => false,
+      combineQwenAiFailoverStopRules: rule => rule ?? (() => false),
+    },
     './replayImageSlimming': {
       slimQwenAiReplayImages: messages => messages,
       qwenAiImageSlimModeFromEnv: () => 'off',
@@ -1511,6 +1519,10 @@ function loadForwarderForBridgeTests(overrides = {}) {
     },
     './qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
+    },
+    './qwenContentFailover': {
+      createQwenAiContentFailoverStopRule: () => () => false,
+      combineQwenAiFailoverStopRules: rule => rule ?? (() => false),
     },
     './replayImageSlimming': {
       slimQwenAiReplayImages: messages => messages,

@@ -909,6 +909,49 @@ export class QwenAiRequestGovernor {
     this.pump()
   }
 
+  /**
+   * Persistent evidence that Qwen returned busy/risk pages across several
+   * distinct accounts for one logical request. Each reported account gets a
+   * bounded cooldown (no accountFault classification — the credentials stay
+   * healthy, so expiry or clearAllCooldowns frees the account), and the events
+   * feed the existing global risk circuit + half-open recovery probe so
+   * client reconnects back off instead of re-attacking the risk gate
+   * (observed 2026-09-07: five codex reconnects re-attacked IP-level RGV587
+   * risk control until the session died). Returns the applied per-account
+   * cooldown in ms for the caller to stamp Retry-After, or undefined when the
+   * account count stays below the storm threshold (a single-account busy blip
+   * belongs to the same-account busy retry budget, not a storm).
+   */
+  reportQwenAiBusyStorm(
+    accountIds: readonly string[],
+    requestClass: QwenAiRequestClass = 'normal',
+  ): number | undefined {
+    const distinctAccountIds = [...new Set(accountIds)]
+    if (distinctAccountIds.length === 0) return undefined
+
+    const threshold = Math.max(1, Math.floor(numberFromEnv(
+      'CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD',
+      2,
+    )))
+    if (distinctAccountIds.length < threshold) return undefined
+
+    const config = this.getConfig()
+    const cooldownMs = Math.max(
+      config.accountMinIntervalMs,
+      numberFromEnv('CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS', config.riskCooldownMs),
+    )
+    for (const accountId of distinctAccountIds) {
+      this.openCooldown(accountId, cooldownMs, 'qwen_ai_busy_storm')
+    }
+    if (requestClass === 'normal') {
+      for (const accountId of distinctAccountIds) {
+        this.recordGlobalRiskControl(accountId, config, this.getQwenAiAccountScope())
+      }
+    }
+    this.pump()
+    return cooldownMs
+  }
+
   private openCooldown(accountId: string, cooldownMs: number, reason: string, failures?: number): void {
     const now = Date.now()
     const current = this.accountCooldowns.get(accountId)

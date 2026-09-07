@@ -7,6 +7,11 @@ import {
   shouldSlimQwenAiAttemptImages,
 } from '../../src/main/proxy/replayImageSlimming.ts'
 import { createQwenAiBusyFailoverStopRule } from '../../src/main/proxy/qwenBusyFailover.ts'
+import {
+  createQwenAiContentFailoverStopRule,
+  combineQwenAiFailoverStopRules,
+  isQwenAiContentDeterminedFailure,
+} from '../../src/main/proxy/qwenContentFailover.ts'
 import type { ChatMessage } from '../../src/main/proxy/types.ts'
 
 test('replay slimming keeps only the newest image-bearing message intact', () => {
@@ -128,8 +133,136 @@ test('busy stop rule caps same-shape upstream-busy rotations', () => {
   }
 })
 
-test('image slim mode parses off / on-busy (default) / always from env', () => {
-  const saved = process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+test('busy stop rule signals rotation stop exactly once at the cap decision', () => {
+  const busy = () => ({
+    success: false as const,
+    status: 503,
+    error: 'busy',
+    errorCode: 'qwen_ai_upstream_busy',
+    retryable: true,
+    accountFault: false,
+    retryScope: 'next-account' as const,
+  })
+
+  let stopped = 0
+  const rule = createQwenAiBusyFailoverStopRule(2, { onRotationStopped: () => { stopped += 1 } })
+  assert.ok(rule)
+  // rotating under the cap never fires the hook
+  assert.equal(rule(busy(), [busy(), busy()]), false)
+  assert.equal(stopped, 0, 'within cap: no stop signal')
+  // the stop decision fires it exactly once
+  assert.equal(rule(busy(), [busy(), busy(), busy()]), true)
+  assert.equal(stopped, 1)
+  // mixed history neither stops nor fires
+  assert.equal(rule(busy(), [busy(), { ...busy(), errorCode: 'qwen_ai_stream_error' } as any, busy()]), false)
+  assert.equal(stopped, 1, 'mixed history: no additional stop signal')
+  // 'off' creates no rule, so the hook can never fire
+  process.env.CHAT2API_QWEN_AI_BUSY_FAILOVER_ROTATION_MAX = 'off'
+  try {
+    assert.equal(createQwenAiBusyFailoverStopRule(undefined, { onRotationStopped: () => { stopped += 1 } }), undefined)
+  } finally {
+    delete process.env.CHAT2API_QWEN_AI_BUSY_FAILOVER_ROTATION_MAX
+  }
+  assert.equal(stopped, 1)
+})
+
+test('content stop rule caps content-determined 422 rotations', () => {
+  const content = (errorCode = 'qwen_ai_semantic_incomplete') => ({
+    success: false as const,
+    status: 422,
+    error: 'content rejection',
+    errorCode,
+    retryable: false,
+    accountFault: false,
+  })
+
+  const rule = createQwenAiContentFailoverStopRule(1)
+  assert.ok(rule)
+  // cap 1 = at most 2 rotations (3 accounts total), matching the busy rule's
+  // comparison shape (history.length > maxRotations)
+  assert.equal(rule(content(), []), false, 'first content failure rotates')
+  assert.equal(rule(content(), [content()]), false, 'second failure still within rotation 1')
+  // second content rotation would follow the same rejected content: stop
+  assert.equal(rule(content(), [content(), content()]), true, 'beyond cap: stop')
+  // the deployment default is even tighter: 0 extra rotations (2 accounts)
+  const defaultRule = createQwenAiContentFailoverStopRule(0)
+  assert.ok(defaultRule)
+  assert.equal(defaultRule(content(), [content()]), true, 'default cap stops after the one shared replay')
+  // mixed history (busy → semantic) keeps rotating; capacity ≠ content
+  const busy = {
+    success: false as const,
+    status: 503,
+    error: 'busy',
+    errorCode: 'qwen_ai_upstream_busy',
+    retryable: true,
+    accountFault: false,
+    retryScope: 'next-account' as const,
+  }
+  assert.equal(rule(content(), [busy, content()]), false)
+  // non-content neutral codes never trigger
+  assert.equal(rule({ ...content('qwen_ai_queue_timeout') }, []), false)
+  // an unparsed transcript upload is decided by the payload, not the account
+  // (observed: the same 84K-token transcript failed file-parse on six
+  // consecutive accounts, each burning the full 120s parse budget)
+  assert.equal(rule({ ...content('qwen_ai_file_parse_timeout') }, [content('qwen_ai_file_parse_timeout'), content('qwen_ai_file_parse_timeout')]), true)
+  assert.equal(defaultRule({ ...content('qwen_ai_file_parse_timeout') }, [content('qwen_ai_file_parse_timeout')]), true)
+  assert.equal(defaultRule({ ...content('qwen_ai_file_parse_timeout') }, []), false, 'first parse timeout still grants the one shared replay')
+  // accountFault not explicitly false is not a content-determined failure
+  assert.equal(rule({ ...content(), accountFault: undefined }, []), false)
+  assert.equal(isQwenAiContentDeterminedFailure({ ...content(), accountFault: undefined }), false)
+  assert.equal(isQwenAiContentDeterminedFailure(content('qwen_ai_wrapper_leak')), true)
+
+  // 'off' disables; invalid values fall back to the default 0
+  process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX = 'off'
+  try {
+    assert.equal(createQwenAiContentFailoverStopRule(), undefined)
+    process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX = 'bogus'
+    const fallback = createQwenAiContentFailoverStopRule()
+    assert.ok(fallback)
+    assert.equal(fallback(content(), [content(), content()]), true, 'invalid env falls back to cap 0')
+  } finally {
+    delete process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX
+  }
+})
+
+test('combine stop rules consults every active rule', () => {
+  const content = {
+    success: false as const,
+    status: 422,
+    error: 'content rejection',
+    errorCode: 'qwen_ai_semantic_incomplete',
+    retryable: false,
+    accountFault: false,
+  }
+  const busy = {
+    success: false as const,
+    status: 503,
+    error: 'busy',
+    errorCode: 'qwen_ai_upstream_busy',
+    retryable: true,
+    accountFault: false,
+    retryScope: 'next-account' as const,
+  }
+
+  // all-disabled → undefined keeps the failover loop's original behavior
+  assert.equal(combineQwenAiFailoverStopRules(undefined, undefined), undefined)
+  // single rule passes through
+  const contentOnly = combineQwenAiFailoverStopRules(undefined, createQwenAiContentFailoverStopRule(1))
+  assert.ok(contentOnly)
+  assert.equal(contentOnly(busy, [busy, busy, busy]), false, 'busy chain never trips the content rule')
+  // composed: either rule's stop condition wins
+  const combined = combineQwenAiFailoverStopRules(
+    createQwenAiBusyFailoverStopRule(2),
+    createQwenAiContentFailoverStopRule(1),
+  )
+  assert.ok(combined)
+  assert.equal(combined(busy, [busy, busy, busy]), true, 'busy chain stops via the busy rule')
+  assert.equal(combined(content, [content, content]), true, 'content chain stops via the content rule')
+  assert.equal(combined(busy, [busy, content]), false, 'mixed history keeps rotating')
+  assert.equal(combined(content, []), false, 'first failure always rotates')
+})
+
+test('image slim mode parses off / on-busy (default) / always from env', () => {  const saved = process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
   try {
     delete process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
     assert.equal(qwenAiImageSlimModeFromEnv(), 'on-busy')

@@ -266,6 +266,10 @@ function loadChatRoute({
     '../qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
     },
+    '../qwenContentFailover': {
+      createQwenAiContentFailoverStopRule: () => () => false,
+      combineQwenAiFailoverStopRules: rule => rule ?? (() => false),
+    },
     '../replayImageSlimming': {
       slimQwenAiReplayImages: messages => messages,
       qwenAiImageSlimModeFromEnv: () => 'off',

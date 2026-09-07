@@ -15,6 +15,12 @@ import {
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
+import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
+import {
+  combineQwenAiFailoverStopRules,
+  createQwenAiContentFailoverStopRule,
+} from '../qwenContentFailover'
+import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
 import { classifyChatRequest } from '../requestIntent'
@@ -530,20 +536,40 @@ router.post('/messages', async (ctx: Context) => {
     requestIntent: requestIntent.intent,
   })
 
+  // This route threads no Qwen recovery state, so account-neutral semantic
+  // replays were unbounded here; the content stop rule bounds them, and the
+  // busy hook reports a cross-account busy storm to the governor. Both rules
+  // only match qwen errorCodes with accountFault === false, so non-Qwen
+  // selections can never trip them — no provider check needed.
+  const busyAccountIds: string[] = []
+  let busyStormCooldownMs: number | undefined
+
   const runWithAccountFailover = () => forwardWithAccountFailover({
     initialSelection,
     maxFailovers,
     signal: clientSignal,
     forward: async ({ selection }) => {
       const attemptContext = createProxyContext(selection)
-      return requestForwarder.forwardChatCompletion(
+      const result = await requestForwarder.forwardChatCompletion(
         openaiReq,
         selection.account,
         selection.provider,
         selection.actualModel,
         attemptContext,
       )
+      if (!result.success && result.errorCode === 'qwen_ai_upstream_busy') {
+        busyAccountIds.push(selection.account.id)
+      }
+      return result
     },
+    shouldStopFailover: combineQwenAiFailoverStopRules(
+      createQwenAiBusyFailoverStopRule(undefined, {
+        onRotationStopped: () => {
+          busyStormCooldownMs = qwenAiRequestGovernor.reportQwenAiBusyStorm(busyAccountIds)
+        },
+      }),
+      createQwenAiContentFailoverStopRule(),
+    ),
     selectNext: excludedAccountIds => loadBalancer.selectAccount(
       openaiReq.model,
       config.loadBalanceStrategy,
@@ -613,6 +639,16 @@ router.post('/messages', async (ctx: Context) => {
         latency,
       })
       ctx.status = result.status || 500
+      if (
+        busyStormCooldownMs !== undefined
+          && result.errorCode === 'qwen_ai_upstream_busy'
+      ) {
+        // A cross-account busy storm was reported to the governor; pace the
+        // client's reconnects with the applied cooldown instead of letting it
+        // immediately re-attack the risk gate. The Anthropic route forwards
+        // no upstream error headers, so the hint is set directly.
+        ctx.set('Retry-After', String(Math.max(1, Math.ceil(busyStormCooldownMs / 1000))))
+      }
       ctx.body = {
         type: 'error',
         error: {

@@ -651,6 +651,117 @@ test('Qwen AI deferred stream risk failures are reported back to the governor', 
   assert.equal(status.accounts[0].governorCooldownReason, 'qwen_ai_risk_control')
 })
 
+test('a busy storm cools every reported account with a retry-after hint', () => {
+  const savedThreshold = process.env.CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD
+  const savedCooldown = process.env.CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS
+  try {
+    delete process.env.CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD
+    delete process.env.CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS
+    const Governor = loadGovernorForRuntimeTest(1_000, {
+      accountMinIntervalMs: 0,
+      riskCooldownMs: 5_000,
+    })
+    const governor = new Governor()
+
+    // below threshold: a single-account busy blip is not a storm
+    assert.equal(governor.reportQwenAiBusyStorm(['account-1']), undefined)
+    let status = governor.getStatus(
+      [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+      [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+    )
+    assert.equal(status.accounts[0].governorCooldownInMs, 0)
+    assert.equal(status.accounts[0].governorCooldownReason, undefined)
+
+    // a two-account storm applies the risk-scale cooldown to both
+    const appliedCooldownMs = governor.reportQwenAiBusyStorm(['account-1', 'account-2', 'account-1'])
+    assert.equal(appliedCooldownMs, 5_000)
+    status = governor.getStatus(
+      ['account-1', 'account-2'].map(id => ({
+        id, name: id, providerId: 'qwen-ai', status: 'active',
+      })),
+      [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+    )
+    assert.ok(status.accounts[0].governorCooldownInMs > 4_000)
+    assert.equal(status.accounts[0].governorCooldownReason, 'qwen_ai_busy_storm')
+    assert.ok(status.accounts[1].governorCooldownInMs > 4_000)
+    assert.equal(status.accounts[1].governorCooldownReason, 'qwen_ai_busy_storm')
+    // an empty or repeated-single-id report is below threshold by definition
+    assert.equal(governor.reportQwenAiBusyStorm([]), undefined)
+    assert.equal(governor.reportQwenAiBusyStorm(['account-2', 'account-2']), undefined)
+
+    // an explicit env override wins over the risk-scale default
+    process.env.CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS = '2000'
+    assert.equal(governor.reportQwenAiBusyStorm(['account-3', 'account-4']), 2_000)
+  } finally {
+    if (savedThreshold === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD
+    else process.env.CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD = savedThreshold
+    if (savedCooldown === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS
+    else process.env.CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS = savedCooldown
+  }
+})
+
+test('a persistent busy storm opens the global risk circuit for the pool', async () => {
+  const accounts = ['account-1', 'account-2', 'account-3', 'account-4'].map(id => ({
+    id,
+    name: id,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    riskCooldownMs: 5_000,
+    maxRiskCooldownMs: 5_000,
+    globalRiskCooldownMs: 5_000,
+    maxGlobalRiskCooldownMs: 5_000,
+    riskWindowMs: 5_000,
+    globalRiskThreshold: 3,
+  }, { accounts, providers })
+  const governor = new Governor()
+
+  // round 1: three distinct accounts returned busy in one logical request
+  const firstRoundCooldownMs = governor.reportQwenAiBusyStorm(
+    ['account-1', 'account-2', 'account-3'],
+  )
+  assert.ok(firstRoundCooldownMs !== undefined && firstRoundCooldownMs > 0)
+
+  // the fourth account is still healthy, so a three-account storm alone does
+  // not open the pool-wide circuit
+  let healthyRequestStarted = false
+  const healthyResult = await governor.run('account-4', async () => {
+    healthyRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  assert.equal(healthyRequestStarted, true)
+  assert.equal(healthyResult.success, true)
+
+  // round 2: the client reconnect starts a fresh logical request whose busy
+  // rotation sweeps the last healthy account and re-trips a second account —
+  // every account in the pool is now cooling, so the global circuit opens and
+  // the next reconnect flushes with 429 + Retry-After instead of re-attacking
+  // the upstream risk gate
+  const secondRoundCooldownMs = governor.reportQwenAiBusyStorm(['account-4', 'account-1'])
+  assert.ok(secondRoundCooldownMs !== undefined && secondRoundCooldownMs > 0)
+
+  let nextRequestStarted = false
+  const nextResult = await governor.run('account-1', async () => {
+    nextRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(nextRequestStarted, false)
+  assert.equal(nextResult.status, 429)
+  assert.equal(nextResult.errorCode, 'qwen_ai_global_risk_circuit')
+  assert.equal(nextResult.accountFault, false)
+  const retryAfter = Object.entries(nextResult.headers || {})
+    .find(([key]) => key.toLowerCase() === 'retry-after')?.[1]
+  assert.ok(retryAfter && Number(retryAfter) >= 1, 'circuit flush carries a Retry-After pacing hint')
+  assert.ok(status.globalCooldownInMs > 0)
+})
+
 test('context compaction risk cools accounts without opening the ordinary global circuit', () => {
   const accounts = Array.from({ length: 10 }, (_, index) => ({
     id: `account-${index + 1}`,

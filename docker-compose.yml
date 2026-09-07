@@ -102,6 +102,20 @@ services:
       # base) before account failover takes over. Zero keeps the old
       # rotate-immediately policy.
       CHAT2API_QWEN_AI_BUSY_RETRY_COUNT: ${CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-1}
+      # Content-determined 422 failures (dangling answers, wrapper leaks,
+      # malformed tool calls) follow the request, not the account: cap the
+      # account rotation so one client request cannot burn the pool with
+      # identical replays. 'off' disables the cap.
+      CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX: ${CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX:-0}
+      # A busy page on >= N distinct accounts within one logical request is a
+      # storm (IP-level risk control masquerading as capacity): report it to
+      # the governor so the busy chain cools down and the global risk circuit
+      # can engage instead of client reconnects re-attacking the risk gate.
+      CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD: ${CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD:-2}
+      # Per-account cooldown applied to every account in a reported busy
+      # storm (floored at the account pacing interval). Never classifies the
+      # credentials as faulty; expiry or clearAllCooldowns frees the account.
+      CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS: ${CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS:-600000}
       # Blank/default permits one same-chat semantic correction. Zero disables
       # it; positive values remain bounded by the workflow recovery deadline.
       CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1}

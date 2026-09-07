@@ -219,6 +219,20 @@ CHAT2API_QWEN_AI_RETRY_COUNT=1
 # account once with exponential backoff before account rotation. 0 rotates
 # immediately (old policy).
 CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+# Content-determined 422 failures (dangling answers, wrapper leaks, malformed
+# tool calls) follow the request, not the account: the cap bounds how many
+# extra accounts replay the identical content. 0 = one second account (the
+# shared replay budget), 'off' disables the cap.
+CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX=0
+# Busy pages on >= N distinct accounts within one logical request constitute a
+# storm (IP-level risk control masquerading as capacity): each account in the
+# chain is benched and the global risk circuit can open, so client reconnects
+# back off (the terminal response carries Retry-After) instead of re-attacking
+# the risk gate.
+CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD=2
+# Per-account busy-storm cooldown in ms (floored at the account pacing
+# interval). Credentials stay healthy; expiry frees the account.
+CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
 # Transport-level 502/aborted-stream resume attempts on the same account.
 CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=2
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1

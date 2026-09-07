@@ -20,6 +20,10 @@ import {
 } from '../forwarder'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
+import {
+  combineQwenAiFailoverStopRules,
+  createQwenAiContentFailoverStopRule,
+} from '../qwenContentFailover'
 import { slimQwenAiReplayImages, qwenAiImageSlimModeFromEnv, shouldSlimQwenAiAttemptImages } from '../replayImageSlimming'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
@@ -620,6 +624,16 @@ router.post('/completions', async (ctx: Context) => {
   const deferManagedStreamCommit = initialProviderIsQwenAi
     && shouldDeferQwenAiManagedStreamCommit(request)
 
+  // Busy-failover stop reports the storm here once rotation is capped, so
+  // the governor can bench the busy chain's accounts and engage the global
+  // risk circuit instead of letting client reconnects re-attack the risk
+  // gate. The forward closure collects every account that returned busy —
+  // the terminal attempt never reaches onFailedAttempt. Declared at handler
+  // scope so the post-outcome Retry-After stamp can read the applied
+  // cooldown after runWithAccountFailover resolves.
+  const busyAccountIds: string[] = []
+  let busyStormCooldownMs: number | undefined
+
   const runWithAccountFailover = () => {
     // Same replay-slimming rationale as the Responses route: after an
     // upstream-busy rejection, rotate with a slimmed image history instead of
@@ -641,16 +655,27 @@ router.post('/completions', async (ctx: Context) => {
             && shouldSlimQwenAiAttemptImages(imageSlimMode, slimImagesOnNextAttempt)
           ? { ...request, messages: slimQwenAiReplayImages(request.messages) }
           : request
-        return requestForwarder.forwardChatCompletion(
+        const result = await requestForwarder.forwardChatCompletion(
           requestForAttempt,
           selection.account,
           selection.provider,
           selection.actualModel,
           attemptContext,
         )
+        if (!result.success && result.errorCode === 'qwen_ai_upstream_busy') {
+          busyAccountIds.push(selection.account.id)
+        }
+        return result
       },
       shouldStopFailover: QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
-        ? createQwenAiBusyFailoverStopRule()
+        ? combineQwenAiFailoverStopRules(
+          createQwenAiBusyFailoverStopRule(undefined, {
+            onRotationStopped: () => {
+              busyStormCooldownMs = qwenAiRequestGovernor.reportQwenAiBusyStorm(busyAccountIds)
+            },
+          }),
+          createQwenAiContentFailoverStopRule(),
+        )
         : undefined,
     selectNext: excludedAccountIds => loadBalancer.selectAccount(
       request.model,
@@ -729,7 +754,24 @@ router.post('/completions', async (ctx: Context) => {
     account = outcome.selection.account
     provider = outcome.selection.provider
     actualModel = outcome.selection.actualModel
-    const result = outcome.result
+    let result = outcome.result
+    if (
+      busyStormCooldownMs !== undefined
+        && !result.success
+        && result.errorCode === 'qwen_ai_upstream_busy'
+    ) {
+      // A cross-account busy storm was reported to the governor; pace the
+      // client's reconnects with the applied cooldown instead of letting it
+      // immediately re-attack the risk gate.
+      result = {
+        ...result,
+        headers: {
+          ...(result.headers || {}),
+          'Retry-After': String(Math.max(1, Math.ceil(busyStormCooldownMs / 1000))),
+        },
+      }
+      outcome.result = result
+    }
     const effectiveSelection = resolveEffectiveSelection(outcome.selection, result)
     account = effectiveSelection.account
     provider = effectiveSelection.provider

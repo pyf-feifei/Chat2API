@@ -7,6 +7,7 @@ import {
   resolveAccountFailoverLimit,
 } from '../../src/main/proxy/accountFailover.ts'
 import { estimateQwenAiRequestInputTokens } from '../../src/main/proxy/qwenAiCompactionBoundary.ts'
+import { createQwenAiContentFailoverStopRule } from '../../src/main/proxy/qwenContentFailover.ts'
 import type {
   AccountSelection,
   ChatCompletionRequest,
@@ -263,6 +264,40 @@ test('account-neutral file parse timeout continues on the next account', async (
   assert.equal(outcome.failoverCount, 1)
 })
 
+test('persistent file-parse timeouts stop rotating after the cap', async () => {
+  const accounts = ['account-1', 'account-2', 'account-3'].map(id => selection(id))
+  const parseTimeout: ForwardResult = {
+    success: false,
+    status: 504,
+    error: 'Qwen AI file parse timed out',
+    errorCode: 'qwen_ai_file_parse_timeout',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  }
+  const attempted: string[] = []
+
+  // The same unparsed transcript times out on every account (observed
+  // 2026-09-07: six consecutive accounts, each burning the full 120s parse
+  // budget). The content stop rule ends the chain after the one shared
+  // replay instead of serially exhausting the pool.
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: accounts[0],
+    maxFailovers: 5,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      return { ...parseTimeout }
+    },
+    selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+    shouldStopFailover: createQwenAiContentFailoverStopRule(0),
+  })
+
+  assert.deepEqual(attempted, ['account-1', 'account-2'])
+  assert.equal(outcome.result.success, false)
+  assert.equal(outcome.result.errorCode, 'qwen_ai_file_parse_timeout')
+  assert.equal(outcome.failoverCount, 1)
+})
+
 test('exhausted malformed-tool recovery replays the complete request on the next account', async () => {
   const accounts = [selection('account-1'), selection('account-2')]
   const attempted: string[] = []
@@ -342,6 +377,52 @@ test('account-neutral busy and semantic failures reach a healthy later account',
   assert.equal(outcome.selection.account.id, 'account-3')
   assert.equal(outcome.failoverCount, 2)
   assert.equal(outcome.result.body.choices[0].message.content, 'healthy-account-only')
+})
+
+test('content-determined failures stop rotating after the cap instead of burning the pool', async () => {
+  const accounts = [selection('account-1'), selection('account-2'), selection('account-3')]
+  const semanticFailure: ForwardResult = {
+    success: false,
+    status: 422,
+    error: 'Qwen AI completed with a dangling answer while managed tools were available',
+    errorCode: 'qwen_ai_semantic_incomplete',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  }
+  const attempted: string[] = []
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: accounts[0],
+    maxFailovers: 5,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      return { ...semanticFailure }
+    },
+    selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+    shouldStopFailover: createQwenAiContentFailoverStopRule(0),
+  })
+
+  // cap 0 grants exactly one account rotation (2 accounts total): the second
+  // account's private branch is the last cheap recovery before the same
+  // rejected content means the request itself is the problem
+  assert.deepEqual(attempted, ['account-1', 'account-2'])
+  assert.equal(outcome.result.success, false)
+  assert.equal(outcome.result.errorCode, 'qwen_ai_semantic_incomplete')
+  assert.equal(outcome.failoverCount, 1)
+
+  // without the rule the same chain would rotate through the whole pool
+  const attemptedUnbounded: string[] = []
+  await forwardWithAccountFailover({
+    initialSelection: accounts[0],
+    maxFailovers: 5,
+    forward: async ({ selection: current }) => {
+      attemptedUnbounded.push(current.account.id)
+      return { ...semanticFailure }
+    },
+    selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+  })
+  assert.deepEqual(attemptedUnbounded, ['account-1', 'account-2', 'account-3'])
 })
 
 test('concurrent 180K multi-tool requests remain intact across account-neutral failover', async () => {
