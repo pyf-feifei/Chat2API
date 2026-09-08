@@ -1,4 +1,5 @@
 ﻿import { execFile } from 'child_process'
+import { platform } from 'os'
 import { storeManager } from '../../store/store'
 
 const SOLVER_SCRIPT = process.env.ZAI_CAPTCHA_SOLVER_PATH || '/app/scripts/zai-captcha/solve.py'
@@ -42,7 +43,8 @@ async function doSolve(accountId: string, token: string): Promise<string | null>
       '--wait-seconds', '60',
     ]
 
-    const child = execFile('python3', args, {
+    const pythonCmd = platform() === 'win32' ? 'python' : 'python3'
+    const child = execFile(pythonCmd, args, {
       timeout: SOLVER_TIMEOUT_MS,
       maxBuffer: 10 * 1024 * 1024,
     }, (error, stdout, stderr) => {
