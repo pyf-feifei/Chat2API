@@ -4287,6 +4287,7 @@ export class RequestForwarder {
 
       const handler = new ZaiStreamHandler(actualModel, deleteChatCallback)
       handler.setChatId(chatId)
+      handler.setAccountInfo(account.id, account.credentials?.token || '')
       
       if (request.stream === true) {
         const transformedStream = await handler.handleStream(response.data)

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Z.ai Adapter
  * Implements Z.ai (GLM International) API protocol
  */
@@ -20,11 +20,12 @@ import {
   ToolCallState 
 } from '../utils/streamToolHandler'
 import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
+import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-captcha-solver'
 
 const TOKEN_EXPIRY_WARNING_MS = 5 * 60 * 1000 // 5 minutes
 
 const ZAI_API_BASE = 'https://chat.z.ai'
-const X_FE_VERSION = 'prod-fe-1.1.92'
+const X_FE_VERSION = 'prod-fe-1.1.93'
 const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 
 const FAKE_HEADERS = {
@@ -116,6 +117,7 @@ export class ZaiAdapter {
   private provider: Provider
   private account: Account
   private token: string | null = null
+  private captchaRetryAttempted: boolean = false
 
   constructor(provider: Provider, account: Account) {
     this.provider = provider
@@ -128,6 +130,15 @@ export class ZaiAdapter {
   }
 
   private getCaptchaVerifyParam(): string | undefined {
+    // Always read fresh credentials from store to pick up captcha updates
+    try {
+      const freshAccount = storeManager.getAccountById(this.account.id, true)
+      if (freshAccount?.credentials) {
+        return freshAccount.credentials.captcha_verify_param || freshAccount.credentials.captchaVerifyParam || undefined
+      }
+    } catch (e) {
+      // Fallback to cached credentials
+    }
     const credentials = this.account.credentials
     return credentials.captcha_verify_param || credentials.captchaVerifyParam || undefined
   }
@@ -313,7 +324,7 @@ export class ZaiAdapter {
         mcp_servers: [],
         enable_thinking: true,
         auto_web_search: false,
-        message_version: 1,
+        message_version: 2,
         extra: {},
         timestamp: Date.now(),
         type: 'default',
@@ -618,6 +629,47 @@ export class ZaiAdapter {
 
     const response = await this.sendRequestWithRetry(requestBody, token, chatId, signature, timestamp, requestId, userId)
 
+    // Peek at stream to detect captcha errors before returning
+    if (response.status === 200 && response.data && typeof response.data.on === 'function' && !this.captchaRetryAttempted) {
+      try {
+        const firstChunk = await new Promise<Buffer>((resolve) => {
+          let resolved = false
+          const onData = (chunk: Buffer) => {
+            if (!resolved) { resolved = true; response.data.removeListener('data', onData); resolve(chunk) }
+          }
+          response.data.on('data', onData)
+          setTimeout(() => { if (!resolved) { resolved = true; resolve(Buffer.alloc(0)) } }, 8000)
+        })
+
+        if (firstChunk.length > 0) {
+          const chunkText = firstChunk.toString('utf8')
+          if (chunkText.includes('FRONTEND_CAPTCHA_REQUIRED')) {
+            console.log('[Z.ai] Captcha error detected, solving and retrying with fresh context...')
+            // Destroy the failed stream
+            try { response.data.destroy() } catch {}
+            const { solveCaptchaAndUpdateAccount } = await import('./zai-captcha-solver')
+            const solved = await solveCaptchaAndUpdateAccount(this.account.id, token)
+            if (solved) {
+              this.captchaRetryAttempted = true
+              // Redo entire chatCompletion with fresh chat, signature, timestamp, requestId
+              console.log('[Z.ai] Retrying chatCompletion with fresh context after captcha solve...')
+              return this.chatCompletion(request)
+            }
+            console.log('[Z.ai] Captcha solve failed, returning original response')
+          }
+
+          // No captcha error - reconstruct stream with peeked chunk prepended
+          const { PassThrough } = await import('stream')
+          const reconstructed = new PassThrough()
+          reconstructed.write(firstChunk)
+          response.data.pipe(reconstructed)
+          response.data = reconstructed as any
+        }
+      } catch (peekErr) {
+        console.error('[Z.ai] Stream peek error:', peekErr)
+      }
+    }
+
     return { response, chatId, requestId }
   }
 
@@ -693,6 +745,8 @@ export class ZaiAdapter {
 
     console.log('[Z.ai] Response status:', response.status)
 
+
+
     if ((response.status === 401 || response.status === 403) && !isRetry) {
       console.log(`[Z.ai] Auth error (${response.status}), attempting token refresh...`)
       const newToken = await this.attemptTokenRefresh()
@@ -745,6 +799,8 @@ export class ZaiStreamHandler {
   private streamEnded: boolean = false
   private citationBuffer: { value: string } = { value: '' }
   private thinkingCitationBuffer: { value: string } = { value: '' }
+  private accountId: string = ''
+  private accountToken: string = ''
 
   constructor(model: string, onEnd?: (chatId: string) => void) {
     this.model = model
@@ -755,6 +811,11 @@ export class ZaiStreamHandler {
 
   setChatId(chatId: string) {
     this.chatId = chatId
+  }
+
+  setAccountInfo(accountId: string, accountToken: string) {
+    this.accountId = accountId
+    this.accountToken = accountToken
   }
 
   getLastMessageId(): string {
@@ -935,16 +996,39 @@ export class ZaiStreamHandler {
           } else if (result.error || data.error) {
             const error = result.error || data.error
             console.error('[Z.ai] Stream error:', error)
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: `\nError: ${error.detail || JSON.stringify(error)}` }, finish_reason: 'stop' }],
-                created: this.created,
-              })}\n\n`
-            )
-            safeEnd('data: [DONE]\n\n')
+            console.error('[Z.ai] Stream error event (full):', JSON.stringify(data))
+            if (isCaptchaRequiredError(error) && !streamEnded) {
+              console.log('[Z.ai] Captcha required detected in stream, attempting auto-solve...')
+              transStream.write(
+                `data: ${JSON.stringify({
+                  id: this.chatId,
+                  model: this.model,
+                  object: 'chat.completion.chunk',
+                  choices: [{ index: 0, delta: { content: '\n[Captcha required - auto-solving, please retry your request...]' }, finish_reason: 'stop' }],
+                  created: this.created,
+                })}\n\n`
+              )
+              safeEnd('data: [DONE]\n\n')
+              // Trigger background captcha solve
+              const acctId = this.accountId || ''
+              const acctToken = this.accountToken || ''
+              if (acctId && acctToken) {
+                solveCaptchaAndUpdateAccount(acctId, acctToken).then(ok => {
+                  console.log('[Z.ai] Background captcha solve result:', ok ? 'success' : 'failed')
+                }).catch(e => console.error('[Z.ai] Background captcha solve error:', e))
+              }
+            } else {
+              transStream.write(
+                `data: ${JSON.stringify({
+                  id: this.chatId,
+                  model: this.model,
+                  object: 'chat.completion.chunk',
+                  choices: [{ index: 0, delta: { content: `\nError: ${error.detail || JSON.stringify(error)}` }, finish_reason: 'stop' }],
+                  created: this.created,
+                })}\n\n`
+              )
+              safeEnd('data: [DONE]\n\n')
+            }
           }
         } catch (err) {
           console.error('[Z.ai] Stream parse error:', err)
@@ -1047,7 +1131,20 @@ export class ZaiStreamHandler {
                 resolveOnce(data)
               } else if (result.error || eventData.error) {
                 const error = result.error || eventData.error
-                data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
+                console.error('[Z.ai] Non-stream error event (full):', JSON.stringify(eventData))
+                if (isCaptchaRequiredError(error)) {
+                  console.log('[Z.ai] Captcha required detected in non-stream, attempting auto-solve...')
+                  const acctId = this.accountId || ''
+                  const acctToken = this.accountToken || ''
+                  if (acctId && acctToken) {
+                    solveCaptchaAndUpdateAccount(acctId, acctToken).then(ok => {
+                      console.log('[Z.ai] Non-stream captcha solve result:', ok ? 'success' : 'failed')
+                    }).catch(e => console.error('[Z.ai] Non-stream captcha solve error:', e))
+                  }
+                  data.choices[0].message.content += '\n[Captcha required - auto-solving, please retry your request]'
+                } else {
+                  data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
+                }
                 resolveOnce(data)
               }
             } catch (err) {

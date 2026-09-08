@@ -775,8 +775,11 @@ class StoreManager {
       updatedAt: Date.now(),
     }
     
+    let mergedCredentials: Record<string, string> | undefined
     if (updates.credentials) {
-      updatedAccount.credentials = this.encryptCredentials(updates.credentials)
+      const existingCredentials = this.decryptCredentials(accounts[index].credentials || {})
+      mergedCredentials = { ...existingCredentials, ...updates.credentials }
+      updatedAccount.credentials = this.encryptCredentials(mergedCredentials)
     }
     
     accounts[index] = updatedAccount
@@ -784,7 +787,7 @@ class StoreManager {
 
     return {
       ...updatedAccount,
-      credentials: updates.credentials || this.decryptCredentials(accounts[index].credentials),
+      credentials: mergedCredentials || this.decryptCredentials(accounts[index].credentials),
     }
   }
 

@@ -114,3 +114,12 @@ index.bundle.js
 .codex-*.txt
 test_180k.py
 test_context.py
+
+# Z.ai captcha solver local data files
+scripts/zai-captcha/zai_token.txt
+scripts/zai-captcha/zai_accounts_plain.json
+scripts/zai-captcha/no-captcha.png
+scripts/zai-captcha/get_token*.js
+scripts/zai-captcha/decrypt_*.js
+scripts/zai-captcha/dump_accounts.js
+scripts/zai-captcha/find_*.js

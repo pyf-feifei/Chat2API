@@ -134,12 +134,27 @@ ENV QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 ENV QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS=2000
 ENV QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
 ENV QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
+# Install Chromium and Python deps for Z.ai captcha solver
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    python3-pip \
+    python3-numpy \
+    python3-pil \
+    && pip3 install --no-cache-dir --break-system-packages patchright \
+    && python3 -m patchright install chromium 2>/dev/null || true \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+ENV CHROME_PATH=/usr/bin/chromium
+ENV ZAI_CAPTCHA_SOLVER_PATH=/app/scripts/zai-captcha/solve.py
+ENV ZAI_CAPTCHA_ARTIFACT_DIR=/tmp/zai-captcha
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/out-server ./out-server
 COPY --from=build /app/out-admin ./out-admin
 COPY --from=build /app/sha3_wasm_bg.7b9ca65ddd.wasm ./sha3_wasm_bg.7b9ca65ddd.wasm
-RUN mkdir -p /data
+COPY scripts/zai-captcha /app/scripts/zai-captcha
+RUN mkdir -p /data /tmp/zai-captcha
 VOLUME ["/data"]
 EXPOSE 8080
 CMD ["node", "out-server/server/index.js"]

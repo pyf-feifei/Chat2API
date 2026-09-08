@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Z.ai Adapter
  * Implements Z.ai (GLM International) API protocol
  */
@@ -15,7 +15,7 @@ import {
 } from '../types'
 
 const ZAI_API_BASE = 'https://chat.z.ai'
-const X_FE_VERSION = 'prod-fe-1.1.92'
+const X_FE_VERSION = 'prod-fe-1.1.93'
 const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 
 const FAKE_HEADERS = {

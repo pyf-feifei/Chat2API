@@ -1,4 +1,4 @@
-import type { BuiltinProviderConfig } from '../../store/types'
+﻿import type { BuiltinProviderConfig } from '../../store/types'
 
 export const zaiConfig: BuiltinProviderConfig = {
   id: 'zai',
@@ -21,7 +21,7 @@ export const zaiConfig: BuiltinProviderConfig = {
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
-    'X-FE-Version': 'prod-fe-1.1.92',
+    'X-FE-Version': 'prod-fe-1.1.93',
     'X-Region': 'domestic',
   },
   enabled: true,
@@ -31,7 +31,7 @@ export const zaiConfig: BuiltinProviderConfig = {
     Accept: 'application/json',
     Referer: 'https://chat.z.ai/',
     'X-Region': 'domestic',
-    'X-FE-Version': 'prod-fe-1.1.92',
+    'X-FE-Version': 'prod-fe-1.1.93',
   },
   modelCapabilities: {
     'GLM-5.2': { thinkingSkippable: true },
