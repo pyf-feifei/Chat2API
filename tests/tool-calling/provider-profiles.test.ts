@@ -100,3 +100,17 @@ test('qwen-ai history formatters follow the managed-protocol knob per call', () 
     else process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL = previous
   }
 })
+
+test('zai opts into transcript transport and undeclared-capability exclusion', () => {
+  const zaiProfile = getProviderToolProfile('zai')
+
+  assert.equal(zaiProfile.managedSupport, true)
+  assert.equal(zaiProfile.supportsNativeTools, false)
+  assert.equal(zaiProfile.preferredManagedProtocol, 'managed_xml')
+  assert.equal(zaiProfile.usesTranscriptDocumentTransport, true)
+  assert.equal(zaiProfile.excludesUndeclaredProviderCapabilities, true)
+  assert.match(
+    zaiProfile.formatAssistantToolCalls(calls),
+    /<\|CHAT2API\|invoke name="default_api:read_file"/,
+  )
+})

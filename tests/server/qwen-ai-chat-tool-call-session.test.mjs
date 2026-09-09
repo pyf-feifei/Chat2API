@@ -27,6 +27,19 @@ function loadTypeScriptModule(path, localModules = {}) {
       return localModules[specifier]
     }
     if (specifier.startsWith('.')) {
+      if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+        return {
+          isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+          getWebshareProxyAgent: () => undefined,
+          webshareProxyUrlForLog: () => undefined,
+        }
+      }
       throw new Error(`Unexpected Chat tool-call test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -303,6 +316,19 @@ function loadChatRouteHarness(options = {}) {
   const module = { exports: {} }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) return localModules[specifier]
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     throw new Error(`Unexpected Chat tool-call test import: ${specifier}`)
   }
   new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)

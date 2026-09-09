@@ -123,3 +123,6 @@ scripts/zai-captcha/get_token*.js
 scripts/zai-captcha/decrypt_*.js
 scripts/zai-captcha/dump_accounts.js
 scripts/zai-captcha/find_*.js
+
+# Local sync of the Docker data volume (encrypted credentials)
+.chat2api-docker-data/

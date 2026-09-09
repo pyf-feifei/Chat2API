@@ -7,9 +7,10 @@ import {
   ProxyStatus,
   AdvancedConfig,
   QwenAiGovernorPanel,
+  WebshareProxyPanel,
 } from '@/components/proxy'
 import { useProxyStore } from '@/stores/proxyStore'
-import { Settings, Scale, Activity, Settings2, Gauge } from 'lucide-react'
+import { Settings, Scale, Activity, Settings2, Gauge, Globe } from 'lucide-react'
 
 export function ProxySettings() {
   const { t } = useTranslation()
@@ -54,6 +55,10 @@ export function ProxySettings() {
             <Gauge className="h-4 w-4 flex-shrink-0" />
             <span className="hidden md:inline truncate">{t('proxy.qwenGovernor.tab')}</span>
           </TabsTrigger>
+          <TabsTrigger value="webshare" className="flex items-center gap-2 py-2 px-3 flex-1 min-w-0">
+            <Globe className="h-4 w-4 flex-shrink-0" />
+            <span className="hidden md:inline truncate">{t('proxy.webshare.tab', 'Webshare Proxy')}</span>
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="status" className="mt-6">
@@ -74,6 +79,10 @@ export function ProxySettings() {
 
         <TabsContent value="qwenGovernor" className="mt-6">
           <QwenAiGovernorPanel />
+        </TabsContent>
+
+        <TabsContent value="webshare" className="mt-6">
+          <WebshareProxyPanel />
         </TabsContent>
       </Tabs>
     </div>

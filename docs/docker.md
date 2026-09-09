@@ -194,6 +194,9 @@ QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
+# Z.ai context offload mirrors the Qwen document transport knobs above.
+CHAT2API_ZAI_REQUEST_MAX_BYTES=92160
+CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED=true
 # Route client system prompts through the upstream native system_message field
 # (verified against chat.qwen.ai 2026-08-26; the upstream remembers it per
 # chat across continuation turns). Set flattened to inline them into the
@@ -374,6 +377,14 @@ submitted to Qwen instead of being rejected locally with HTTP 413. With
 transcript upload disabled, the body may remain above the offload target and is
 still submitted directly as text, subject to Qwen's own request and context
 limits.
+Z.ai reuses the same offload idea on its own file upload endpoint: before the
+completion request, Chat2API measures the serialized inline history and, when
+it exceeds `CHAT2API_ZAI_REQUEST_MAX_BYTES` (default `92160` bytes; `0`
+disables), uploads the complete transcript as a `context-<id>.txt` document
+and keeps only a pointer sentence plus an 8KB tail excerpt on the active turn.
+`CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED` defaults to `true`; set `false` to
+keep the full transcript inline. Original user attachments are unaffected.
+
 In complete managed document mode the entire conversation (including the
 pending user message) moves to the transcript document. So the operative task
 stays visible without a file read, Chat2API keeps an inline tail excerpt of

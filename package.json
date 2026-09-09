@@ -54,6 +54,7 @@
     "electron-store": "^10.0.0",
     "electron-updater": "^6.3.9",
     "eventsource-parser": "^3.0.6",
+    "https-proxy-agent": "^9.1.0",
     "i18next": "^25.8.11",
     "i18next-browser-languagedetector": "^8.2.1",
     "js-sha3": "^0.9.3",

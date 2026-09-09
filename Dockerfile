@@ -65,6 +65,11 @@ ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
 ENV CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED=true
 # Synthetic transcript format: txt (default) or md.
 ENV CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION=txt
+# Z.ai context offload mirrors the Qwen document transport: oversized inline
+# history is uploaded as a transcript document; zero disables the offload.
+ENV CHAT2API_ZAI_REQUEST_MAX_BYTES=92160
+# Set false to keep the complete Z.ai transcript inline.
+ENV CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED=true
 # Bound inline Hermes routing summaries while complete tool documentation stays
 # in the account-scoped reference attachment. Zero omits inline descriptions.
 ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
@@ -148,13 +153,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CHROME_PATH=/usr/bin/chromium
 ENV ZAI_CAPTCHA_SOLVER_PATH=/app/scripts/zai-captcha/solve.py
 ENV ZAI_CAPTCHA_ARTIFACT_DIR=/tmp/zai-captcha
+# Qwen RGV587 risk-session refresher (aliyun slider solve -> x5sec cookie harvest)
+ENV QWEN_CAPTCHA_SOLVER_PATH=/app/scripts/qwen-captcha/refresh.py
+ENV QWEN_CAPTCHA_ARTIFACT_DIR=/tmp/qwen-captcha
+# Perturb uploaded transcripts on retries (>= 2) so RGV587's content-verdict
+# cache cannot pin identical resubmissions. 'false' disables.
+ENV CHAT2API_QWEN_AI_RETRY_NONCE=true
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/out-server ./out-server
 COPY --from=build /app/out-admin ./out-admin
 COPY --from=build /app/sha3_wasm_bg.7b9ca65ddd.wasm ./sha3_wasm_bg.7b9ca65ddd.wasm
 COPY scripts/zai-captcha /app/scripts/zai-captcha
-RUN mkdir -p /data /tmp/zai-captcha
+COPY scripts/qwen-captcha /app/scripts/qwen-captcha
+RUN mkdir -p /data /tmp/zai-captcha /tmp/qwen-captcha
 VOLUME ["/data"]
 EXPOSE 8080
 CMD ["node", "out-server/server/index.js"]

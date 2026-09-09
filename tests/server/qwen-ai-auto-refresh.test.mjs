@@ -34,6 +34,19 @@ function loadTokenRefreshModule({ post, updateAccount } = {}) {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) {
       return localModules[specifier]
     }
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     throw new Error(`Unexpected token refresher test import: ${specifier}`)
   }
 

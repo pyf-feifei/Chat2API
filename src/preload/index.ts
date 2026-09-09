@@ -1,10 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IpcChannels } from '../main/ipc/channels'
-import type { 
-  Provider, 
-  Account, 
-  ProxyStatus, 
-  ProviderCheckResult, 
+import type {
+  Provider,
+  Account,
+  ProxyStatus,
+  ProviderCheckResult,
   OAuthResult,
   AuthType,
   CredentialField,
@@ -18,7 +18,17 @@ import type {
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
   ProviderModelCapability,
+  WebshareProxyConfig,
 } from '../shared/types'
+
+export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
+  effective: {
+    enabled: boolean
+    proxyUrl: string
+    entries?: Array<{ proxyUrl: string; cooldownUntil: number; failureCount: number }>
+  }
+  source: 'config' | 'env'
+}
 
 const proxyAPI = {
   start: (port?: number): Promise<boolean> => 
@@ -758,6 +768,117 @@ const qwenAiGovernorAPI = {
   },
 }
 
+const webshareProxyAPI = {
+  async getConfig(): Promise<WebshareProxyConfigPayload | null> {
+    const config = await configAPI.get()
+    const secret = config.managementApi?.managementApiSecret
+    if (!secret) return null
+
+    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/webshare-proxy/config`, {
+      headers: { Authorization: `Bearer ${secret}` },
+    })
+    const payload = await response.json()
+    return payload.data ?? null
+  },
+
+  async updateConfig(updates: Partial<WebshareProxyConfig>): Promise<WebshareProxyConfigPayload> {
+    const config = await configAPI.get()
+    const secret = config.managementApi?.managementApiSecret
+    if (!secret) {
+      throw new Error('Management API secret is not configured.')
+    }
+
+    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/webshare-proxy/config`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(updates),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error?.message || `Webshare proxy update failed: HTTP ${response.status}`)
+    }
+    return payload.data
+  },
+
+  async clearConfig(): Promise<WebshareProxyConfigPayload> {
+    const config = await configAPI.get()
+    const secret = config.managementApi?.managementApiSecret
+    if (!secret) {
+      throw new Error('Management API secret is not configured.')
+    }
+
+    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/webshare-proxy/config`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${secret}` },
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error?.message || `Webshare proxy clear failed: HTTP ${response.status}`)
+    }
+    return payload.data
+  },
+
+  async fetchProxyList(apiKey: string, page = 1) {
+    const config = await configAPI.get()
+    const secret = config.managementApi?.managementApiSecret
+    if (!secret) {
+      throw new Error('Management API secret is not configured.')
+    }
+
+    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/webshare-proxy/api-keys/proxy-list`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ apiKey, page }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error?.message || `Webshare proxy list fetch failed: HTTP ${response.status}`)
+    }
+    return payload.data
+  },
+
+  async syncNow(): Promise<WebshareProxyConfigPayload> {
+    const config = await configAPI.get()
+    const secret = config.managementApi?.managementApiSecret
+    if (!secret) {
+      throw new Error('Management API secret is not configured.')
+    }
+    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/webshare-proxy/sync`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}` },
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error?.message || `Webshare pool sync failed: HTTP ${response.status}`)
+    }
+    return payload.data
+  },
+
+  async disengageSticky(): Promise<WebshareProxyConfigPayload> {
+    const config = await configAPI.get()
+    const secret = config.managementApi?.managementApiSecret
+    if (!secret) {
+      throw new Error('Management API secret is not configured.')
+    }
+
+    const response = await fetch(`${resolveLocalManagementApiBaseUrl(config)}/webshare-proxy/sticky/disengage`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}` },
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error?.message || `Webshare sticky disengage failed: HTTP ${response.status}`)
+    }
+    return payload.data
+  },
+}
+
 const trayAPI = {
   openDashboard: (): void => 
     ipcRenderer.send('tray:open-dashboard'),
@@ -786,6 +907,7 @@ const electronAPI = {
   contextManagement: contextManagementAPI,
   toolCalling: toolCallingAPI,
   qwenAiGovernor: qwenAiGovernorAPI,
+  webshareProxy: webshareProxyAPI,
   tray: trayAPI,
   
   on: (channel: string, callback: (...args: unknown[]) => void) => {

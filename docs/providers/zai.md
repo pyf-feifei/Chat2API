@@ -27,6 +27,21 @@
 
 后续方向：需要独立评估真实浏览器辅助模式，让 Z.ai Web 页面自行生成短时验证码参数；在此之前不建议把 Z.ai 作为稳定可用供应商。
 
+## 搜索与思考深度
+
+- 单轮搜索：请求体 `web_search: true`（或 `X-Web-Search: true` 头）映射为 z.ai 的 `features.auto_web_search`。
+- 高级搜索（多轮研究）：请求体 `deep_research: true`（或 `X-Deep-Research: true` 头）同时开启搜索与思考，由 z.ai 服务端执行多轮检索分析。
+- 思考深度：`reasoning_effort`（`low`/`medium`/`high`；`minimal`/`xhigh` 先归一化）映射为 z.ai Web 的 `features.reasoning_effort`（`low`/`high`/`max`）；未显式指定档位时默认 `max`；`reasoning_effort: false` 关闭深度思考。
+
+## 超长会话传输
+
+内联历史超出 `CHAT2API_ZAI_REQUEST_MAX_BYTES`（默认 `92160` 字节）时，代理将完整会话转录为 `context-<id>.txt` 文档上传，活跃轮仅保留指针句与 8KB 尾部摘录。`CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED=false` 关闭该 offload、保持完整内联上下文；用户原始附件上传不受影响。
+
+## 工具调用与多轮历史
+
+- z.ai 上游以建会话时的种子消息作为模型上下文；代理把扁平化后的完整历史（含 managed XML 工具调用、工具结果与 workflow 续接提示）作为种子写入新建 chat，保证 tool result 回喂与多轮上下文可达上游。
+- 流式/非流式工具拦截统一走 `ToolStreamParser(plan)`（与 GLM 一致），识别 managed 协议并防止包装泄漏。
+
 ## 教程
 
 1. 登录 `chat.z.ai`。

@@ -89,6 +89,15 @@ import {
   qwenAiSafeExplicitRetryScope,
   qwenAiAccountRetryScope,
 } from './qwenAiAccountPolicy'
+import {
+  isWebshareProxyEnabled,
+  isWebshareStickyActive,
+  maybeProbeWebshareDirectExit,
+  engageWebshareStickyMode,
+  disengageWebshareStickyMode,
+  reportWebshareProxyFailure,
+  reportWebshareProxySuccess,
+} from './webshareProxy'
 
 function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
   return classifyQwenAiAccountFault(value)
@@ -223,6 +232,22 @@ function isQwenAiUpstreamBusyResult(result: ForwardResult): boolean {
   return !result.success
     && result.errorCode === 'qwen_ai_upstream_busy'
     && result.accountFault === false
+}
+
+/**
+ * Document-pipeline failures: the upload/parse stage rejected or stalled the
+ * synthetic transcript. These follow the pipeline, not the account (observed
+ * 2026-09-07/08: identical parse timeouts across six accounts while the
+ * inline channel served normally), so the escape is a transport downgrade,
+ * not account rotation.
+ */
+function isQwenAiDocumentPipelineFailure(result: ForwardResult): boolean {
+  return !result.success
+    && result.accountFault === false
+    && (
+      result.errorCode === 'qwen_ai_file_parse_timeout'
+      || /file parse|file upload|upload sts|parse request failed|parse failed/i.test(result.error ?? '')
+    )
 }
 
 function qwenAiToolCallIdsFromChatResponse(response: unknown): string[] {
@@ -920,8 +945,14 @@ type QwenAiForwardOptions = {
   requestDeadlineAt?: number
   /** Complete-message transport selected from an observed upstream response. */
   messageTransport?: QwenAiMessageTransport
+  /** Keep the inline escape retry inline even above the byte offload target. */
+  messageTransportLocked?: boolean
   /** Snapshot of the synthetic transcript upload policy for this request. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
+  /** Route this attempt through the configured Webshare proxy (RGV587 recovery). */
+  webshareProxy?: boolean
+  /** Logical retry counter (1 = first attempt); >= 2 perturbs the transcript nonce. */
+  attemptNumber?: number
 }
 
 /**
@@ -998,7 +1029,10 @@ type ForwardAttemptOptions = {
   qwenAiRequestTimeoutMs?: number
   qwenAiRequestDeadlineAt?: number
   qwenAiMessageTransport?: QwenAiMessageTransport
+  /** Keep the inline escape retry inline even above the byte offload target. */
+  qwenAiMessageTransportLocked?: boolean
   qwenAiTranscriptTransportPolicy?: QwenAiTranscriptTransportPolicy
+  qwenAiWebshareProxy?: boolean
   attempt?: number
 }
 
@@ -1180,9 +1214,11 @@ export class RequestForwarder {
           actualModel,
           context,
           {
+            // Keep the remaining time uncapped-by-1: a spent deadline should
+            // surface as a request-timeout 504, never a 1ms axios abort.
             qwenAiRequestTimeoutMs: qwenAiRequestDeadlineAt === undefined
               ? undefined
-              : Math.max(1, qwenAiRequestDeadlineAt - Date.now()),
+              : qwenAiRequestDeadlineAt - Date.now(),
             qwenAiRequestDeadlineAt,
           },
         )
@@ -1298,9 +1334,12 @@ export class RequestForwarder {
       const deadline = qwenAiRequestDeadline === undefined
         ? undefined
         : new Promise<typeof qwenDeadlineExpired>(resolve => {
+            // The pre-race check above already caught an expired deadline, so
+            // the remaining time here is strictly positive; Math.max(1) would
+            // turn a negative remainder into an immediate spurious fire.
             deadlineTimer = setTimeout(
               () => resolve(qwenDeadlineExpired),
-              Math.max(1, qwenAiRequestDeadline - Date.now()),
+              qwenAiRequestDeadline - Date.now(),
             )
           })
       const aborted = context.signal
@@ -1329,11 +1368,24 @@ export class RequestForwarder {
     let attempt = 0
     let standardRetriesUsed = 0
     let qwenAiBusyRetries = 0
+    let qwenAiWebshareRetries = 0
+    let qwenAiWebshareProxy = false
+    let qwenAiDocumentEscapeRetries = 0
+    let qwenAiMessageTransportLocked = false
+    /** One-shot direct retry after a proxy-routed transport failure degraded sticky mode. */
+    let qwenAiDirectRetryAfterProxyFailureUsed: boolean | undefined
     let nextRetryDelayMs = 0
     let qwenAiMessageTransport: QwenAiMessageTransport = 'inline'
     const qwenAiTranscriptTransportPolicy = isQwenAiProvider
       ? qwenAiTranscriptTransportPolicyFromEnv()
       : undefined
+    // Sticky mode (mode B): while the direct exit IP is RGV587-flagged, ALL
+    // attempts on this request route through the Webshare proxy instead of
+    // paying a failed direct attempt + recovery retry per request. The probe
+    // in webshareProxy.ts disengages sticky mode once the direct IP recovers.
+    if (isQwenAiProvider && isWebshareStickyActive()) {
+      qwenAiWebshareProxy = true
+    }
 
     const scheduleQwenAiBusyRetry = (result: ForwardResult): boolean => {
       if (
@@ -1343,13 +1395,40 @@ export class RequestForwarder {
         return false
       }
 
+      // RGV587 envelope (FAIL_SYS_USER_VALIDATE + 被挤爆) means the account's
+      // web session is behind an aliyun validation challenge — account
+      // rotation and exit-IP changes keep hitting the same verdict. Track
+      // challenges and let the risk refresher re-issue the session cookies
+      // (x5sec family) via a real browser once the threshold trips. Dynamic
+      // import keeps this advisory hook off the static import graph.
+      if (/FAIL_SYS_USER_VALIDATE|RGV587/i.test(result.error ?? '')) {
+        void import('./adapters/qwen-risk-refresh')
+          .then(module => module.noteQwenAiRiskChallenge(account, result.error))
+          .catch(() => {})
+      }
+
       const observedAt = Date.now()
       const delayMs = qwenAiUpstreamBusyRetryDelayMs(result, qwenAiBusyRetries)
       const remainingBudgetMs = Math.max(0, qwenAiRequestDeadline - observedAt)
       const retryLimit = qwenAiBusyRetryCountFromEnv()
-      const willRetry = qwenAiBusyRetries < retryLimit
+      let willRetry = qwenAiBusyRetries < retryLimit
         && !context.signal?.aborted
         && observedAt + delayMs < qwenAiRequestDeadline
+      // RGV587 busy responses are IP-level risk control: rotating accounts
+      // keeps hitting the same flagged exit IP. When the ordinary same-account
+      // busy budget is exhausted (or configured to 0), retry once through the
+      // configured Webshare proxy so only this recovery uses proxy traffic.
+      let retryViaWebshare = false
+      if (
+        !willRetry
+        && qwenAiWebshareRetries < 1
+        && isWebshareProxyEnabled()
+        && !context.signal?.aborted
+        && observedAt + delayMs < qwenAiRequestDeadline
+      ) {
+        willRetry = true
+        retryViaWebshare = true
+      }
       const nextMessageTransport: QwenAiMessageTransport = qwenAiMessageTransport === 'inline'
         ? 'document'
         : qwenAiMessageTransport
@@ -1367,6 +1446,7 @@ export class RequestForwarder {
         messageTransport: qwenAiMessageTransport,
         nextMessageTransport: willRetry ? nextMessageTransport : undefined,
         willRetry,
+        retryViaWebshare: willRetry ? retryViaWebshare : undefined,
         stopReason: context.signal?.aborted
           ? 'client_aborted'
           : willRetry
@@ -1377,7 +1457,12 @@ export class RequestForwarder {
       }))
       if (!willRetry) return false
 
-      qwenAiBusyRetries += 1
+      if (retryViaWebshare) {
+        qwenAiWebshareRetries += 1
+        qwenAiWebshareProxy = true
+      } else {
+        qwenAiBusyRetries += 1
+      }
       qwenAiMessageTransport = nextMessageTransport
       nextRetryDelayMs = delayMs
       attempt += 1
@@ -1385,6 +1470,11 @@ export class RequestForwarder {
     }
 
     while (true) {
+      // Sticky mode's direct-IP probe is opportunistic and fire-and-forget:
+      // never on the request path, only while sticky traffic is flowing.
+      if (qwenAiWebshareProxy && isWebshareStickyActive()) {
+        maybeProbeWebshareDirectExit()
+      }
       if (context.signal?.aborted) {
         lastStatus = 499
         lastHeaders = undefined
@@ -1513,12 +1603,18 @@ export class RequestForwarder {
           context,
           {
             qwenAiRecoveryBypassAccountInterval: useRecoveryBypass,
+            // A spent deadline must surface as a clean 504 instead of being
+            // clamped to a 1ms axios timeout that aborts the request the
+            // moment it is issued (observed 2026-09-08: reconnects inherited
+            // an exhausted deadline and every retry died as ECONNABORTED).
             qwenAiRequestTimeoutMs: qwenAiRequestDeadline === undefined
               ? undefined
-              : Math.max(1, qwenAiRequestDeadline - Date.now()),
+              : qwenAiRequestDeadline - Date.now(),
             qwenAiRequestDeadlineAt: qwenAiRequestDeadline,
             qwenAiMessageTransport,
+            qwenAiMessageTransportLocked: qwenAiMessageTransportLocked,
             qwenAiTranscriptTransportPolicy,
+            qwenAiWebshareProxy,
             attempt: attempt + 1,
           },
         )
@@ -1539,7 +1635,45 @@ export class RequestForwarder {
           : rawResult
 
         if (result.success) {
+          if (qwenAiWebshareProxy) {
+            // A proxy-routed attempt that completed clears that pool entry's
+            // failure history so future recovery traffic trusts it again.
+            reportWebshareProxySuccess()
+            // Mode B arm: the proxy exit succeeded where the direct exit was
+            // RGV587-blocked — proof the direct IP is risk-controlled. Keep
+            // all Qwen traffic on the proxy until the direct probe recovers.
+            if (qwenAiWebshareRetries > 0 && isWebshareProxyEnabled()) {
+              engageWebshareStickyMode(
+                `proxy recovery succeeded after direct ${lastErrorCode ?? lastStatus ?? 'failure'}`,
+              )
+            }
+          }
           return result
+        }
+
+        // A proxy-routed attempt that still failed cools this pool entry so
+        // the next recovery rotates to a different Webshare key/exit.
+        let degradedProxyTransport = false
+        if (qwenAiWebshareProxy && !context.signal?.aborted) {
+          reportWebshareProxyFailure()
+          // The proxy exit itself is unreachable (connect failure / tunnel
+          // drop): stay off the proxy for the next attempt and re-test the
+          // direct exit instead of wedging every retry behind a dead tunnel.
+          // Socket-level evidence decides this, NOT the mapped HTTP status:
+          // the adapter layers 502/504 over transport faults via
+          // statusFromError, and isQwenAiTransientTransportError treats any
+          // >=400 status as an upstream decision (observed 2026-09-09: a
+          // thrown ECONNREFUSED became a 502 result and the degrade check
+          // missed it entirely).
+          degradedProxyTransport = isQwenAiTransientTransportError({
+            code: result.errorCode,
+            message: result.error,
+          })
+          if (degradedProxyTransport) {
+            disengageWebshareStickyMode('proxy transport failure — retrying via the direct exit')
+            qwenAiWebshareProxy = false
+            qwenAiDirectRetryAfterProxyFailureUsed = false
+          }
         }
 
         lastError = result.error
@@ -1574,6 +1708,50 @@ export class RequestForwarder {
           continue
         }
 
+        // Document-pipeline escape hatch: a parse/upload failure is decided
+        // by the pipeline (not the account — observed 2026-09-07/08: the
+        // same transcript timed out on six accounts while the inline channel
+        // stayed healthy). One same-account retry with the document transport
+        // disabled keeps the turn alive on the inline channel instead of
+        // burning every remaining account on a dead pipeline. Pipeline stalls
+        // can also be IP-level (RGV587 aftermath): when the Webshare proxy is
+        // configured and this attempt did not already use it, the escape
+        // retry leaves through a different exit IP.
+        if (
+          isQwenAiProvider
+          && qwenAiMessageTransport === 'document'
+          && isQwenAiDocumentPipelineFailure(result)
+          && qwenAiDocumentEscapeRetries < 1
+          && !context.signal?.aborted
+          && qwenAiRequestDeadline !== undefined
+          && Date.now() < qwenAiRequestDeadline
+        ) {
+          qwenAiDocumentEscapeRetries += 1
+          qwenAiMessageTransport = 'inline'
+          const retryViaWebshare = !qwenAiWebshareProxy
+            && qwenAiWebshareRetries < 1
+            && isWebshareProxyEnabled()
+          if (retryViaWebshare) {
+            qwenAiWebshareRetries += 1
+            qwenAiWebshareProxy = true
+          }
+          nextRetryDelayMs = 0
+          attempt += 1
+          // The escape retry must not offload back onto the dead document
+          // pipeline: lock the transport to inline for this attempt even when
+          // the payload exceeds the byte offload target.
+          qwenAiMessageTransportLocked = true
+          console.warn('[QwenAI] document pipeline failed, retrying inline', JSON.stringify({
+            requestId: context.requestId,
+            accountId: account.id,
+            status: result.status,
+            errorCode: result.errorCode,
+            attempt,
+            viaWebshare: retryViaWebshare || undefined,
+          }))
+          continue
+        }
+
         const canRecoverManagedToolStream = recoverManagedToolStream
           && result.status === 502
           && result.recoveryHint === 'managed_tool_stream_validation'
@@ -1599,6 +1777,31 @@ export class RequestForwarder {
           break
         }
 
+        // A proxy-routed transport failure already degraded sticky mode and
+        // dropped the proxy flag; grant exactly one direct-exit retry even
+        // when the ordinary retry budget is 0, so a dead proxy exit cannot
+        // take an otherwise healthy request down with it. (qwenAiWebshareRetries
+        // is not consulted: sticky-mode routing does not spend it.)
+        if (
+          isQwenAiProvider
+          && degradedProxyTransport
+          && !qwenAiWebshareProxy
+          && qwenAiDirectRetryAfterProxyFailureUsed === false
+          && qwenAiRequestDeadline !== undefined
+          && Date.now() < qwenAiRequestDeadline
+        ) {
+          qwenAiDirectRetryAfterProxyFailureUsed = true
+          nextRetryDelayMs = 0
+          attempt += 1
+          console.warn('[QwenAI] proxy transport failed, retrying once via the direct exit', JSON.stringify({
+            requestId: context.requestId,
+            accountId: account.id,
+            errorCode: lastErrorCode,
+            attempt,
+          }))
+          continue
+        }
+
         if (standardRetriesUsed >= maxRetries) break
         standardRetriesUsed += 1
         nextRetryDelayMs = 5000
@@ -1608,6 +1811,20 @@ export class RequestForwarder {
         lastStatus = statusFromError(error)
         lastHeaders = headersFromError(error)
         lastErrorCode = errorCodeFromError(error)
+        // Exception-path proxy accounting: a thrown adapter error still used
+        // a proxy exit when the attempt was proxy-routed (observed 2026-09-09:
+        // a dead pool endpoint surfaced as a thrown ECONNREFUSED from chat
+        // creation, bypassing the result-path failure reporting entirely).
+        const thrownTransientTransportFailure = isQwenAiProvider
+          && isQwenAiTransientTransportError(error)
+        if (qwenAiWebshareProxy && !context.signal?.aborted) {
+          reportWebshareProxyFailure()
+          if (thrownTransientTransportFailure) {
+            disengageWebshareStickyMode('proxy transport failure — retrying via the direct exit')
+            qwenAiWebshareProxy = false
+            qwenAiDirectRetryAfterProxyFailureUsed = false
+          }
+        }
         const errorClassification = {
           ...(error && typeof error === 'object' ? error as Record<string, unknown> : {}),
           status: lastStatus,
@@ -1630,8 +1847,7 @@ export class RequestForwarder {
             ? 'next-account'
             : undefined
         const errorRetryable = (error as { retryable?: unknown })?.retryable
-        const transientTransportFailure = isQwenAiProvider
-          && isQwenAiTransientTransportError(error)
+        const transientTransportFailure = thrownTransientTransportFailure
         lastRetryable = lastStatus === 499
           || (isQwenAiProvider && lastStatus === 504)
           || errorCodeFromError(error) === 'qwen_ai_risk_control'
@@ -1672,6 +1888,31 @@ export class RequestForwarder {
           || defaultManagedToolRecoveryOnly
         ) {
           break
+        }
+
+        // A proxy-routed transport failure already degraded sticky mode and
+        // dropped the proxy flag; grant exactly one direct-exit retry even
+        // when the ordinary retry budget is 0, so a dead proxy exit cannot
+        // take an otherwise healthy request down with it. (qwenAiWebshareRetries
+        // is not consulted: sticky-mode routing does not spend it.)
+        if (
+          isQwenAiProvider
+          && !qwenAiWebshareProxy
+          && transientTransportFailure
+          && qwenAiDirectRetryAfterProxyFailureUsed === false
+          && qwenAiRequestDeadline !== undefined
+          && Date.now() < qwenAiRequestDeadline
+        ) {
+          qwenAiDirectRetryAfterProxyFailureUsed = true
+          nextRetryDelayMs = 0
+          attempt += 1
+          console.warn('[QwenAI] proxy transport failed, retrying once via the direct exit', JSON.stringify({
+            requestId: context.requestId,
+            accountId: account.id,
+            errorCode: lastErrorCode,
+            attempt,
+          }))
+          continue
         }
 
         if (standardRetriesUsed >= maxRetries) break
@@ -2602,7 +2843,10 @@ export class RequestForwarder {
         requestTimeoutMs: options.qwenAiRequestTimeoutMs,
         requestDeadlineAt: options.qwenAiRequestDeadlineAt,
         messageTransport: options.qwenAiMessageTransport,
+        messageTransportLocked: options.qwenAiMessageTransportLocked,
         transcriptTransportPolicy: options.qwenAiTranscriptTransportPolicy,
+        webshareProxy: options.qwenAiWebshareProxy,
+        attemptNumber: options.attempt,
       }),
       {
         signal: context.signal,
@@ -3646,11 +3890,16 @@ export class RequestForwarder {
         image_generation: providerRequest.image_generation,
         signal: context?.signal,
         deadlineAt: options.requestDeadlineAt,
+        // Uncapped-by-1: a spent deadline surfaces as qwen_ai_request_timeout
+        // via the deadline scope, not as a 1ms axios abort.
         timeoutMs: options.requestDeadlineAt === undefined
           ? options.requestTimeoutMs
-          : Math.max(1, options.requestDeadlineAt - Date.now()),
+          : options.requestDeadlineAt - Date.now(),
         messageTransport: options.messageTransport,
+        messageTransportLocked: options.messageTransportLocked,
         transcriptTransportPolicy: options.transcriptTransportPolicy,
+        webshareProxy: options.webshareProxy,
+        attemptNumber: options.attemptNumber,
       })
       const sessionBridge = context?.qwenAiSessionBridge
       const continuation = sessionBridge?.continuation
@@ -3718,7 +3967,9 @@ export class RequestForwarder {
             // which becomes an expensive document upload for long sessions.
             chatInProgressRetryAttempts: qwenAiResponsesContinuationRetryAttemptsFromEnv(),
             messageTransport: options.messageTransport,
+            messageTransportLocked: options.messageTransportLocked,
             transcriptTransportPolicy: options.transcriptTransportPolicy,
+            webshareProxy: options.webshareProxy,
             signal: context?.signal,
             deadlineAt: options.requestDeadlineAt,
           })
@@ -3997,7 +4248,9 @@ export class RequestForwarder {
                   content: workflowContinuationContent,
                   nativeSystemPrompt: resolveQwenAiNativeContinuationSystemPrompt(transformed.messages),
                   messageTransport: options.messageTransport,
+                  messageTransportLocked: options.messageTransportLocked,
                   transcriptTransportPolicy: options.transcriptTransportPolicy,
+                  webshareProxy: options.webshareProxy,
                   enable_thinking: providerRequest.enable_thinking !== undefined
                     ? providerRequest.enable_thinking
                     : providerRequest.reasoning_effort !== undefined
@@ -4261,17 +4514,63 @@ export class RequestForwarder {
         temperature: request.temperature,
         web_search: request.web_search,
         reasoning_effort: toThreeLevelReasoningEffort(request.reasoning_effort),
+        thinking_budget: request.thinking_budget,
+        deep_research: request.deep_research,
       })
 
       const latency = Date.now() - startTime
 
       if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
+        const status = response.status
+        const zaiErrorBody = typeof (response as any).zaiErrorBody === "string" ? (response as any).zaiErrorBody : ""
+        let errorMessage = `HTTP ${status}`
+        if (zaiErrorBody) errorMessage += ': ' + zaiErrorBody.slice(0, 500)
+
+        const isAuth = status === 401 || status === 403
+        const isRateLimit = status === 429
+        const isCaptcha = zaiErrorBody.includes('FRONTEND_CAPTCHA_REQUIRED')
+        const isServer = status >= 500
+
+        let errorCode: string | undefined
+        let accountFault: boolean | undefined
+        let retryScope: 'next-account' | undefined
+        let retryable: boolean | undefined
+
+        if (isCaptcha) {
+          errorCode = 'zai_captcha_required'
+          accountFault = false
+          retryScope = 'next-account'
+          retryable = false
+        } else if (isAuth) {
+          errorCode = 'zai_auth_error'
+          accountFault = true
+          retryScope = 'next-account'
+          retryable = false
+        } else if (isRateLimit) {
+          errorCode = 'zai_rate_limit'
+          accountFault = true
+          retryScope = 'next-account'
+          retryable = false
+        } else if (isServer) {
+          errorCode = 'zai_server_error'
+          accountFault = false
+          retryable = true
+        } else {
+          errorCode = 'zai_http_' + status
+          accountFault = false
+        }
+
+        console.warn('[Z.ai] Chat request failed:', JSON.stringify({ status, errorCode, accountFault, accountId: account.id }))
+
         return {
           success: false,
-          status: response.status,
+          status,
           error: errorMessage,
           latency,
+          errorCode,
+          accountFault,
+          retryScope,
+          retryable,
         }
       }
 
@@ -4285,7 +4584,7 @@ export class RequestForwarder {
           }
         : undefined
 
-      const handler = new ZaiStreamHandler(actualModel, deleteChatCallback)
+      const handler = new ZaiStreamHandler(actualModel, deleteChatCallback, transformed.plan)
       handler.setChatId(chatId)
       handler.setAccountInfo(account.id, account.credentials?.token || '')
       
@@ -4321,10 +4620,17 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
+      const errMsg = error instanceof Error ? error.message : 'Unknown error'
+      const errCode = (error as any)?.code || (error as any)?.errorCode
+      const isTimeout = errCode === 'ECONNABORTED' || errMsg.includes('timeout') || errMsg.includes('ETIMEDOUT')
+      const isConnRefused = errCode === 'ECONNREFUSED' || errCode === 'ECONNRESET' || errCode === 'ENOTFOUND'
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errMsg,
         latency,
+        errorCode: isTimeout ? 'zai_timeout' : isConnRefused ? 'zai_transport_error' : 'zai_unknown',
+        accountFault: false,
+        retryable: isTimeout || isConnRefused,
       }
     }
   }

@@ -278,6 +278,19 @@ function loadChatRoute({
   }
   const testRequire = specifier => {
     if (specifier in localModules) return localModules[specifier]
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     throw new Error(`Unexpected chat route test import: ${specifier}`)
   }
 

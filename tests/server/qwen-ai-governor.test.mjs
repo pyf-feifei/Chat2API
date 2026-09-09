@@ -66,6 +66,19 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
       return { calculateQwenAiAdaptiveLimits, calculateQwenAiRequestReadyAt, parseQwenAiRetryAfterMs }
     }
     if (specifier === './qwenAiAccountPolicy') return { isQwenAiAccountFault }
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     throw new Error(`Unexpected governor test import: ${specifier}`)
   }
 
@@ -106,6 +119,19 @@ function loadLoadBalancerForRuntimeTest(storeOverrides = {}) {
       return { qwenAiRequestGovernor: { isAccountImmediatelyAvailable: () => true } }
     }
     if (specifier === '../store/types' || specifier === './types') return {}
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     throw new Error(`Unexpected load-balancer test import: ${specifier}`)
   }
 

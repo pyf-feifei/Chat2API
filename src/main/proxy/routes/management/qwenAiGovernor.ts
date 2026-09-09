@@ -6,6 +6,7 @@ import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import { loadBalancer } from '../../loadbalancer'
 import { qwenAiRequestGovernor } from '../../qwenAiRequestGovernor'
 import { qwenAiSessionRepairService } from '../../qwenAiSessionRepair'
+import { refreshQwenAiRiskSession } from '../../adapters/qwen-risk-refresh'
 import type {
   ManagementApiResponse,
   QwenAiGovernorConfig,
@@ -109,6 +110,46 @@ router.delete('/cooldowns', async (ctx: Context) => {
     success: true,
     data: { cleared: true },
   } as ManagementApiResponse<{ cleared: boolean }>
+})
+
+/**
+ * Manual risk-session refresh (x5sec harvest): launches the browser-based
+ * aliyun slider solver for one account and persists the harvested risk
+ * cookies. Immediate remedy when an account is pinned behind RGV587
+ * (FAIL_SYS_USER_VALIDATE) — rotation and exit-IP changes cannot escape
+ * that verdict, only a re-validated session can.
+ */
+router.post('/accounts/:accountId/refresh-risk-session', async (ctx: Context) => {
+  const accountId = ctx.params.accountId
+  const account = storeManager.getAccounts(true).find(candidate => candidate.id === accountId)
+  if (!account) {
+    ctx.status = 404
+    ctx.body = {
+      success: false,
+      error: { code: 'not_found', message: `Account not found: ${accountId}` },
+    } as ManagementApiResponse
+    return
+  }
+  const updated = await refreshQwenAiRiskSession(account)
+  if (!updated) {
+    ctx.status = 502
+    ctx.body = {
+      success: false,
+      error: {
+        code: 'refresh_failed',
+        message: 'Risk-session refresh did not return usable cookies (see service logs)',
+      },
+    } as ManagementApiResponse
+    return
+  }
+  ctx.body = {
+    success: true,
+    data: {
+      accountId,
+      refreshed: true,
+      hasCookies: Boolean(updated.credentials.cookies || updated.credentials.cookie),
+    },
+  } as ManagementApiResponse<{ accountId: string; refreshed: boolean; hasCookies: boolean }>
 })
 
 export default router

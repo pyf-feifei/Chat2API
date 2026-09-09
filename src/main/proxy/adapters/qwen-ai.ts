@@ -61,6 +61,7 @@ import {
   getToolStreamValidationFailure,
   type ToolStreamValidationFailure,
 } from '../toolCalling/streamValidationPolicy'
+import { getWebshareProxyAgent, webshareProxyUrlForLog } from '../webshareProxy'
 import type { ToolCall } from '../types'
 import {
   isCompleteJsonText,
@@ -265,8 +266,21 @@ interface ChatCompletionRequest {
   timeoutMs?: number
   /** Selects how the complete converted conversation reaches Qwen. */
   messageTransport?: QwenAiMessageTransport
+  /**
+   * Inline escape retry: keep messageTransport inline even above the byte
+   * offload target, so the retry never re-enters the dead document pipeline.
+   */
+  messageTransportLocked?: boolean
   /** Snapshot of the synthetic transcript transport policy for this request. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
+  /** When true, route this request through the configured Webshare proxy. */
+  webshareProxy?: boolean
+  /**
+   * Logical retry counter (1 = first attempt). Attempts >= 2 perturb the
+   * uploaded transcript with a nonce so RGV587's content-verdict cache
+   * cannot pin the resubmission.
+   */
+  attemptNumber?: number
 }
 
 interface QwenAiWorkflowContinuationRequest {
@@ -296,8 +310,12 @@ interface QwenAiWorkflowContinuationRequest {
   managedToolCalling?: boolean
   managedToolWorkflowContinuation?: boolean
   messageTransport?: QwenAiMessageTransport
+  /** Keep the inline escape retry inline even above the offload target. */
+  messageTransportLocked?: boolean
   /** Snapshot of the synthetic transcript transport policy for this request. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
+  /** When true, route this request through the configured Webshare proxy. */
+  webshareProxy?: boolean
   /** Per-call override for same-chat CHAT_IN_PROGRESS retries. */
   chatInProgressRetryAttempts?: number
   signal?: AbortSignal
@@ -2628,9 +2646,12 @@ function createQwenAiRequestDeadlineScope(
     remainingTimeoutMs(configuredTimeoutMs: number): number {
       throwIfStopped()
       const safeConfigured = Math.max(1, Math.floor(configuredTimeoutMs))
-      return deadlineAt === undefined
-        ? safeConfigured
-        : Math.max(1, Math.min(safeConfigured, deadlineAt - Date.now()))
+      if (deadlineAt === undefined) return safeConfigured
+      // A spent deadline is already stopped (throwIfStopped above throws the
+      // structured timeout), so the remainder here is strictly positive.
+      // Never clamp a negative remainder to 1ms: that turns a clean 504
+      // deadline stop into an instant axios ECONNABORTED.
+      return Math.min(safeConfigured, deadlineAt - Date.now())
     },
     dispose() {
       if (deadlineTimer) {
@@ -3584,6 +3605,7 @@ export class QwenAiAdapter {
   private account: Account
   private tokenRefresher = new QwenAiTokenRefresher()
   private deleteChatRequests = new Map<string, Promise<boolean>>()
+  private useWebshareProxy = false
   private axiosInstance = axios.create({
     timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
     maxBodyLength: Infinity,
@@ -3605,11 +3627,19 @@ export class QwenAiAdapter {
     createOptions: () => Record<string, any>,
   ): Promise<AxiosResponse> {
     let options = createOptions()
+    if (this.useWebshareProxy) {
+      const agent = getWebshareProxyAgent()
+      if (agent) options.httpsAgent = agent
+    }
     let response = await this.axiosInstance.post(url, payload, options)
 
     if (response.status === 401) {
       this.account = await this.tokenRefresher.refreshAfterUnauthorized(this.account, options.signal)
       options = createOptions()
+      if (this.useWebshareProxy) {
+        const agent = getWebshareProxyAgent()
+        if (agent) options.httpsAgent = agent
+      }
       response = await this.axiosInstance.post(url, payload, options)
     }
 
@@ -3621,12 +3651,20 @@ export class QwenAiAdapter {
     createOptions: () => Record<string, any>,
   ): Promise<AxiosResponse> {
     let options = createOptions()
+    if (this.useWebshareProxy) {
+      const agent = getWebshareProxyAgent()
+      if (agent) options.httpsAgent = agent
+    }
     let response = await this.axiosInstance.get(url, options)
 
     if (response.status === 401) {
       destroyReadableStream(response.data)
       this.account = await this.tokenRefresher.refreshAfterUnauthorized(this.account, options.signal)
       options = createOptions()
+      if (this.useWebshareProxy) {
+        const agent = getWebshareProxyAgent()
+        if (agent) options.httpsAgent = agent
+      }
       response = await this.axiosInstance.get(url, options)
     }
 
@@ -4192,9 +4230,12 @@ export class QwenAiAdapter {
     const url = `${QWEN_AI_BASE}/api/v2/chats/${chatId}`
 
     try {
-      const response = await this.axiosInstance.delete(url, {
-        headers: this.getHeaders(),
-      })
+      const deleteOptions: Record<string, any> = { headers: this.getHeaders() }
+      if (this.useWebshareProxy) {
+        const agent = getWebshareProxyAgent()
+        if (agent) deleteOptions.httpsAgent = agent
+      }
+      const response = await this.axiosInstance.delete(url, deleteOptions)
 
       if (response.data?.success) {
         console.log('[QwenAI] Deleted chat:', chatId)
@@ -4219,9 +4260,12 @@ export class QwenAiAdapter {
     try {
       console.log('[QwenAI] Deleting all chats for account')
       
-      const response = await this.axiosInstance.delete(url, {
-        headers: this.getHeaders(),
-      })
+      const deleteAllOptions: Record<string, any> = { headers: this.getHeaders() }
+      if (this.useWebshareProxy) {
+        const agent = getWebshareProxyAgent()
+        if (agent) deleteAllOptions.httpsAgent = agent
+      }
+      const response = await this.axiosInstance.delete(url, deleteAllOptions)
 
       if (response.data?.success) {
         console.log('[QwenAI] All chats deleted successfully')
@@ -4241,6 +4285,10 @@ export class QwenAiAdapter {
     chatId: string
     parentId: string | null
   }> {
+    this.useWebshareProxy = request.webshareProxy === true
+    if (this.useWebshareProxy) {
+      console.info('[QwenAI] routing request through Webshare proxy', JSON.stringify({ accountId: this.account.id, proxy: webshareProxyUrlForLog() }))
+    }
     const scope = createQwenAiRequestDeadlineScope(request.signal, request.deadlineAt)
     let chatId: string | undefined
     let response: AxiosResponse | undefined
@@ -4301,6 +4349,7 @@ export class QwenAiAdapter {
       ) => (
         prepareQwenAiMultimodalMessage(messages, uploader, {
           transport,
+          messageTransportLocked: request.messageTransportLocked,
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
           managedDocumentMode,
@@ -4312,6 +4361,7 @@ export class QwenAiAdapter {
           declaredToolNames: request.managedToolCalling
             ? (this.toolCallingPlan?.tools ?? []).map(tool => tool.name)
             : [],
+          retryNonce: request.attemptNumber,
           signal: scope.signal,
           deadlineAt: request.deadlineAt,
         })
@@ -4388,8 +4438,12 @@ export class QwenAiAdapter {
       // Treat the configured byte value as an offload target, not a client
       // request ceiling. Qwen's document transport can preserve the complete
       // context while reducing the completion JSON before its first POST.
+      // The inline escape (document pipeline failure) must NOT re-enter the
+      // dead pipeline through this offload; an unlocked explicit 'inline' is
+      // merely the default transport and may still offload by size.
       if (
         transcriptTransportPolicy.uploadEnabled
+        && !request.messageTransportLocked
         && requestMaxBytes > 0
         && payloadBytes > requestMaxBytes
         && preparedUserMessage.transport !== 'document'
@@ -4402,6 +4456,7 @@ export class QwenAiAdapter {
 
       if (
         transcriptTransportPolicy.uploadEnabled
+        && !request.messageTransportLocked
         && requestMaxBytes > 0
         && payloadBytes > requestMaxBytes
         && request.managedToolCalling
@@ -4464,10 +4519,19 @@ export class QwenAiAdapter {
         console.log('[QwenAI] Request headers:', JSON.stringify(this.sanitizeHeadersForLog(this.getHeaders(chatId)), null, 2))
       }
 
-      const requestTimeoutMs = scope.remainingTimeoutMs(Math.min(
+      // A non-positive configured timeout means the deadline already spent
+      // the budget (or a caller passed an exhausted remainder): surface the
+      // structured request timeout instead of arming axios with a sub-ms
+      // timeout that aborts the POST the moment it is issued.
+      const configuredRequestTimeoutMs = Math.min(
         QWEN_AI_REQUEST_TIMEOUT_MS,
         request.timeoutMs ?? QWEN_AI_REQUEST_TIMEOUT_MS,
-      ))
+      )
+      if (configuredRequestTimeoutMs <= 0) {
+        scope.throwIfStopped()
+        throw createQwenAiRequestTimeoutError()
+      }
+      const requestTimeoutMs = scope.remainingTimeoutMs(configuredRequestTimeoutMs)
       response = await scope.wait(
         this.postWithRefreshRetry(url, serializedPayload, () => ({
           headers: {
@@ -4534,7 +4598,13 @@ export class QwenAiAdapter {
         'x-accel-buffering': 'no',
       },
       responseType: 'stream',
-      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      // A recovery attempt must fail on its own schedule, not on the full
+      // request deadline: the resumed generation can hit the same upstream
+      // stall that triggered the resume (observed 2026-09-09 — the recovery
+      // hung invisibly for 23 minutes until the client disconnected). Bound
+      // each attempt to ~2 idle-watchdog windows so the failure surfaces to
+      // the outer account-failover in minutes.
+      timeout: Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, Math.max(QWEN_AI_STREAM_IDLE_TIMEOUT_MS * 2, 120_000)),
       signal,
       validateStatus: () => true,
     }))
@@ -4573,6 +4643,7 @@ export class QwenAiAdapter {
       throw new Error('Qwen AI workflow continuation requires chat ID, parent response ID, and content or messages')
     }
 
+    this.useWebshareProxy = request.webshareProxy === true
     await this.refreshTokenIfNeeded(request.signal)
     if (!this.getToken() && !this.getCookies()) {
       const error = new Error('Qwen AI token/cookies not configured, please add credentials in account settings') as QwenAiUpstreamError
@@ -4616,6 +4687,7 @@ export class QwenAiAdapter {
         uploader,
         {
           transport: request.messageTransport,
+          messageTransportLocked: request.messageTransportLocked,
           transcriptTransportPolicy: request.transcriptTransportPolicy
             ?? qwenAiTranscriptTransportPolicyFromEnv(),
           managedToolCalling: request.managedToolCalling,
@@ -4717,7 +4789,13 @@ export class QwenAiAdapter {
       // Keep the normal request timeout for an accepted stream. The separate
       // admission deadline below only controls repeated CHAT_IN_PROGRESS
       // responses, so a long first token is not cut off by the busy budget.
-      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      // The deadline-derived cap keeps a stalled continuation from wedging
+      // the whole recovery silently until the client gives up (observed
+      // 2026-09-09): the attempt fails here and the outer layer rotates.
+      timeout: Math.min(
+        QWEN_AI_REQUEST_TIMEOUT_MS,
+        Math.max(120_000, continuationDeadline - Date.now()),
+      ),
       signal: request.signal,
       validateStatus: () => true,
     })
@@ -5750,9 +5828,21 @@ export class QwenAiStreamHandler {
     const handleIdle = async () => {
       if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight || transientRecoveryInFlight) return
       idleTimer = undefined
+      const idleTimeoutMs = options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS
       const idleError = new Error(
-        `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
+        `Qwen AI response stream was idle for more than ${Math.ceil(idleTimeoutMs / 1000)}s.`,
       )
+      // The watchdog must never disappear silently: healthy thinking refreshes
+      // it every few seconds (measured p99 summary gap 76s over a full day of
+      // codex traffic), so reaching here means the upstream truly stopped
+      // emitting events. Observed 2026-09-09: this fired and the recovery
+      // wedged invisibly for 23 minutes until the client gave up.
+      console.warn('[QwenAI] Upstream stream idle watchdog fired', JSON.stringify({
+        idleTimeoutMs,
+        pendingSemanticRecovery: Boolean(this.pendingSemanticRecoveryError),
+        bufferedManagedFrameCount: managedBranchFrames.length,
+        sawUpstreamCompletion,
+      }))
 
       // A semantic defect observed before a terminal marker is held until
       // either the provider terminates or the idle watchdog proves that the
@@ -5762,6 +5852,12 @@ export class QwenAiStreamHandler {
         const pendingSemanticRecoveryError = this.pendingSemanticRecoveryError
         this.pendingSemanticRecoveryError = undefined
         recoverFromSemanticEmpty(pendingSemanticRecoveryError, true)
+        // The semantic path can silently re-park the defect or hit a guard.
+        // Never leave the stream without a timer: re-arm so the next stall
+        // escalates (or the parked error fails the stream) instead of wedging.
+        if (!finalChunkSent && !semanticRecoveryInFlight && !transientRecoveryInFlight && !idleTimer) {
+          refreshIdleTimer()
+        }
         return
       }
       if (this.currentBranchHasWrapperLeak()) {

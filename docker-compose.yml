@@ -72,6 +72,11 @@ services:
       CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED: ${CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED:-true}
       # Synthetic transcript format: txt (default) or md.
       CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION: ${CHAT2API_QWEN_AI_TRANSCRIPT_EXTENSION:-txt}
+      # Z.ai context offload mirrors the Qwen document transport: oversized inline
+      # history is uploaded as a transcript document; 0 disables automatic offload.
+      CHAT2API_ZAI_REQUEST_MAX_BYTES: ${CHAT2API_ZAI_REQUEST_MAX_BYTES:-92160}
+      # Set false to keep the complete Z.ai transcript inline.
+      CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED: ${CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED:-true}
       # Inline tail (bytes) of the archived transcript kept on the active turn
       # when complete managed document transport archives the pending user
       # message, so the operative task stays visible without a file read.

@@ -114,6 +114,14 @@ const profiles: Record<string, ProviderToolProfile> = {
     providerId: 'qwen',
     ...chat2ApiXmlHistoryProfile,
   },
+  // Z.ai uses transcript document offload for long contexts and has its own
+  // web search / tool capabilities that can intercept managed-tool turns.
+  zai: {
+    providerId: 'zai',
+    ...chat2ApiXmlHistoryProfile,
+    usesTranscriptDocumentTransport: true,
+    excludesUndeclaredProviderCapabilities: true,
+  },
   // 'qwen-ai' resolves per call in getProviderToolProfile so the managed
   // protocol env knob (CHAT2API_QWEN_AI_MANAGED_PROTOCOL) cannot desync the
   // history formatters from the teaching protocol across env changes.

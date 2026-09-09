@@ -32,6 +32,61 @@ export type Theme = 'light' | 'dark' | 'system'
 
 export type QwenAiSessionMode = 'legacy' | 'tool-call-binding'
 
+/**
+ * Webshare proxy for RGV587 IP-level risk-control recovery. Disabled by
+ * default; when enabled, only the recovery retry path leaves through the
+ * proxy. `enabled: false` with a URL set keeps the URL stored for quick
+ * re-enable.
+ */
+export interface WebshareProxyEntry {
+  id: string
+  name: string
+  proxyUrl: string
+  enabled: boolean
+  /** Timestamp when this entry was last used for a request. */
+  lastUsed?: number
+  /** Timestamp until which this entry is cooled down after a failure. */
+  cooldownUntil?: number
+  /** Consecutive failure count (reset on success). */
+  failureCount?: number
+  /** Owning Webshare API key id for auto-synced entries. */
+  sourceKeyId?: string
+  createdAt: number
+}
+
+export interface WebshareApiKeyEntry {
+  id: string
+  label: string
+  apiKey: string
+  createdAt: number
+}
+
+export interface WebshareProxyListItem {
+  ipAddress: string
+  port: number
+  username: string
+  password: string
+  country: string
+  countryName: string
+  city: string
+  valid: boolean
+}
+
+export interface WebshareProxyConfig {
+  enabled: boolean
+  proxyUrl: string
+  /** Multi-proxy entries for rotation. When non-empty, takes precedence over proxyUrl. */
+  entries?: WebshareProxyEntry[]
+  /** Rotation strategy for multi-proxy entries. */
+  rotationStrategy?: 'round-robin' | 'random' | 'failover'
+  /** Auto-sync each key's Proxy List into the pool (default true). */
+  autoSync?: boolean
+  /** Sync interval in minutes (clamped to 5..1440). */
+  syncIntervalMinutes?: number
+  /** Webshare dashboard API keys; expanding a key pulls its proxy list. */
+  apiKeys?: WebshareApiKeyEntry[]
+}
+
 export interface QwenAiGovernorConfig {
   autoTuneEnabled: boolean
   autoTuneMaxConcurrent: number
@@ -219,6 +274,7 @@ export interface AppConfig {
   toolPromptConfig?: LegacyToolPromptConfig
   qwenAiGovernorConfig: QwenAiGovernorConfig
   qwenAiSessionMode: QwenAiSessionMode
+  webshareProxyConfig?: WebshareProxyConfig
   managementApi: ManagementApiConfig
   contextManagement?: unknown
   language: 'zh-CN' | 'en-US'
@@ -490,6 +546,7 @@ export interface ConfigUpdateRequest {
   toolPromptConfig?: LegacyToolPromptConfig
   qwenAiGovernorConfig?: Partial<QwenAiGovernorConfig>
   qwenAiSessionMode?: QwenAiSessionMode
+  webshareProxyConfig?: WebshareProxyConfig
   managementApi?: ManagementApiConfig
 }
 

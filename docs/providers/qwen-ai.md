@@ -103,6 +103,46 @@ CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
 
 阈值取 `1` 即"任何停止点上的 busy 都上报"；冷却下限不低于账号节奏间隔。真实容量事件被误判时，全局熔断的半开探活会在节奏间隔后放行一个请求、首个成功即关闭熔断，分钟级自愈。阈值应 ≤ busy 轮换上限 + 1（默认 2 ≤ 3），保证风暴在停止点或之前必被上报；两者为独立旋钮，部署可自行调整但不应打破该耦合。
 
+
+## RGV587 风控的 Webshare 代理重试（可选）
+
+RGV587 是 IP 级风控：验证信封标记的是出口 IP，轮换账号只会让所有账号继续从同一个被标记的出口撞上风控墙。配置 Webshare 代理后，当请求被归类为 `qwen_ai_upstream_busy`（RGV587 伪装成容量 busy）且同账号 busy 重试预算（`CHAT2API_QWEN_AI_BUSY_RETRY_COUNT`，默认 0）耗尽时，代理会通过 Webshare 出口 IP 把同一请求再重试一次（每个逻辑请求最多 1 次）；平时所有流量仍走直连，只有这条恢复路径使用代理，流量消耗保持最低。
+
+两条触发路径都会用代理（各最多 1 次）：busy 重试预算耗尽后的恢复重试，以及文档管线失败逃生重试（见下节）。
+
+### 管理页面配置（推荐）
+
+管理页 → 代理设置 → **Webshare Proxy** 标签页可直接配置代理 URL 与启用开关：保存即持久化并**运行时立即生效**（无需重启容器），状态徽章显示当前生效配置与来源。持久化配置优先于环境变量；点"清除"回到纯环境变量模式。
+
+除单 URL 外，标签页还支持 **key 池**（每个 key = 一个独立出口 IP）：添加多个 Webshare key 后选择轮换策略（round-robin 逐个轮换 / failover 固定主 key、坏了自动切下一个、冷却过期自动切回 / random 随机）。某个出口失败会进入冷却（60s 起，连续失败翻倍，上限 30 分钟），流量自动切到下一个 key；成功即清零冷却。池优先于单 URL。
+
+Webshare API Keys：管理页可存储 Webshare 官网 API Key；保存后后端自动拉取每个 key 的 Proxy List 并把全部出口并入轮换池（条目打 sourceKeyId 标），默认每 30 分钟自动同步（可配 5..1440 分钟，也可「立即同步」手动触发）；合并按代理 URL 匹配，保留冷却/失败/启停与手动条目的运行时状态；key 列表中消失的出口在下次成功同步时移除，拉取失败的 key 保留最后已知出口。
+
+### 粘性切换（模式 B）
+
+单次逃生（上文默认行为）每个请求都要先撞一次直连风控再走代理；粘性模式消除这笔重复税：当某次恢复重试**经代理成功**（证明直连出口 IP 被风控而代理出口正常），代理进入粘性状态——**所有** Qwen 流量常驻走 Webshare 出口（池内继续按策略轮换），同时后台每 60 秒对 `www.qwen.ai` 发一次直连探测（不带账号、不占请求路径）：
+
+- 探测响应仍带 RGV587/风控标记 → 保持粘性；连续干净探测达到 2 次 → 自动切回直连（防风控抖动误判）；
+- 探测超时/网络故障 → 视为不可判定，保持粘性（切回过早代价是请求失败，多走一会代理只花带宽）；
+- 代理出口本身传输层失败（隧道断开等）→ 立即解除粘性并改走直连重试，不会卡死在坏代理后面。
+
+管理页状态徽章区会显示粘性横幅（进入原因、已通过探测次数、下次探测时间），并可手动"立即切回直连"（`POST /v0/management/webshare-proxy/sticky/disengage`）。
+
+### 环境变量配置
+
+```env
+WEBSHARE_PROXY_ENABLED=true
+WEBSHARE_PROXY_URL=http://user:pass@proxy.webshare.io:8080
+```
+
+也接受 `CHAT2API_` 前缀的等价变量（`CHAT2API_WEBSHARE_PROXY_ENABLED` / `CHAT2API_WEBSHARE_PROXY_URL`，前缀版优先）。未配置代理或开关不为 `true`/`1` 时，行为与之前完全一致（busy 风暴治理照常生效）。
+
+## 文档管线失败的 inline 逃生
+
+`qwen_hermes` 托管协议会把超长会话转录上传为文档（`CHAT2API_QWEN_AI_TRANSCRIPT_UPLOAD_ENABLED`）。文档管线（上传/解析）整体性故障时（2026-09-07/08 实测：同一转录在 6 个账号上全部 parse 超时 120s，而 inline 通道同窗口 12 秒正常完成），换账号无意义——失败由管线而非账号决定。
+
+发生 `qwen_ai_file_parse_timeout` 等文档管线失败时，代理会在**同一账号**上以 inline 传输重试一次（`messageTransportLocked`，跳过字节 offload，不再重入死掉的文档管线）；若此时 Webshare 代理已配置且该请求尚未用过代理，这次逃生重试会经代理出口 IP 发出（IP 级故障时 inline 直连同样可能被风控）。逃生重试每个逻辑请求最多 1 次。
+
 ## 同会话语义续写耗尽后的全新会话升级
 
 managed tool calling 中，模型偶尔会在工具循环进行到一半时输出"叙事性"文本（说明它打算做什么）而不是工具调用（dangling answer）。代理会先在同一会话里发送 workflow continuation 提示要求它给出真正的工具调用；若续写分支本身仍是 dangling answer（同会话预算 `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` 默认 1 次已耗尽），代理会升级为：

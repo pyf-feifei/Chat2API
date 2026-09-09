@@ -28,6 +28,13 @@ function loadTypeScriptModule(path, localModules = {}) {
   const module = { exports: {} }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) return localModules[specifier]
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     if (specifier.startsWith('.')) throw new Error(`Unexpected policy test import: ${specifier}`)
     return runtimeRequire(specifier)
   }
@@ -237,6 +244,19 @@ function loadRequestForwarder(overrides = {}) {
       return localModules[specifier]
     }
     if (specifier.startsWith('.')) {
+      if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+        return {
+          isWebshareProxyEnabled: () => overrides.webshareEnabled === true,
+          isWebshareStickyActive: () => Boolean(overrides.webshareStickyActive),
+          maybeProbeWebshareDirectExit: overrides.webshareProbe || (() => {}),
+          engageWebshareStickyMode: overrides.engageSticky || (() => {}),
+          disengageWebshareStickyMode: overrides.disengageSticky || (() => {}),
+          reportWebshareProxyFailure: overrides.reportWebshareFailure || (() => {}),
+          reportWebshareProxySuccess: overrides.reportWebshareSuccess || (() => {}),
+          getWebshareProxyAgent: () => undefined,
+          webshareProxyUrlForLog: () => undefined,
+        }
+      }
       throw new Error(`Unexpected forwarder recovery test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -2976,4 +2996,195 @@ test('Qwen Responses bridge keeps CHAT_IN_PROGRESS account-neutral but forwards 
       }
     })
   }
+})
+
+// ---------------------------------------------------------------------------
+// Webshare sticky mode (mode B)
+// ---------------------------------------------------------------------------
+
+test('proxy recovery success engages sticky mode after a direct RGV587 busy failure', async () => {
+  const engagements = []
+  const reports = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    engageSticky: reason => engagements.push(reason),
+    reportWebshareSuccess: () => reports.push('success'),
+    reportWebshareFailure: () => reports.push('failure'),
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      attempts.push(args.at(-1))
+      if (attempts.length === 1) {
+        return {
+          success: false,
+          status: 503,
+          error: 'Qwen AI upstream is busy',
+          errorCode: 'qwen_ai_upstream_busy',
+          retryable: true,
+          accountFault: false,
+        }
+      }
+      return { success: true, status: 200, body: { choices: [] } }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true)
+    assert.equal(attempts.length, 2)
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
+    assert.equal(engagements.length, 1, 'the proxy-routed recovery success must engage sticky mode')
+    assert.ok(engagements[0].includes('qwen_ai_upstream_busy'), 'the engage reason names the direct failure')
+    // Only the proxy-routed attempt reports pool state: the direct attempt
+    // never touched a pool entry, so no failure was recorded against one.
+    assert.deepEqual(reports, ['success'])
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('sticky-active traffic routes every attempt through the proxy', async () => {
+  const probes = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    webshareStickyActive: true,
+    webshareProbe: () => probes.push('probe'),
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.equal(attempts.length, 1)
+  assert.equal(attempts[0].qwenAiWebshareProxy, true, 'sticky mode proxies the first attempt — no direct RGV587 tax')
+  assert.ok(probes.length >= 1, 'sticky traffic triggers the direct-IP recovery probe')
+})
+
+test('a proxy transport failure disengages sticky mode and retries direct', async () => {
+  const disengagements = []
+  const previousRetryCount = process.env.CHAT2API_QWEN_AI_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_RETRY_COUNT = '1'
+  try {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    webshareStickyActive: true,
+    disengageSticky: reason => disengagements.push(reason),
+    // Mirror the real classifier for a socket-level fault: the ECONNRESET
+    // signature without an HTTP status (statuses >= 400 are treated as
+    // upstream decisions, not tunnel faults).
+    isQwenAiTransientTransportError: value => {
+      const record = value ?? {}
+      const status = record.status ?? record.statusCode
+      if (typeof status === 'number' && status >= 400) return false
+      return /ECONNRESET|socket hang up/i.test(String(record.errorCode ?? record.code ?? record.error ?? record.message ?? ''))
+    },
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    if (attempts.length === 1) {
+      // Proxy tunnel drop: a transport failure carries the socket error
+      // signature without an HTTP status (isQwenAiTransientTransportError
+      // treats any >=400 status as an upstream decision, not a tunnel
+      // fault).
+      return {
+        success: false,
+        status: 0,
+        error: 'socket hang up while routing through the recovery proxy',
+        errorCode: 'ECONNRESET',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    // Tools make this a managed-tool request: the only Qwen shape that
+    // grants a same-account retry budget (CHAT2API_QWEN_AI_RETRY_COUNT=1).
+    { model: 'model-1', messages: [], stream: true, tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }] },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [true, false], 'the retry must leave the dead proxy for the direct exit')
+  assert.equal(disengagements.length, 1, 'the proxy transport failure must disengage sticky mode')
+  } finally {
+    if (previousRetryCount === undefined) delete process.env.CHAT2API_QWEN_AI_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_RETRY_COUNT = previousRetryCount
+  }
+})
+
+test('a thrown proxy transport error disengages sticky mode and retries once direct', async () => {
+  const disengagements = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    webshareStickyActive: true,
+    disengageSticky: reason => disengagements.push(reason),
+    // The adapter wraps socket errors as plain Error objects; the classifier
+    // matches on the message evidence.
+    isQwenAiTransientTransportError: value => {
+      const record = value ?? {}
+      const status = record.status ?? record.statusCode
+      if (typeof status === 'number' && status >= 400) return false
+      return /ECONNREFUSED|ECONNRESET|socket hang up/i.test(String(record.errorCode ?? record.code ?? record.error ?? record.message ?? ''))
+    },
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  // The dead proxy exit surfaces as a THROWN adapter error (chat creation
+  // fails before any structured result), reproducing the 2026-09-09
+  // container observation.
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    if (attempts.length === 1) {
+      throw Object.assign(new Error('connect ECONNREFUSED 192.0.2.1:9999'), { code: 'ECONNREFUSED' })
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true, 'the one-shot direct retry must recover the request')
+  assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [true, false], 'the retry must leave the dead proxy for the direct exit')
+  assert.equal(disengagements.length, 1, 'the thrown proxy transport error must disengage sticky mode')
 })

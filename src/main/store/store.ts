@@ -35,6 +35,7 @@ import {
   DEFAULT_REQUEST_LOG_CONFIG,
   normalizeQwenAiGovernorConfig,
   normalizeQwenAiSessionMode,
+  normalizeWebshareProxyConfig,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -256,6 +257,9 @@ class StoreManager {
       toolPromptConfig: undefined,
       qwenAiGovernorConfig: normalizeQwenAiGovernorConfig(rawConfig.qwenAiGovernorConfig),
       qwenAiSessionMode: normalizeQwenAiSessionMode(rawConfig.qwenAiSessionMode),
+      webshareProxyConfig: rawConfig.webshareProxyConfig === undefined
+        ? undefined
+        : normalizeWebshareProxyConfig(rawConfig.webshareProxyConfig),
     }
   }
 
@@ -979,6 +983,14 @@ class StoreManager {
         ...currentConfig.qwenAiGovernorConfig,
         ...updates.qwenAiGovernorConfig,
       }
+    }
+
+    // Webshare proxy config replaces wholesale; an explicit undefined clears
+    // the section so env-only behavior is restored (delete endpoint).
+    if ('webshareProxyConfig' in updates) {
+      newConfig.webshareProxyConfig = updates.webshareProxyConfig === undefined
+        ? undefined
+        : normalizeWebshareProxyConfig(updates.webshareProxyConfig)
     }
 
     const normalized = this.normalizeConfig(newConfig)

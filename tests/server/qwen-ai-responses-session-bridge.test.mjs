@@ -23,6 +23,19 @@ function loadTypeScriptModule(path, localModules = {}) {
       return localModules[specifier]
     }
     if (specifier.startsWith('.')) {
+      if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+        return {
+          isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+          getWebshareProxyAgent: () => undefined,
+          webshareProxyUrlForLog: () => undefined,
+        }
+      }
       throw new Error(`Unexpected session bridge test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -677,6 +690,19 @@ function loadResponsesRouteHarness(options = {}) {
   }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) return localModules[specifier]
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     if (specifier.startsWith('.')) throw new Error(`Unexpected Responses bridge route import: ${specifier}`)
     return runtimeRequire(specifier)
   }
@@ -1565,6 +1591,19 @@ function loadForwarderForBridgeTests(overrides = {}) {
   }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) return localModules[specifier]
+    if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+      return {
+        isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+        getWebshareProxyAgent: () => undefined,
+        webshareProxyUrlForLog: () => undefined,
+      }
+    }
     if (specifier.startsWith('.')) throw new Error(`Unexpected forwarder bridge import: ${specifier}`)
     return runtimeRequire(specifier)
   }

@@ -25,14 +25,16 @@ import type {
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
   QwenAiSessionMode,
+  WebshareProxyConfig,
+  WebshareProxyListItem,
 } from '../../../shared/types'
 
-export type { 
-  Provider, 
-  Account, 
+export type {
+  Provider,
+  Account,
   ProxyStatus,
   ProxyStatistics,
-  ProviderCheckResult, 
+  ProviderCheckResult,
   OAuthResult,
   AuthType,
   CredentialField,
@@ -54,6 +56,33 @@ export type {
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
   QwenAiSessionMode,
+  WebshareProxyConfig,
+  WebshareProxyEntry,
+  WebshareProxyListItem,
+}
+
+export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
+  effective: {
+    enabled: boolean
+    proxyUrl: string
+    entries?: Array<{ proxyUrl: string; cooldownUntil: number; failureCount: number }>
+  }
+  /** Sticky mode runtime state (mode B: all Qwen traffic on the proxy). */
+  sticky?: {
+    active: boolean
+    since: number
+    reason: string
+    nextProbeAt: number
+    passedProbes: number
+  }
+  sync?: {
+    enabled: boolean
+    intervalMinutes: number
+    syncing: boolean
+    lastSyncAt: number
+    lastError: string
+  }
+  source: 'config' | 'env'
 }
 
 export interface CustomProviderFormData {
@@ -499,6 +528,16 @@ interface QwenAiGovernorAPI {
   clearAllCooldowns: () => Promise<void>
 }
 
+interface WebshareProxyAPI {
+  getConfig: () => Promise<WebshareProxyConfigPayload | null>
+  updateConfig: (updates: Partial<WebshareProxyConfig>) => Promise<WebshareProxyConfigPayload>
+  clearConfig: () => Promise<WebshareProxyConfigPayload>
+  /** Manually leave sticky mode (back to direct + per-request recovery). */
+  disengageSticky: () => Promise<WebshareProxyConfigPayload>
+  fetchProxyList: (apiKey: string, page?: number) => Promise<{ count: number; page: number; items: WebshareProxyListItem[] }>
+  syncNow: () => Promise<WebshareProxyConfigPayload>
+}
+
 interface M365OAuthAPI {
   browserStart: (accountType: 'personal' | 'work') => Promise<{ state: string; authUrl: string }>
   browserExchange: (payload: { url?: string; code?: string; state?: string }) => Promise<{
@@ -542,6 +581,7 @@ interface ElectronAPI {
   contextManagement: ContextManagementAPI
   toolCalling: ToolCallingAPI
   qwenAiGovernor: QwenAiGovernorAPI
+  webshareProxy: WebshareProxyAPI
   tray: TrayAPI
   on: (channel: string, callback: (...args: unknown[]) => void) => () => void
   send: (channel: string, ...args: unknown[]) => void

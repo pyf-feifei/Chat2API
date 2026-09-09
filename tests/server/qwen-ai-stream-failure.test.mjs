@@ -182,6 +182,19 @@ function loadQwenAiStreamHandler(overrides = {}) {
       return localModules[specifier]
     }
     if (specifier.startsWith('.')) {
+      if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+        return {
+          isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+          getWebshareProxyAgent: () => undefined,
+          webshareProxyUrlForLog: () => undefined,
+        }
+      }
       throw new Error(`Unexpected Qwen AI stream test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -6007,6 +6020,124 @@ test('Qwen AI escalates an over-target managed document and still submits it ups
     responseStream.destroy()
     if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
     else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+  }
+})
+
+test('Qwen AI locked inline escape keeps an over-target transcript inline', async () => {
+  const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = '2048'
+  const preparationTransports = []
+  const preparationLocked = []
+  let postCalls = 0
+  let postedBody
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async (_messages, _uploader, options) => {
+        preparationTransports.push(options.transport)
+        preparationLocked.push(options.messageTransportLocked)
+        return {
+          content: 'x'.repeat(8_000),
+          files: [],
+          transport: 'inline',
+          transcriptUtf8Bytes: 8_002,
+          inlineUtf8Bytes: 8_002,
+        }
+      },
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'locked-inline-escape-chat'
+    adapter.postWithRefreshRetry = async (_url, body) => {
+      postCalls += 1
+      postedBody = body
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    // The forwarder's document-pipeline escape retry: inline transport,
+    // locked so the byte offload cannot re-enter the dead document pipeline.
+    await adapter.chatCompletion({
+      model: 'client-configured-model',
+      messages: [{ role: 'user', content: 'active request' }],
+      messageTransport: 'inline',
+      messageTransportLocked: true,
+      managedToolCalling: true,
+    })
+
+    assert.deepEqual(preparationTransports, ['inline'])
+    assert.deepEqual(preparationLocked, [true])
+    assert.equal(postCalls, 1)
+    // The over-target transcript must ride inline, not offload to a document.
+    assert.ok(Buffer.byteLength(postedBody, 'utf8') > 2048)
+  } finally {
+    responseStream.destroy()
+    if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+    else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+  }
+})
+
+test('Qwen AI spent deadline surfaces a request timeout before issuing a sub-ms POST', async () => {
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+  let postCalls = 0
+
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async () => ({
+        content: 'active request',
+        files: [],
+        transport: 'inline',
+        nativeSystemPrompt: '',
+        transcriptUtf8Bytes: 32,
+        inlineUtf8Bytes: 32,
+      }),
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'spent-deadline-chat'
+    adapter.postWithRefreshRetry = async () => {
+      postCalls += 1
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    await assert.rejects(
+      adapter.chatCompletion({
+        model: 'client-configured-model',
+        messages: [{ role: 'user', content: 'active request' }],
+        // Exhausted remainder, as a reconnect-after-budget-burn caller would
+        // produce without the forwarder's pre-checks.
+        timeoutMs: 0,
+        deadlineAt: Date.now() - 1,
+      }),
+      error => {
+        assert.ok(
+          /request deadline|request timeout/i.test(String(error?.message ?? '')),
+          `expected a structured request-timeout error, got: ${error?.message}`,
+        )
+        return true
+      },
+    )
+    assert.equal(postCalls, 0, 'a spent deadline must never issue an upstream POST')
+  } finally {
+    responseStream.destroy()
   }
 })
 

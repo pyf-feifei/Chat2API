@@ -147,6 +147,19 @@ function loadQwenAiModule() {
       return localModules[specifier]
     }
     if (specifier.startsWith('.')) {
+      if (specifier === './webshareProxy' || specifier === '../webshareProxy') {
+        return {
+          isWebshareProxyEnabled: () => false,
+        isWebshareStickyActive: () => false,
+        maybeProbeWebshareDirectExit: () => {},
+        engageWebshareStickyMode: () => {},
+        disengageWebshareStickyMode: () => {},
+        reportWebshareProxyFailure: () => {},
+        reportWebshareProxySuccess: () => {},
+          getWebshareProxyAgent: () => undefined,
+          webshareProxyUrlForLog: () => undefined,
+        }
+      }
       throw new Error(`Unexpected Qwen AI image test import: ${specifier}`)
     }
     return runtimeRequire(specifier)

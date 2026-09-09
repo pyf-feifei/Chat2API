@@ -13,12 +13,17 @@ import { storeManager } from '../../store/store'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
 import { parseToolCallsFromText } from '../utils/toolParser'
 import { 
-  createToolCallState, 
-  processStreamContent, 
-  flushToolCallBuffer,
   createBaseChunk,
-  ToolCallState 
 } from '../utils/streamToolHandler'
+import { getProviderToolProfile, type ProviderToolProfile } from '../toolCalling/providerProfiles'
+import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
+import { isProgressStyleManagedAnswer, isToolDenialManagedAnswer } from './qwenAiProgressIntent.ts'
+import { isClientCancellationError } from '../utils/errors'
+import {
+  hasManagedWorkflowCompletionMarker,
+  requiresManagedWorkflowCompletionMarker,
+} from '../toolCalling/workflowCompletion'
+import type { ToolCallingPlan } from '../toolCalling/types'
 import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
 import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-captcha-solver'
 
@@ -99,9 +104,85 @@ interface ChatCompletionRequest {
   temperature?: number
   web_search?: boolean
   reasoning_effort?: 'low' | 'medium' | 'high' | boolean
+  thinking_budget?: number
+  deep_research?: boolean
   chatId?: string
   parentMessageId?: string
   files?: any[]
+}
+
+const ZAI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
+const ZAI_TRANSCRIPT_TAIL_BYTES = 8 * 1024
+
+function zaiBooleanEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const normalized = raw.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false
+  return fallback
+}
+
+export function zaiTranscriptUploadEnabled(): boolean {
+  return zaiBooleanEnv('CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED', true)
+}
+
+function zaiRequestMaxBytesFromEnv(): number {
+  const raw = Number(process.env.CHAT2API_ZAI_REQUEST_MAX_BYTES)
+  if (!Number.isFinite(raw) || raw < 0) return ZAI_REQUEST_MAX_BYTES_DEFAULT
+  return Math.floor(raw)
+}
+
+type ZaiReasoningLevel = 'low' | 'high' | 'max'
+
+/** Map OpenAI-style effort to z.ai's web enum (low / high / max). */
+function zaiReasoningEffortLevel(
+  effort: 'low' | 'medium' | 'high' | boolean | undefined,
+): ZaiReasoningLevel | undefined {
+  if (effort === 'low') return 'low'
+  if (effort === 'medium') return 'high'
+  if (effort === 'high') return 'max'
+  return undefined
+}
+
+function renderZaiTranscript(messages: ZaiMessage[]): string {
+  return messages
+    .map((msg) => {
+      const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+      return `${msg.role}: ${text}`
+    })
+    .join('\n')
+}
+
+function zaiTranscriptTail(transcript: string, maxBytes: number): string {
+  const buf = Buffer.from(transcript, 'utf8')
+  if (buf.byteLength <= maxBytes) return transcript
+  return buf.subarray(buf.byteLength - maxBytes).toString('utf8')
+}
+
+/** Flatten managed tool history into the provider tool profile wire format. */
+function normalizeZaiToolMessage(msg: any, toolProfile: ProviderToolProfile): ZaiMessage {
+  if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+    return {
+      role: 'assistant',
+      content: toolProfile.formatAssistantToolCalls(msg.tool_calls.map((tc: any) => ({
+        id: tc.id,
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+      }))),
+    }
+  }
+  if (msg.role === 'tool' && msg.tool_call_id) {
+    return {
+      role: 'user',
+      content: toolProfile.formatToolResult({
+        toolCallId: msg.tool_call_id,
+        content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
+        isError: msg.is_error === true,
+      }),
+    }
+  }
+  return msg
 }
 
 function uuid(separator: boolean = true): string {
@@ -324,6 +405,7 @@ export class ZaiAdapter {
         mcp_servers: [],
         enable_thinking: true,
         auto_web_search: false,
+        reasoning_effort: 'max',
         message_version: 2,
         extra: {},
         timestamp: Date.now(),
@@ -469,12 +551,13 @@ export class ZaiAdapter {
     // Extract system message and merge with user message
     let systemContent = ''
     let processedMessages = []
+    const toolProfile = getProviderToolProfile('zai')
     
     for (const msg of request.messages) {
       if (msg.role === 'system') {
         systemContent += (systemContent ? '\n\n' : '') + (typeof msg.content === 'string' ? msg.content : '')
       } else {
-        processedMessages.push(msg)
+        processedMessages.push(normalizeZaiToolMessage(msg, toolProfile))
       }
     }
     
@@ -499,6 +582,7 @@ export class ZaiAdapter {
     // Process file attachments from messages
     const fileUploader = new ZaiFileUploader(token)
     const uploadedFileRefs: any[] = []
+    const pendingUploadedFiles: ZaiUploadedFile[] = []
     for (let msgIdx = 0; msgIdx < processedMessages.length; msgIdx++) {
       const msg = processedMessages[msgIdx]
       if (msg.role !== 'user') continue
@@ -516,9 +600,8 @@ export class ZaiAdapter {
           const normalizedFile = await extractFileFromContent(part)
           if (!normalizedFile) continue
           const uploadedFile = await fileUploader.uploadFile(normalizedFile)
-          const fileRef = fileUploader.createFileReference(uploadedFile, messageId)
-          uploadedFileRefs.push(fileRef)
-          console.log('[Z.ai] File uploaded and referenced:', uploadedFile.filename)
+          pendingUploadedFiles.push(uploadedFile)
+          console.log('[Z.ai] File uploaded:', uploadedFile.filename)
         } catch (err) {
           console.error('[Z.ai] Failed to upload file:', err)
         }
@@ -537,11 +620,26 @@ export class ZaiAdapter {
     }
 
     const signaturePrompt = this.extractLastUserMessage(processedMessages)
+    // z.ai upstream builds model context from the seeded chat history, not the
+    // completions messages array: seed multi-message requests with the full
+    // flattened transcript so tool results and prior turns reach the model.
+    const historySeed = processedMessages.length > 1
+      ? renderZaiTranscript(processedMessages)
+      : signaturePrompt
+    if (processedMessages.length > 1) {
+      console.log('[Z.ai] Seeding new chat with flattened history messages:', processedMessages.length)
+    }
     
     // Always create a new chat (single-turn mode only)
-    const chatResult = await this.createChat(mappedModel, signaturePrompt)
+    const chatResult = await this.createChat(mappedModel, historySeed)
     const chatId = chatResult.chatId
     const messageId = chatResult.messageId
+
+    // References need the fresh user-message id, so bind uploads after chat creation.
+    for (const uploadedFile of pendingUploadedFiles) {
+      uploadedFileRefs.push(fileUploader.createFileReference(uploadedFile, messageId))
+      console.log('[Z.ai] File referenced:', uploadedFile.filename)
+    }
     const parentMessageId = null
     console.log('[Z.ai] Created new chat:', chatId)
     
@@ -555,8 +653,16 @@ export class ZaiAdapter {
     const modelForDetection = request.originalModel || request.model
     const modelLower = modelForDetection.toLowerCase()
     
+    const effortLevel = zaiReasoningEffortLevel(request.reasoning_effort)
+    if (effortLevel) console.log('[Z.ai] Thinking depth level:', effortLevel)
     let enableThinking = request.reasoning_effort === false ? false : true
     let enableWebSearch = !!request.web_search
+    if (request.web_search === true) console.log('[Z.ai] Web search enabled (from request param)')
+    if (request.deep_research === true) {
+      enableWebSearch = true
+      if (request.reasoning_effort !== false) enableThinking = true
+      console.log('[Z.ai] Advanced search (multi-round research) enabled via deep_research')
+    }
     
     // Auto-enable based on model name (if not explicitly set)
     if (!enableThinking && (modelLower.includes('think') || modelLower.includes('r1'))) {
@@ -580,6 +686,38 @@ export class ZaiAdapter {
       vlm_web_search_enable: false,
       vlm_website_mode: false,
       enable_thinking: enableThinking,
+      ...(enableThinking ? { reasoning_effort: effortLevel ?? 'max', ...(request.thinking_budget ? { thinking_budget: request.thinking_budget } : {}) } : {}),
+    }
+
+    // Qwen-style context offload: archive oversized inline history as an
+    // uploaded transcript document so long sessions survive the byte target.
+    if (zaiTranscriptUploadEnabled()) {
+      const maxBytes = zaiRequestMaxBytesFromEnv()
+      const inlineBytes = Buffer.byteLength(JSON.stringify(processedMessages), 'utf8')
+      if (maxBytes > 0 && inlineBytes > maxBytes) {
+        const transcript = renderZaiTranscript(processedMessages)
+        const tailExcerpt = zaiTranscriptTail(transcript, ZAI_TRANSCRIPT_TAIL_BYTES)
+        try {
+          const transcriptBuffer = Buffer.from(transcript, 'utf8')
+          const uploadedTranscript = await fileUploader.uploadFile({
+            data: transcriptBuffer,
+            sizeBytes: transcriptBuffer.byteLength,
+            filename: `context-${requestId.slice(0, 8)}.txt`,
+            mimeType: 'text/plain',
+          })
+          uploadedFileRefs.push(fileUploader.createFileReference(uploadedTranscript, messageId))
+          processedMessages = [
+            {
+              role: 'user',
+              content: `The complete conversation context is attached as ${uploadedTranscript.filename}. A tail excerpt follows:
+${tailExcerpt}`,
+            },
+          ]
+          console.log('[Z.ai] Context offloaded to transcript document:', uploadedTranscript.filename, 'inlineBytes:', inlineBytes)
+        } catch (err) {
+          console.error('[Z.ai] Transcript offload failed, keeping inline context:', err)
+        }
+      }
     }
 
     const requestBody: Record<string, any> = {
@@ -772,8 +910,10 @@ export class ZaiAdapter {
         })
         const errorBody = Buffer.concat(chunks).toString('utf8')
         console.log('[Z.ai] Error response body:', errorBody)
+        Object.assign(response, { zaiErrorBody: errorBody })
       } else if (response.data) {
         console.log('[Z.ai] Error response data:', JSON.stringify(response.data, null, 2))
+        Object.assign(response, { zaiErrorBody: JSON.stringify(response.data) })
       }
     }
 
@@ -785,6 +925,54 @@ export class ZaiAdapter {
   }
 }
 
+const MANAGED_SHORT_ANSWER_CODE_POINTS = 300
+
+/**
+ * Ported from the Qwen managed-tool governance: classifies marker-less,
+ * tool-call-less answers that would silently stall an agentic workflow so
+ * the caller can log the condition (and later trigger continuation).
+ */
+function shouldRetryManagedAnswer(
+  content: string,
+  plan: ToolCallingPlan | undefined,
+  parsed: { toolCalls?: unknown[]; rawMatches?: unknown[]; malformedReason?: string },
+): boolean {
+  if (!plan?.shouldParseResponse) return false
+  if (parsed.toolCalls && parsed.toolCalls.length > 0) return false
+  if (hasManagedWorkflowCompletionMarker(content, plan)) return false
+  if (/<chat2api_workflow_complete(?:\/|>)[\s\S]*\S/.test(content)) return true
+  const trimmed = content.trim()
+  if (!trimmed) return false
+  if (plan.failedToolResultPending === true) return false
+  if (plan.hasLiveToolWorkflow) {
+    if (isProgressStyleManagedAnswer(trimmed)) {
+      console.info('[Z.ai] Progress-style answer over live workflow triggers continuation')
+      return true
+    }
+    if ([...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS) {
+      console.info('[Z.ai] Short marker-less answer over live workflow triggers continuation')
+      return true
+    }
+  }
+  if (isProgressStyleManagedAnswer(trimmed)) {
+    console.info('[Z.ai] Progress-style answer without tool call triggers continuation')
+    return true
+  }
+  const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
+  if (!midWorkflow) {
+    if (parsed.rawMatches && parsed.rawMatches.length > 0 && parsed.malformedReason) return true
+    if (isToolDenialManagedAnswer(trimmed)) {
+      console.info('[Z.ai] Capability-denial answer triggers continuation')
+      return true
+    }
+    if (plan.toolChoiceMode === 'auto') return false
+    if (trimmed.length > 0) return false
+  }
+  if (requiresManagedWorkflowCompletionMarker(plan) && !hasManagedWorkflowCompletionMarker(content, plan)) {
+    return plan.hasLiveToolWorkflow === true || trimmed.length <= 800
+  }
+  return false
+}
 export class ZaiStreamHandler {
   private chatId: string = ''
   private model: string
@@ -793,7 +981,8 @@ export class ZaiStreamHandler {
   private content: string = ''
   private toolCallsSent: boolean = false
   private lastMessageId: string = ''
-  private toolCallState: ToolCallState
+  private toolStreamParser?: ToolStreamParser
+  private toolCallingPlan?: ToolCallingPlan
   private sentRole: boolean = false
   private sentThinkingRole: boolean = false
   private streamEnded: boolean = false
@@ -802,11 +991,12 @@ export class ZaiStreamHandler {
   private accountId: string = ''
   private accountToken: string = ''
 
-  constructor(model: string, onEnd?: (chatId: string) => void) {
+  constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
-    this.toolCallState = createToolCallState()
+    this.toolCallingPlan = toolCallingPlan
+    this.toolStreamParser = toolCallingPlan?.shouldParseResponse ? new ToolStreamParser(toolCallingPlan) : undefined
   }
 
   setChatId(chatId: string) {
@@ -946,13 +1136,21 @@ export class ZaiStreamHandler {
             
             // Process tool call interception
             const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
-            const { chunks: outputChunks } = processStreamContent(
-              cleanedContent, 
-              this.toolCallState, 
-              baseChunk, 
-              !this.sentRole && !this.sentThinkingRole,
-              'zai'
-            )
+            const outputChunks = this.toolStreamParser
+              ? this.toolStreamParser.push(cleanedContent, baseChunk, !this.sentRole && !this.sentThinkingRole)
+              : (cleanedContent
+                  ? [{
+                      ...baseChunk,
+                      choices: [{
+                        index: 0,
+                        delta: {
+                          ...(!this.sentRole && !this.sentThinkingRole ? { role: 'assistant' } : {}),
+                          content: cleanedContent,
+                        },
+                        finish_reason: null,
+                      }],
+                    }]
+                  : [])
 
             for (const outChunk of outputChunks) {
               transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
@@ -964,14 +1162,26 @@ export class ZaiStreamHandler {
             
             // Flush any remaining tool calls
             const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
-            const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'zai')
+            const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
             
             for (const outChunk of flushChunks) {
               transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
             }
             
             // Check if we emitted tool calls
-            const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+            const emittedToolCalls = this.toolStreamParser?.hasEmittedToolCall() ?? false
+            // Managed-tool governance: flag dangling answers that neither call a tool
+            // nor prove completion, matching the Qwen classification rules.
+            if (!emittedToolCalls && this.toolCallingPlan?.shouldParseResponse) {
+              const dangling = shouldRetryManagedAnswer(this.content, this.toolCallingPlan, {
+                toolCalls: [],
+                rawMatches: [],
+              })
+              if (dangling) {
+                console.warn('[Z.ai] Managed answer classified as dangling stall; delivering as-is (continuation not yet implemented)', JSON.stringify({ contentLength: this.content.length }))
+              }
+            }
+            const finishReason = emittedToolCalls ? 'tool_calls' : 'stop'
             
             const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
             

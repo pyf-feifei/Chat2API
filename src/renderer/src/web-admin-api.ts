@@ -12,6 +12,9 @@ import type {
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
   SystemPrompt,
+  WebshareProxyConfig,
+  WebshareProxyEntry,
+  WebshareProxyListItem,
 } from './types/electron'
 
 const MANAGEMENT_SECRET_KEY = 'chat2api.managementSecret'
@@ -1133,6 +1136,61 @@ const qwenAiGovernor = {
   },
 }
 
+export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
+  effective: {
+    enabled: boolean
+    proxyUrl: string
+    entries?: Array<{ proxyUrl: string; cooldownUntil: number; failureCount: number }>
+  }
+  /** Sticky mode runtime state (mode B: all Qwen traffic on the proxy). */
+  sticky?: {
+    active: boolean
+    since: number
+    reason: string
+    nextProbeAt: number
+    passedProbes: number
+  }
+  sync?: {
+    enabled: boolean
+    intervalMinutes: number
+    syncing: boolean
+    lastSyncAt: number
+    lastError: string
+  }
+  source: 'config' | 'env'
+}
+
+const webshareProxy = {
+  getConfig: (): Promise<WebshareProxyConfigPayload> =>
+    managementFetch<WebshareProxyConfigPayload>('/webshare-proxy/config'),
+
+  updateConfig: (updates: Partial<WebshareProxyConfig>): Promise<WebshareProxyConfigPayload> =>
+    managementFetch<WebshareProxyConfigPayload>('/webshare-proxy/config', {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    }),
+
+  clearConfig: (): Promise<WebshareProxyConfigPayload> =>
+    managementFetch<WebshareProxyConfigPayload>('/webshare-proxy/config', {
+      method: 'DELETE',
+    }),
+
+  fetchProxyList: (apiKey: string, page = 1): Promise<{ count: number; page: number; items: WebshareProxyListItem[] }> =>
+    managementFetch<{ count: number; page: number; items: WebshareProxyListItem[] }>('/webshare-proxy/api-keys/proxy-list', {
+      method: 'POST',
+      body: JSON.stringify({ apiKey, page }),
+    }),
+
+  syncNow: (): Promise<WebshareProxyConfigPayload> =>
+    managementFetch<WebshareProxyConfigPayload>('/webshare-proxy/sync', { method: 'POST' }),
+
+  /** Manually leave sticky mode (back to direct + per-request recovery). */
+  disengageSticky: (): Promise<WebshareProxyConfigPayload> =>
+    managementFetch<WebshareProxyConfigPayload>('/webshare-proxy/sticky/disengage', {
+      method: 'POST',
+    }),
+}
+
 const tray = {
   openDashboard: (): void => undefined,
   setHeight: (): void => undefined,
@@ -1201,6 +1259,7 @@ window.electronAPI = {
   contextManagement,
   toolCalling,
   qwenAiGovernor,
+  webshareProxy,
   tray,
   on,
   send,

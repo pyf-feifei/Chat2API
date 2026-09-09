@@ -3,7 +3,7 @@
  * Defines core data structures for accounts, providers, and configuration
  */
 
-import type { ProviderModelCapability, ProviderStatus } from '../../shared/types'
+import type { ProviderModelCapability, ProviderStatus, WebshareApiKeyEntry, WebshareProxyConfig, WebshareProxyEntry } from '../../shared/types'
 import type { LegacyToolPromptConfig, ToolCallingConfig } from '../../shared/toolCalling.ts'
 import { DEFAULT_TOOL_CALLING_CONFIG } from '../../shared/toolCalling.ts'
 
@@ -94,6 +94,85 @@ export function normalizeQwenAiSessionMode(value: unknown): QwenAiSessionMode {
     ? value
     : DEFAULT_QWEN_AI_SESSION_MODE
 }
+
+/**
+ * Webshare proxy for Qwen AI RGV587 (IP-level risk control) recovery.
+ * Disabled by default; the proxy is used only by the recovery retry path.
+ * The entry shape is shared with the renderer; this module adds
+ * normalization helpers for the persisted config.
+ */
+export type { WebshareProxyEntry, WebshareProxyConfig } from '../../shared/types'
+
+export const DEFAULT_WEBSHARE_PROXY_CONFIG: WebshareProxyConfig = {
+  enabled: false,
+  proxyUrl: '',
+}
+
+let webshareEntryCounter = 0
+
+export function generateWebshareEntryId(): string {
+  webshareEntryCounter += 1
+  return `ws_${webshareEntryCounter}_${Date.now().toString(36)}`
+}
+
+function normalizeWebshareApiKey(value: unknown): WebshareApiKeyEntry | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  const apiKey = typeof record.apiKey === 'string' ? record.apiKey.trim() : ''
+  if (!apiKey) return undefined
+  return {
+    id: typeof record.id === 'string' && record.id ? record.id : generateWebshareEntryId(),
+    label: typeof record.label === 'string' ? record.label.trim() : '',
+    apiKey,
+    createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now(),
+  }
+}
+
+function normalizeWebshareEntry(value: unknown): WebshareProxyEntry | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const r = value as Record<string, unknown>
+  const proxyUrl = typeof r.proxyUrl === 'string' ? r.proxyUrl.trim() : ''
+  if (!proxyUrl) return undefined
+  return {
+    id: typeof r.id === 'string' && r.id ? r.id : generateWebshareEntryId(),
+    name: typeof r.name === 'string' ? r.name.trim() : '',
+    proxyUrl,
+    enabled: r.enabled !== false,
+    lastUsed: typeof r.lastUsed === 'number' ? r.lastUsed : undefined,
+    cooldownUntil: typeof r.cooldownUntil === 'number' ? r.cooldownUntil : undefined,
+    failureCount: typeof r.failureCount === 'number' ? Math.max(0, r.failureCount) : 0,
+    sourceKeyId: typeof r.sourceKeyId === 'string' && r.sourceKeyId ? r.sourceKeyId : undefined,
+    createdAt: typeof r.createdAt === 'number' ? r.createdAt : Date.now(),
+  }
+}
+
+export function clampWebshareSyncInterval(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  return Math.min(1440, Math.max(5, Math.round(value)))
+}
+export function normalizeWebshareProxyConfig(value: unknown): WebshareProxyConfig {
+  if (!value || typeof value !== 'object') return { ...DEFAULT_WEBSHARE_PROXY_CONFIG }
+  const record = value as Record<string, unknown>
+  const entries = Array.isArray(record.entries)
+    ? record.entries.map(normalizeWebshareEntry).filter((e): e is WebshareProxyEntry => e !== undefined)
+    : undefined
+  const apiKeys = Array.isArray(record.apiKeys)
+    ? record.apiKeys.map(normalizeWebshareApiKey).filter((k): k is WebshareApiKeyEntry => k !== undefined)
+    : undefined
+  const strategy = record.rotationStrategy === 'random' || record.rotationStrategy === 'failover'
+    ? record.rotationStrategy
+    : 'round-robin'
+  return {
+    enabled: record.enabled === true,
+    proxyUrl: typeof record.proxyUrl === 'string' ? record.proxyUrl.trim() : '',
+    entries: entries && entries.length > 0 ? entries : undefined,
+    rotationStrategy: entries && entries.length > 0 ? strategy : undefined,
+    apiKeys: apiKeys && apiKeys.length > 0 ? apiKeys : undefined,
+    autoSync: record.autoSync !== false,
+    syncIntervalMinutes: clampWebshareSyncInterval(record.syncIntervalMinutes),
+  }
+}
+
 
 export interface QwenAiGovernorConfig {
   autoTuneEnabled: boolean
@@ -284,6 +363,8 @@ export interface AppConfig {
   qwenAiGovernorConfig: QwenAiGovernorConfig
   /** Qwen AI tool-result conversation handling strategy */
   qwenAiSessionMode: QwenAiSessionMode
+  /** Webshare proxy for RGV587 recovery (optional; env fallback) */
+  webshareProxyConfig?: WebshareProxyConfig
   /** Management API configuration */
   managementApi: ManagementApiConfig
   /** Context management configuration */

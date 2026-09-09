@@ -13,6 +13,7 @@ export default defineConfig({
           'koa-bodyparser',
           'koa-router',
           'eventsource-parser',
+          'https-proxy-agent',
           'js-sha3',
           'mime-types',
           'zstd-codec',
