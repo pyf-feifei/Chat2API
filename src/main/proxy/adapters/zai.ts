@@ -29,25 +29,61 @@ import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-capt
 
 const TOKEN_EXPIRY_WARNING_MS = 5 * 60 * 1000 // 5 minutes
 
-const ZAI_API_BASE = 'https://chat.z.ai'
-const X_FE_VERSION = 'prod-fe-1.1.93'
-const ZAI_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+const ZAI_FALLBACK_ORIGIN = 'https://chat.z.ai'
+const ZAI_FALLBACK_API_ROOT = 'https://chat.z.ai/api'
+const ZAI_FALLBACK_CHAT_PATH = '/v2/chat/completions'
+const ZAI_FALLBACK_HOST = 'chat.z.ai'
+const ZAI_FALLBACK_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+const ZAI_FALLBACK_FE_VERSION = 'prod-fe-1.1.93'
+const ZAI_FALLBACK_LANGUAGE = 'zh-CN'
+const ZAI_FALLBACK_TIMEZONE = 'Asia/Shanghai'
+const ZAI_FALLBACK_PAGE_TITLE = 'Z.ai - Free AI Chatbot & Agent powered by GLM-5 & GLM-4.7'
+const ZAI_SIGNATURE_WINDOW_MS = 5 * 60 * 1000
+// The z.ai web frontend signs chat requests with this shared key; deployments can rotate it via env.
+const ZAI_SIGNATURE_SECRET = zaiStringEnv('CHAT2API_ZAI_SIGNATURE_SECRET', 'key-@@@@)))()((9))-xxxx&&&%%%%%')
+const ZAI_CHAT_TIMEOUT_MS = zaiNumberEnv('CHAT2API_ZAI_REQUEST_TIMEOUT_MS', 120000)
+const ZAI_CONTROL_TIMEOUT_MS = zaiNumberEnv('CHAT2API_ZAI_CONTROL_TIMEOUT_MS', 15000)
+const ZAI_DELETE_ALL_TIMEOUT_MS = zaiNumberEnv('CHAT2API_ZAI_DELETE_ALL_TIMEOUT_MS', 30000)
 
-const FAKE_HEADERS = {
-  Accept: '*/*',
-  'Accept-Encoding': 'identity',
-  'Accept-Language': 'zh-CN',
-  'Cache-Control': 'no-cache',
-  Origin: ZAI_API_BASE,
-  Pragma: 'no-cache',
-  'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"macOS"',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-origin',
-  'User-Agent': ZAI_USER_AGENT,
-  'X-Region': 'domestic',
+function zaiStringEnv(name: string, fallback: string): string {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  return raw.trim()
+}
+
+function zaiNumberEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name])
+  if (!Number.isFinite(raw) || raw <= 0) return fallback
+  return Math.floor(raw)
+}
+
+function zaiHeader(provider: Provider, name: string): string | undefined {
+  const headers = provider.headers || {}
+  const lower = name.toLowerCase()
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower) {
+      const text = String(value ?? '').trim()
+      if (text) return text
+    }
+  }
+  return undefined
+}
+
+function zaiTimezone(): string {
+  try {
+    const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone
+    if (resolved) return resolved
+  } catch {
+    // fall through to env/fallback below
+  }
+  return zaiStringEnv('CHAT2API_ZAI_TIMEZONE', ZAI_FALLBACK_TIMEZONE)
+}
+
+function zaiTimezoneOffsetMinutes(): number {
+  // Date.getTimezoneOffset() matches the sign convention used by the z.ai web
+  // client (UTC+8 reports -480).
+  return new Date().getTimezoneOffset()
 }
 
 const SEARCH_CITATION_PATTERN = '【turn\\d+search\\d+】'
@@ -205,6 +241,95 @@ export class ZaiAdapter {
     this.account = account
   }
 
+  private zOrigin(): string {
+    const endpoint = (this.provider.apiEndpoint || '').trim()
+    if (endpoint) {
+      try {
+        return new URL(endpoint).origin
+      } catch {
+        // fall through to env/fallback below
+      }
+    }
+    return zaiStringEnv('CHAT2API_ZAI_API_BASE', ZAI_FALLBACK_ORIGIN)
+  }
+
+  private zApiRoot(): string {
+    const endpoint = (this.provider.apiEndpoint || '').trim().replace(/\/+$/, '')
+    if (endpoint) return endpoint
+    return zaiStringEnv('CHAT2API_ZAI_API_ROOT', ZAI_FALLBACK_API_ROOT)
+  }
+
+  private zHost(): string {
+    try {
+      return new URL(this.zOrigin()).host
+    } catch {
+      return zaiStringEnv('CHAT2API_ZAI_HOST', ZAI_FALLBACK_HOST)
+    }
+  }
+
+  private zProtocol(): string {
+    try {
+      return new URL(this.zOrigin()).protocol
+    } catch {
+      return 'https:'
+    }
+  }
+
+  private zChatCompletionsUrl(): string {
+    const chatPath = this.provider.chatPath || ZAI_FALLBACK_CHAT_PATH
+    return `${this.zApiRoot()}${chatPath.startsWith('/') ? '' : '/'}${chatPath}`
+  }
+
+  private zUserAgent(): string {
+    return (
+      zaiHeader(this.provider, 'user-agent') ||
+      zaiStringEnv('CHAT2API_ZAI_USER_AGENT', ZAI_FALLBACK_USER_AGENT)
+    )
+  }
+
+  private zFeVersion(): string {
+    return (
+      zaiHeader(this.provider, 'x-fe-version') ||
+      zaiStringEnv('CHAT2API_ZAI_FE_VERSION', ZAI_FALLBACK_FE_VERSION)
+    )
+  }
+
+  private zLanguage(): string {
+    return (
+      zaiHeader(this.provider, 'accept-language') ||
+      zaiStringEnv('CHAT2API_ZAI_LANGUAGE', ZAI_FALLBACK_LANGUAGE)
+    )
+  }
+
+  private zLanguages(): string {
+    const language = this.zLanguage()
+    const fallback = language.includes('-') ? `${language},${language.split('-')[0]}` : language
+    return zaiStringEnv('CHAT2API_ZAI_LANGUAGES', fallback)
+  }
+
+  private zBaseHeaders(): Record<string, string> {
+    const configured = this.provider.headers || {}
+    const headers: Record<string, string> =
+      Object.keys(configured).length > 0
+        ? { ...configured }
+        : {
+            Accept: '*/*',
+            'Accept-Encoding': 'identity',
+            'Accept-Language': this.zLanguage(),
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+            'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"macOS"',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'X-Region': 'domestic',
+          }
+    if (!headers.Origin && !headers.origin) headers.Origin = this.zOrigin()
+    if (!headers['User-Agent'] && !headers['user-agent']) headers['User-Agent'] = this.zUserAgent()
+    return headers
+  }
   private getToken(): string {
     const credentials = this.account.credentials
     return credentials.token || credentials.accessToken || credentials.jwt || ''
@@ -341,7 +466,7 @@ export class ZaiAdapter {
   }
 
   private generateSignature(messageText: string, requestId: string, timestampMs: number, userId: string): string {
-    const secret = 'key-@@@@)))()((9))-xxxx&&&%%%%%'
+    const secret = ZAI_SIGNATURE_SECRET
     const r = timestampMs
     const i = String(timestampMs)
     const e = `requestId,${requestId},timestamp,${timestampMs},user_id,${userId}`
@@ -354,7 +479,7 @@ export class ZaiAdapter {
     const canonicalString = `${e}|${w}|${i}`
 
     // E = window index (5 minute window)
-    const windowIndex = Math.floor(r / (5 * 60 * 1000))
+    const windowIndex = Math.floor(r / ZAI_SIGNATURE_WINDOW_MS)
     
     // Layer1: A = HMAC(secret, window_index) -> hex string
     const derivedKey = crypto.createHmac('sha256', secret).update(String(windowIndex)).digest()
@@ -414,17 +539,17 @@ export class ZaiAdapter {
     }
     
     const makeRequest = async (tok: string) => axios.post(
-      `${ZAI_API_BASE}/api/v1/chats/new`,
+      `${this.zApiRoot()}/v1/chats/new`,
       requestBody,
       {
         headers: {
           Authorization: `Bearer ${tok}`,
           'Content-Type': 'application/json',
-          ...FAKE_HEADERS,
+          ...this.zBaseHeaders(),
           'Cookie': `token=${tok}`,
-          Referer: `${ZAI_API_BASE}/`,
+          Referer: `${this.zOrigin()}/`,
         },
-        timeout: 15000,
+        timeout: ZAI_CONTROL_TIMEOUT_MS,
         validateStatus: () => true,
       }
     )
@@ -454,14 +579,14 @@ export class ZaiAdapter {
       const token = await this.ensureToken()
       
       const response = await axios.delete(
-        `${ZAI_API_BASE}/api/v1/chats/${chatId}`,
+        `${this.zApiRoot()}/v1/chats/${chatId}`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
-            ...FAKE_HEADERS,
-            Referer: `${ZAI_API_BASE}/`,
+            ...this.zBaseHeaders(),
+            Referer: `${this.zOrigin()}/`,
           },
-          timeout: 15000,
+          timeout: ZAI_CONTROL_TIMEOUT_MS,
           validateStatus: () => true,
         }
       )
@@ -481,14 +606,14 @@ export class ZaiAdapter {
       console.log('[Z.ai] Deleting all chats...')
       
       const response = await axios.delete(
-        `${ZAI_API_BASE}/api/v1/chats/`,
+        `${this.zApiRoot()}/v1/chats/`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
-            ...FAKE_HEADERS,
-            Referer: `${ZAI_API_BASE}/`,
+            ...this.zBaseHeaders(),
+            Referer: `${this.zOrigin()}/`,
           },
-          timeout: 30000,
+          timeout: ZAI_DELETE_ALL_TIMEOUT_MS,
           validateStatus: () => true,
         }
       )
@@ -518,33 +643,18 @@ export class ZaiAdapter {
     // - GLM-5.1 and GLM-5-Turbo keep uppercase
     // - GLM-5V-Turbo uses lowercase "v" in the request model id
     // - GLM-5 and GLM-4.7 use lowercase request model ids
-    const modelMapping: Record<string, string> = {
-      'glm-5.1': 'GLM-5.1',
-      'glm-5-turbo': 'GLM-5-Turbo',
-      'glm-5v-turbo': 'GLM-5v-Turbo',
-      'glm-5': 'glm-5',
-      'glm-4.7': 'glm-4.7',
-      // Also handle uppercase input
-      'GLM-5.1': 'GLM-5.1',
-      'GLM-5-Turbo': 'GLM-5-Turbo',
-      'GLM-5V-Turbo': 'GLM-5v-Turbo',
-      'GLM-5v-Turbo': 'GLM-5v-Turbo',
-      'GLM-5': 'glm-5',
-      'GLM-4.7': 'glm-4.7',
-      'GLM-5.3-Flash': 'x-preview-l',
-      'x-preview-l': 'x-preview-l',
-      'GLM-5.3': 'glm-5.3',
-      'glm-5.3': 'glm-5.3',
-      'GLM-5.2': 'glm-5.2',
-      'glm-5.2': 'glm-5.2',
-      'GLM-4.6V': 'glm-4.6v',
-      'glm-4.6v': 'glm-4.6v',
-      'GLM-4.5': '0727-360B-API',
-      '0727-360B-API': '0727-360B-API',
-      'GLM-4.5-Air': '0727-106B-API',
-      '0727-106B-API': '0727-106B-API',
+    // Use provider-configured model mappings (from builtin/zai.ts) instead of hardcoded map.
+    // Supports case-insensitive lookup so both GLM-5.3-Flash and glm-5.3-flash resolve correctly.
+    const lowerModel = request.model.toLowerCase()
+    let mappedModel = request.model
+    if (this.provider.modelMappings) {
+      for (const [key, value] of Object.entries(this.provider.modelMappings)) {
+        if (key.toLowerCase() === lowerModel) {
+          mappedModel = value
+          break
+        }
+      }
     }
-    const mappedModel = modelMapping[request.model] || modelMapping[request.model.toLowerCase()] || request.model
     
     console.log('[Z.ai] Original model:', request.model, '-> Mapped model:', mappedModel)
     
@@ -580,7 +690,7 @@ export class ZaiAdapter {
     }
     
     // Process file attachments from messages
-    const fileUploader = new ZaiFileUploader(token)
+    const fileUploader = new ZaiFileUploader(token, this.zApiRoot(), this.zBaseHeaders())
     const uploadedFileRefs: any[] = []
     const pendingUploadedFiles: ZaiUploadedFile[] = []
     for (let msgIdx = 0; msgIdx < processedMessages.length; msgIdx++) {
@@ -735,8 +845,8 @@ ${tailExcerpt}`,
         '{{CURRENT_DATE}}': new Date().toISOString().substring(0, 10),
         '{{CURRENT_TIME}}': new Date().toISOString().substring(11, 19),
         '{{CURRENT_WEEKDAY}}': ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][new Date().getDay()],
-        '{{CURRENT_TIMEZONE}}': 'Asia/Shanghai',
-        '{{USER_LANGUAGE}}': 'zh-CN',
+        '{{CURRENT_TIMEZONE}}': zaiTimezone(),
+        '{{USER_LANGUAGE}}': this.zLanguage(),
       },
       chat_id: chatId,
       id: requestId,
@@ -821,6 +931,10 @@ ${tailExcerpt}`,
     userId: string,
     isRetry: boolean = false,
   ): Promise<AxiosResponse> {
+    const screenWidth = zaiStringEnv('CHAT2API_ZAI_SCREEN_WIDTH', '1512')
+    const screenHeight = zaiStringEnv('CHAT2API_ZAI_SCREEN_HEIGHT', '982')
+    const viewportWidth = zaiStringEnv('CHAT2API_ZAI_VIEWPORT_WIDTH', '923')
+    const viewportHeight = zaiStringEnv('CHAT2API_ZAI_VIEWPORT_HEIGHT', '945')
     const queryParams = new URLSearchParams({
       timestamp: String(timestamp),
       requestId,
@@ -828,55 +942,57 @@ ${tailExcerpt}`,
       version: '0.0.1',
       platform: 'web',
       token,
-      user_agent: ZAI_USER_AGENT,
-      language: 'zh-CN',
-      languages: 'zh-CN,zh',
-      timezone: 'Asia/Shanghai',
+      user_agent: this.zUserAgent(),
+      language: this.zLanguage(),
+      languages: this.zLanguages(),
+      timezone: zaiTimezone(),
       cookie_enabled: 'true',
-      screen_width: '1512',
-      screen_height: '982',
-      screen_resolution: '1512x982',
-      viewport_height: '945',
-      viewport_width: '923',
-      viewport_size: '923x945',
-      color_depth: '30',
-      pixel_ratio: '2',
-      current_url: `${ZAI_API_BASE}/c/${chatId}`,
+      screen_width: screenWidth,
+      screen_height: screenHeight,
+      screen_resolution: `${screenWidth}x${screenHeight}`,
+      viewport_height: viewportHeight,
+      viewport_width: viewportWidth,
+      viewport_size: `${viewportWidth}x${viewportHeight}`,
+      color_depth: zaiStringEnv('CHAT2API_ZAI_COLOR_DEPTH', '30'),
+      pixel_ratio: zaiStringEnv('CHAT2API_ZAI_PIXEL_RATIO', '2'),
+      current_url: `${this.zOrigin()}/c/${chatId}`,
       pathname: `/c/${chatId}`,
       search: '',
       hash: '',
-      host: 'chat.z.ai',
-      hostname: 'chat.z.ai',
-      protocol: 'https:',
+      host: this.zHost(),
+      hostname: this.zHost(),
+      protocol: this.zProtocol(),
       referrer: '',
-      title: 'Z.ai - Free AI Chatbot & Agent powered by GLM-5 & GLM-4.7',
-      timezone_offset: '-480',
+      title: zaiStringEnv('CHAT2API_ZAI_PAGE_TITLE', ZAI_FALLBACK_PAGE_TITLE),
+      timezone_offset: String(zaiTimezoneOffsetMinutes()),
       local_time: new Date().toISOString(),
       utc_time: new Date().toUTCString(),
       is_mobile: 'false',
       is_touch: 'false',
       max_touch_points: '0',
-      browser_name: 'Chrome',
-      os_name: 'Mac OS',
+      browser_name: zaiStringEnv('CHAT2API_ZAI_BROWSER_NAME', 'Chrome'),
+      os_name: zaiStringEnv('CHAT2API_ZAI_OS_NAME', 'Mac OS'),
       signature_timestamp: String(timestamp),
     })
 
     const response = await axios.post(
-      `${ZAI_API_BASE}/api/v2/chat/completions?${queryParams.toString()}`,
+      `${this.zChatCompletionsUrl()}?${queryParams.toString()}`,
       requestBody,
       {
         headers: {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
-          ...FAKE_HEADERS,
+          ...this.zBaseHeaders(),
           'X-Signature': signature,
-          'X-FE-Version': X_FE_VERSION,
+          'X-FE-Version': this.zFeVersion(),
           'Cookie': `token=${token}`,
-          Referer: `${ZAI_API_BASE}/c/${chatId}`,
+          Referer: `${this.zOrigin()}/c/${chatId}`,
           Priority: 'u=1, i',
+          // SSE must arrive uncompressed so the stream parser can read every chunk.
+          'Accept-Encoding': 'identity',
         },
         responseType: 'stream',
-        timeout: 120000,
+        timeout: ZAI_CHAT_TIMEOUT_MS,
         validateStatus: () => true,
       }
     )

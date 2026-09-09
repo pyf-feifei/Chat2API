@@ -5,24 +5,48 @@ import fs from 'fs'
 import path from 'path'
 import type { ChatMessage, ChatMessageContent } from '../types.ts'
 
-const ZAI_API_BASE = 'https://chat.z.ai'
-const ZAI_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+const ZAI_FALLBACK_ORIGIN = 'https://chat.z.ai'
+const ZAI_FALLBACK_API_ROOT = 'https://chat.z.ai/api'
+const ZAI_FALLBACK_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
 
-const FAKE_HEADERS = {
-  Accept: '*/*',
-  'Accept-Encoding': 'gzip, deflate, br, zstd',
-  'Accept-Language': 'zh-CN',
-  'Cache-Control': 'no-cache',
-  Origin: ZAI_API_BASE,
-  Pragma: 'no-cache',
-  'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-origin',
-  'User-Agent': ZAI_USER_AGENT,
-  'X-Region': 'domestic',
+function zaiFilesStringEnv(name: string, fallback: string): string {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  return raw.trim()
+}
+
+function zaiFilesNumberEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name])
+  if (!Number.isFinite(raw) || raw <= 0) return fallback
+  return Math.floor(raw)
+}
+
+function zaiOriginFromApiRoot(apiRoot: string): string {
+  try {
+    return new URL(apiRoot).origin
+  } catch {
+    return ZAI_FALLBACK_ORIGIN
+  }
+}
+
+function zaiDefaultUploadHeaders(origin: string, userAgent: string): Record<string, string> {
+  return {
+    Accept: '*/*',
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
+    'Accept-Language': zaiFilesStringEnv('CHAT2API_ZAI_LANGUAGE', 'zh-CN'),
+    'Cache-Control': 'no-cache',
+    Origin: origin,
+    Pragma: 'no-cache',
+    'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Chromium";v="148"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    'User-Agent': userAgent,
+    'X-Region': 'domestic',
+  }
 }
 
 export interface ZaiUploadedFile {
@@ -69,10 +93,22 @@ interface NormalizedInputFile {
 export class ZaiFileUploader {
   private token: string
   private userId: string
+  private apiRoot: string
+  private origin: string
+  private baseHeaders: Record<string, string>
 
-  constructor(token: string) {
+  constructor(token: string, apiRoot?: string, baseHeaders?: Record<string, string>) {
     this.token = token
     this.userId = this.extractUserIdFromToken(token)
+    this.apiRoot = (apiRoot || zaiFilesStringEnv('CHAT2API_ZAI_API_ROOT', ZAI_FALLBACK_API_ROOT)).replace(/\/+$/, '')
+    this.origin = zaiOriginFromApiRoot(this.apiRoot)
+    this.baseHeaders =
+      baseHeaders && Object.keys(baseHeaders).length > 0
+        ? { ...baseHeaders }
+        : zaiDefaultUploadHeaders(this.origin, zaiFilesStringEnv('CHAT2API_ZAI_USER_AGENT', ZAI_FALLBACK_USER_AGENT))
+    if (!this.baseHeaders.Origin && !this.baseHeaders.origin) {
+      this.baseHeaders = { ...this.baseHeaders, Origin: this.origin }
+    }
   }
 
   private extractUserIdFromToken(token: string): string {
@@ -107,17 +143,17 @@ export class ZaiFileUploader {
     })
 
     const response = await axios.post(
-      `${ZAI_API_BASE}/api/v1/files/`,
+      `${this.apiRoot}/v1/files/`,
       formData,
       {
         headers: {
           Authorization: `Bearer ${this.token}`,
-          ...FAKE_HEADERS,
+          ...this.baseHeaders,
           Cookie: `token=${this.token}`,
-          Referer: `${ZAI_API_BASE}/`,
+          Referer: `${this.origin}/`,
           ...formData.getHeaders(),
         },
-        timeout: 120000,
+        timeout: zaiFilesNumberEnv('CHAT2API_ZAI_UPLOAD_TIMEOUT_MS', 120000),
         validateStatus: () => true,
       }
     )
