@@ -21,6 +21,12 @@ const QWEN_AI_CONTENT_FAILURE_ROTATION_CODES = new Set([
   'malformed_tool_call',
   'missing_tool_call',
   'qwen_ai_file_parse_timeout',
+  // HTTP-level parse rejection (502/503/504 from the /files/parse gateway):
+  // same pipeline-decided family as the timeout above, and the stop rule must
+  // cap the escape rotation the same way (observed 2026-09-10: one account's
+  // parse hung ~59s → 504 while the next account parsed the identical
+  // transcript in 39s).
+  'qwen_ai_file_parse_http_error',
 ])
 
 export function isQwenAiContentDeterminedFailure(result: ForwardResult): boolean {

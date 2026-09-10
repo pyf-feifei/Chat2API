@@ -82,8 +82,25 @@ const MANAGED_TOOL_DENIAL_DEFAULT_PATTERN_SOURCES = [
   "no (?:such )?tool (?:is )?(?:available|defined|declared|registered)",
   "tool (?:is )?not (?:available|accessible|defined|declared)",
   "tool (?:call was )?(?:skipped|omitted|dropped) because",
+  // Session-long capability-denial narratives (2026-09-10 incident: the model
+  // spent 100+ turns claiming "the exec_command tool is currently unavailable
+  // in this environment" while every executed call succeeded). These phrasings
+  // assert the MANAGED tools are absent — never a legitimate tool-result
+  // report, because tool results arrive through the result channel, not prose.
+  "tool[s]? (?:is|are|was|were) (?:currently )?unavailable",
+  "unavailable in this (?:environment|session|turn)",
+  "once [^\\n.]{0,60}?become[s]? available",
+  "retry in a new turn where [^\\n.]{0,60}?(?:is |are )?available",
+  "[\"'`]?(?:is|are)(?: [a-z]+){0,2}? returning [\"'`]?does not exists",
   "我(?:没有|无法|不能)(?:访问|调用|使用)(?:该|这个|任何)?工具",
-  "工具(?:不可用|不存在|无法访问)",
+  // Chinese variants insert modifiers between the noun and the denial
+  // ("工具在当前环境中不可用"), so the gap is tolerated instead of requiring
+  // adjacency.
+  "工具[^，。\\n]{0,12}?(?:不可用|不存在|无法访问|无法使用)",
+  "(?:无法|不能)在此环境中",
+  // "当工具恢复可用时我可以…" asserts current unavailability while promising a
+  // later retry — a denial claim by construction.
+  "工具[^，。\\n]{0,12}?恢复可用",
   'i am (?:currently )?(?:retrieving|fetching|consulting)',
   '正在(?:检索|获取|查询)实时',
 ].join('|')
@@ -120,4 +137,27 @@ export function isToolDenialManagedAnswer(trimmedContent: string): boolean {
   if (!regex) return false
   const firstParagraph = trimmedContent.split('\n\n')[0]
   return regex.test(firstParagraph)
+}
+
+export interface ManagedToolDenialClaim {
+  /** Index of the first character of the denial claim. */
+  index: number
+  /** Index of the first character AFTER the denial claim. */
+  end: number
+}
+
+/**
+ * Unanchored, length-cap-free denial-claim locator for stream hold-back: the
+ * 2026-09-10 incident showed denial claims sitting mid-message (after legit
+ * analysis prose, before a dumped code payload AND a valid tool call), which
+ * the capped first-paragraph classifier cannot see. Returns the FIRST claim
+ * occurrence so the caller can hold everything from it onward.
+ */
+export function findManagedToolDenialClaim(text: string): ManagedToolDenialClaim | undefined {
+  if (!text) return undefined
+  const regex = managedToolDenialRegex()
+  if (!regex) return undefined
+  const match = regex.exec(text)
+  if (!match) return undefined
+  return { index: match.index, end: match.index + match[0].length }
 }

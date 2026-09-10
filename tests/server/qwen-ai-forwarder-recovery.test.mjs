@@ -66,6 +66,10 @@ function loadRequestForwarder(overrides = {}) {
     http2: {},
     '../store/types': {},
     './types': {},
+    './qwenBusyClassification': {
+      isQwenAiUpstreamBusyResult: (result) => result?.errorCode === 'qwen_ai_upstream_busy'
+        || result?.errorCode === 'qwen_ai_capacity_limit',
+    },
     './status': { proxyStatusManager: {} },
     '../store/store': {
       storeManager: {
@@ -3187,4 +3191,120 @@ test('a thrown proxy transport error disengages sticky mode and retries once dir
   assert.equal(result.success, true, 'the one-shot direct retry must recover the request')
   assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [true, false], 'the retry must leave the dead proxy for the direct exit')
   assert.equal(disengagements.length, 1, 'the thrown proxy transport error must disengage sticky mode')
+})
+
+test('size-offloaded document parse failure rotates the account instead of replaying inline', async () => {
+  const RequestForwarder = loadRequestForwarder()
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    const options = args.at(-1)
+    attempts.push(options)
+    // Simulate the adapter's probe write-back: the forwarder requested
+    // inline, but the payload blew past the offload target and the adapter
+    // sent the transcript as a document (the 2026-09-10 codex session 504).
+    options.qwenAiTransportProbe.requestedTransport = 'inline'
+    options.qwenAiTransportProbe.actualTransport = 'document'
+    options.qwenAiTransportProbe.offloadedBySize = true
+    return {
+      success: false,
+      status: 504,
+      error: 'Qwen AI file parse request failed: HTTP 504',
+      errorCode: 'qwen_ai_file_parse_http_error',
+      retryable: false,
+      accountFault: false,
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.retryScope, 'next-account', 'the escape must hand off to the route failover for a fresh account')
+  assert.equal(result.accountFault, false)
+  assert.equal(result.errorCode, 'qwen_ai_file_parse_http_error')
+  assert.equal(
+    attempts.length,
+    1,
+    'an oversized transcript cannot ride the inline channel: rotate, do not replay inline on the same account',
+  )
+  assert.notEqual(attempts[0].qwenAiTransportProbe, undefined, 'every attempt must carry a fresh transport probe')
+})
+
+test('document pipeline escape keeps the inline downgrade when the payload fits inline', async () => {
+  const previousBusyRetries = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '1'
+  const RequestForwarder = loadRequestForwarder()
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    const options = args.at(-1)
+    attempts.push(options)
+    if (attempts.length === 1) {
+      // The busy retry upgrades the forwarder-level transport to document.
+      return {
+        success: false,
+        status: 429,
+        error: 'Qwen AI upstream busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+    if (attempts.length === 2) {
+      // The attempt never reached the transport-settle stage, so the probe
+      // stays empty while the forwarder-level transport is 'document'.
+      return {
+        success: false,
+        status: 504,
+        error: 'Qwen AI file parse request failed: HTTP 504',
+        errorCode: 'qwen_ai_file_parse_http_error',
+        retryable: false,
+        accountFault: false,
+      }
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  try {
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true)
+    assert.equal(attempts.length, 3)
+    assert.equal(
+      attempts[2].qwenAiMessageTransport,
+      'inline',
+      'a document transport that fits inline must keep the same-account inline escape',
+    )
+    assert.equal(attempts[2].qwenAiMessageTransportLocked, true, 'the inline escape retry must stay locked off the document pipeline')
+  } finally {
+    if (previousBusyRetries === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previousBusyRetries
+  }
+})
+
+test('the HTTP parse error is content-determined for the rotation stop rule', async () => {
+  const qwenContentFailover = loadTypeScriptModule('src/main/proxy/qwenContentFailover.ts')
+
+  assert.equal(
+    qwenContentFailover.isQwenAiContentDeterminedFailure({
+      errorCode: 'qwen_ai_file_parse_http_error',
+      accountFault: false,
+    }),
+    true,
+    'the stop rule must cap the document-escape rotation at one extra account',
+  )
 })

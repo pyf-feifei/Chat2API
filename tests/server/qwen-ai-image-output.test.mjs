@@ -31,6 +31,14 @@ function loadQwenAiModule() {
     axios: {
       create: () => ({}),
     },
+    '../toolCalling/promptGuidance': {
+      platformToolDiagnosticPattern: () => /does not exists/i,
+      largePayloadGuidanceEnabled: () => true,
+    },
+    './qwenBusyClassification': {
+      isQwenAiUpstreamBusyResult: (result) => result?.errorCode === 'qwen_ai_upstream_busy'
+        || result?.errorCode === 'qwen_ai_capacity_limit',
+    },
     '../../store/types': {},
     '../promptToolUse': {
       hasToolUse: () => false,

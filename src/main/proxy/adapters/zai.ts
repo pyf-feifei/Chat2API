@@ -17,6 +17,7 @@ import {
 } from '../utils/streamToolHandler'
 import { getProviderToolProfile, type ProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
+import { getToolProtocol } from '../toolCalling/protocols'
 import { isProgressStyleManagedAnswer, isToolDenialManagedAnswer } from './qwenAiProgressIntent.ts'
 import { isClientCancellationError } from '../utils/errors'
 import {
@@ -45,6 +46,47 @@ const ZAI_SIGNATURE_SECRET = zaiStringEnv('CHAT2API_ZAI_SIGNATURE_SECRET', 'key-
 const ZAI_CHAT_TIMEOUT_MS = zaiNumberEnv('CHAT2API_ZAI_REQUEST_TIMEOUT_MS', 120000)
 const ZAI_CONTROL_TIMEOUT_MS = zaiNumberEnv('CHAT2API_ZAI_CONTROL_TIMEOUT_MS', 15000)
 const ZAI_DELETE_ALL_TIMEOUT_MS = zaiNumberEnv('CHAT2API_ZAI_DELETE_ALL_TIMEOUT_MS', 30000)
+
+/**
+ * Managed workflow continuation budget (mirrors the Qwen default of 1):
+ * how many times a dangling managed-tool answer is recovered with a follow-up
+ * generation instead of being delivered as a silent workflow stall.
+ */
+export function zaiWorkflowContinuationAttemptsFromEnv(): number {
+  const raw = process.env.CHAT2API_ZAI_WORKFLOW_CONTINUATION_ATTEMPTS
+  if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) return 1
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) return 1
+  return value
+}
+
+/** Absolute wall-clock budget across all continuation rounds of one request. */
+export function zaiWorkflowContinuationTimeoutMsFromEnv(): number {
+  return zaiNumberEnv('CHAT2API_ZAI_WORKFLOW_CONTINUATION_TIMEOUT_MS', 180000)
+}
+
+/**
+ * Idle watchdog for the upstream SSE stream (mirrors the Qwen watchdog that
+ * proved a healthy thinking stream never stays silent past ~76s). A fully
+ * silent upstream for this long is a stalled generation, not a slow one;
+ * 0 disables the watchdog.
+ */
+function zaiStreamIdleTimeoutMsFromEnv(): number {
+  const raw = Number(process.env.CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS)
+  if (!Number.isFinite(raw) || raw < 0) return 180000
+  return Math.floor(raw)
+}
+
+/**
+ * Debug: log the first raw upstream `chat:completion` frames of each stream
+ * (Qwen parity with CHAT2API_QWEN_AI_DEBUG_REQUEST). Used to observe the
+ * upstream event shape (message id placement) without guessing.
+ */
+function zaiDebugStreamFromEnv(): boolean {
+  return zaiBooleanEnv('CHAT2API_ZAI_DEBUG_STREAM', false)
+}
+
+let zaiDebugFrameCounter = 0
 
 function zaiStringEnv(name: string, fallback: string): string {
   const raw = process.env[name]
@@ -633,29 +675,45 @@ export class ZaiAdapter {
     }
   }
 
-  async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; chatId: string; requestId: string }> {
-    const token = await this.ensureToken()
-    const userId = this.extractUserIDFromToken(token)
-    
-    console.log('[Z.ai] chatCompletion called with request.model:', request.model)
-    
+  private mapZaiModel(model: string): string {
     // Z.ai API requires specific model name casing:
     // - GLM-5.1 and GLM-5-Turbo keep uppercase
     // - GLM-5V-Turbo uses lowercase "v" in the request model id
     // - GLM-5 and GLM-4.7 use lowercase request model ids
     // Use provider-configured model mappings (from builtin/zai.ts) instead of hardcoded map.
     // Supports case-insensitive lookup so both GLM-5.3-Flash and glm-5.3-flash resolve correctly.
-    const lowerModel = request.model.toLowerCase()
-    let mappedModel = request.model
+    const lowerModel = model.toLowerCase()
     if (this.provider.modelMappings) {
       for (const [key, value] of Object.entries(this.provider.modelMappings)) {
         if (key.toLowerCase() === lowerModel) {
-          mappedModel = value
-          break
+          return value
         }
       }
     }
-    
+    return model
+  }
+
+  private zaiVariables(): Record<string, string> {
+    return {
+      '{{USER_NAME}}': 'User',
+      '{{USER_LOCATION}}': 'Unknown',
+      '{{CURRENT_DATETIME}}': new Date().toISOString().replace('T', ' ').substring(0, 19),
+      '{{CURRENT_DATE}}': new Date().toISOString().substring(0, 10),
+      '{{CURRENT_TIME}}': new Date().toISOString().substring(11, 19),
+      '{{CURRENT_WEEKDAY}}': ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][new Date().getDay()],
+      '{{CURRENT_TIMEZONE}}': zaiTimezone(),
+      '{{USER_LANGUAGE}}': this.zLanguage(),
+    }
+  }
+
+  async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; chatId: string; requestId: string }> {
+    const token = await this.ensureToken()
+    const userId = this.extractUserIDFromToken(token)
+
+    console.log('[Z.ai] chatCompletion called with request.model:', request.model)
+
+    const mappedModel = this.mapZaiModel(request.model)
+
     console.log('[Z.ai] Original model:', request.model, '-> Mapped model:', mappedModel)
     
     // Extract system message and merge with user message
@@ -838,16 +896,7 @@ ${tailExcerpt}`,
       params: {},
       extra: {},
       features,
-      variables: {
-        '{{USER_NAME}}': 'User',
-        '{{USER_LOCATION}}': 'Unknown',
-        '{{CURRENT_DATETIME}}': new Date().toISOString().replace('T', ' ').substring(0, 19),
-        '{{CURRENT_DATE}}': new Date().toISOString().substring(0, 10),
-        '{{CURRENT_TIME}}': new Date().toISOString().substring(11, 19),
-        '{{CURRENT_WEEKDAY}}': ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][new Date().getDay()],
-        '{{CURRENT_TIMEZONE}}': zaiTimezone(),
-        '{{USER_LANGUAGE}}': this.zLanguage(),
-      },
+      variables: this.zaiVariables(),
       chat_id: chatId,
       id: requestId,
       current_user_message_id: messageId,
@@ -880,14 +929,7 @@ ${tailExcerpt}`,
     // Peek at stream to detect captcha errors before returning
     if (response.status === 200 && response.data && typeof response.data.on === 'function' && !this.captchaRetryAttempted) {
       try {
-        const firstChunk = await new Promise<Buffer>((resolve) => {
-          let resolved = false
-          const onData = (chunk: Buffer) => {
-            if (!resolved) { resolved = true; response.data.removeListener('data', onData); resolve(chunk) }
-          }
-          response.data.on('data', onData)
-          setTimeout(() => { if (!resolved) { resolved = true; resolve(Buffer.alloc(0)) } }, 8000)
-        })
+        const firstChunk = await ZaiAdapter.peekStreamFirstChunk(response.data, 8000)
 
         if (firstChunk.length > 0) {
           const chunkText = firstChunk.toString('utf8')
@@ -919,6 +961,189 @@ ${tailExcerpt}`,
     }
 
     return { response, chatId, requestId }
+  }
+
+  /**
+   * Managed workflow continuation tier 1: append a follow-up user turn to an
+   * EXISTING z.ai chat instead of seeding a new one. `current_user_message_id`
+   * is a fresh id for the follow-up and `current_user_message_parent_id`
+   * anchors it on the assistant message the chat just produced, so the
+   * upstream keeps its own session context (thinking state, seeded transcript,
+   * and the dangling assistant branch). Mirrors the Qwen same-chat
+   * continuation contract.
+   */
+  async continueChat(request: ChatCompletionRequest & { chatId: string; parentMessageId: string }): Promise<{ response: AxiosResponse; chatId: string; requestId: string }> {
+    if (!request.chatId || !request.parentMessageId) {
+      throw new Error('[Z.ai] continueChat requires chatId and parentMessageId')
+    }
+    const token = await this.ensureToken()
+    const userId = this.extractUserIDFromToken(token)
+
+    const mappedModel = this.mapZaiModel(request.model)
+    const toolProfile = getProviderToolProfile('zai')
+    const processedMessages = request.messages.map((msg) => normalizeZaiToolMessage(msg, toolProfile))
+
+    const nudgeText = this.extractLastUserMessage(processedMessages)
+    const requestId = uuid()
+    const userMessageId = uuid()
+    const timestamp = Date.now()
+    const signature = this.generateSignature(nudgeText, requestId, timestamp, userId)
+
+    const effortLevel = zaiReasoningEffortLevel(request.reasoning_effort)
+    const enableThinking = request.reasoning_effort !== false
+    const requestBody: Record<string, any> = {
+      stream: true,
+      model: mappedModel,
+      messages: processedMessages,
+      signature_prompt: nudgeText,
+      params: {},
+      extra: {},
+      features: {
+        image_generation: false,
+        web_search: false,
+        auto_web_search: !!request.web_search,
+        preview_mode: true,
+        flags: [],
+        vlm_tools_enable: false,
+        vlm_web_search_enable: false,
+        vlm_website_mode: false,
+        enable_thinking: enableThinking,
+        ...(enableThinking ? { reasoning_effort: effortLevel ?? 'max', ...(request.thinking_budget ? { thinking_budget: request.thinking_budget } : {}) } : {}),
+      },
+      variables: this.zaiVariables(),
+      chat_id: request.chatId,
+      id: requestId,
+      current_user_message_id: userMessageId,
+      current_user_message_parent_id: request.parentMessageId,
+      // A recovery turn must not churn chat titles/tags on the account.
+      background_tasks: {
+        title_generation: false,
+        tags_generation: false,
+      },
+    }
+
+    const captchaVerifyParam = this.getCaptchaVerifyParam()
+    if (captchaVerifyParam) {
+      requestBody.captcha_verify_param = captchaVerifyParam
+    }
+
+    console.log('[Z.ai] Sending continuation request...')
+    console.log('[Z.ai] Continuation model:', mappedModel)
+    console.log('[Z.ai] Continuation chatId:', request.chatId)
+    console.log('[Z.ai] Continuation parentMessageId:', request.parentMessageId)
+
+    let response = await this.sendRequestWithRetry(requestBody, token, request.chatId, signature, timestamp, requestId, userId)
+
+    // Captcha gate parity with chatCompletion: peek the first chunk so a
+    // FRONTEND_CAPTCHA_REQUIRED failure is solved and retried in place
+    // instead of aborting the replacement branch mid-stream.
+    if (response.status === 200 && response.data && typeof response.data.on === 'function') {
+      try {
+        const firstChunk = await ZaiAdapter.peekStreamFirstChunk(response.data, 8000)
+        if (firstChunk.length > 0) {
+          if (firstChunk.toString('utf8').includes('FRONTEND_CAPTCHA_REQUIRED')) {
+            console.log('[Z.ai] Continuation captcha error detected, solving and retrying...')
+            try { response.data.destroy() } catch {}
+            const { solveCaptchaAndUpdateAccount } = await import('./zai-captcha-solver')
+            const solved = await solveCaptchaAndUpdateAccount(this.account.id, token)
+            if (solved) {
+              const freshParam = this.getCaptchaVerifyParam()
+              if (freshParam) requestBody.captcha_verify_param = freshParam
+              const retryRequestId = uuid()
+              const retryTimestamp = Date.now()
+              const retrySignature = this.generateSignature(nudgeText, retryRequestId, retryTimestamp, userId)
+              response = await this.sendRequestWithRetry(requestBody, token, request.chatId, retrySignature, retryTimestamp, retryRequestId, userId)
+              return { response, chatId: request.chatId, requestId: retryRequestId }
+            }
+            console.log('[Z.ai] Continuation captcha solve failed, returning original response')
+          }
+          // Reconstruct the stream with the peeked chunk prepended so no
+          // upstream byte is lost to the peek.
+          const reconstructed = new PassThrough()
+          reconstructed.write(firstChunk)
+          response.data.pipe(reconstructed)
+          response.data = reconstructed as any
+        }
+      } catch (peekErr) {
+        console.error('[Z.ai] Continuation stream peek error:', peekErr)
+      }
+    }
+
+    return { response, chatId: request.chatId, requestId }
+  }
+
+  /**
+   * Resolve the assistant message id to anchor a same-chat continuation.
+   * The v2 SSE stream never returns the assistant message id (observed:
+   * done frames carry only {phase:'done',done:true}), so the id must come
+   * from the chat tree. Mirrors how the z.ai web client addresses follow-up
+   * turns inside an existing conversation.
+   */
+  async getLastAssistantMessageId(chatId: string): Promise<string> {
+    try {
+      const token = await this.ensureToken()
+      const response = await axios.get(
+        `${this.zApiRoot()}/v1/chats/${chatId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...this.zBaseHeaders(),
+            'Cookie': `token=${token}`,
+            Referer: `${this.zOrigin()}/c/${chatId}`,
+          },
+          timeout: ZAI_CONTROL_TIMEOUT_MS,
+          validateStatus: () => true,
+        },
+      )
+      if (response.status !== 200) {
+        console.warn('[Z.ai] Fetch chat for assistant id failed:', response.status)
+        return ''
+      }
+      const chat = response.data?.data?.chat ?? response.data?.chat
+      const history = chat?.history
+      const messages = history?.messages
+      if (!messages || typeof messages !== 'object') {
+        if (zaiDebugStreamFromEnv()) {
+          console.log('[Z.ai] DEBUG chat payload shape:', JSON.stringify(response.data).slice(0, 800))
+        }
+        console.warn('[Z.ai] Chat history missing for assistant id lookup:', chatId)
+        return ''
+      }
+      const currentId: string | undefined = history.currentId
+      if (currentId && messages[currentId]?.role === 'assistant') {
+        return currentId
+      }
+      let latestId = ''
+      let latestTimestamp = -1
+      for (const [id, message] of Object.entries(messages as Record<string, { role?: string; timestamp?: number }>)) {
+        if (message?.role !== 'assistant') continue
+        const ts = typeof message.timestamp === 'number' ? message.timestamp : -1
+        if (ts >= latestTimestamp) {
+          latestTimestamp = ts
+          latestId = id
+        }
+      }
+      return latestId
+    } catch (error) {
+      console.warn('[Z.ai] Assistant id lookup failed:', error instanceof Error ? error.message : error)
+      return ''
+    }
+  }
+
+  /**
+   * Read the first upstream chunk without losing it: callers decide whether
+   * the chunk signals a captcha failure or gets prepended back onto the
+   * stream. Resolves an empty buffer when nothing arrives within the window.
+   */
+  static peekStreamFirstChunk(data: any, timeoutMs: number): Promise<Buffer> {
+    return new Promise<Buffer>((resolve) => {
+      let resolved = false
+      const onData = (chunk: Buffer) => {
+        if (!resolved) { resolved = true; data.removeListener('data', onData); resolve(chunk) }
+      }
+      data.on('data', onData)
+      setTimeout(() => { if (!resolved) { resolved = true; resolve(Buffer.alloc(0)) } }, timeoutMs)
+    })
   }
 
   private async sendRequestWithRetry(
@@ -1043,51 +1268,113 @@ ${tailExcerpt}`,
 
 const MANAGED_SHORT_ANSWER_CODE_POINTS = 300
 
+export interface ZaiManagedAnswerVerdict {
+  /** True when the turn should be recovered with a managed workflow continuation. */
+  continuation: boolean
+  /** The branch read as final but omitted the required completion marker. */
+  completionProofMissing: boolean
+  /** The continuation prompt must demand a concrete tool call instead of offering the final-answer alternative. */
+  requireManagedToolCall: boolean
+  /** Classification label for logs. Empty when the answer is delivered normally. */
+  reason: string
+}
+
+function zaiManagedAnswerIdle(reason: string): ZaiManagedAnswerVerdict {
+  return { continuation: false, completionProofMissing: false, requireManagedToolCall: false, reason }
+}
+
 /**
  * Ported from the Qwen managed-tool governance: classifies marker-less,
  * tool-call-less answers that would silently stall an agentic workflow so
- * the caller can log the condition (and later trigger continuation).
+ * the caller can trigger a managed workflow continuation.
+ *
+ * Deliberate divergence from the Qwen classifier: a long marker-less final
+ * answer over a live workflow is NOT a continuation candidate here. The z.ai
+ * stream bridge has no content-replacement plumbing, so re-prompting a
+ * substantive answer would append a near-duplicate of text already delivered
+ * to the client; that family is reported via `reason` but delivered as-is.
  */
-function shouldRetryManagedAnswer(
+function classifyZaiManagedAnswer(
   content: string,
   plan: ToolCallingPlan | undefined,
-  parsed: { toolCalls?: unknown[]; rawMatches?: unknown[]; malformedReason?: string },
-): boolean {
-  if (!plan?.shouldParseResponse) return false
-  if (parsed.toolCalls && parsed.toolCalls.length > 0) return false
-  if (hasManagedWorkflowCompletionMarker(content, plan)) return false
-  if (/<chat2api_workflow_complete(?:\/|>)[\s\S]*\S/.test(content)) return true
+): ZaiManagedAnswerVerdict {
+  if (!plan?.shouldParseResponse) return zaiManagedAnswerIdle('parse_disabled')
+  let parsed: { toolCalls?: unknown[]; rawMatches?: unknown[]; malformedReason?: string }
+  try {
+    parsed = getToolProtocol(plan.protocol).parse(content, {
+      tools: plan.tools,
+      protocol: plan.protocol,
+      allowPartial: true,
+    })
+  } catch {
+    parsed = { toolCalls: [], rawMatches: [], malformedReason: 'classification_parse_error' }
+  }
+  if (parsed.toolCalls && parsed.toolCalls.length > 0) return zaiManagedAnswerIdle('tool_call_present')
+  if (hasManagedWorkflowCompletionMarker(content, plan)) return zaiManagedAnswerIdle('completion_marker_present')
+  if (/<chat2api_workflow_complete(?:\/|>)[\s\S]*\S/.test(content)) {
+    return {
+      continuation: true,
+      completionProofMissing: false,
+      requireManagedToolCall: plan.hasLiveToolWorkflow === true,
+      reason: 'completion_marker_followed_by_prose',
+    }
+  }
   const trimmed = content.trim()
-  if (!trimmed) return false
-  if (plan.failedToolResultPending === true) return false
+  if (!trimmed) return zaiManagedAnswerIdle('empty_answer')
+  if (plan.failedToolResultPending === true) return zaiManagedAnswerIdle('failed_tool_result_pending')
   if (plan.hasLiveToolWorkflow) {
     if (isProgressStyleManagedAnswer(trimmed)) {
       console.info('[Z.ai] Progress-style answer over live workflow triggers continuation')
-      return true
+      return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'progress_style_answer_over_live_workflow' }
     }
     if ([...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS) {
       console.info('[Z.ai] Short marker-less answer over live workflow triggers continuation')
-      return true
+      return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'short_markerless_answer_over_live_workflow' }
     }
   }
   if (isProgressStyleManagedAnswer(trimmed)) {
     console.info('[Z.ai] Progress-style answer without tool call triggers continuation')
-    return true
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'progress_style_answer_without_tool_call' }
+  }
+  if (isToolDenialManagedAnswer(trimmed)) {
+    console.info('[Z.ai] Capability-denial answer triggers continuation')
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'capability_denial_answer' }
   }
   const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
   if (!midWorkflow) {
-    if (parsed.rawMatches && parsed.rawMatches.length > 0 && parsed.malformedReason) return true
-    if (isToolDenialManagedAnswer(trimmed)) {
-      console.info('[Z.ai] Capability-denial answer triggers continuation')
-      return true
+    if (parsed.rawMatches && parsed.rawMatches.length > 0 && parsed.malformedReason) {
+      return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'malformed_managed_block' }
     }
-    if (plan.toolChoiceMode === 'auto') return false
-    if (trimmed.length > 0) return false
+    if (plan.toolChoiceMode === 'auto') return zaiManagedAnswerIdle('first_turn_auto_answer')
+    if (trimmed.length > 0) return zaiManagedAnswerIdle('first_turn_answer')
   }
   if (requiresManagedWorkflowCompletionMarker(plan) && !hasManagedWorkflowCompletionMarker(content, plan)) {
-    return plan.hasLiveToolWorkflow === true || trimmed.length <= 800
+    if (plan.hasLiveToolWorkflow === true) {
+      // See the class-level comment: substantive marker-less finals are
+      // delivered as-is instead of risking a duplicated visible answer.
+      return zaiManagedAnswerIdle('completion_marker_missing_live_workflow')
+    }
+    return { continuation: true, completionProofMissing: true, requireManagedToolCall: false, reason: 'completion_marker_missing_short_answer' }
   }
-  return false
+  return zaiManagedAnswerIdle('answer_delivered')
+}
+export { classifyZaiManagedAnswer }
+
+/**
+ * Recovery handle supplied by the forwarder: turns a classified dangling
+ * answer into a fresh upstream generation, tier 1 being a same-chat
+ * follow-up anchored on the assistant message and tier 2 a fresh-chat
+ * replay of the transcript with the dangling branch + continuation prompt
+ * appended. Both tiers return the raw upstream SSE response; the stream
+ * handler splices the replacement branch into the client-visible stream.
+ */
+export interface ZaiWorkflowContinuationHandle {
+  start(
+    verdict: ZaiManagedAnswerVerdict,
+    danglingContent: string,
+    parentMessageId: string,
+  ): Promise<{ response: AxiosResponse; chatId: string } | null>
+  activeChatId(): string
 }
 export class ZaiStreamHandler {
   private chatId: string = ''
@@ -1106,6 +1393,7 @@ export class ZaiStreamHandler {
   private thinkingCitationBuffer: { value: string } = { value: '' }
   private accountId: string = ''
   private accountToken: string = ''
+  private continuation?: ZaiWorkflowContinuationHandle
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
@@ -1122,6 +1410,20 @@ export class ZaiStreamHandler {
   setAccountInfo(accountId: string, accountToken: string) {
     this.accountId = accountId
     this.accountToken = accountToken
+  }
+
+  /**
+   * Install the managed workflow continuation handle (forwarder-supplied).
+   * When set, a classified dangling answer is recovered with a replacement
+   * upstream branch instead of being delivered as a silent stall.
+   */
+  setContinuation(continuation: ZaiWorkflowContinuationHandle) {
+    this.continuation = continuation
+  }
+
+  /** Latest upstream chat id, including any fresh-chat continuation tier. */
+  getActiveChatId(): string {
+    return this.continuation?.activeChatId() ?? this.chatId
   }
 
   getLastMessageId(): string {
@@ -1189,12 +1491,31 @@ export class ZaiStreamHandler {
     const transStream = new PassThrough()
 
     console.log('[Z.ai] Starting stream handler...')
-    
-    let streamEnded = false
+
+    // Client-visible stream state: once ended, nothing more may be written.
+    let clientEnded = false
+    // Per-branch state: a continuation replacement branch gets a fresh tool
+    // parser and its own content window; `this.content` stays cumulative so
+    // delivered prose and the replacement branch both reach the client in
+    // order.
+    let branchToolParser = this.toolStreamParser
+    let branchContentStart = 0
+    let branchFinished = false
+    let continuationInFlight = false
+    let continuationSeq = 0
+    let idleTimer: NodeJS.Timeout | undefined
+
+    const stopIdleTimer = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+        idleTimer = undefined
+      }
+    }
 
     const safeEnd = (data?: string) => {
-      if (streamEnded) return
-      streamEnded = true
+      if (clientEnded) return
+      clientEnded = true
+      stopIdleTimer()
       if (data) {
         transStream.end(data)
       } else {
@@ -1202,185 +1523,335 @@ export class ZaiStreamHandler {
       }
     }
 
-    const parser = createParser({
-      onEvent: (event: any) => {
-        try {
-          if (event.data === '[DONE]') return
+    const notifyEnd = () => {
+      if (!this.onEnd) return
+      try {
+        this.onEnd(this.getActiveChatId())
+      } catch (e) {
+        console.error('[Z.ai] onEnd callback error:', e)
+      }
+    }
 
-          const data = JSON.parse(event.data)
-          
-          if (data.type !== 'chat:completion') return
-          
-          const result = data.data
-          if (!result) return
+    const finishStream = (finishReason: string, usage?: any) => {
+      if (clientEnded) return
+      transStream.write(
+        `data: ${JSON.stringify({
+          id: this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          usage: usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: this.created,
+        })}\n\n`
+      )
+      safeEnd('data: [DONE]\n\n')
+      notifyEnd()
+    }
 
-          // Extract message ID from response for multi-turn support
-          if (result.id && result.role === 'assistant' && !this.lastMessageId) {
-            this.lastMessageId = result.id
-            console.log('[Z.ai] Extracted assistant message id:', this.lastMessageId)
-          }
+    const writeVisibleNotice = (text: string) => {
+      if (clientEnded) return
+      transStream.write(
+        `data: ${JSON.stringify({
+          id: this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+          created: this.created,
+        })}\n\n`
+      )
+    }
 
-          if (result.phase === 'thinking' && result.delta_content) {
-            const cleanedContent = cleanSearchCitationsWithBuffer(result.delta_content, this.thinkingCitationBuffer)
-            if (!cleanedContent) return
-            // Output thinking content as reasoning_content
-            if (!this.sentThinkingRole) {
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
-                  created: this.created,
-                })}\n\n`
-              )
-              this.sentThinkingRole = true
-            }
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { reasoning_content: cleanedContent }, finish_reason: null }],
-                created: this.created,
-              })}\n\n`
-            )
-          } else if (result.phase === 'answer' && result.delta_content) {
-            const cleanedContent = cleanSearchCitationsWithBuffer(result.delta_content, this.citationBuffer)
-            if (!cleanedContent) return
-            this.content += cleanedContent
-            
-            // Process tool call interception
-            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
-            const outputChunks = this.toolStreamParser
-              ? this.toolStreamParser.push(cleanedContent, baseChunk, !this.sentRole && !this.sentThinkingRole)
-              : (cleanedContent
-                  ? [{
-                      ...baseChunk,
-                      choices: [{
-                        index: 0,
-                        delta: {
-                          ...(!this.sentRole && !this.sentThinkingRole ? { role: 'assistant' } : {}),
-                          content: cleanedContent,
-                        },
-                        finish_reason: null,
-                      }],
-                    }]
-                  : [])
+    const attachUpstream = (upstreamStream: any) => {
+      const branchParser = createParser({ onEvent: handleEvent })
+      upstreamStream.on('data', (buffer: Buffer) => {
+        if (clientEnded || continuationInFlight) return
+        armIdleTimer()
+        branchParser.feed(buffer.toString())
+      })
+      upstreamStream.once('error', (err: Error) => {
+        console.error('[Z.ai] Stream error:', err)
+        // A `done` event (or an in-flight continuation swap) owns the terminal.
+        if (clientEnded || branchFinished || continuationInFlight) return
+        branchFinished = true
+        safeEnd('data: [DONE]\n\n')
+      })
+      upstreamStream.once('close', () => {
+        console.log('[Z.ai] Stream closed')
+        if (clientEnded || branchFinished || continuationInFlight) return
+        branchFinished = true
+        safeEnd('data: [DONE]\n\n')
+      })
+    }
 
-            for (const outChunk of outputChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-
-            if (outputChunks.length > 0) this.sentRole = true
-          } else if (result.phase === 'done' && result.done) {
-            console.log('[Z.ai] Stream finished, content length:', this.content.length)
-            
-            // Flush any remaining tool calls
-            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
-            const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
-            
-            for (const outChunk of flushChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-            
-            // Check if we emitted tool calls
-            const emittedToolCalls = this.toolStreamParser?.hasEmittedToolCall() ?? false
-            // Managed-tool governance: flag dangling answers that neither call a tool
-            // nor prove completion, matching the Qwen classification rules.
-            if (!emittedToolCalls && this.toolCallingPlan?.shouldParseResponse) {
-              const dangling = shouldRetryManagedAnswer(this.content, this.toolCallingPlan, {
-                toolCalls: [],
-                rawMatches: [],
-              })
-              if (dangling) {
-                console.warn('[Z.ai] Managed answer classified as dangling stall; delivering as-is (continuation not yet implemented)', JSON.stringify({ contentLength: this.content.length }))
-              }
-            }
-            const finishReason = emittedToolCalls ? 'tool_calls' : 'stop'
-            
-            const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
-            
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                usage,
-                created: this.created,
-              })}\n\n`
-            )
-            safeEnd('data: [DONE]\n\n')
-            if (this.onEnd) {
-              try {
-                this.onEnd(this.chatId)
-              } catch (e) {
-                console.error('[Z.ai] onEnd callback error:', e)
-              }
-            }
-          } else if (result.error || data.error) {
-            const error = result.error || data.error
-            console.error('[Z.ai] Stream error:', error)
-            console.error('[Z.ai] Stream error event (full):', JSON.stringify(data))
-            if (isCaptchaRequiredError(error) && !streamEnded) {
-              console.log('[Z.ai] Captcha required detected in stream, attempting auto-solve...')
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: '\n[Captcha required - auto-solving, please retry your request...]' }, finish_reason: 'stop' }],
-                  created: this.created,
-                })}\n\n`
-              )
-              safeEnd('data: [DONE]\n\n')
-              // Trigger background captcha solve
-              const acctId = this.accountId || ''
-              const acctToken = this.accountToken || ''
-              if (acctId && acctToken) {
-                solveCaptchaAndUpdateAccount(acctId, acctToken).then(ok => {
-                  console.log('[Z.ai] Background captcha solve result:', ok ? 'success' : 'failed')
-                }).catch(e => console.error('[Z.ai] Background captcha solve error:', e))
-              }
-            } else {
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: `\nError: ${error.detail || JSON.stringify(error)}` }, finish_reason: 'stop' }],
-                  created: this.created,
-                })}\n\n`
-              )
-              safeEnd('data: [DONE]\n\n')
-            }
-          }
-        } catch (err) {
-          console.error('[Z.ai] Stream parse error:', err)
+    const attemptContinuation = async (
+      verdict: ZaiManagedAnswerVerdict,
+      danglingContent: string,
+      parentMessageId: string,
+    ): Promise<boolean> => {
+      if (!this.continuation || clientEnded) return false
+      continuationInFlight = true
+      stopIdleTimer()
+      try {
+        const started = await this.continuation.start(verdict, danglingContent, parentMessageId)
+        if (clientEnded) {
+          try { started?.response?.data?.destroy?.() } catch {}
+          return false
         }
-      },
-    })
+        const nextStream = started?.response?.data
+        if (!started || !nextStream || typeof nextStream.on !== 'function') {
+          console.warn('[Z.ai] Managed workflow continuation unavailable; delivering branch as-is', JSON.stringify({
+            reason: verdict.reason,
+          }))
+          try { nextStream?.destroy?.() } catch {}
+          return false
+        }
+        continuationSeq += 1
+        console.warn('[Z.ai] Managed workflow continuation branch attached', JSON.stringify({
+          reason: verdict.reason,
+          attempt: continuationSeq,
+          chatId: started.chatId,
+          parentMessageId: parentMessageId || '(fresh chat)',
+        }))
+        if (started.chatId && started.chatId !== this.chatId) this.setChatId(started.chatId)
+        branchToolParser = this.toolCallingPlan?.shouldParseResponse ? new ToolStreamParser(this.toolCallingPlan) : undefined
+        branchContentStart = this.content.length
+        branchFinished = false
+        attachUpstream(nextStream)
+        armIdleTimer()
+        return true
+      } catch (error) {
+        console.warn('[Z.ai] Managed workflow continuation attempt failed:', error instanceof Error ? error.message : error)
+        return false
+      } finally {
+        continuationInFlight = false
+      }
+    }
 
-    stream.on('data', (buffer: Buffer) => {
-      if (streamEnded) return
-      parser.feed(buffer.toString())
-    })
-    stream.once('error', (err: Error) => {
-      console.error('[Z.ai] Stream error:', err)
-      safeEnd('data: [DONE]\n\n')
-    })
-    stream.once('close', () => {
-      console.log('[Z.ai] Stream closed')
-      safeEnd('data: [DONE]\n\n')
-    })
+    const handleIdleStall = (idleMs: number) => {
+      idleTimer = undefined
+      if (clientEnded || continuationInFlight) return
+      console.warn('[Z.ai] Upstream stream idle watchdog fired; recovering', JSON.stringify({
+        chatId: this.chatId,
+        idleMs,
+        contentLength: this.content.length,
+        lastMessageId: this.lastMessageId,
+      }))
+      const branchContent = this.content.slice(branchContentStart)
+      if (this.toolCallingPlan?.shouldParseResponse && this.continuation) {
+        // No same-chat anchor here: the upstream generation is still in
+        // flight, so recovery replays the transcript in a fresh chat.
+        void (async () => {
+          const attached = await attemptContinuation({
+            continuation: true,
+            completionProofMissing: false,
+            requireManagedToolCall: this.toolCallingPlan?.hasLiveToolWorkflow === true,
+            reason: 'upstream_idle_stall',
+          }, branchContent, '')
+          if (clientEnded) return
+          if (!attached) {
+            // Visibility over silence: tell the client the stream stalled
+            // instead of hanging the request open indefinitely.
+            writeVisibleNotice(`\n\n[Z.ai] Upstream stream was idle for ${Math.round(idleMs / 1000)}s; ending the response.`)
+            finishStream('stop')
+          }
+        })()
+        return
+      }
+      writeVisibleNotice(`\n\n[Z.ai] Upstream stream was idle for ${Math.round(idleMs / 1000)}s; ending the response.`)
+      finishStream('stop')
+    }
+
+    const armIdleTimer = () => {
+      stopIdleTimer()
+      const idleMs = zaiStreamIdleTimeoutMsFromEnv()
+      if (idleMs <= 0) return
+      idleTimer = setTimeout(() => handleIdleStall(idleMs), idleMs)
+      // A stalled upstream must not keep the process alive by itself.
+      idleTimer.unref?.()
+    }
+
+    const handleDone = (result: any) => {
+      if (branchFinished || clientEnded) return
+      branchFinished = true
+      stopIdleTimer()
+      console.log('[Z.ai] Stream finished, content length:', this.content.length)
+
+      // Flush any remaining tool calls
+      const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+      const flushChunks = branchToolParser?.flush(baseChunk) ?? []
+
+      for (const outChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+
+      // Check if we emitted tool calls
+      const emittedToolCalls = branchToolParser?.hasEmittedToolCall() ?? false
+      // Managed-tool governance: classify dangling answers that neither call a
+      // tool nor prove completion, matching the Qwen classification rules.
+      const branchContent = this.content.slice(branchContentStart)
+      const verdict = classifyZaiManagedAnswer(branchContent, this.toolCallingPlan)
+      const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+
+      if (!emittedToolCalls && verdict.continuation) {
+        console.warn('[Z.ai] Managed answer classified as dangling stall; starting managed workflow continuation', JSON.stringify({
+          reason: verdict.reason,
+          contentLength: branchContent.length,
+          lastMessageId: this.lastMessageId,
+        }))
+        void (async () => {
+          const attached = await attemptContinuation(verdict, branchContent, this.lastMessageId)
+          if (clientEnded) return
+          if (!attached) {
+            finishStream('stop', usage)
+          }
+        })()
+        return
+      }
+      if (!emittedToolCalls && verdict.reason === 'completion_marker_missing_live_workflow') {
+        // Deliberate divergence from the Qwen classifier: a substantive
+        // marker-less final over a live workflow is delivered as-is because
+        // re-prompting would duplicate already-streamed text.
+        console.info('[Z.ai] Delivering substantive marker-less live-workflow answer as-is', JSON.stringify({ reason: verdict.reason }))
+      }
+      finishStream(emittedToolCalls ? 'tool_calls' : 'stop', usage)
+    }
+
+    const handleUpstreamError = (result: any, data: any) => {
+      if (branchFinished || clientEnded) return
+      branchFinished = true
+      stopIdleTimer()
+      const error = result.error || data.error
+      console.error('[Z.ai] Stream error:', error)
+      console.error('[Z.ai] Stream error event (full):', JSON.stringify(data))
+      if (isCaptchaRequiredError(error) && !clientEnded) {
+        console.log('[Z.ai] Captcha required detected in stream, attempting auto-solve...')
+        transStream.write(
+          `data: ${JSON.stringify({
+            id: this.chatId,
+            model: this.model,
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { content: '\n[Captcha required - auto-solving, please retry your request...]' }, finish_reason: 'stop' }],
+            created: this.created,
+          })}\n\n`
+        )
+        safeEnd('data: [DONE]\n\n')
+        // Trigger background captcha solve
+        const acctId = this.accountId || ''
+        const acctToken = this.accountToken || ''
+        if (acctId && acctToken) {
+          solveCaptchaAndUpdateAccount(acctId, acctToken).then(ok => {
+            console.log('[Z.ai] Background captcha solve result:', ok ? 'success' : 'failed')
+          }).catch(e => console.error('[Z.ai] Background captcha solve error:', e))
+        }
+      } else {
+        transStream.write(
+          `data: ${JSON.stringify({
+            id: this.chatId,
+            model: this.model,
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { content: `\nError: ${error.detail || JSON.stringify(error)}` }, finish_reason: 'stop' }],
+            created: this.created,
+          })}\n\n`
+        )
+        safeEnd('data: [DONE]\n\n')
+      }
+    }
+
+    const handleEvent = (event: any) => {
+      try {
+        if (event.data === '[DONE]') return
+
+        // First frames show the delta shape; done frames show where the
+        // upstream puts the assistant message id and usage.
+        const debugWorthy = zaiDebugFrameCounter < 8 || /"done"\s*:\s*true/.test(event.data)
+        if (zaiDebugStreamFromEnv() && debugWorthy) {
+          zaiDebugFrameCounter += 1
+          console.log('[Z.ai] DEBUG upstream frame', zaiDebugFrameCounter, ':', event.data.slice(0, 800))
+        }
+
+        const data = JSON.parse(event.data)
+
+        if (data.type !== 'chat:completion') return
+
+        const result = data.data
+        if (!result) return
+
+        // Extract message ID from response for multi-turn support
+        if (result.id && result.role === 'assistant' && !this.lastMessageId) {
+          this.lastMessageId = result.id
+          console.log('[Z.ai] Extracted assistant message id:', this.lastMessageId)
+        }
+
+        if (result.phase === 'thinking' && result.delta_content) {
+          const cleanedContent = cleanSearchCitationsWithBuffer(result.delta_content, this.thinkingCitationBuffer)
+          if (!cleanedContent) return
+          // Output thinking content as reasoning_content
+          if (!this.sentThinkingRole) {
+            transStream.write(
+              `data: ${JSON.stringify({
+                id: this.chatId,
+                model: this.model,
+                object: 'chat.completion.chunk',
+                choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
+                created: this.created,
+              })}\n\n`
+            )
+            this.sentThinkingRole = true
+          }
+          transStream.write(
+            `data: ${JSON.stringify({
+              id: this.chatId,
+              model: this.model,
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { reasoning_content: cleanedContent }, finish_reason: null }],
+              created: this.created,
+            })}\n\n`
+          )
+        } else if (result.phase === 'answer' && result.delta_content) {
+          const cleanedContent = cleanSearchCitationsWithBuffer(result.delta_content, this.citationBuffer)
+          if (!cleanedContent) return
+          this.content += cleanedContent
+
+          // Process tool call interception
+          const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+          const outputChunks = branchToolParser
+            ? branchToolParser.push(cleanedContent, baseChunk, !this.sentRole && !this.sentThinkingRole)
+            : (cleanedContent
+                ? [{
+                    ...baseChunk,
+                    choices: [{
+                      index: 0,
+                      delta: {
+                        ...(!this.sentRole && !this.sentThinkingRole ? { role: 'assistant' } : {}),
+                        content: cleanedContent,
+                      },
+                      finish_reason: null,
+                    }],
+                  }]
+                : [])
+
+          for (const outChunk of outputChunks) {
+            transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+          }
+
+          if (outputChunks.length > 0) this.sentRole = true
+        } else if (result.phase === 'done' && result.done) {
+          handleDone(result)
+        } else if (result.error || data.error) {
+          handleUpstreamError(result, data)
+        }
+      } catch (err) {
+        console.error('[Z.ai] Stream parse error:', err)
+      }
+    }
+
+    armIdleTimer()
+    attachUpstream(stream)
 
     return transStream
   }
 
-  async handleNonStream(response: any): Promise<any> {
-    console.log('[Z.ai] Starting non-stream handler...')
-    
+  private collectNonStreamResponse(response: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const data = {
         id: '',
@@ -1439,11 +1910,16 @@ export class ZaiStreamHandler {
               if (event.data === '[DONE]') return
 
               const eventData = JSON.parse(event.data)
-              
+
               if (eventData.type !== 'chat:completion') return
-              
+
               const result = eventData.data
               if (!result) return
+
+              if (result.id && result.role === 'assistant' && !this.lastMessageId) {
+                this.lastMessageId = result.id
+                console.log('[Z.ai] Extracted assistant message id:', this.lastMessageId)
+              }
 
               if (result.phase === 'thinking' && result.delta_content) {
                 reasoningContent += cleanSearchCitationsWithBuffer(result.delta_content, thinkingBuffer)
@@ -1526,7 +2002,7 @@ export class ZaiStreamHandler {
             // Direct JSON object
             data.choices[0].message.content = streamData.choices?.[0]?.message?.content || ''
           }
-          
+
           console.log('[Z.ai] Non-stream JSON finished, content length:', data.choices[0].message.content.length)
           resolveOnce(data)
         } catch (err) {
@@ -1538,6 +2014,51 @@ export class ZaiStreamHandler {
         resolveOnce(data)
       }
     })
+  }
+
+  async handleNonStream(response: any): Promise<any> {
+    console.log('[Z.ai] Starting non-stream handler...')
+
+    const result = await this.collectNonStreamResponse(response)
+    if (!this.toolCallingPlan?.shouldParseResponse || !this.continuation) {
+      return result
+    }
+
+    // Managed workflow continuation for the buffered path: a classified
+    // dangling answer is recovered with a replacement branch whose text is
+    // appended to the collected content; the forwarder parses the final text
+    // for tool calls afterwards (applyToolCallsToResponse).
+    for (let guard = 0; guard < 3; guard += 1) {
+      const content: string = result.choices?.[0]?.message?.content || ''
+      const verdict = classifyZaiManagedAnswer(content, this.toolCallingPlan)
+      if (!verdict.continuation) break
+
+      console.warn('[Z.ai] Non-stream managed answer classified as dangling stall; starting managed workflow continuation', JSON.stringify({
+        reason: verdict.reason,
+        contentLength: content.length,
+        lastMessageId: this.lastMessageId,
+      }))
+      const started = await this.continuation.start(verdict, content, this.lastMessageId)
+      if (!started) {
+        console.warn('[Z.ai] Managed workflow continuation unavailable; delivering dangling answer as-is', JSON.stringify({ reason: verdict.reason }))
+        break
+      }
+
+      const next = await this.collectNonStreamResponse(started.response)
+      const nextContent: string = next.choices?.[0]?.message?.content || ''
+      const nextReasoning: string = next.choices?.[0]?.message?.reasoning_content || ''
+      if (nextContent) {
+        result.choices[0].message.content = content ? `${content}\n\n${nextContent}` : nextContent
+      }
+      if (nextReasoning) {
+        const prevReasoning: string = result.choices[0].message.reasoning_content || ''
+        result.choices[0].message.reasoning_content = prevReasoning ? `${prevReasoning}\n\n${nextReasoning}` : nextReasoning
+      }
+      if (next.usage) {
+        result.usage = next.usage
+      }
+    }
+    return result
   }
 
   getChatId(): string {

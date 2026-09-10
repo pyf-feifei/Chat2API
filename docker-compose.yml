@@ -77,6 +77,20 @@ services:
       CHAT2API_ZAI_REQUEST_MAX_BYTES: ${CHAT2API_ZAI_REQUEST_MAX_BYTES:-92160}
       # Set false to keep the complete Z.ai transcript inline.
       CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED: ${CHAT2API_ZAI_TRANSCRIPT_UPLOAD_ENABLED:-true}
+      # Z.ai managed workflow continuation (Qwen parity): a classified dangling
+      # answer (progress prose / short narration / capability denial without a
+      # tool call) is recovered with a same-chat follow-up turn, falling back
+      # to a fresh-chat replay. Zero disables recovery entirely.
+      CHAT2API_ZAI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_ZAI_WORKFLOW_CONTINUATION_ATTEMPTS:-1}
+      # Absolute wall-clock budget across all Z.ai continuation rounds.
+      CHAT2API_ZAI_WORKFLOW_CONTINUATION_TIMEOUT_MS: ${CHAT2API_ZAI_WORKFLOW_CONTINUATION_TIMEOUT_MS:-180000}
+      # Z.ai upstream SSE idle watchdog: a fully silent upstream for this long
+      # is a stalled generation (healthy thinking streams emit continuously).
+      # Recovery replays in a fresh chat; 0 disables the watchdog.
+      CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS: ${CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS:-180000}
+      # Debug: log the first raw upstream chat:completion frames of each Z.ai
+      # stream (Qwen parity with CHAT2API_QWEN_AI_DEBUG_REQUEST).
+      CHAT2API_ZAI_DEBUG_STREAM: ${CHAT2API_ZAI_DEBUG_STREAM:-false}
       # Inline tail (bytes) of the archived transcript kept on the active turn
       # when complete managed document transport archives the pending user
       # message, so the operative task stays visible without a file read.
@@ -98,6 +112,9 @@ services:
       CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION: ${CHAT2API_QWEN_AI_DOCUMENT_TOOL_ATTESTATION-}
       # Debug: log upstream request payload summaries (confirm injected texts).
       CHAT2API_QWEN_AI_DEBUG_REQUEST: ${CHAT2API_QWEN_AI_DEBUG_REQUEST:-false}
+      CHAT2API_QWEN_AI_DEBUG_STREAM: ${CHAT2API_QWEN_AI_DEBUG_STREAM:-false}
+      CHAT2API_QWEN_AI_RETRY_NONCE: ${CHAT2API_QWEN_AI_RETRY_NONCE:-true}
+      CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE: ${CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE:-retry}
       # Complete tool docs remain attached; zero omits only inline routing summaries.
       CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS: ${CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240}
       # Non-negative retry counts are bounded by the cumulative request deadline.

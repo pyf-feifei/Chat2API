@@ -24,11 +24,13 @@ import {
   resolveQwenAiModelMode as realResolveQwenAiModelMode,
 } from '../../src/main/providers/qwen-ai-model-mode.ts'
 import { consumeQwenAiAccountNeutralReplaySlot as realConsumeQwenAiAccountNeutralReplaySlot } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
+import { platformToolDiagnosticPattern as realPlatformToolDiagnosticPattern } from '../../src/main/proxy/toolCalling/promptGuidance.ts'
 import {
   hasManagedWorkflowCompletionMarker as realHasManagedWorkflowCompletionMarker,
   parseManagedWorkflowCompletionProof as realParseManagedWorkflowCompletionProof,
   requiresManagedWorkflowCompletionMarker as realRequiresManagedWorkflowCompletionMarker,
   stripManagedWorkflowCompletionMarker as realStripManagedWorkflowCompletionMarker,
+  stripStrayManagedWorkflowCompletionMarkers as realStripStrayManagedWorkflowCompletionMarkers,
 } from '../../src/main/proxy/toolCalling/workflowCompletion.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
@@ -129,6 +131,10 @@ function loadQwenAiStreamHandler(overrides = {}) {
       parseManagedWorkflowCompletionProof: realParseManagedWorkflowCompletionProof,
       requiresManagedWorkflowCompletionMarker: realRequiresManagedWorkflowCompletionMarker,
       stripManagedWorkflowCompletionMarker: realStripManagedWorkflowCompletionMarker,
+      stripStrayManagedWorkflowCompletionMarkers: realStripStrayManagedWorkflowCompletionMarkers,
+    },
+    '../toolCalling/promptGuidance': {
+      platformToolDiagnosticPattern: realPlatformToolDiagnosticPattern,
     },
     '../toolCalling/streamValidationPolicy': {
       getToolStreamValidationFailure: overrides.getToolStreamValidationFailure || (() => undefined),
@@ -403,7 +409,7 @@ test('Qwen AI removes tool availability noise only when a managed call is emitte
   assert.match(body, /"finish_reason":"tool_calls"/)
 })
 
-test('Qwen AI preserves proved tool availability text when no structured call is present', async () => {
+test('Qwen AI recovers a platform-diagnostic answer instead of delivering its marker proof', async () => {
   const {
     QwenAiStreamHandler,
     QWEN_AI_STREAM_FAILURE_EVENT,
@@ -419,8 +425,11 @@ test('Qwen AI preserves proved tool availability text when no structured call is
     undefined,
     qwenHermesCompletionPlan({
       tools: [{ name: 'Read', source: 'openai', parameters: {} }],
-      // This case verifies ordinary answer text after the transport-only
-      // completion proof has established that the branch is terminal.
+      // DEBUG_STREAM evidence 2026-09-10: the upstream platform intercepts
+      // in-flight tool calls and replaces them with its own diagnostic. A
+      // "final answer + completion proof" that follows that diagnostic is the
+      // model giving up over a killed call — it must be recovered, not
+      // delivered as a verified completion.
       workflowContinuation: true,
     }),
   )
@@ -445,11 +454,25 @@ test('Qwen AI preserves proved tool availability text when no structured call is
   await ended
 
   const body = Buffer.concat(chunks).toString()
-  assert.equal(failure, undefined)
-  assert.match(body, /Tool Read does not exists\./)
-  assert.match(body, /The requested text is complete\./)
+  // Denial-prose holds can split the preserved text across content chunks,
+  // so the pinned semantics are asserted on the joined delta text.
+  let deliveredText = ''
+  for (const line of body.split('\n')) {
+    const match = line.match(/^data: (.+)$/)
+    if (!match || match[1] === '[DONE]') continue
+    try {
+      const parsedFrame = JSON.parse(match[1])
+      const delta = parsedFrame?.choices?.[0]?.delta
+      if (typeof delta?.content === 'string') deliveredText += delta.content
+    } catch { /* non-JSON frames are irrelevant here */ }
+  }
+  assert.equal(failure?.status, 422)
+  assert.equal(failure?.code, 'qwen_ai_semantic_incomplete')
+  assert.equal(failure?.accountFault, false)
+  assert.doesNotMatch(deliveredText, /Tool Read does not exists\./)
+  assert.doesNotMatch(deliveredText, /The requested text is complete\./)
   assert.doesNotMatch(body, /chat2api_workflow_complete/)
-  assert.doesNotMatch(body, /"finish_reason":"tool_calls"/)
+  assert.match(body, /event: error/)
 })
 
 test('Qwen AI stream publishes bridge state only after a real response id completes', async () => {
@@ -10604,4 +10627,171 @@ test('Qwen AI keeps an active thinking stream on its first generation', async ()
   const body = Buffer.concat(chunks).toString()
   assert.equal(failure, undefined)
   assert.match(body, /first generation answer/)
+})
+
+test('Qwen AI stream delivers a marker-plus-tool-call response without leaking the marker', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    getToolProtocol: realGetToolProtocol,
+    getToolStreamValidationFailure: realGetToolStreamValidationFailure,
+  })
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    protocol: 'qwen_hermes',
+    shouldParseResponse: true,
+    workflowContinuation: true,
+    failedToolResultPending: false,
+    allowedToolNames: new Set(['declared_tool']),
+    tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const parents = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async parentId => {
+      parents.push(parentId)
+      throw new Error('marker plus tool call must resolve inside the same response')
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  const toolBlock = [
+    '<tool_call>',
+    '<function=declared_tool>',
+    '<parameter=cmd>',
+    'echo verified',
+    '</parameter>',
+    '</function>',
+    '</tool_call>',
+  ].join('\n')
+  const deltas = [
+    'Analysis complete for the requested inspection.\n\n',
+    '<chat2api_workflow_complete/>\n\n',
+    toolBlock,
+  ]
+  initial.end([
+    `data: ${JSON.stringify({
+      response_id: 'marker-plus-tool',
+      choices: [{ delta: { phase: 'answer', content: '' } }],
+    })}\n\n`,
+    ...deltas.map(delta => `data: ${JSON.stringify({
+      response_id: 'marker-plus-tool',
+      choices: [{ delta: { phase: 'answer', content: delta } }],
+    })}\n\n`),
+    `data: ${JSON.stringify({
+      response_id: 'marker-plus-tool',
+      choices: [{ delta: { phase: 'answer', status: 'finished', content: '' } }],
+    })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(parents, [])
+  assert.equal(failure, undefined)
+  assert.doesNotMatch(body, /chat2api_workflow_complete/)
+  assert.match(body, /Analysis complete for the requested inspection\./)
+  assert.match(body, /declared_tool/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+})
+
+test('Qwen AI stream stress: adversarial marker pattern never leaks across 60 cycles', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    getToolProtocol: realGetToolProtocol,
+    getToolStreamValidationFailure: realGetToolStreamValidationFailure,
+  })
+  const toolBlock = [
+    '<tool_call>',
+    '<function=declared_tool>',
+    '<parameter=cmd>',
+    'echo verified',
+    '</parameter>',
+    '</function>',
+    '</tool_call>',
+  ].join('\n')
+
+  for (let cycle = 0; cycle < 60; cycle += 1) {
+    const initial = new PassThrough()
+    initial.on('error', () => {})
+    const handler = new QwenAiStreamHandler('test-model', undefined, {
+      protocol: 'qwen_hermes',
+      shouldParseResponse: true,
+      workflowContinuation: true,
+      failedToolResultPending: false,
+      allowedToolNames: new Set(['declared_tool']),
+      tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+      toolChoiceMode: 'auto',
+    })
+    handler.setChatId(`stress-chat-${cycle}`)
+    const parents = []
+    const bridge = createQwenAiResumableStream(initial, {
+      getResponseId: () => handler.getResponseId(),
+      isComplete: () => handler.isComplete(),
+      continueWorkflow: async parentId => {
+        parents.push(parentId)
+        throw new Error(`cycle ${cycle}: adversarial pattern must not spend a continuation`)
+      },
+      onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+      maxAttempts: 0,
+      workflowContinuationAttempts: 1,
+      delayMs: 0,
+    })
+    const output = await handler.handleStream(bridge, {
+      responseTimeoutMs: 1_000,
+      bufferManagedBranch: true,
+      recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+    })
+    const chunks = []
+    let failure
+    output.on('data', chunk => chunks.push(chunk))
+    output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+    const ended = once(output, 'end')
+
+    // Split the adversarial response at a cycle-dependent offset so marker
+    // fragments land at many delta boundaries.
+    const prose = `Cycle ${cycle}: verified the selector and captured the screenshot for the record.`
+    const response = `${prose}\n\n<chat2api_workflow_complete/>\n\n${toolBlock}`
+    const split = 5 + (cycle % 40)
+    const deltas = [response.slice(0, split), response.slice(split)]
+
+    initial.end([
+      ...deltas.map(delta => `data: ${JSON.stringify({
+        response_id: `stress-${cycle}`,
+        choices: [{ delta: { phase: 'answer', content: delta } }],
+      })}\n\n`),
+      `data: ${JSON.stringify({
+        response_id: `stress-${cycle}`,
+        choices: [{ delta: { phase: 'answer', status: 'finished', content: '' } }],
+      })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join(''))
+    await ended
+
+    const body = Buffer.concat(chunks).toString()
+    assert.equal(
+      body.includes('chat2api_workflow_complete'),
+      false,
+      `cycle ${cycle}: completion marker leaked into the client stream`,
+    )
+    assert.deepEqual(parents, [], `cycle ${cycle}: continuation round-trip was spent`)
+    assert.equal(failure, undefined, `cycle ${cycle}: unexpected stream failure`)
+    assert.match(body, /declared_tool/, `cycle ${cycle}: tool call was not delivered`)
+    assert.match(body, /"finish_reason":"tool_calls"/, `cycle ${cycle}: tool-call finish reason missing`)
+  }
 })

@@ -109,10 +109,15 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
   'Retry with an appropriate declared tool only when another attempt can make progress; otherwise explain the blocking failure clearly in the final answer instead of repeating the same operation.',
 ].join(' ')
 
-const SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT = [
+const SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT_TAIL = [
   'The immediately preceding matched tool-result batch completed successfully, so those corresponding tool calls have already run.',
   'Use their returned results and do not repeat a completed call merely to satisfy the original request.',
-  'The workflow itself is still in progress: either invoke the next declared tool for a distinct unfinished operation, or, when the returned results verify that every requested operation is complete, return the final answer with the required completion marker.',
+  // The marker clause is appended only for protocols whose contract actually
+  // requires the completion marker. Referencing "the required completion
+  // marker" on protocols that never define one (managed_xml, m365_fenced,
+  // …) is an undefined instruction the model can only answer by inventing a
+  // marker of its own.
+  'The workflow itself is still in progress: either invoke the next declared tool for a distinct unfinished operation, or, when the returned results verify that every requested operation is complete, return the final answer',
 ].join(' ')
 
 const MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT = [
@@ -174,7 +179,11 @@ export function createToolWorkflowContinuationMessage(options: {
       options.plan?.workflowContinuation
         ? options.failedToolResultPending
           ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT
-          : SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT
+          : SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT_TAIL + (
+            options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
+              ? ' with the required completion marker.'
+              : '.'
+          )
         : undefined,
       recoveryPrompt,
       continuationReminder,

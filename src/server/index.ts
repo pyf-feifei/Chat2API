@@ -3,6 +3,7 @@ import { nodeRuntime } from '../main/runtime/nodeRuntime'
 import { proxyServer } from '../main/proxy/server'
 import { storeManager } from '../main/store/store'
 import { applyServerConfigOverrides } from './bootstrapConfig'
+import { bootstrapWebshareFromStore } from '../main/proxy/websharePoolSync'
 
 setRuntime(nodeRuntime)
 
@@ -38,6 +39,7 @@ async function main(): Promise<void> {
   await storeManager.initialize()
   await storeManager.syncDynamicBuiltinProviderModels()
   const config = applyServerConfigOverrides()
+  bootstrapWebshareFromStore()
 
   const started = await proxyServer.start(config.proxyPort, config.proxyHost)
   if (!started) {

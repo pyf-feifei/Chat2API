@@ -1023,3 +1023,15 @@ test('qwen Hermes tool responses escape the tool_caller boundary', () => {
   })
   assert.doesNotMatch(rendered, /<tool_caller>/)
 })
+
+test('recovery and continuation prompts teach large-payload splitting after upstream rejection', () => {
+  const tools = [{ name: 'exec_command', parameters: { type: 'object', properties: {} } }] as any[]
+  assert.match(
+    qwenHermesProtocol.renderRecoveryPrompt(tools),
+    /retry the SAME operation with a smaller payload split across multiple calls/,
+  )
+  assert.match(
+    qwenHermesProtocol.renderContinuationReminder(tools),
+    /smaller payload chunks across multiple calls/,
+  )
+})

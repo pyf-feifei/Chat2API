@@ -31,6 +31,7 @@ import {
   type QwenAiManagedDocumentMode,
   type QwenAiMessageTransport,
   type QwenAiTranscriptTransportPolicy,
+  type QwenAiTransportProbe,
 } from './qwen-ai-files'
 
 export {
@@ -50,8 +51,10 @@ import {
 import {
   hasManagedWorkflowCompletionMarker,
   parseManagedWorkflowCompletionProof,
+  stripStrayManagedWorkflowCompletionMarkers,
   requiresManagedWorkflowCompletionMarker,
 } from '../toolCalling/workflowCompletion'
+import { platformToolDiagnosticPattern } from '../toolCalling/promptGuidance'
 import {
   getToolArgumentValidationIssues,
   normalizeArguments,
@@ -271,6 +274,11 @@ interface ChatCompletionRequest {
    * offload target, so the retry never re-enters the dead document pipeline.
    */
   messageTransportLocked?: boolean
+  /**
+   * Mutable write-back of the transport this attempt actually used; the
+   * forwarder's document-pipeline escape hatch reads it after a failure.
+   */
+  transportProbe?: QwenAiTransportProbe
   /** Snapshot of the synthetic transcript transport policy for this request. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   /** When true, route this request through the configured Webshare proxy. */
@@ -312,6 +320,8 @@ interface QwenAiWorkflowContinuationRequest {
   messageTransport?: QwenAiMessageTransport
   /** Keep the inline escape retry inline even above the offload target. */
   messageTransportLocked?: boolean
+  /** Same write-back channel as the main chat request. */
+  transportProbe?: QwenAiTransportProbe
   /** Snapshot of the synthetic transcript transport policy for this request. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   /** When true, route this request through the configured Webshare proxy. */
@@ -2701,6 +2711,20 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
+  // The upstream platform's tool registry intercepts in-flight tool calls and
+  // replaces them with its own diagnostic (DEBUG_STREAM evidence 2026-09-10:
+  // a multi-KB structured call truncated mid-arguments followed by "Tool …
+  // does not exists."). A "final answer + completion marker" that follows the
+  // diagnostic is the model giving up over a killed call, not a verified
+  // completion — recover and re-prompt instead of delivering the dump.
+  // Failed tool results keep their deliberately relaxed contract.
+  if (
+    plan.failedToolResultPending !== true
+    && platformToolDiagnosticPattern()?.test(content)
+  ) {
+    return true
+  }
+
   // An explicit completion proof marks a genuine final answer.
   if (hasManagedWorkflowCompletionMarker(content, plan)) {
     return false
@@ -4480,6 +4504,17 @@ export class QwenAiAdapter {
         }))
       }
 
+      // Report the settled transport back to the forwarder before the chat
+      // POST: a document-pipeline failure (upload/parse) happens AFTER this
+      // point, and the escape hatch must see the transport the attempt truly
+      // used, not the requested one.
+      if (request.transportProbe) {
+        request.transportProbe.requestedTransport = request.messageTransport ?? 'inline'
+        request.transportProbe.actualTransport = preparedUserMessage.transport
+        request.transportProbe.offloadedBySize = preparedUserMessage.transport === 'document'
+          && (request.messageTransport ?? 'inline') !== 'document'
+      }
+
       console.info('[QwenAI] upstream request shape', JSON.stringify({
         requestId: request.requestId,
         accountId: this.account.id,
@@ -4706,6 +4741,15 @@ export class QwenAiAdapter {
       content = preparedMessage.content
       files = preparedMessage.files
       nativeSystemPrompt = preparedMessage.nativeSystemPrompt
+      // Same write-back as the first-turn path: continuation uploads can hit
+      // the same document pipeline and the escape hatch needs the real
+      // transport.
+      if (request.transportProbe) {
+        request.transportProbe.requestedTransport = request.messageTransport ?? 'inline'
+        request.transportProbe.actualTransport = preparedMessage.transport
+        request.transportProbe.offloadedBySize = preparedMessage.transport === 'document'
+          && (request.messageTransport ?? 'inline') !== 'document'
+      }
     }
     // Continuation deltas carry no client system messages of their own, so
     // the forwarder-supplied prompt is what refreshes the native field.
@@ -7027,7 +7071,7 @@ export class QwenAiStreamHandler {
         if (!flushNonStreamOutputGuards()) return
 
         const choice = data.choices[0]
-        const answerText = choice.message.content || ''
+        let answerText = choice.message.content || ''
         const finalReasoning = summaryText || reasoningText
         const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
         if (completeUndeclaredNativeToolNames.length > 0) {
@@ -7069,6 +7113,16 @@ export class QwenAiStreamHandler {
             )
             recoverFromSemanticEmpty(createQwenAiToolValidationError(managedValidationFailure))
             return
+          }
+          // A completion marker next to parsed tool calls is protocol
+          // violation text, never client prose. Deliver the tool call in this
+          // response instead of spending a continuation round-trip on it.
+          if ((managedParse.toolCalls?.length ?? 0) > 0) {
+            const strippedAnswer = stripStrayManagedWorkflowCompletionMarkers(answerText)
+            if (strippedAnswer !== answerText) {
+              answerText = strippedAnswer
+              choice.message.content = strippedAnswer
+            }
           }
         }
 

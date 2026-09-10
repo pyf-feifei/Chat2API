@@ -241,6 +241,10 @@ export function consumeQwenAiAccountNeutralReplaySlot(
 
 const QWEN_AI_ACCOUNT_NEUTRAL_REPLAY_CODES = new Set([
   'qwen_ai_file_parse_timeout',
+  // HTTP-level parse rejection from the /files/parse gateway — the pipeline
+  // decided, not the credential (observed 2026-09-10: 504 on one account,
+  // 39s success on the next).
+  'qwen_ai_file_parse_http_error',
   // Transient upstream STS unavailability (HTTP 200 + error body, e.g.
   // {"code":"RateLimited","details":"401 Unauthorized"}) is not evidence the
   // credential is bad; another account may upload the same file fine.
@@ -318,7 +322,12 @@ export function isQwenAiAccountFault(value: QwenAiAccountFailureClassification |
   // Account rotation is intentionally restricted to the documented classes.
   // An explicit true from a wrapper cannot turn a 5xx/ordinary 429 into an
   // account fault, which prevents the pool from being drained by congestion.
+  // 402 (Payment Required) is per-account quota exhaustion: rotating off is
+  // correct, and the governor's cooldown stops the pool from re-selecting
+  // the dead-credit account on the next request (observed 2026-09-10: 20
+  // 402 attempts burned across 7 accounts in 2 minutes with no cooldown).
   return status === 401
+    || status === 402
     || status === 403
     || (status === 429 && code === 'QWEN_AI_CAPACITY_LIMIT')
 }
@@ -333,6 +342,7 @@ export function qwenAiAccountRetryScope(
   const status = statusOf(value)
   const code = codeOf(value)
   return status === 401
+    || status === 402
     || status === 403
     || (status === 429 && code === 'QWEN_AI_CAPACITY_LIMIT')
     ? 'next-account'

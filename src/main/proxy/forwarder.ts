@@ -44,8 +44,9 @@ import {
 import type {
   QwenAiMessageTransport,
   QwenAiTranscriptTransportPolicy,
+  QwenAiTransportProbe,
 } from './adapters/qwen-ai-files'
-import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
+import { ZaiAdapter, ZaiStreamHandler, zaiWorkflowContinuationAttemptsFromEnv, zaiWorkflowContinuationTimeoutMsFromEnv } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
@@ -228,11 +229,8 @@ function retryAfterMsFromResult(result: ForwardResult): number | undefined {
   return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : undefined
 }
 
-function isQwenAiUpstreamBusyResult(result: ForwardResult): boolean {
-  return !result.success
-    && result.errorCode === 'qwen_ai_upstream_busy'
-    && result.accountFault === false
-}
+import { isQwenAiUpstreamBusyResult } from './qwenBusyClassification'
+export { isQwenAiUpstreamBusyResult }
 
 /**
  * Document-pipeline failures: the upload/parse stage rejected or stalled the
@@ -947,6 +945,8 @@ type QwenAiForwardOptions = {
   messageTransport?: QwenAiMessageTransport
   /** Keep the inline escape retry inline even above the byte offload target. */
   messageTransportLocked?: boolean
+  /** Per-attempt adapter write-back of the transport actually used. */
+  transportProbe?: QwenAiTransportProbe
   /** Snapshot of the synthetic transcript upload policy for this request. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   /** Route this attempt through the configured Webshare proxy (RGV587 recovery). */
@@ -1031,6 +1031,11 @@ type ForwardAttemptOptions = {
   qwenAiMessageTransport?: QwenAiMessageTransport
   /** Keep the inline escape retry inline even above the byte offload target. */
   qwenAiMessageTransportLocked?: boolean
+  /**
+   * Per-attempt write-back of the transport the adapter actually used. Fresh
+   * object per attempt; the Qwen adapter fills it once the transport settles.
+   */
+  qwenAiTransportProbe?: QwenAiTransportProbe
   qwenAiTranscriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   qwenAiWebshareProxy?: boolean
   attempt?: number
@@ -1256,13 +1261,14 @@ export class RequestForwarder {
       ? Math.min(observedAt, context.startTime)
       : observedAt
     const sanitizedHistory = sanitizeAssistantInputHistory(request.messages)
-    if (sanitizedHistory.contaminatedFieldCount > 0) {
-      console.warn('[Forwarder] Removed managed tool-result wrapper from assistant input history', JSON.stringify({
+    if (sanitizedHistory.contaminatedFieldCount > 0 || sanitizedHistory.strippedMarkerCount > 0) {
+      console.warn('[Forwarder] Sanitized assistant input history before upstream replay', JSON.stringify({
         requestId: context.requestId,
         providerId: provider.id,
         model: request.model,
         contaminatedFieldCount: sanitizedHistory.contaminatedFieldCount,
         removedMessageCount: sanitizedHistory.removedMessageCount,
+        strippedMarkerCount: sanitizedHistory.strippedMarkerCount,
       }))
     }
     request = {
@@ -1594,6 +1600,12 @@ export class RequestForwarder {
         return createQwenAiRequestTimeoutResult(startTime)
       }
 
+      // Fresh probe per attempt: the adapter reports the transport it actually
+      // settled (a size offload upgrades inline → document without touching
+      // qwenAiMessageTransport), and a failed attempt that never reached the
+      // transport stage must not inherit the previous attempt's report.
+      const qwenAiTransportProbe: QwenAiTransportProbe = {}
+
       try {
         const rawResult = await this.doForward(
           modifiedRequest,
@@ -1613,6 +1625,7 @@ export class RequestForwarder {
             qwenAiRequestDeadlineAt: qwenAiRequestDeadline,
             qwenAiMessageTransport,
             qwenAiMessageTransportLocked: qwenAiMessageTransportLocked,
+            qwenAiTransportProbe,
             qwenAiTranscriptTransportPolicy,
             qwenAiWebshareProxy,
             attempt: attempt + 1,
@@ -1711,15 +1724,33 @@ export class RequestForwarder {
         // Document-pipeline escape hatch: a parse/upload failure is decided
         // by the pipeline (not the account — observed 2026-09-07/08: the
         // same transcript timed out on six accounts while the inline channel
-        // stayed healthy). One same-account retry with the document transport
-        // disabled keeps the turn alive on the inline channel instead of
-        // burning every remaining account on a dead pipeline. Pipeline stalls
-        // can also be IP-level (RGV587 aftermath): when the Webshare proxy is
-        // configured and this attempt did not already use it, the escape
-        // retry leaves through a different exit IP.
+        // stayed healthy). One escape retry per client request, in one of two
+        // directions depending on how the attempt reached the pipeline:
+        //   - The adapter offloaded inline → document BY SIZE (the probe
+        //     says so): the payload cannot ride the inline channel, so the
+        //     escape re-sends the SAME document transport on a fresh account
+        //     via the route's failover loop — observed 2026-09-10: a
+        //     transcript whose /files/parse hung ~59s → 504 on one account
+        //     parsed in 39s on the next. The content stop rule (this parse
+        //     code is content-determined) caps that at one rotation so a
+        //     pipeline-wide outage cannot burn the pool.
+        //   - Otherwise (transport fits inline): one same-account retry with
+        //     the document transport disabled. Pipeline stalls can also be
+        //     IP-level (RGV587 aftermath): when the Webshare proxy is
+        //     configured and this attempt did not already use it, the escape
+        //     retry leaves through a different exit IP.
+        // The trigger must consult the transport the attempt ACTUALLY used:
+        // the adapter's size offload upgrades inline → document on its own,
+        // so the forwarder-level variable alone misses exactly the oversized
+        // sessions where the pipeline failure hurts most.
+        const attemptUsedDocumentTransport = qwenAiMessageTransport === 'document'
+          || qwenAiTransportProbe?.actualTransport === 'document'
+        const parsePipelineFailure = result.errorCode === 'qwen_ai_file_parse_http_error'
+          || result.errorCode === 'qwen_ai_file_parse_timeout'
+          || /file parse/i.test(result.error ?? '')
         if (
           isQwenAiProvider
-          && qwenAiMessageTransport === 'document'
+          && attemptUsedDocumentTransport
           && isQwenAiDocumentPipelineFailure(result)
           && qwenAiDocumentEscapeRetries < 1
           && !context.signal?.aborted
@@ -1727,6 +1758,26 @@ export class RequestForwarder {
           && Date.now() < qwenAiRequestDeadline
         ) {
           qwenAiDocumentEscapeRetries += 1
+          if (qwenAiTransportProbe?.offloadedBySize === true && parsePipelineFailure) {
+            console.warn('[QwenAI] document pipeline failed, rotating account for a fresh document transport', JSON.stringify({
+              requestId: context.requestId,
+              accountId: account.id,
+              status: result.status,
+              errorCode: result.errorCode,
+              attempt: attempt + 1,
+            }))
+            // Re-assert the account-neutral parse classification so the
+            // route's failover loop rotates and its content stop rule caps
+            // the rotation at one extra account.
+            return {
+              ...result,
+              success: false,
+              errorCode: result.errorCode ?? 'qwen_ai_file_parse_http_error',
+              accountFault: false,
+              retryScope: 'next-account',
+              latency: Math.max(0, Date.now() - startTime),
+            }
+          }
           qwenAiMessageTransport = 'inline'
           const retryViaWebshare = !qwenAiWebshareProxy
             && qwenAiWebshareRetries < 1
@@ -2844,6 +2895,7 @@ export class RequestForwarder {
         requestDeadlineAt: options.qwenAiRequestDeadlineAt,
         messageTransport: options.qwenAiMessageTransport,
         messageTransportLocked: options.qwenAiMessageTransportLocked,
+        transportProbe: options.qwenAiTransportProbe,
         transcriptTransportPolicy: options.qwenAiTranscriptTransportPolicy,
         webshareProxy: options.qwenAiWebshareProxy,
         attemptNumber: options.attempt,
@@ -3897,6 +3949,7 @@ export class RequestForwarder {
           : options.requestDeadlineAt - Date.now(),
         messageTransport: options.messageTransport,
         messageTransportLocked: options.messageTransportLocked,
+        transportProbe: options.transportProbe,
         transcriptTransportPolicy: options.transcriptTransportPolicy,
         webshareProxy: options.webshareProxy,
         attemptNumber: options.attemptNumber,
@@ -3968,6 +4021,7 @@ export class RequestForwarder {
             chatInProgressRetryAttempts: qwenAiResponsesContinuationRetryAttemptsFromEnv(),
             messageTransport: options.messageTransport,
             messageTransportLocked: options.messageTransportLocked,
+            transportProbe: options.transportProbe,
             transcriptTransportPolicy: options.transcriptTransportPolicy,
             webshareProxy: options.webshareProxy,
             signal: context?.signal,
@@ -4587,7 +4641,129 @@ export class RequestForwarder {
       const handler = new ZaiStreamHandler(actualModel, deleteChatCallback, transformed.plan)
       handler.setChatId(chatId)
       handler.setAccountInfo(account.id, account.credentials?.token || '')
-      
+
+      // Managed workflow continuation (Qwen parity): a classified dangling
+      // answer (progress prose / short narration / capability denial without a
+      // tool call) is recovered with a replacement upstream generation instead
+      // of being delivered as a silent workflow stall. Tier 1 appends a
+      // follow-up user turn to the SAME z.ai chat; tier 2 replays the
+      // transcript with the dangling branch + continuation prompt in a fresh
+      // chat. Both budgets are env-configurable and default to one attempt.
+      if (transformed.plan?.shouldParseResponse) {
+        const continuationAttemptsLimit = zaiWorkflowContinuationAttemptsFromEnv()
+        const continuationDeadlineAt = Date.now() + zaiWorkflowContinuationTimeoutMsFromEnv()
+        let continuationAttemptsUsed = 0
+        let activeChatId = chatId
+        const buildContinuationNudge = (verdict: { completionProofMissing: boolean; requireManagedToolCall: boolean }) => createToolWorkflowContinuationMessage({
+          activeUserRequest: extractLatestActiveUserRequest(transformed.messages),
+          completionProofMissing: verdict.completionProofMissing
+            && transformed.plan.failedToolResultPending !== true,
+          failedToolResultPending: transformed.plan.failedToolResultPending === true,
+          requireManagedToolCall: verdict.requireManagedToolCall,
+          plan: transformed.plan,
+        })
+        handler.setContinuation({
+          activeChatId: () => activeChatId,
+          start: async (verdict, danglingContent, parentMessageId) => {
+            if (continuationAttemptsUsed >= continuationAttemptsLimit) return null
+            if (Date.now() >= continuationDeadlineAt) return null
+            continuationAttemptsUsed += 1
+            const nudgeMessage = buildContinuationNudge(verdict)
+            const nudgeContent = typeof nudgeMessage.content === 'string'
+              ? nudgeMessage.content
+              : JSON.stringify(nudgeMessage.content)
+
+            // Tier 1: same-chat follow-up anchored on the assistant message.
+            // The SSE stream never carries the assistant message id, so
+            // resolve it from the chat tree unless the upstream is still
+            // generating (idle stall — the reply is not in the tree yet).
+            let sameChatParentId = ''
+            if (verdict.reason !== 'upstream_idle_stall' && activeChatId) {
+              sameChatParentId = parentMessageId
+                || await adapter.getLastAssistantMessageId(activeChatId).catch(() => '')
+            }
+            if (sameChatParentId) {
+              try {
+                console.warn('[Z.ai] Managed workflow continuation: same-chat follow-up', JSON.stringify({
+                  reason: verdict.reason,
+                  attempt: continuationAttemptsUsed,
+                  maxAttempts: continuationAttemptsLimit,
+                  chatId: activeChatId,
+                  parentMessageId: sameChatParentId,
+                  contentLength: danglingContent.length,
+                }))
+                const continued = await adapter.continueChat({
+                  model: actualModel,
+                  messages: [{ role: 'user', content: nudgeContent }],
+                  chatId: activeChatId,
+                  parentMessageId: sameChatParentId,
+                  web_search: request.web_search,
+                  reasoning_effort: toThreeLevelReasoningEffort(request.reasoning_effort),
+                  thinking_budget: request.thinking_budget,
+                })
+                if (continued.response.status === 200 && continued.response.data && typeof continued.response.data.on === 'function') {
+                  return { response: continued.response, chatId: activeChatId }
+                }
+                console.warn('[Z.ai] Same-chat continuation rejected; escalating to fresh chat', JSON.stringify({
+                  status: continued.response.status,
+                }))
+                try { continued.response.data?.destroy?.() } catch {}
+              } catch (error) {
+                console.warn('[Z.ai] Same-chat continuation failed; escalating to fresh chat', error instanceof Error ? error.message : error)
+              }
+            }
+
+            // Tier 2: fresh-chat replay. The dangling branch and the
+            // continuation prompt are appended so the replacement branch sees
+            // its own rejected narration. Mirror the Qwen replay: strip the
+            // engine-appended trailing continuation turn before appending.
+            try {
+              const replayMessages = transformed.plan.workflowContinuation
+                ? transformed.messages.slice(0, -1)
+                : transformed.messages
+              console.warn('[Z.ai] Managed workflow continuation: fresh-chat replay', JSON.stringify({
+                reason: verdict.reason,
+                attempt: continuationAttemptsUsed,
+                maxAttempts: continuationAttemptsLimit,
+                previousChatId: activeChatId,
+                contentLength: danglingContent.length,
+              }))
+              const restarted = await adapter.chatCompletion({
+                model: actualModel,
+                originalModel: request.model,
+                messages: [
+                  ...replayMessages,
+                  { role: 'assistant', content: danglingContent },
+                  { role: 'user', content: nudgeContent },
+                ] as any,
+                stream: request.stream,
+                temperature: request.temperature,
+                web_search: request.web_search,
+                reasoning_effort: toThreeLevelReasoningEffort(request.reasoning_effort),
+                thinking_budget: request.thinking_budget,
+                deep_research: request.deep_research,
+              })
+              if (restarted.response.status === 200 && restarted.response.data && typeof restarted.response.data.on === 'function') {
+                const previousChatId = activeChatId
+                activeChatId = restarted.chatId
+                if (previousChatId && previousChatId !== restarted.chatId) {
+                  void deleteChatCallback?.(previousChatId)
+                }
+                return { response: restarted.response, chatId: restarted.chatId }
+              }
+              console.warn('[Z.ai] Fresh-chat continuation rejected', JSON.stringify({
+                status: restarted.response.status,
+              }))
+              try { restarted.response.data?.destroy?.() } catch {}
+              return null
+            } catch (error) {
+              console.warn('[Z.ai] Fresh-chat continuation failed', error instanceof Error ? error.message : error)
+              return null
+            }
+          },
+        })
+      }
+
       if (request.stream === true) {
         const transformedStream = await handler.handleStream(response.data)
         
@@ -4605,9 +4781,9 @@ export class RequestForwarder {
       const result = await handler.handleNonStream(response.data)
 
       this.applyToolCallsToResponse(result, transformed)
-      
+
       if (deleteChatCallback) {
-        await deleteChatCallback(chatId)
+        await deleteChatCallback(handler.getActiveChatId())
       }
 
       return {

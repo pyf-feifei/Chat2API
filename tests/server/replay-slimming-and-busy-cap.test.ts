@@ -328,3 +328,44 @@ test('docker-compose passes the image slimming knobs through', () => {
   assert.match(source, /CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES/)
   assert.match(source, /CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES/)
 })
+
+test('retry nonce scope: always perturbs attempt 1, retry preserves cache path, off disables', async (t) => {
+  const { applyQwenAiRetryNonce, qwenAiRetryNonceScopeFromEnv } = await import('../../src/main/proxy/adapters/qwen-ai-files.ts')
+  t.after(() => {
+    delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
+    delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE
+  })
+
+  process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE = 'always'
+  const first = applyQwenAiRetryNonce('body', 1)
+  assert.notEqual(first, 'body', 'always scope must perturb attempt 1 (reconnect fingerprint immunity)')
+
+  process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE = 'retry'
+  assert.equal(applyQwenAiRetryNonce('body', 1), 'body', 'retry scope keeps attempt-1 upload-cache path')
+  assert.notEqual(applyQwenAiRetryNonce('body', 2), 'body')
+
+  process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE = 'off'
+  assert.equal(applyQwenAiRetryNonce('body', 3), 'body')
+  assert.equal(qwenAiRetryNonceScopeFromEnv(), 'off')
+
+  delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
+  assert.equal(qwenAiRetryNonceScopeFromEnv(), 'retry', 'default scope unchanged')
+})
+
+test('capacity_limit (429 quota_limit) classifies as busy-family for the webshare recovery lever', async (t) => {
+  const { isQwenAiUpstreamBusyResult } = await import('../../src/main/proxy/qwenBusyClassification.ts')
+  t.after(() => {})
+  const base = { success: false, accountFault: true, retryScope: 'next-account' }
+  assert.equal(
+    isQwenAiUpstreamBusyResult({ ...base, errorCode: 'qwen_ai_capacity_limit' }),
+    true,
+    'capacity_limit must reach the exit-IP recovery (webshare retry) despite account-fault flag',
+  )
+  assert.equal(
+    isQwenAiUpstreamBusyResult({ ...base, errorCode: 'qwen_ai_upstream_busy', accountFault: false }),
+    true,
+  )
+  assert.equal(isQwenAiUpstreamBusyResult({ ...base, errorCode: 'qwen_ai_upstream_busy' }), false,
+    'plain busy with accountFault stays out (existing contract)')
+  assert.equal(isQwenAiUpstreamBusyResult({ ...base, errorCode: 'qwen_ai_capacity_limit', success: true }), false)
+})

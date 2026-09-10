@@ -1387,6 +1387,10 @@ function loadForwarderForBridgeTests(overrides = {}) {
     http2: {},
     '../store/types': {},
     './types': {},
+    './qwenBusyClassification': {
+      isQwenAiUpstreamBusyResult: (result) => result?.errorCode === 'qwen_ai_upstream_busy'
+        || result?.errorCode === 'qwen_ai_capacity_limit',
+    },
     './status': { proxyStatusManager: {} },
     '../store/store': {
       storeManager: {

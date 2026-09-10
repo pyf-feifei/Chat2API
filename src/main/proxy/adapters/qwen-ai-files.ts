@@ -234,6 +234,22 @@ export interface PreparedQwenAiMessage {
 
 export type QwenAiMessageTransport = 'inline' | 'document'
 export type QwenAiManagedDocumentMode = 'hybrid' | 'complete'
+
+/**
+ * Mutable write-back channel from the adapter to the forwarder's escape
+ * logic. The adapter settles the effective message transport per attempt
+ * (payload-size offload upgrades 'inline' to 'document' on its own), and the
+ * forwarder-level transport variable stays at its requested value — observed
+ * 2026-09-10: a document-pipeline 504 then missed the escape hatch because
+ * the forwarder still believed the attempt was inline. The adapter fills this
+ * object once the attempt's transport is final.
+ */
+export interface QwenAiTransportProbe {
+  requestedTransport?: QwenAiMessageTransport
+  actualTransport?: QwenAiMessageTransport
+  /** True when the adapter upgraded inline → document because of payload size. */
+  offloadedBySize?: boolean
+}
 export type QwenAiSystemPromptMode = 'native' | 'flattened'
 export type QwenAiToolProtocolChannel = 'inline' | 'native'
 
@@ -504,6 +520,18 @@ function qwenAiFileOperationRequestTimeoutMsFromEnv(): number {
   return positiveIntegerFromEnv('QWEN_AI_FILE_OPERATION_TIMEOUT_MS', 120000)
 }
 
+function qwenAiFileParseRetryMaxFromEnv(): number {
+  const raw = process.env.QWEN_AI_FILE_PARSE_RETRY_MAX
+  if (!raw) return 2
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return 2
+  return Math.min(5, Math.floor(parsed))
+}
+
+function qwenAiFileParseRetryDelayMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_RETRY_DELAY_MS', 2000)
+}
+
 function boundedPositiveIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, positiveIntegerFromEnv(name, fallback)))
 }
@@ -563,6 +591,36 @@ function createQwenAiFileParseTimeoutError(
   error.accountFault = false
   error.retryScope = 'next-account'
   return error
+}
+
+/**
+ * The parse POST itself came back with an HTTP error. Classified like the
+ * parse-timeout family (account-neutral, next-account replay): observed
+ * 2026-09-10 a transcript whose /files/parse hung ~59s and returned 504 on
+ * one account parsed in 39s on the next. The precise HTTP status stays in
+ * the message and on the error.
+ */
+function createQwenAiFileParseHttpError(status: number): QwenAiFileOperationError {
+  const error = new Error(
+    `Qwen AI file parse request failed: HTTP ${status}`,
+  ) as QwenAiFileOperationError
+  error.status = status
+  error.code = 'qwen_ai_file_parse_http_error'
+  error.retryable = false
+  error.accountFault = false
+  error.retryScope = 'next-account'
+  return error
+}
+
+/** Socket/request-level faults of the parse POST that an immediate retry can clear. */
+function isQwenAiParsePostTransportRetry(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code
+  return code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ECONNRESET'
+}
+
+function canQwenAiFileParseRetry(options: QwenAiFileOperationOptions): boolean {
+  const deadlineAt = operationDeadlineAt(options)
+  return deadlineAt === undefined || Date.now() < deadlineAt
 }
 
 function throwIfQwenAiFileOperationStopped(options: QwenAiFileOperationOptions): void {
@@ -2801,20 +2859,56 @@ export class QwenAiFileUploader {
     options: QwenAiFileOperationOptions = {},
   ): Promise<void> {
     throwIfQwenAiFileOperationStopped(options)
-    const parseResponse = await this.postJson(
-      `${QWEN_AI_BASE}/api/v2/files/parse`,
-      { file_id: fileId },
-      () => ({
-        headers: this.getHeaders(),
-        timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
-        validateStatus: () => true,
-      }),
-      options,
-    )
+    const retryMax = qwenAiFileParseRetryMaxFromEnv()
+    const retryDelayMs = qwenAiFileParseRetryDelayMsFromEnv()
+    // The parse POST occasionally stalls behind Qwen's gateway and comes back
+    // 502/503/504 (or times out client-side) while the pipeline is otherwise
+    // healthy — observed 2026-09-10: one attempt hung ~59s → 504, and the SAME
+    // transcript parsed in 39s/4.4s on the following attempts. Retry in place
+    // before declaring the attempt failed; account rotation stays the bigger
+    // hammer one layer up.
+    for (let parseAttempt = 1; ; parseAttempt += 1) {
+      let parseResponse: AxiosResponse
+      try {
+        parseResponse = await this.postJson(
+          `${QWEN_AI_BASE}/api/v2/files/parse`,
+          { file_id: fileId },
+          () => ({
+            headers: this.getHeaders(),
+            timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
+            validateStatus: () => true,
+          }),
+          options,
+        )
+      } catch (error) {
+        if (
+          parseAttempt <= retryMax
+          && isQwenAiParsePostTransportRetry(error)
+          && canQwenAiFileParseRetry(options)
+        ) {
+          console.warn(`[QwenAI][File] parse request transport error, retrying fileId=${fileId} attempt=${parseAttempt}/${retryMax + 1}`)
+          await delay(retryDelayMs, options)
+          throwIfQwenAiFileOperationStopped(options)
+          continue
+        }
+        throw error
+      }
 
-    throwIfQwenAiFileOperationStopped(options)
-    if (parseResponse.status >= 400) {
-      throw new Error(`Qwen AI file parse request failed: HTTP ${parseResponse.status}`)
+      throwIfQwenAiFileOperationStopped(options)
+      if (parseResponse.status >= 400) {
+        if (
+          parseResponse.status >= 500
+          && parseAttempt <= retryMax
+          && canQwenAiFileParseRetry(options)
+        ) {
+          console.warn(`[QwenAI][File] parse request HTTP ${parseResponse.status}, retrying fileId=${fileId} attempt=${parseAttempt}/${retryMax + 1}`)
+          await delay(retryDelayMs, options)
+          throwIfQwenAiFileOperationStopped(options)
+          continue
+        }
+        throw createQwenAiFileParseHttpError(parseResponse.status)
+      }
+      break
     }
 
     await this.waitForParse(fileId, options)
@@ -2958,11 +3052,33 @@ function createQwenAiTranscriptDocument(
  */
 let retryNonceSequence = 0
 
+/**
+ * CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE controls when the perturbation applies:
+ * - 'retry' (default): attempt >= 2 only — first attempts keep the upload
+ *   cache hit path (unchanged historical behavior);
+ * - 'always': every attempt is perturbed, including attempt 1. The upstream
+ *   content-fingerprint verdict cache persists ACROSS requests, so a client
+ *   reconnect that resubmits an unchanged conversation byte-for-byte is
+ *   pinned by that cache even though it is a brand-new request (2026-09-10
+ *   evening-peak quota_limit storm: codex reconnect loop, 12 rejections on 1
+ *   unique document hash). 'always' trades the transcript upload-cache hit
+ *   for fingerprint immunity;
+ * - 'off': disables perturbation entirely (same as CHAT2API_QWEN_AI_RETRY_NONCE=false).
+ */
+export function qwenAiRetryNonceScopeFromEnv(): 'retry' | 'always' | 'off' {
+  const disabled = String(process.env.CHAT2API_QWEN_AI_RETRY_NONCE ?? 'true').trim().toLowerCase() === 'false'
+  if (disabled) return 'off'
+  const raw = String(process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE ?? '').trim().toLowerCase()
+  if (raw === 'always') return 'always'
+  if (raw === 'off') return 'off'
+  return 'retry'
+}
+
 export function applyQwenAiRetryNonce(content: string, nonce?: number): string {
-  if (!nonce || nonce < 2 || !content) return content
-  if (String(process.env.CHAT2API_QWEN_AI_RETRY_NONCE ?? 'true').trim().toLowerCase() === 'false') {
-    return content
-  }
+  const scope = qwenAiRetryNonceScopeFromEnv()
+  if (scope === 'off' || !content) return content
+  const shouldPerturb = scope === 'always' ? Boolean(nonce) : Boolean(nonce && nonce >= 2)
+  if (!shouldPerturb) return content
   retryNonceSequence += 1
   return `${content}\n[chat2api transport note: conversation resync ${nonce}-${Date.now().toString(36)}-${retryNonceSequence.toString(36)}]`
 }

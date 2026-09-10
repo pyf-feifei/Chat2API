@@ -1,5 +1,8 @@
 import type { ChatMessage } from '../types.ts'
 import { stripManagedToolResultWrappers } from './managedToolResultGuard.ts'
+import {
+  stripStrayManagedWorkflowCompletionMarkers,
+} from './workflowCompletion.ts'
 import type { ToolProtocolId } from './types.ts'
 
 const ASSISTANT_AUXILIARY_TEXT_FIELDS = [
@@ -21,6 +24,7 @@ export interface AssistantInputBoundaryResult {
   messages: ChatMessage[]
   contaminatedFieldCount: number
   removedMessageCount: number
+  strippedMarkerCount: number
 }
 
 /**
@@ -28,6 +32,12 @@ export interface AssistantInputBoundaryResult {
  * history is sent upstream again. Structured tool calls and their arguments
  * remain untouched; a contaminated visible text block is discarded as a
  * whole because surrounding prose belongs to the same untrusted generation.
+ *
+ * Stray managed-workflow completion markers are additionally stripped from
+ * assistant history IN PLACE (unlike wrapper contamination, the surrounding
+ * prose is kept): the marker is a proxy protocol token that must never ride
+ * back upstream, where the model mimics its own prior marker usage and the
+ * leak self-perpetuates across turns (2026-09-10 incident).
  */
 export function sanitizeAssistantInputHistory(
   messages: ChatMessage[],
@@ -35,7 +45,14 @@ export function sanitizeAssistantInputHistory(
 ): AssistantInputBoundaryResult {
   let contaminatedFieldCount = 0
   let removedMessageCount = 0
+  let strippedMarkerCount = 0
   const sanitizedMessages: ChatMessage[] = []
+
+  const stripMarkers = (value: string): string => {
+    const stripped = stripStrayManagedWorkflowCompletionMarkers(value)
+    if (stripped !== value) strippedMarkerCount += 1
+    return stripped
+  }
 
   for (const message of messages) {
     if (message.role !== 'assistant') {
@@ -47,7 +64,8 @@ export function sanitizeAssistantInputHistory(
     let content: ChatMessage['content'] = message.content
 
     if (typeof message.content === 'string') {
-      if (containsManagedToolResultWrapper(message.content, protectedToolCallProtocol)) {
+      content = stripMarkers(message.content)
+      if (containsManagedToolResultWrapper(content, protectedToolCallProtocol)) {
         contaminated = true
         contaminatedFieldCount += 1
         content = null
@@ -56,11 +74,12 @@ export function sanitizeAssistantInputHistory(
       const sanitizedParts: unknown[] = []
       for (const part of message.content) {
         if (typeof part === 'string') {
-          if (containsManagedToolResultWrapper(part, protectedToolCallProtocol)) {
+          const strippedPart = stripMarkers(part)
+          if (containsManagedToolResultWrapper(strippedPart, protectedToolCallProtocol)) {
             contaminated = true
             contaminatedFieldCount += 1
           } else {
-            sanitizedParts.push(part)
+            sanitizedParts.push(strippedPart)
           }
           continue
         }
@@ -78,19 +97,23 @@ export function sanitizeAssistantInputHistory(
         }
 
         const textFields = ['text', 'content'] as const
-        const contaminatedPart = textFields.some(field => (
-          typeof record[field] === 'string'
-          && containsManagedToolResultWrapper(
-            record[field] as string,
-            protectedToolCallProtocol,
-          )
-        ))
+        let contaminatedPart = false
+        const sanitizedRecordPart: Record<string, unknown> = { ...record }
+        for (const field of textFields) {
+          const value = sanitizedRecordPart[field]
+          if (typeof value !== 'string') continue
+          const strippedValue = stripMarkers(value)
+          sanitizedRecordPart[field] = strippedValue
+          if (containsManagedToolResultWrapper(strippedValue, protectedToolCallProtocol)) {
+            contaminatedPart = true
+          }
+        }
         if (contaminatedPart) {
           contaminated = true
           contaminatedFieldCount += 1
           continue
         }
-        sanitizedParts.push(part)
+        sanitizedParts.push(sanitizedRecordPart)
       }
       content = sanitizedParts.length > 0
         ? sanitizedParts as ChatMessage['content']
@@ -103,10 +126,10 @@ export function sanitizeAssistantInputHistory(
     }
     for (const field of ASSISTANT_AUXILIARY_TEXT_FIELDS) {
       const value = sanitizedRecord[field]
-      if (
-        typeof value === 'string'
-        && containsManagedToolResultWrapper(value, null)
-      ) {
+      if (typeof value !== 'string') continue
+      const strippedValue = stripMarkers(value)
+      sanitizedRecord[field] = strippedValue
+      if (containsManagedToolResultWrapper(strippedValue, null)) {
         contaminated = true
         contaminatedFieldCount += 1
         sanitizedRecord[field] = undefined
@@ -125,6 +148,7 @@ export function sanitizeAssistantInputHistory(
     messages: sanitizedMessages,
     contaminatedFieldCount,
     removedMessageCount,
+    strippedMarkerCount,
   }
 }
 

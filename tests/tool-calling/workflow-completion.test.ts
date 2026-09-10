@@ -398,3 +398,16 @@ test('long matched tool history opens a completion-proved final-answer turn', ()
   assert.equal(requiresManagedWorkflowCompletionMarker(transformed.plan), true)
   assert.match(String(transformed.messages[0].content), /chat2api_workflow_complete/)
 })
+
+test('continuation prompt references the completion marker only for marker-contract protocols', () => {
+  const hermes = createToolWorkflowContinuationMessage({
+    plan: managedPlan({ workflowContinuation: true }),
+  })
+  assert.match(String(hermes.content), /with the required completion marker\./)
+
+  const managedXml = createToolWorkflowContinuationMessage({
+    plan: managedPlan({ protocol: 'managed_xml', workflowContinuation: true }),
+  })
+  assert.doesNotMatch(String(managedXml.content), /completion marker/)
+  assert.match(String(managedXml.content), /return the final answer\./)
+})

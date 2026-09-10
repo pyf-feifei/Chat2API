@@ -19,6 +19,16 @@ import {
   TOOL_CALLER_START,
   toolNames,
 } from './shared.ts'
+import {
+  LARGE_PAYLOAD_GUIDANCE_CHUNking,
+  LARGE_PAYLOAD_GUIDANCE_RETRY,
+  largePayloadGuidanceEnabled,
+} from '../promptGuidance.ts'
+
+function largePayloadSuffix(text: string): string {
+  return largePayloadGuidanceEnabled() && text ? `
+${text}` : ''
+}
 
 const TOOL_CALL_START = '<tool_call>'
 const TOOL_CALL_END = '</tool_call>'
@@ -165,16 +175,18 @@ parameter_value
 </parameter>
 </function>
 </tool_call>
-Repeat the parameter block for every argument required by the selected function's JSON schema. Encode object and array values as JSON.
+Repeat the parameter block for every argument required by the selected function's JSON schema. Encode object and array values as JSON.${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_RETRY)}
 Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this output must be function calls only.`
   },
 
   renderContinuationReminder(tools) {
     return `Managed tool workflow status: IN PROGRESS. The tool results above were just returned to you by the client, so the workflow has NOT reached a final answer yet.
 This turn must end with exactly one of: (1) the next <tool_call> block for a distinct unfinished operation, or (2) your complete final answer ending with the exact marker <chat2api_workflow_complete/> as the final characters.
+The two endings are mutually exclusive: a response containing a <tool_call> block must NOT also contain the completion marker, and the marker must never appear anywhere except as the final characters of a final answer with no tool call.
 Do not answer with a plan, progress update, or a description of what you will do next — those are protocol violations on this turn and trigger a retry.
 Tool results are input only: never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this turn ends with the next call block or the final answer, nothing else.
 Declared function names (use only these): ${serializeHermesJson(tools.map((tool) => tool.name))}
+${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_CHUNking)}
 Exact call format:
 <tool_call>
 <function=exact_function_name>
@@ -361,7 +373,7 @@ parameter_value
 </function>
 </tool_call>
 
-Use only function and parameter names declared above. Include every required parameter and satisfy the selected function's JSON schema. Encode object and array parameter values as JSON. Emit one <tool_call> block per function call. You may provide reasoning before the first function call, but never add text after a function call. If completing the request requires a tool, emit the tool call in this response instead of describing or promising a later action. When no function is needed, answer normally without tool-call tags.
+Use only function and parameter names declared above. Include every required parameter and satisfy the selected function's JSON schema. Encode object and array parameter values as JSON. Emit one <tool_call> block per function call. You may provide reasoning before the first function call, but never add text after a function call. If completing the request requires a tool, emit the tool call in this response instead of describing or promising a later action. When no function is needed, answer normally without tool-call tags.${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_CHUNking)}
 Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate a tool-result block, a fenced result envelope, or any result-wrapper tag in your own output; your output is only reasoning, a function-call block, or a final answer.`
 }
 

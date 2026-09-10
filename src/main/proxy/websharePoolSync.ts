@@ -64,6 +64,43 @@ function persistedConfig(): WebshareProxyConfig | undefined {
 }
 
 /**
+ * Boot-time bootstrap: re-apply the persisted webshare config after a process
+ * restart. Without this, the runtime `configured` state and the sync timer
+ * only exist after the admin UI re-saves the config, so every container
+ * recreation silently disabled the webshare recovery lever until someone
+ * happened to re-save it (observed 2026-09-10: no pool sync after recreate,
+ * isWebshareProxyEnabled() fell back to empty env → false).
+ */
+export function bootstrapWebshareFromStore(): void {
+  const persisted = persistedConfig()
+  if (!persisted) return
+  void (async () => {
+    try {
+      const { setWebshareProxyConfig } = await import('./webshareProxy')
+      // Seed the pool with the persisted entries synchronously so the
+      // recovery lever is armed even if the webshare API is unreachable at
+      // boot; the sync timer then keeps them fresh.
+      setWebshareProxyConfig({
+        enabled: persisted.enabled !== false,
+        proxyUrl: persisted.proxyUrl ?? '',
+      }, (persisted.entries ?? []).map(entry => ({
+        proxyUrl: entry.proxyUrl,
+        enabled: entry.enabled !== false,
+        failureCount: entry.failureCount ?? 0,
+      })))
+      applyWebshareSyncConfig(persisted)
+      console.info('[WebsharePoolSync] bootstrapped from persisted config', JSON.stringify({
+        enabled: persisted.enabled !== false,
+        keys: (persisted.apiKeys ?? []).length,
+        entries: (persisted.entries ?? []).length,
+      }))
+    } catch (error) {
+      console.warn('[WebsharePoolSync] bootstrap failed:', error instanceof Error ? error.message : error)
+    }
+  })()
+}
+
+/**
  * (Re)arm the sync timer from the persisted config. Passing undefined (config
  * section deleted) stops syncing entirely.
  */

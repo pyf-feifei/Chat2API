@@ -92,6 +92,103 @@ export function supportsManagedWorkflowCompletionMarker(
   )
 }
 
+const COMPLETION_MARKER_PREFIX = '<chat2api_workflow_complete'
+
+export interface ManagedWorkflowCompletionMarkerOccurrence {
+  start: number
+  /** Exclusive end: the index of the first character after the marker text. */
+  end: number
+}
+
+/**
+ * Locates a stray completion marker in assistant prose: a marker occurrence
+ * that is not inside an open code fence and not a quoted or indented line.
+ * These are the same visibility guards the proof parser applies, so text that
+ * would be rejected as a proof for formatting reasons (documented literal
+ * markers) is not treated as protocol output here either.
+ */
+export function findStrayManagedWorkflowCompletionMarker(
+  content: string,
+  fromIndex = 0,
+): ManagedWorkflowCompletionMarkerOccurrence | undefined {
+  let searchIndex = Math.max(0, fromIndex)
+  while (searchIndex <= content.length - COMPLETION_MARKER_PREFIX.length) {
+    const start = content.indexOf(COMPLETION_MARKER_PREFIX, searchIndex)
+    if (start === -1) return undefined
+
+    const slashClose = content.startsWith('/>', start + COMPLETION_MARKER_PREFIX.length)
+      ? COMPLETION_MARKER_PREFIX.length + 2
+      : undefined
+    const bareClose = content.startsWith('>', start + COMPLETION_MARKER_PREFIX.length)
+      ? COMPLETION_MARKER_PREFIX.length + 1
+      : undefined
+    if (!slashClose && !bareClose) {
+      searchIndex = start + 1
+      continue
+    }
+
+    if (isInsideOpenCodeFence(content, start) || isQuotedOrCodeLine(content, start)) {
+      searchIndex = start + 1
+      continue
+    }
+
+    return { start, end: start + (slashClose ?? bareClose!) }
+  }
+  return undefined
+}
+
+/**
+ * Streaming companion of {@link findStrayManagedWorkflowCompletionMarker}:
+ * reports whether the buffer ends with a partial marker prefix that must be
+ * held back until the next delta disambiguates it. Prefixes of every full
+ * variant are matched (including the bare-prefix-plus-"/" state), because a
+ * delta boundary can land anywhere inside the marker text.
+ */
+export function trailingPartialManagedWorkflowCompletionMarkerIndex(
+  buffer: string,
+): number | undefined {
+  const maxVariantLength = Math.max(
+    ...MANAGED_WORKFLOW_COMPLETE_MARKER_VARIANTS.map(variant => variant.length),
+  )
+  const maxCandidateLength = Math.min(maxVariantLength - 1, buffer.length)
+  for (let length = maxCandidateLength; length >= 1; length -= 1) {
+    const index = buffer.length - length
+    const slice = buffer.slice(index)
+    if (!MANAGED_WORKFLOW_COMPLETE_MARKER_VARIANTS.some(variant => variant.startsWith(slice))) {
+      continue
+    }
+    if (isInsideOpenCodeFence(buffer, index) || isQuotedOrCodeLine(buffer, index)) return undefined
+    return index
+  }
+  return undefined
+}
+
+/**
+ * Whether the held text can still become a completion marker once more
+ * content arrives. Used to release a partial hold as ordinary prose as soon
+ * as the stream leaves the marker path, so a stray "<" at a delta boundary
+ * never suppresses the rest of the response.
+ */
+export function isManagedWorkflowCompletionMarkerPath(text: string): boolean {
+  return MANAGED_WORKFLOW_COMPLETE_MARKER_VARIANTS.some(variant => variant.startsWith(text))
+}
+
+/**
+ * Removes every stray marker occurrence from assistant prose. Guarded
+ * occurrences (code fences, quotes, indentation) are preserved as literal
+ * text; tool-call argument payloads are never routed through this helper.
+ */
+export function stripStrayManagedWorkflowCompletionMarkers(content: string): string {
+  let result = content
+  let searchFrom = 0
+  for (;;) {
+    const occurrence = findStrayManagedWorkflowCompletionMarker(result, searchFrom)
+    if (!occurrence) return result
+    result = result.slice(0, occurrence.start) + result.slice(occurrence.end)
+    searchFrom = occurrence.start
+  }
+}
+
 function isInsideOpenCodeFence(content: string, index: number): boolean {
   let openFence: { character: '`' | '~'; length: number } | undefined
   const linesBeforeMarker = content.slice(0, index).split('\n')

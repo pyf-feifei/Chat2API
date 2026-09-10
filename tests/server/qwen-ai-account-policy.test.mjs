@@ -165,3 +165,22 @@ test('ordinary upstream failures cannot acquire an account-neutral replay scope'
     }), undefined)
   }
 })
+
+test('402 quota exhaustion is an account fault with next-account rotation', () => {
+  const error = { status: 402, code: 'PAYMENT_REQUIRED', message: 'insufficient quota' }
+
+  assert.equal(isQwenAiAccountFault(error), true, '402 must rotate off the dead-credit account')
+  assert.equal(qwenAiAccountRetryScope(error), 'next-account')
+})
+
+test('402 through the nested wrapper keeps the account boundary', () => {
+  const error = {
+    status_code: 502,
+    original_exception: {
+      response: { status: 402, data: { error: { code: 'INSUFFICIENT_CREDITS' } } },
+    },
+  }
+
+  assert.equal(isQwenAiAccountFault(error), true)
+  assert.equal(qwenAiAccountRetryScope(error), 'next-account')
+})

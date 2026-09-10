@@ -248,6 +248,10 @@ function loadRequestForwarder(overrides = {}) {
 
   const localModules = {
     axios: { create: () => ({}) },
+    './qwenBusyClassification': {
+      isQwenAiUpstreamBusyResult: (result) => result?.errorCode === 'qwen_ai_upstream_busy'
+        || result?.errorCode === 'qwen_ai_capacity_limit',
+    },
     http2: {},
     '../store/types': {},
     './types': {},
