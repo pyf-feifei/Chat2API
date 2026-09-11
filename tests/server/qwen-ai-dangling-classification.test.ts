@@ -106,6 +106,15 @@ test('first-turn auto direct answers remain legitimate (no live workflow)', () =
   // Even an intent-shaped first answer stays deliverable when it does not hit
   // the generic opener list (assistance layer only, deliberately minimal).
   assert.equal(classifyDangling(stall3, firstTurn), false, 'stall3 wording on a clean first turn')
+  // The colon-terminated promise rule is deliberately ZAI-ONLY: the qwen
+  // non-stream contract (tests/server/qwen-ai-stream-failure.test.mjs
+  // "accepts terminal prose ending in punctuation") pins punctuation-final
+  // prose as a legitimate auto-mode terminal here.
+  assert.equal(
+    classifyDangling('可以在本地 Codex 会话存储里找一下，我用这个 UUID 搜文件名和内容：', firstTurn),
+    false,
+    'colon promise prose stays deliverable on qwen',
+  )
 })
 
 test('over a live workflow even LONG marker-less narrations are dangling (no length escape)', () => {

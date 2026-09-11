@@ -2956,7 +2956,13 @@ export class QwenAiFileUploader {
       throwIfQwenAiFileOperationStopped(options)
       if (Date.now() >= pollingDeadlineAt) break
       if (response.status >= 400) {
-        throw new Error(`Qwen AI file parse status request failed: HTTP ${response.status}`)
+        // Classified like the parse-POST HTTP family: the status poll can fail
+        // with account-local quota verdicts (observed 2026-09-10: HTTP 402 on
+        // the status endpoint during the evening peak). Without the
+        // account-neutral classification the document-pipeline escape
+        // (inline downgrade — the actual remedy for file-quota exhaustion)
+        // never engages and the raw HTTP status surfaces to the client.
+        throw createQwenAiFileParseHttpError(response.status)
       }
 
       const status = response.data?.data?.[fileId]?.status
@@ -2972,7 +2978,12 @@ export class QwenAiFileUploader {
       }
 
       if (['failed', 'error', 'fail'].includes(normalizedStatus)) {
-        throw new Error(`Qwen AI file parse failed for uploaded document: ${normalizedStatus}`)
+        const parseFailedError: QwenAiFileOperationError = new Error(
+          `Qwen AI file parse failed for uploaded document: ${normalizedStatus}`,
+        )
+        parseFailedError.accountFault = false
+        parseFailedError.retryScope = 'next-account'
+        throw parseFailedError
       }
     }
 

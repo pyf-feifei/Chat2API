@@ -126,6 +126,22 @@ export function managedToolDenialRegex(): RegExp | undefined {
 }
 
 /**
+ * A short answer that terminates in a colon (ASCII or fullwidth) promises an
+ * enumeration, command, code block, or tool call that is not present — a
+ * structural dangling signal independent of the opener wording. Observed live
+ * 2026-09-11 (GLM-5.3-Flash first turn via codex): the model answered
+ * "可以在本地 Codex 会话存储里找一下，我用这个 UUID 搜文件名和内容：" and ended
+ * the turn; no opener matched ("我用…" is not an intent opener), no tool call,
+ * no rejected block, so the promise prose was delivered and the client turn
+ * stopped silently. Length cap mirrors the progress-intent cap: substantive
+ * complete answers do not end on a colon. Callers pass trimmed content.
+ */
+export function isColonTerminatedShortAnswer(trimmedContent: string): boolean {
+  if (!trimmedContent || trimmedContent.length > MANAGED_PROGRESS_INTENT_MAX_CODE_POINTS) return false
+  return /[:：]\s*$/u.test(trimmedContent)
+}
+
+/**
  * A capability-denial answer claims the declared tools are unavailable (or
  * that data is being fetched some other way) without a tool call. Length cap
  * mirrors the progress-intent cap: substantive answers that actually complete

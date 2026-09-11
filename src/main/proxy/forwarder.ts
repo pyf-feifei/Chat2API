@@ -1424,8 +1424,22 @@ export class RequestForwarder {
       // keeps hitting the same flagged exit IP. When the ordinary same-account
       // busy budget is exhausted (or configured to 0), retry once through the
       // configured Webshare proxy so only this recovery uses proxy traffic.
+      // Capacity_limit (429 "目前服务访问量较大") skips the direct-exit busy
+      // budget entirely and goes to Webshare on the FIRST failure: at peak the
+      // direct exit is already a lost cause for the heavy session shape
+      // (2026-09-10 night: every real tool call killed server-side while echo
+      // probes passed), and each doomed 120s direct retry burns the user's
+      // turn budget before the exit-IP lever engages.
       let retryViaWebshare = false
       if (
+        result.errorCode === 'qwen_ai_capacity_limit'
+        && isWebshareProxyEnabled()
+        && qwenAiWebshareRetries < 1
+        && !context.signal?.aborted
+      ) {
+        willRetry = true
+        retryViaWebshare = true
+      } else if (
         !willRetry
         && qwenAiWebshareRetries < 1
         && isWebshareProxyEnabled()

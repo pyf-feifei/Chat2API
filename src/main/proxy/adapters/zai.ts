@@ -17,8 +17,8 @@ import {
 } from '../utils/streamToolHandler'
 import { getProviderToolProfile, type ProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
-import { getToolProtocol } from '../toolCalling/protocols'
-import { isProgressStyleManagedAnswer, isToolDenialManagedAnswer } from './qwenAiProgressIntent.ts'
+import { getToolProtocol, hasRejectedToolCallBlock } from '../toolCalling/protocols'
+import { isColonTerminatedShortAnswer, isProgressStyleManagedAnswer, isToolDenialManagedAnswer } from './qwenAiProgressIntent.ts'
 import { isClientCancellationError } from '../utils/errors'
 import {
   hasManagedWorkflowCompletionMarker,
@@ -1268,6 +1268,46 @@ ${tailExcerpt}`,
 
 const MANAGED_SHORT_ANSWER_CODE_POINTS = 300
 
+/**
+ * True when the answer's trailing fenced code block parses as a JSON object
+ * whose top-level keys are ALL declared tool parameter names. The model
+ * sometimes writes the NEXT tool call's argument object as a fenced JSON
+ * example instead of the taught wire format (observed live 2026-09-11,
+ * GLM-5.3-Flash via codex: a unified_exec {"cmd", "yield_time_ms"} block
+ * delivered as prose; the turn completed and the action was lost). Such a
+ * block is an un-executed tool attempt, not documentation. Guards against
+ * false positives on legitimately documented examples: the fence must end the
+ * answer, the prose before it is capped like progress-intent prose, and the
+ * key match is derived from the declared schemas (never hardcoded).
+ */
+function hasTrailingFencedToolArgumentJson(trimmed: string, plan: ToolCallingPlan): boolean {
+  const closer = trimmed.lastIndexOf('```')
+  if (closer === -1 || closer + 3 !== trimmed.length) return false
+  const opener = trimmed.lastIndexOf('```', closer - 1)
+  if (opener === -1) return false
+  if ([...trimmed.slice(0, opener)].length > MANAGED_SHORT_ANSWER_CODE_POINTS) return false
+  const firstLineEnd = trimmed.indexOf('\n', opener)
+  if (firstLineEnd === -1 || firstLineEnd > closer) return false
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed.slice(firstLineEnd + 1, closer))
+  } catch {
+    return false
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+  const keys = Object.keys(parsed as Record<string, unknown>)
+  if (keys.length === 0) return false
+  const declaredParameterNames = new Set<string>()
+  for (const tool of plan.tools ?? []) {
+    const properties = tool.parameters?.properties
+    if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+      for (const name of Object.keys(properties)) declaredParameterNames.add(name)
+    }
+  }
+  if (declaredParameterNames.size === 0) return false
+  return keys.every((key) => declaredParameterNames.has(key))
+}
+
 export interface ZaiManagedAnswerVerdict {
   /** True when the turn should be recovered with a managed workflow continuation. */
   continuation: boolean
@@ -1322,6 +1362,30 @@ function classifyZaiManagedAnswer(
   const trimmed = content.trim()
   if (!trimmed) return zaiManagedAnswerIdle('empty_answer')
   if (plan.failedToolResultPending === true) return zaiManagedAnswerIdle('failed_tool_result_pending')
+  // A protocol-shaped block that yielded no valid tool call is a REJECTED tool
+  // attempt (undeclared name, schema-invalid args, truncated mid-call — none
+  // set malformedReason). The stream parser drops such blocks silently, so the
+  // client only ever saw the surrounding prose; delivering it ends the turn
+  // with the action lost. Recover regardless of workflow state: observed live
+  // 2026-09-11 (GLM-5.3-Flash first turn): the model emitted a managed_xml
+  // call to an undeclared tool, the block was dropped, and the appended block
+  // length also defeated the 300-codepoint progress-intent cap, so the
+  // promise prose was delivered and the client turn stopped. Must precede the
+  // progress-style checks — those cap on the WHOLE content, which the rejected
+  // block itself inflates.
+  if (hasRejectedToolCallBlock(parsed)) {
+    console.info('[Z.ai] Rejected tool-call block without a valid call triggers continuation', JSON.stringify({
+      invalidToolNames: parsed.invalidToolNames,
+      malformedReason: parsed.malformedReason,
+      blockCount: parsed.rawMatches.length,
+    }))
+    return {
+      continuation: true,
+      completionProofMissing: false,
+      requireManagedToolCall: plan.hasLiveToolWorkflow === true,
+      reason: 'rejected_tool_call_block',
+    }
+  }
   if (plan.hasLiveToolWorkflow) {
     if (isProgressStyleManagedAnswer(trimmed)) {
       console.info('[Z.ai] Progress-style answer over live workflow triggers continuation')
@@ -1340,11 +1404,29 @@ function classifyZaiManagedAnswer(
     console.info('[Z.ai] Capability-denial answer triggers continuation')
     return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'capability_denial_answer' }
   }
+  // A short answer ending in a colon promises an enumeration, command, code
+  // block, or tool call that never arrived. Structural and wording-independent
+  // (observed live 2026-09-11 first turn: "…我用这个 UUID 搜文件名和内容：" was
+  // delivered as the whole answer and the client turn stopped); must precede
+  // the first-turn idle fall-throughs below. Deployment-tunable: set
+  // CHAT2API_ZAI_COLON_PROMISE_CONTINUATION=off to disable the signal.
+  if (zaiBooleanEnv('CHAT2API_ZAI_COLON_PROMISE_CONTINUATION', true) && isColonTerminatedShortAnswer(trimmed)) {
+    console.info('[Z.ai] Colon-terminated short answer without tool call triggers continuation')
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'colon_terminated_short_answer' }
+  }
+  // The model sometimes writes the next tool call's argument object as a
+  // fenced JSON block instead of the taught wire format; the block is not
+  // executed and the turn ends with the action lost. Schema-derived key match,
+  // no hardcoded tool names (observed live 2026-09-11 first turn). Deployment-
+  // tunable: set CHAT2API_ZAI_FENCED_TOOL_ARGS_CONTINUATION=off to disable.
+  if (zaiBooleanEnv('CHAT2API_ZAI_FENCED_TOOL_ARGS_CONTINUATION', true) && hasTrailingFencedToolArgumentJson(trimmed, plan)) {
+    console.info('[Z.ai] Trailing fenced JSON matching declared tool parameters triggers continuation')
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'fenced_tool_argument_json' }
+  }
   const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
   if (!midWorkflow) {
-    if (parsed.rawMatches && parsed.rawMatches.length > 0 && parsed.malformedReason) {
-      return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'malformed_managed_block' }
-    }
+    // Rejected protocol blocks already returned as 'rejected_tool_call_block'
+    // above; nothing reaches this branch with rawMatches left to inspect.
     if (plan.toolChoiceMode === 'auto') return zaiManagedAnswerIdle('first_turn_auto_answer')
     if (trimmed.length > 0) return zaiManagedAnswerIdle('first_turn_answer')
   }

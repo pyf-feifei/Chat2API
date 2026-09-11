@@ -2800,6 +2800,13 @@ function isDanglingManagedToolAnswer(
     return true
   }
 
+  // NOTE: unlike the zai classifier, a colon-terminated short answer is NOT
+  // dangling here. Qwen's non-stream contract (pinned by
+  // "Qwen AI non-stream accepts terminal prose ending in punctuation",
+  // tests/server/qwen-ai-stream-failure.test.mjs) accepts punctuation-final
+  // prose as a legitimate auto-mode terminal; the 2026-09-11 colon-promise
+  // incident was observed on the zai provider only.
+
   // First-turn requests (including auto-mode ones) may legitimately answer
   // directly without tools: no tool result has come back yet, so the model
   // answering the request outright is a valid terminal state. A live workflow

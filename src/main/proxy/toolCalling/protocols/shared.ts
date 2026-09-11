@@ -60,6 +60,19 @@ export function createParseResult(input: {
   }
 }
 
+/**
+ * True when the response contained protocol-shaped tool-call blocks that
+ * produced NO valid tool call. Fenced/quoted protocol examples are stripped
+ * before parsing, so a raw match means the model genuinely attempted the
+ * taught wire format and the attempt was rejected (undeclared tool name,
+ * schema-invalid arguments, or structural truncation — none of which set
+ * malformedReason). Delivering only the surrounding prose silently ends the
+ * client's tool turn, so classifiers must recover instead of delivering.
+ */
+export function hasRejectedToolCallBlock(parsed: Pick<ToolParseResult, 'rawMatches' | 'toolCalls'>): boolean {
+  return parsed.rawMatches.length > 0 && parsed.toolCalls.length === 0
+}
+
 export function buildToolCall(
   id: string,
   index: number,

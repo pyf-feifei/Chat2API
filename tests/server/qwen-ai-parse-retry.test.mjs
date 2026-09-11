@@ -121,6 +121,49 @@ test('parse POST keeps the account-neutral classification after retry exhaustion
   assert.match(error.message, /HTTP 504/)
 })
 
+test('parse status poll HTTP 402 keeps the account-neutral classification', async () => {
+  // Observed 2026-09-10: the evening-peak file quota surfaced as HTTP 402 on
+  // the status endpoint. Unclassified, the raw status escaped to the client
+  // and killed the stream; classified, the forwarder's document-pipeline
+  // escape rotates to a fresh account instead.
+  const { uploader, calls } = createUploader(async url => {
+    if (url === PARSE_URL) return { status: 200, data: { success: true } }
+    assert.equal(url, PARSE_STATUS_URL)
+    return { status: 402, data: {} }
+  })
+
+  const error = await uploader.parseDocument(FILE_ID, {}).then(
+    () => null,
+    err => err,
+  )
+
+  assert.ok(error)
+  assert.equal(parseCalls(calls).length, 1, 'parse POST must succeed before the status poll runs')
+  assert.equal(error.status, 402)
+  assert.equal(error.code, 'qwen_ai_file_parse_http_error')
+  assert.equal(error.retryable, false)
+  assert.equal(error.accountFault, false)
+  assert.equal(error.retryScope, 'next-account')
+  assert.match(error.message, /HTTP 402/)
+})
+
+test('parse status poll failed verdict is account-neutral for next-account replay', async () => {
+  const { uploader } = createUploader(async url => {
+    if (url === PARSE_URL) return { status: 200, data: { success: true } }
+    return { status: 200, data: { data: { [FILE_ID]: { status: 'failed' } } } }
+  })
+
+  const error = await uploader.parseDocument(FILE_ID, {}).then(
+    () => null,
+    err => err,
+  )
+
+  assert.ok(error)
+  assert.match(error.message, /file parse failed for uploaded document/)
+  assert.equal(error.accountFault, false)
+  assert.equal(error.retryScope, 'next-account')
+})
+
 test('parse POST does not retry client errors', async () => {
   const { uploader, calls } = createUploader(async url => {
     if (url === PARSE_URL) return { status: 401, data: {} }

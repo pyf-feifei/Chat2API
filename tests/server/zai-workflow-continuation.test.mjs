@@ -213,3 +213,168 @@ test('idle watchdog ends a silent upstream with a visible notice', async () => {
     delete process.env.CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS
   }
 })
+
+// ---------------------------------------------------------------------------
+// Rejected tool-call blocks (2026-09-11 GLM-5.3-Flash incident)
+//
+// The model followed the taught managed_xml protocol but the block was
+// rejected (undeclared tool name / schema-invalid arguments). The stream
+// parser drops such blocks silently, so the client only saw the surrounding
+// intent prose — and the appended block length defeated the 300-codepoint
+// progress-intent cap, so the classifier delivered the promise prose as a
+// first-turn auto answer and the client turn stopped with the action lost.
+// ---------------------------------------------------------------------------
+
+const INCIDENT_PROSE = '我先在本地 Codex 配置目录里查找这个会话 ID。我先检查本机 Codex 会话存储，并按这个 UUID 精确检索。'
+
+const UNDECLARED_NAME_BLOCK = '<|CHAT2API|tool_calls><|CHAT2API|invoke name="find_file"><|CHAT2API|parameter name="pattern"><![CDATA[01a08a1f-87b8-7511-88ef-220fd6b03f35]]></|CHAT2API|parameter><|CHAT2API|parameter name="path"><![CDATA[C:\Users\skate_f\.codex\sessions]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>'
+
+const SCHEMA_INVALID_BLOCK = '<|CHAT2API|tool_calls><|CHAT2API|invoke name="shell"><|CHAT2API|parameter name="cwd"><![CDATA[C:\Users\skate_f\.codex]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>'
+
+test('rejected tool-call block (undeclared name) recovers a first-turn promise answer', () => {
+  const verdict = classifyZaiManagedAnswer(INCIDENT_PROSE + UNDECLARED_NAME_BLOCK, createPlan())
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.reason, 'rejected_tool_call_block')
+  assert.equal(verdict.requireManagedToolCall, false)
+})
+
+test('rejected tool-call block (schema-invalid arguments) triggers continuation', () => {
+  // Valid tool name, missing the required `command` argument: parse pushes
+  // the raw match but no tool call. The default createPlan tool schema has no
+  // required fields, so this test pins a plan whose schema actually rejects.
+  const verdict = classifyZaiManagedAnswer(INCIDENT_PROSE + SCHEMA_INVALID_BLOCK, createPlan({
+    tools: [{
+      name: 'shell',
+      parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      source: 'responses',
+    }],
+    allowedToolNames: new Set(['shell']),
+  }))
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.reason, 'rejected_tool_call_block')
+})
+
+test('rejected tool-call block over a live workflow demands the tool call', () => {
+  const verdict = classifyZaiManagedAnswer(
+    INCIDENT_PROSE + UNDECLARED_NAME_BLOCK,
+    createPlan({ hasLiveToolWorkflow: true }),
+  )
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.reason, 'rejected_tool_call_block')
+  assert.equal(verdict.requireManagedToolCall, true)
+})
+
+test('failed tool results keep the relaxed contract over a rejected block', () => {
+  // After an explicit failure result the model may explain or retry without a
+  // tool call; the classifier must not force a continuation there.
+  const verdict = classifyZaiManagedAnswer(
+    INCIDENT_PROSE + UNDECLARED_NAME_BLOCK,
+    createPlan({ failedToolResultPending: true }),
+  )
+  assert.equal(verdict.continuation, false)
+  assert.equal(verdict.reason, 'failed_tool_result_pending')
+})
+
+test('a fenced protocol example in prose is not a rejected tool-call block', () => {
+  // stripFencedCodeBlocks removes fenced literals before parsing, so prose
+  // that QUOTES the wire format stays a legitimate first-turn answer.
+  const fenced = `${INCIDENT_PROSE}\n\n\`\`\`\n${UNDECLARED_NAME_BLOCK}\n\`\`\`\nThe block above shows the required format.`
+  const verdict = classifyZaiManagedAnswer(fenced, createPlan())
+  assert.equal(verdict.continuation, false)
+  assert.equal(verdict.reason, 'first_turn_auto_answer')
+})
+
+test('colon-terminated first-turn promise answer triggers continuation (2026-09-11 incident)', () => {
+  // Observed live: GLM-5.3-Flash answered a codex first turn with exactly this
+  // prose and ended the turn — no opener match, no tool call, no rejected
+  // block. The trailing colon promises the command/tool call that never came.
+  const verdict = classifyZaiManagedAnswer(
+    '可以在本地 Codex 会话存储里找一下，我用这个 UUID 搜文件名和内容：',
+    createPlan(),
+  )
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.requireManagedToolCall, false)
+  assert.equal(verdict.reason, 'colon_terminated_short_answer')
+})
+
+test('colon-terminated detection stays structural: ASCII colon, negatives, length cap', () => {  // ASCII colon (phrased to avoid the progress-opener word-list, which runs
+  // first — the colon signal must be independent of the opener wording).
+  assert.equal(
+    classifyZaiManagedAnswer('The session index lives under the codex home, so the fastest check is a filename grep:', createPlan()).reason,
+    'colon_terminated_short_answer',
+  )
+  // A complete declarative sentence without a trailing colon stays deliverable.
+  assert.equal(
+    classifyZaiManagedAnswer('可以在本地 Codex 会话存储里找一下，我用这个 UUID 搜文件名和内容。', createPlan()).reason,
+    'first_turn_auto_answer',
+  )
+  // A complete answer that merely CONTAINS a colon mid-text stays deliverable.
+  assert.equal(
+    classifyZaiManagedAnswer('配置如下：\n\n完整步骤是先读取会话索引，然后过滤 thread id。', createPlan()).reason,
+    'first_turn_auto_answer',
+  )
+  // Over the progress-intent length cap the colon signal no longer fires;
+  // long answers keep the first-turn auto contract.
+  const longColonAnswer = `以下是完整分析：\n${'结论段落。'.repeat(60)}：`
+  assert.equal(
+    classifyZaiManagedAnswer(longColonAnswer, createPlan()).reason,
+    'first_turn_auto_answer',
+  )
+})
+
+test('trailing fenced JSON matching declared tool parameters triggers continuation (2026-09-11 incident)', () => {
+  // Observed live: GLM-5.3-Flash wrote the next unified_exec call's argument
+  // object as a fenced JSON example instead of the taught managed_xml wire
+  // format; the turn completed, the command never ran. The key match is
+  // derived from the declared schemas, never hardcoded tool names.
+  const unifiedExecPlan = createPlan({
+    tools: [{
+      name: 'unified_exec',
+      parameters: { type: 'object', properties: { cmd: { type: 'string' }, yield_time_ms: { type: 'number' } } },
+      source: 'responses',
+    }],
+    allowedToolNames: new Set(['unified_exec']),
+  })
+  const verdict = classifyZaiManagedAnswer(
+    '文件仍被活跃 Codex 进程占用；我用共享读取模式直接解析 JSONL。\n```json\n{"cmd": "Get-Content ...", "yield_time_ms": 30000}\n```',
+    unifiedExecPlan,
+  )
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.requireManagedToolCall, false)
+  assert.equal(verdict.reason, 'fenced_tool_argument_json')
+
+  // A fenced JSON whose keys are NOT declared parameters is documentation and
+  // stays deliverable.
+  assert.equal(
+    classifyZaiManagedAnswer(
+      '配置格式如下：\n```json\n{"host": "localhost", "port": 8080}\n```',
+      unifiedExecPlan,
+    ).reason,
+    'first_turn_auto_answer',
+  )
+  // A fence that is not the trailing content (prose after it) stays deliverable.
+  assert.equal(
+    classifyZaiManagedAnswer(
+      '示例：\n```json\n{"cmd": "ls"}\n```\n以上就是完整命令。',
+      unifiedExecPlan,
+    ).reason,
+    'first_turn_auto_answer',
+  )
+  // A long explanation around the example keeps the documentation contract.
+  const longExplanation = '下面详细解释每个参数的语义和取值范围。'.repeat(40)
+  assert.equal(
+    classifyZaiManagedAnswer(
+      `${longExplanation}\n\`\`\`json\n{"cmd": "ls", "yield_time_ms": 1000}\n\`\`\``,
+      unifiedExecPlan,
+    ).reason,
+    'first_turn_auto_answer',
+  )
+  // A fenced non-JSON body (e.g. a quoted protocol example) never matches.
+  assert.equal(
+    classifyZaiManagedAnswer(
+      `${INCIDENT_PROSE}\n\`\`\`\n${UNDECLARED_NAME_BLOCK}\n\`\`\``,
+      createPlan(),
+    ).reason,
+    'first_turn_auto_answer',
+  )
+})

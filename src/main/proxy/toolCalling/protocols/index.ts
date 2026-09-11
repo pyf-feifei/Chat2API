@@ -8,6 +8,8 @@ import { anthropicToolUseProtocol } from './anthropicToolUse.ts'
 import { codexResponsesProtocol } from './codexResponses.ts'
 import { m365FencedProtocol } from './m365Fenced.ts'
 
+export { hasRejectedToolCallBlock } from './shared.ts'
+
 const protocols: Record<ToolProtocolId, ToolProtocolAdapter> = {
   openai_chat: managedBracketProtocol,
   managed_bracket: managedBracketProtocol,
