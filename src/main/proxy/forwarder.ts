@@ -4591,6 +4591,7 @@ export class RequestForwarder {
         deep_research: request.deep_research,
       }
       let adapter = new ZaiAdapter(provider, account)
+      let webshareAttemptUsed = false
       let { response, chatId, requestId } = await adapter.chatCompletion(zaiPayload)
 
       if (response.status === 405 && isWebshareProxyEnabled()) {
@@ -4601,7 +4602,17 @@ export class RequestForwarder {
         }))
         adapter = new ZaiAdapter(provider, account)
         adapter.setUseWebshareProxy(true)
+        webshareAttemptUsed = true
         ;({ response, chatId, requestId } = await adapter.chatCompletion(zaiPayload))
+        // Feed the outcome back to the pool: bandwidth-402 endpoints must
+        // enter cooldown so the pool stops routing into a drained key
+        // (observed live 2026-09-11 evening: both keys at quota, ~50% of
+        // webshare retries bounced 402 with no cooldown feedback).
+        if (response.status === 200) {
+          reportWebshareProxySuccess()
+        } else {
+          reportWebshareProxyFailure()
+        }
       }
 
       const latency = Date.now() - startTime
@@ -4651,6 +4662,17 @@ export class RequestForwarder {
           accountFault = false
           retryable = true
           retryScope = 'next-account'
+        } else if (status === 402 && webshareAttemptUsed) {
+          // The webshare attempt itself bounced: pool bandwidth exhaustion
+          // ("Bandwidth limit reached. Please upgrade to continue using the
+          // proxy."). Not an account fault and NOT retryable by rotation —
+          // rotating accounts cannot add proxy bandwidth; surface honestly so
+          // the client retries when bandwidth or the direct exit recovers
+          // (observed live 2026-09-11 evening: both pool keys drained).
+          errorCode = 'zai_webshare_bandwidth_exhausted'
+          errorMessage = 'HTTP 402 (webshare): ' + zaiErrorBody.slice(0, 300)
+          accountFault = false
+          retryable = false
         } else {
           errorCode = 'zai_http_' + status
           accountFault = false
@@ -4795,11 +4817,21 @@ export class RequestForwarder {
                 deep_research: request.deep_research,
               }
               let restarted = await replayAdapter.chatCompletion(replayRequest)
+              let replayViaWebshare = false
               for (let replayRetry = 0; replayRetry < 2 && restarted.response.status !== 200; replayRetry += 1) {
                 try { restarted.response.data?.destroy?.() } catch {}
                 if (restarted.response.status === 405 && isWebshareProxyEnabled()) {
                   console.warn('[Z.ai] Fresh-chat continuation blocked by WAF 405; retrying through Webshare proxy')
                   replayAdapter.setUseWebshareProxy(true)
+                  replayViaWebshare = true
+                } else if (restarted.response.status === 402 && replayViaWebshare) {
+                  // A webshare-served 402 is POOL BANDWIDTH exhaustion, not an
+                  // account fault: cool the pool entry down and stop — the
+                  // replay is delivered as-is by the caller; rotating accounts
+                  // cannot add proxy bandwidth.
+                  reportWebshareProxyFailure()
+                  console.warn('[Z.ai] Fresh-chat continuation: webshare bandwidth exhausted (402); stopping replay retries')
+                  break
                 } else if (restarted.response.status === 402) {
                   loadBalancer.markAccountFailed(replayAccount.id)
                   const rotated = loadBalancer.selectAccount(
