@@ -193,8 +193,31 @@ export function createToolWorkflowContinuationMessage(options: {
 }
 
 /** Select the latest client user turn without mistaking tool results for a new task. */
-export function extractLatestActiveUserRequest(messages: ChatMessage[]): string | undefined {
+/**
+ * Text of the LAST assistant message in the client history, for the zai
+ * adapter's structural repeated-narration rule: a short marker-less answer
+ * that substantially repeats this text is the model re-narrating its plan
+ * instead of acting. An assistant tool-call carrier (null/empty prose) or a
+ * conversation with no assistant turns yields undefined — the rule stays off.
+ */
+export function extractTrailingAssistantText(messages: ChatMessage[]): string | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== 'assistant') continue
+    if (typeof message.content === 'string') {
+      return message.content.trim() ? message.content : undefined
+    }
+    if (!Array.isArray(message.content)) return undefined
+    const text = message.content
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map(part => part.text as string)
+      .join('\n')
+    return text.trim() ? text : undefined
+  }
+  return undefined
+}
+
+export function extractLatestActiveUserRequest(messages: ChatMessage[]): string | undefined {  for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
     if (message.role !== 'user') continue
 

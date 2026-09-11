@@ -1269,6 +1269,19 @@ ${tailExcerpt}`,
 const MANAGED_SHORT_ANSWER_CODE_POINTS = 300
 
 /**
+ * True when the conversation's previous assistant message is itself short
+ * prose (same narration cap). Together with the caller's checks — current
+ * answer short, marker-less, tool-call-less — this identifies a stall loop:
+ * consecutive short prose turns over declared tools with no tool activity in
+ * between. The previous text is forwarder-extracted from client history, so
+ * the rule carries no wording patterns.
+ */
+function isConsecutiveShortProse(trailingAssistantText: string | undefined): boolean {
+  if (!trailingAssistantText) return false
+  return [...trailingAssistantText.trim()].length <= MANAGED_SHORT_ANSWER_CODE_POINTS
+}
+
+/**
  * True when the answer's trailing fenced code block parses as a JSON object
  * whose top-level keys are ALL declared tool parameter names. The model
  * sometimes writes the NEXT tool call's argument object as a fenced JSON
@@ -1337,6 +1350,7 @@ function zaiManagedAnswerIdle(reason: string): ZaiManagedAnswerVerdict {
 function classifyZaiManagedAnswer(
   content: string,
   plan: ToolCallingPlan | undefined,
+  options: { isRecoveryBranch?: boolean; trailingAssistantText?: string } = {},
 ): ZaiManagedAnswerVerdict {
   if (!plan?.shouldParseResponse) return zaiManagedAnswerIdle('parse_disabled')
   let parsed: { toolCalls?: unknown[]; rawMatches?: unknown[]; malformedReason?: string }
@@ -1388,6 +1402,35 @@ function classifyZaiManagedAnswer(
       reason: 'rejected_tool_call_block',
     }
   }
+  // Structural, wording-independent recovery-branch rule: the model has
+  // already been re-prompted once to produce a tool call or a proven final
+  // answer, so any SHORT marker-less tool-call-less branch is workflow
+  // narration by construction — no opener word-list is consulted (observed
+  // live 2026-09-11: an attempt-1 branch escaped with a promise sentence the
+  // opener list had never seen and the turn stalled a second time). Long
+  // marker-less branches keep the live-workflow divergence: they are delivered
+  // as-is because re-prompting would duplicate delivered text.
+  if (options.isRecoveryBranch && [...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS) {
+    console.info('[Z.ai] Short marker-less answer over a recovery branch triggers continuation')
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'recovery_branch_markerless_answer' }
+  }
+  // Structural, wording-independent stall-loop rule: a short marker-less
+  // answer that FOLLOWS another short marker-less assistant message (tools
+  // declared, no tool calls anywhere in between — the classify order already
+  // guarantees neither branch carries one) is the model re-narrating its plan
+  // across turns instead of acting (observed live 2026-09-11: after a stall
+  // the user re-prompted and the model answered with a paraphrase of its
+  // earlier promise prose — character-bigram similarity measured only ~0.35,
+  // so wording/similarity matching cannot cover this family; consecutive
+  // short prose with declared tools is the invariant). The length constant is
+  // the shared narration cap, not a new threshold.
+  if (
+    [...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS
+    && isConsecutiveShortProse(options.trailingAssistantText)
+  ) {
+    console.info('[Z.ai] Consecutive short prose answers over declared tools; triggers continuation')
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'consecutive_short_prose_answers' }
+  }
   if (plan.hasLiveToolWorkflow) {
     if (isProgressStyleManagedAnswer(trimmed)) {
       console.info('[Z.ai] Progress-style answer over live workflow triggers continuation')
@@ -1403,8 +1446,8 @@ function classifyZaiManagedAnswer(
     // The model announced an upcoming action, so the recovery nudge must
     // demand the concrete tool call (renderRecoveryPrompt); offering the
     // final-answer alternative just yields another promise sentence
-    // (observed live 2026-09-11: attempt-1 branch came back with "我会先打
-    // 开…" and the turn stalled again).
+    // (observed live 2026-09-11: an attempt-1 branch escaped with a novel
+    // promise sentence and the turn stalled again).
     return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'progress_style_answer_without_tool_call' }
   }
   if (isToolDenialManagedAnswer(trimmed)) {
@@ -1486,6 +1529,7 @@ export class ZaiStreamHandler {
   private accountId: string = ''
   private accountToken: string = ''
   private continuation?: ZaiWorkflowContinuationHandle
+  private trailingAssistantText?: string
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
@@ -1511,6 +1555,15 @@ export class ZaiStreamHandler {
    */
   setContinuation(continuation: ZaiWorkflowContinuationHandle) {
     this.continuation = continuation
+  }
+
+  /**
+   * Text of the conversation's previous assistant message (forwarder-extracted
+   * from client history). Feeds the structural repeated-narration rule: a
+   * short answer that substantially repeats it is plan narration, not action.
+   */
+  setTrailingAssistantText(text: string | undefined) {
+    this.trailingAssistantText = text?.trim() || undefined
   }
 
   /** Latest upstream chat id, including any fresh-chat continuation tier. */
@@ -1781,7 +1834,10 @@ export class ZaiStreamHandler {
       // Managed-tool governance: classify dangling answers that neither call a
       // tool nor prove completion, matching the Qwen classification rules.
       const branchContent = this.content.slice(branchContentStart)
-      const verdict = classifyZaiManagedAnswer(branchContent, this.toolCallingPlan)
+      const verdict = classifyZaiManagedAnswer(branchContent, this.toolCallingPlan, {
+        isRecoveryBranch: continuationSeq > 0,
+        trailingAssistantText: this.trailingAssistantText,
+      })
       const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
 
       if (!emittedToolCalls && verdict.continuation) {
@@ -2122,7 +2178,10 @@ export class ZaiStreamHandler {
     // for tool calls afterwards (applyToolCallsToResponse).
     for (let guard = 0; guard < 3; guard += 1) {
       const content: string = result.choices?.[0]?.message?.content || ''
-      const verdict = classifyZaiManagedAnswer(content, this.toolCallingPlan)
+      const verdict = classifyZaiManagedAnswer(content, this.toolCallingPlan, {
+        isRecoveryBranch: guard > 0,
+        trailingAssistantText: this.trailingAssistantText,
+      })
       if (!verdict.continuation) break
 
       console.warn('[Z.ai] Non-stream managed answer classified as dangling stall; starting managed workflow continuation', JSON.stringify({

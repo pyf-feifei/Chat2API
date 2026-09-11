@@ -74,14 +74,37 @@ test('classifyZaiManagedAnswer flags progress-style prose without a tool call', 
   assert.equal(verdict.reason, 'progress_style_answer_without_tool_call')
 })
 
-test('classifyZaiManagedAnswer flags first-turn "我会" promise prose (2026-09-11 continuation-branch escape)', () => {
-  // Observed live: the progress-style continuation round-trip itself came
-  // back with "我会先打开…" — an intent opener gap that let the recovered
-  // branch stall the turn a second time.
-  const verdict = classifyZaiManagedAnswer('我会先打开 `prompt.md` 和项目文件清单，确认参考图与当前 3D 场景的对应关系。', createPlan())
-  assert.equal(verdict.continuation, true)
+test('recovery branches classify short marker-less answers wording-independently (2026-09-11 second-escape incident)', () => {
+  // Observed live: an attempt-1 recovery branch escaped with "我会先打开…" —
+  // an intent phrasing the opener word-list had never seen. The structural
+  // rule closes the whole family without word-chasing: on a recovery branch
+  // the model has already been re-prompted once, so ANY short marker-less
+  // tool-call-less answer is narration, regardless of wording.
+  const novelPhrasing = '我会先打开 `prompt.md` 和项目文件清单，确认参考图与当前 3D 场景的对应关系。'
+  assert.equal(
+    classifyZaiManagedAnswer(novelPhrasing, createPlan(), { isRecoveryBranch: true }).reason,
+    'recovery_branch_markerless_answer',
+  )
+  assert.equal(
+    classifyZaiManagedAnswer('没问题，这个任务完全在能力范围内。', createPlan(), { isRecoveryBranch: true }).reason,
+    'recovery_branch_markerless_answer',
+  )
+  // The verdict demands the concrete tool call, not another prose round.
+  const verdict = classifyZaiManagedAnswer(novelPhrasing, createPlan(), { isRecoveryBranch: true })
   assert.equal(verdict.requireManagedToolCall, true)
-  assert.equal(verdict.reason, 'progress_style_answer_without_tool_call')
+  // The FIRST branch keeps the first-turn contract: novel phrasings without a
+  // structural signal stay deliverable (opener list is assistance-only).
+  assert.equal(
+    classifyZaiManagedAnswer(novelPhrasing, createPlan()).reason,
+    'first_turn_auto_answer',
+  )
+  // Over the narration cap a recovery-branch answer keeps the live-workflow
+  // divergence (long marker-less finals are delivered as-is, not re-prompted).
+  const longBranch = '这里是完整的最终回答。'.repeat(60)
+  assert.equal(
+    classifyZaiManagedAnswer(longBranch, createPlan(), { isRecoveryBranch: true }).reason,
+    'first_turn_auto_answer',
+  )
 })
 
 test('classifyZaiManagedAnswer passes through a long first-turn auto answer', () => {
@@ -389,6 +412,34 @@ test('trailing fenced JSON matching declared tool parameters triggers continuati
       `${INCIDENT_PROSE}\n\`\`\`\n${UNDECLARED_NAME_BLOCK}\n\`\`\``,
       createPlan(),
     ).reason,
+    'first_turn_auto_answer',
+  )
+})
+
+test('short answer after another short prose turn triggers continuation (2026-09-11 re-prompt escape)', () => {
+  // Observed live: after the stalled turn the user re-prompted and the model
+  // answered with a paraphrase of its earlier promise prose (character-bigram
+  // similarity measured only ~0.35, so wording/similarity matching cannot
+  // cover paraphrase). The structural invariant is consecutive SHORT prose
+  // turns over declared tools with no tool activity: the previous assistant
+  // message is forwarder-extracted from client history, no wording lists.
+  const previousAssistant = '我先读取 `c:\my\games\speed\prompt.md`，再检查项目结构和现有 3D 模型实现。我会先打开 `prompt.md` 和项目文件清单，确认参考图与当前 3D 场景的对应关系。'
+  const paraphrasedAnswer = '我继续检查项目说明和现有 3D 模型代码，然后对照参考图进行还原。先读取 prompt.md、文件清单和相关实现文件。'
+  const verdict = classifyZaiManagedAnswer(paraphrasedAnswer, createPlan(), { trailingAssistantText: previousAssistant })
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.requireManagedToolCall, true)
+  assert.equal(verdict.reason, 'consecutive_short_prose_answers')
+
+  // After a SUBSTANTIVE previous answer the conversation is not stalling: a
+  // short reply stays a legitimate terminal.
+  const substantivePrevious = '这里是完整的最终回答。'.repeat(60)
+  assert.equal(
+    classifyZaiManagedAnswer('已经完成了，共修改 3 个文件。', createPlan(), { trailingAssistantText: substantivePrevious }).reason,
+    'first_turn_auto_answer',
+  )
+  // No previous assistant message (first turn) -> rule off.
+  assert.equal(
+    classifyZaiManagedAnswer(paraphrasedAnswer, createPlan(), { trailingAssistantText: undefined }).reason,
     'first_turn_auto_answer',
   )
 })

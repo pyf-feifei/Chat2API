@@ -54,6 +54,7 @@ import {
   createToolWorkflowContinuationMessage,
   extractLatestActiveUserAttachments,
   extractLatestActiveUserRequest,
+  extractTrailingAssistantText,
   ToolCallingEngine,
 } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
@@ -4623,6 +4624,16 @@ export class RequestForwarder {
           errorCode = 'zai_server_error'
           accountFault = false
           retryable = true
+        } else if (status === 405) {
+          // Aliyun WAF edge verdict (RGV587 family): control GETs keep passing
+          // while chat POSTs receive the block page — an exit-IP flag, not an
+          // account fault. Retryable so the attempt loop rotates accounts
+          // (fresh cookies + captcha budget) instead of surfacing the block
+          // page to the client (observed live 2026-09-11 mid-session).
+          errorCode = 'zai_waf_405_block'
+          accountFault = false
+          retryable = true
+          retryScope = 'next-account'
         } else {
           errorCode = 'zai_http_' + status
           accountFault = false
@@ -4655,6 +4666,7 @@ export class RequestForwarder {
       const handler = new ZaiStreamHandler(actualModel, deleteChatCallback, transformed.plan)
       handler.setChatId(chatId)
       handler.setAccountInfo(account.id, account.credentials?.token || '')
+      handler.setTrailingAssistantText(extractTrailingAssistantText(transformed.messages))
 
       // Managed workflow continuation (Qwen parity): a classified dangling
       // answer (progress prose / short narration / capability denial without a
