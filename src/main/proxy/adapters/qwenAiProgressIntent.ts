@@ -23,7 +23,7 @@ const MANAGED_PROGRESS_INTENT_DEFAULT_PATTERN_SOURCES = [
   "i'll|i will|i am going to|i'm going to|i need to|i've (?:got|have) to",
   "now let me|first,? let me|first,? i'll|first,? i will",
   "ok(?:ay)?[,.]? (?:let|i'll|i will)|sure[,.]? (?:let|i'll)",
-  '让我|我先|我来|我先来|我现在|接下来|现在让|好的[，,]?我|可以[，,]?我|嗯[，,]?我|我需要',
+  '让我|我先|我来|我先来|我现在|我会|我将|接下来|现在让|好的[，,]?我|可以[，,]?我|嗯[，,]?我|我需要',
 ].join('|')
 
 const MANAGED_PROGRESS_INTENT_MAX_CODE_POINTS = 300

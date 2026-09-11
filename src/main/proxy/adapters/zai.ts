@@ -1379,10 +1379,12 @@ function classifyZaiManagedAnswer(
       malformedReason: parsed.malformedReason,
       blockCount: parsed.rawMatches.length,
     }))
+    // A rejected block IS an attempted call — the recovery nudge must demand
+    // the corrected wire-format call regardless of workflow state.
     return {
       continuation: true,
       completionProofMissing: false,
-      requireManagedToolCall: plan.hasLiveToolWorkflow === true,
+      requireManagedToolCall: true,
       reason: 'rejected_tool_call_block',
     }
   }
@@ -1398,7 +1400,12 @@ function classifyZaiManagedAnswer(
   }
   if (isProgressStyleManagedAnswer(trimmed)) {
     console.info('[Z.ai] Progress-style answer without tool call triggers continuation')
-    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'progress_style_answer_without_tool_call' }
+    // The model announced an upcoming action, so the recovery nudge must
+    // demand the concrete tool call (renderRecoveryPrompt); offering the
+    // final-answer alternative just yields another promise sentence
+    // (observed live 2026-09-11: attempt-1 branch came back with "我会先打
+    // 开…" and the turn stalled again).
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'progress_style_answer_without_tool_call' }
   }
   if (isToolDenialManagedAnswer(trimmed)) {
     console.info('[Z.ai] Capability-denial answer triggers continuation')
@@ -1412,7 +1419,8 @@ function classifyZaiManagedAnswer(
   // CHAT2API_ZAI_COLON_PROMISE_CONTINUATION=off to disable the signal.
   if (zaiBooleanEnv('CHAT2API_ZAI_COLON_PROMISE_CONTINUATION', true) && isColonTerminatedShortAnswer(trimmed)) {
     console.info('[Z.ai] Colon-terminated short answer without tool call triggers continuation')
-    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'colon_terminated_short_answer' }
+    // Promised action → the recovery nudge demands the concrete tool call.
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'colon_terminated_short_answer' }
   }
   // The model sometimes writes the next tool call's argument object as a
   // fenced JSON block instead of the taught wire format; the block is not
@@ -1421,7 +1429,9 @@ function classifyZaiManagedAnswer(
   // tunable: set CHAT2API_ZAI_FENCED_TOOL_ARGS_CONTINUATION=off to disable.
   if (zaiBooleanEnv('CHAT2API_ZAI_FENCED_TOOL_ARGS_CONTINUATION', true) && hasTrailingFencedToolArgumentJson(trimmed, plan)) {
     console.info('[Z.ai] Trailing fenced JSON matching declared tool parameters triggers continuation')
-    return { continuation: true, completionProofMissing: false, requireManagedToolCall: false, reason: 'fenced_tool_argument_json' }
+    // The block IS an attempted call → the recovery nudge demands the real
+    // wire-format call.
+    return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'fenced_tool_argument_json' }
   }
   const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
   if (!midWorkflow) {

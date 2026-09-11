@@ -69,7 +69,18 @@ function parseClientChunks(raw) {
 test('classifyZaiManagedAnswer flags progress-style prose without a tool call', () => {
   const verdict = classifyZaiManagedAnswer('我来查看 Codex 的 skill 注册目录和配置。', createPlan())
   assert.equal(verdict.continuation, true)
-  assert.equal(verdict.requireManagedToolCall, false)
+  // The model announced an action → the recovery nudge demands the call.
+  assert.equal(verdict.requireManagedToolCall, true)
+  assert.equal(verdict.reason, 'progress_style_answer_without_tool_call')
+})
+
+test('classifyZaiManagedAnswer flags first-turn "我会" promise prose (2026-09-11 continuation-branch escape)', () => {
+  // Observed live: the progress-style continuation round-trip itself came
+  // back with "我会先打开…" — an intent opener gap that let the recovered
+  // branch stall the turn a second time.
+  const verdict = classifyZaiManagedAnswer('我会先打开 `prompt.md` 和项目文件清单，确认参考图与当前 3D 场景的对应关系。', createPlan())
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.requireManagedToolCall, true)
   assert.equal(verdict.reason, 'progress_style_answer_without_tool_call')
 })
 
@@ -235,7 +246,8 @@ test('rejected tool-call block (undeclared name) recovers a first-turn promise a
   const verdict = classifyZaiManagedAnswer(INCIDENT_PROSE + UNDECLARED_NAME_BLOCK, createPlan())
   assert.equal(verdict.continuation, true)
   assert.equal(verdict.reason, 'rejected_tool_call_block')
-  assert.equal(verdict.requireManagedToolCall, false)
+  // A rejected block IS an attempted call → recovery demands the real call.
+  assert.equal(verdict.requireManagedToolCall, true)
 })
 
 test('rejected tool-call block (schema-invalid arguments) triggers continuation', () => {
@@ -293,7 +305,8 @@ test('colon-terminated first-turn promise answer triggers continuation (2026-09-
     createPlan(),
   )
   assert.equal(verdict.continuation, true)
-  assert.equal(verdict.requireManagedToolCall, false)
+  // Promised action → recovery demands the concrete tool call.
+  assert.equal(verdict.requireManagedToolCall, true)
   assert.equal(verdict.reason, 'colon_terminated_short_answer')
 })
 
@@ -340,7 +353,8 @@ test('trailing fenced JSON matching declared tool parameters triggers continuati
     unifiedExecPlan,
   )
   assert.equal(verdict.continuation, true)
-  assert.equal(verdict.requireManagedToolCall, false)
+  // The fenced block IS an attempted call → recovery demands the real call.
+  assert.equal(verdict.requireManagedToolCall, true)
   assert.equal(verdict.reason, 'fenced_tool_argument_json')
 
   // A fenced JSON whose keys are NOT declared parameters is documentation and
