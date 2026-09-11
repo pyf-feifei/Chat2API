@@ -63,6 +63,8 @@ interface PoolEntryState {
   cooldownUntil: number
   failureCount: number
   lastUsed?: number
+  /** Owning dashboard key (key-pool sync); groups exits for key-level verdicts. */
+  sourceKeyId?: string
 }
 
 let configured: WebshareProxyRuntimeConfig | undefined
@@ -128,6 +130,7 @@ export function setWebshareProxyConfig(
     failureCount?: number
     lastUsed?: number
     cooldownUntil?: number
+    sourceKeyId?: string
   }>,
   strategy?: 'round-robin' | 'random' | 'failover',
 ): void {
@@ -144,6 +147,7 @@ export function setWebshareProxyConfig(
         : 0,
       failureCount: Math.max(0, Math.floor(entry.failureCount ?? 0)),
       lastUsed: entry.lastUsed,
+      sourceKeyId: entry.sourceKeyId?.trim() || undefined,
     }))
   rotationStrategy = strategy === 'random' || strategy === 'failover' ? strategy : 'round-robin'
   // Failover prefers the first entry; a pool rebuilt from persisted
@@ -162,6 +166,7 @@ export function websharePoolSnapshot(): Array<{
   cooldownUntil: number
   failureCount: number
   lastUsed?: number
+  sourceKeyId?: string
 }> {
   return poolEntries.map(entry => ({ ...entry }))
 }
@@ -244,6 +249,16 @@ export function reportWebshareProxySuccess(proxyUrl?: string): void {
   stampLastUsed(entry)
 }
 
+/** Doubling cooldown so a bad exit stops receiving recovery traffic quickly. */
+function coolEntryForFailure(entry: PoolEntryState): void {
+  entry.failureCount += 1
+  const backoff = Math.min(
+    WEBSHARE_ENTRY_COOLDOWN_MAX_MS,
+    WEBSHARE_ENTRY_COOLDOWN_BASE_MS * (WEBSHARE_ENTRY_COOLDOWN_BACKOFF_FACTOR ** (entry.failureCount - 1)),
+  )
+  entry.cooldownUntil = Date.now() + backoff
+}
+
 /**
  * Record a failure for the entry matching `proxyUrl` (or the last one
  * handed out): doubling cooldown so a bad exit stops receiving
@@ -254,12 +269,31 @@ export function reportWebshareProxyFailure(proxyUrl?: string): void {
   if (!url) return
   const entry = poolEntries.find(candidate => candidate.proxyUrl === url)
   if (!entry) return
-  entry.failureCount += 1
-  const backoff = Math.min(
-    WEBSHARE_ENTRY_COOLDOWN_MAX_MS,
-    WEBSHARE_ENTRY_COOLDOWN_BASE_MS * (WEBSHARE_ENTRY_COOLDOWN_BACKOFF_FACTOR ** (entry.failureCount - 1)),
-  )
-  entry.cooldownUntil = Date.now() + backoff
+  coolEntryForFailure(entry)
+}
+
+/**
+ * Bandwidth exhaustion (HTTP 402 from the webshare edge) is a per-key
+ * account verdict: every exit of the same dashboard key shares the
+ * drained quota, so cool them all — otherwise rotation rediscovers the
+ * drained key one 402 at a time through its remaining "healthy" exits
+ * (observed live 2026-09-12 02:30 CN: two exits of one key 402'd back
+ * to back before round-robin landed on a healthy key).
+ */
+export function reportWebshareKeyBandwidthExhausted(proxyUrl?: string): void {
+  const url = proxyUrl ?? webshareLastProxyUrl
+  if (!url) return
+  const entry = poolEntries.find(candidate => candidate.proxyUrl === url)
+  if (!entry) return
+  const keyExits = entry.sourceKeyId
+    ? poolEntries.filter(candidate => candidate.sourceKeyId === entry.sourceKeyId)
+    : [entry]
+  for (const exit of keyExits) coolEntryForFailure(exit)
+  console.warn('[WebshareProxy] bandwidth 402 — cooled every exit of the drained key', JSON.stringify({
+    sourceKeyId: entry.sourceKeyId ?? '(unkeyed exit)',
+    cooledExits: keyExits.length,
+    poolExits: poolEntries.length,
+  }))
 }
 
 let webshareLastProxyUrl: string | undefined
@@ -275,16 +309,36 @@ function stampLastUsed(entry: PoolEntryState): void {
   entry.lastUsed = webshareLastUsedClock
 }
 
-export function getWebshareProxyAgent(): HttpsProxyAgent<string> | undefined {
+export interface WebshareProxyAgentCheckout {
+  agent: HttpsProxyAgent<string>
+  /** The exit this agent leaves through — the attribution anchor for success/failure reports. */
+  proxyUrl: string
+}
+
+/**
+ * Select the next pool exit and hand back the agent TOGETHER with the exit
+ * URL, atomically. Callers that need to attribute a success/failure to the
+ * exit they actually used must check out once and reuse the pair: the plain
+ * `getWebshareProxyAgent()` selects on every call, so two calls in one
+ * request can leave through different exits and misattribute the outcome
+ * (the zai adapter used to evaluate it twice per request for exactly this
+ * reason).
+ */
+export function checkoutWebshareProxyAgent(): WebshareProxyAgentCheckout | undefined {
   if (!isWebshareProxyEnabled()) return undefined
   const proxyUrl = webshareActiveProxyUrl()
   if (!proxyUrl) return undefined
   webshareLastProxyUrl = proxyUrl
-  const cached = agentCache.get(proxyUrl)
-  if (cached) return cached
-  const agent = new HttpsProxyAgent(proxyUrl)
-  agentCache.set(proxyUrl, agent)
-  return agent
+  let agent = agentCache.get(proxyUrl)
+  if (!agent) {
+    agent = new HttpsProxyAgent(proxyUrl)
+    agentCache.set(proxyUrl, agent)
+  }
+  return { agent, proxyUrl }
+}
+
+export function getWebshareProxyAgent(): HttpsProxyAgent<string> | undefined {
+  return checkoutWebshareProxyAgent()?.agent
 }
 
 /**

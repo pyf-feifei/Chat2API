@@ -13,6 +13,8 @@ import {
   resetWebshareStickyState,
   reportWebshareProxyFailure,
   reportWebshareProxySuccess,
+  reportWebshareKeyBandwidthExhausted,
+  checkoutWebshareProxyAgent,
   webshareProxyUrlForLog,
 } from '../../src/main/proxy/webshareProxy.ts'
 
@@ -254,6 +256,61 @@ test('all entries cooling still returns an exit rather than none', () => {
   // single-entry pool fully cooling must not disable recovery entirely
   assert.equal(isWebshareProxyEnabled(), true)
   assert.ok(getWebshareProxyAgent(), 'a cooling pool still hands out its only exit')
+  clearRuntimeConfig()
+})
+
+test('bandwidth 402 cools every exit of the drained key and leaves other keys alone', () => {
+  clearWebshareEnv()
+  clearRuntimeConfig()
+  setWebshareProxyConfig(
+    { enabled: true, proxyUrl: '' },
+    [
+      { proxyUrl: 'http://a1:@pool.example:1001', sourceKeyId: 'key-A' },
+      { proxyUrl: 'http://a2:@pool.example:1002', sourceKeyId: 'key-A' },
+      { proxyUrl: 'http://b1:@pool.example:2001', sourceKeyId: 'key-B' },
+      { proxyUrl: 'http://manual:@pool.example:3001' },
+    ],
+    'round-robin',
+  )
+
+  reportWebshareKeyBandwidthExhausted('http://a2:@pool.example:1002')
+  const snapshot = websharePoolSnapshot()
+  assert.equal(snapshot[1].failureCount, 1, 'the reported exit must be cooled')
+  assert.ok(snapshot[1].cooldownUntil > Date.now())
+  assert.equal(snapshot[0].failureCount, 1, 'sibling exit of the same key must cool too')
+  assert.ok(snapshot[0].cooldownUntil > Date.now())
+  assert.equal(snapshot[2].failureCount, 0, 'other keys must stay healthy')
+  assert.equal(snapshot[2].cooldownUntil, 0)
+  assert.equal(snapshot[3].failureCount, 0, 'unkeyed exits must stay healthy')
+  assert.equal(snapshot[3].cooldownUntil, 0)
+
+  // rotation must skip the whole drained key, not just the reported exit
+  const next = checkoutWebshareProxyAgent()
+  assert.ok(next, 'healthy exits remain available')
+  assert.notEqual(next!.proxyUrl, 'http://a1:@pool.example:1001')
+  assert.notEqual(next!.proxyUrl, 'http://a2:@pool.example:1002')
+  clearRuntimeConfig()
+})
+
+test('runtime pool preserves sourceKeyId and checkout returns the selected exit', () => {
+  clearWebshareEnv()
+  clearRuntimeConfig()
+  setWebshareProxyConfig(
+    { enabled: true, proxyUrl: '' },
+    [
+      { proxyUrl: 'http://a1:@pool.example:1001', sourceKeyId: 'key-A' },
+      { proxyUrl: 'http://b1:@pool.example:2001', sourceKeyId: 'key-B' },
+    ],
+    'round-robin',
+  )
+  const snapshot = websharePoolSnapshot()
+  assert.equal(snapshot[0].sourceKeyId, 'key-A', 'key ownership must reach the runtime pool')
+  assert.equal(snapshot[1].sourceKeyId, 'key-B')
+
+  const checkout = checkoutWebshareProxyAgent()
+  assert.ok(checkout, 'checkout hands an agent when the pool is enabled')
+  assert.equal(checkout!.proxyUrl, 'http://a1:@pool.example:1001')
+  assert.equal(lastUsedIndex(), 0, 'checkout stamps last-used on the selected exit')
   clearRuntimeConfig()
 })
 

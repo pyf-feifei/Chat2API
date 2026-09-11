@@ -87,6 +87,9 @@ export function bootstrapWebshareFromStore(): void {
         proxyUrl: entry.proxyUrl,
         enabled: entry.enabled !== false,
         failureCount: entry.failureCount ?? 0,
+        // Key ownership must survive restarts: key-level bandwidth-402
+        // cooldowns (reportWebshareKeyBandwidthExhausted) attribute by it.
+        sourceKeyId: entry.sourceKeyId,
       })))
       applyWebshareSyncConfig(persisted)
       console.info('[WebsharePoolSync] bootstrapped from persisted config', JSON.stringify({

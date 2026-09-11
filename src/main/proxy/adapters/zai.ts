@@ -27,7 +27,7 @@ import {
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
 import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-captcha-solver'
-import { getWebshareProxyAgent, webshareProxyUrlForLog } from '../webshareProxy'
+import { checkoutWebshareProxyAgent, webshareProxyUrlForLog } from '../webshareProxy'
 
 const TOKEN_EXPIRY_WARNING_MS = 5 * 60 * 1000 // 5 minutes
 
@@ -279,6 +279,7 @@ export class ZaiAdapter {
   private token: string | null = null
   private captchaRetryAttempted: boolean = false
   private useWebshareProxy = false
+  private lastWebshareProxyUrl: string | undefined = undefined
 
   constructor(provider: Provider, account: Account) {
     this.provider = provider
@@ -292,6 +293,16 @@ export class ZaiAdapter {
    */
   setUseWebshareProxy(enabled: boolean) {
     this.useWebshareProxy = enabled
+  }
+
+  /**
+   * The pool exit the last chat POST actually left through (undefined when
+   * the request went out the direct exit). Failure reports anchor to this
+   * instead of the pool's global last-selected marker, which concurrent
+   * requests keep advancing.
+   */
+  getWebshareProxyUrlUsed(): string | undefined {
+    return this.lastWebshareProxyUrl
   }
 
   private zOrigin(): string {
@@ -1211,6 +1222,14 @@ ${tailExcerpt}`,
       signature_timestamp: String(timestamp),
     })
 
+    // One atomic pool checkout per attempt: the agent and the exit it leaves
+    // through are selected together, so failure reports (here and in the
+    // forwarder) anchor to the exit that actually served the request. The
+    // previous shape evaluated getWebshareProxyAgent() twice per request,
+    // advancing round-robin twice and risking a different exit per call.
+    const webshareCheckout = this.useWebshareProxy ? checkoutWebshareProxyAgent() : undefined
+    this.lastWebshareProxyUrl = webshareCheckout?.proxyUrl
+
     const response = await axios.post(
       `${this.zChatCompletionsUrl()}?${queryParams.toString()}`,
       requestBody,
@@ -1233,9 +1252,7 @@ ${tailExcerpt}`,
         // Exit-IP WAF verdicts (zai_waf_405_block) are lifted by routing the
         // recovery attempt through the configured webshare pool, mirroring
         // the qwen capacity_limit fast path.
-        ...(this.useWebshareProxy && getWebshareProxyAgent()
-          ? { httpsAgent: getWebshareProxyAgent() }
-          : {}),
+        ...(webshareCheckout ? { httpsAgent: webshareCheckout.agent } : {}),
       }
     )
 

@@ -99,6 +99,7 @@ import {
   disengageWebshareStickyMode,
   reportWebshareProxyFailure,
   reportWebshareProxySuccess,
+  reportWebshareKeyBandwidthExhausted,
   webshareProxyUrlForLog,
 } from './webshareProxy'
 
@@ -4642,14 +4643,21 @@ export class RequestForwarder {
         adapter.setUseWebshareProxy(true)
         webshareAttemptUsed = true
         ;({ response, chatId, requestId } = await adapter.chatCompletion(zaiPayload))
-        // Feed the outcome back to the pool: bandwidth-402 endpoints must
-        // enter cooldown so the pool stops routing into a drained key
-        // (observed live 2026-09-11 evening: both keys at quota, ~50% of
-        // webshare retries bounced 402 with no cooldown feedback).
+        // Feed the outcome back to the pool, anchored to the exit this
+        // attempt actually used (concurrent requests keep advancing the
+        // pool's global last-selected marker).
+        const usedWebshareUrl = adapter.getWebshareProxyUrlUsed()
         if (response.status === 200) {
-          reportWebshareProxySuccess()
+          reportWebshareProxySuccess(usedWebshareUrl)
+        } else if (response.status === 402) {
+          // "Bandwidth limit reached" is a per-key account verdict, not an
+          // exit fault: every exit of the same dashboard key shares the
+          // drained quota. Cool the whole key so rotation stops paying 402s
+          // across its remaining "healthy" exits (observed live 2026-09-12
+          // 02:30 CN: two exits of one key 402'd back to back).
+          reportWebshareKeyBandwidthExhausted(usedWebshareUrl)
         } else {
-          reportWebshareProxyFailure()
+          reportWebshareProxyFailure(usedWebshareUrl)
         }
       }
 
