@@ -27,6 +27,7 @@ import {
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
 import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-captcha-solver'
+import { getWebshareProxyAgent, webshareProxyUrlForLog } from '../webshareProxy'
 
 const TOKEN_EXPIRY_WARNING_MS = 5 * 60 * 1000 // 5 minutes
 
@@ -277,10 +278,20 @@ export class ZaiAdapter {
   private account: Account
   private token: string | null = null
   private captchaRetryAttempted: boolean = false
+  private useWebshareProxy = false
 
   constructor(provider: Provider, account: Account) {
     this.provider = provider
     this.account = account
+  }
+
+  /**
+   * Route this adapter's upstream chat POST through the webshare pool. Used
+   * by the forwarder as the recovery lever for exit-IP WAF verdicts
+   * (zai_waf_405_block); no-op when the pool is disabled or empty.
+   */
+  setUseWebshareProxy(enabled: boolean) {
+    this.useWebshareProxy = enabled
   }
 
   private zOrigin(): string {
@@ -1219,6 +1230,12 @@ ${tailExcerpt}`,
         responseType: 'stream',
         timeout: ZAI_CHAT_TIMEOUT_MS,
         validateStatus: () => true,
+        // Exit-IP WAF verdicts (zai_waf_405_block) are lifted by routing the
+        // recovery attempt through the configured webshare pool, mirroring
+        // the qwen capacity_limit fast path.
+        ...(this.useWebshareProxy && getWebshareProxyAgent()
+          ? { httpsAgent: getWebshareProxyAgent() }
+          : {}),
       }
     )
 

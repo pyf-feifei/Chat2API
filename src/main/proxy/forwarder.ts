@@ -99,6 +99,7 @@ import {
   disengageWebshareStickyMode,
   reportWebshareProxyFailure,
   reportWebshareProxySuccess,
+  webshareProxyUrlForLog,
 } from './webshareProxy'
 
 function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
@@ -4573,9 +4574,12 @@ export class RequestForwarder {
     console.log('[forwardZai] provider.modelMappings:', provider.modelMappings)
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
-      
-      const adapter = new ZaiAdapter(provider, account)
-      const { response, chatId, requestId } = await adapter.chatCompletion({
+
+      // Exit-IP WAF verdicts (zai_waf_405_block) are a property of the direct
+      // egress, not of the account: on the first 405, retry the SAME request
+      // through the webshare pool instead of rotating accounts that share the
+      // same flagged exit (mirrors the qwen capacity_limit fast path).
+      const zaiPayload = {
         model: actualModel,
         originalModel: request.model,
         messages: transformed.messages as any,
@@ -4585,7 +4589,20 @@ export class RequestForwarder {
         reasoning_effort: toThreeLevelReasoningEffort(request.reasoning_effort),
         thinking_budget: request.thinking_budget,
         deep_research: request.deep_research,
-      })
+      }
+      let adapter = new ZaiAdapter(provider, account)
+      let { response, chatId, requestId } = await adapter.chatCompletion(zaiPayload)
+
+      if (response.status === 405 && isWebshareProxyEnabled()) {
+        try { (response.data as any)?.destroy?.() } catch {}
+        console.warn('[Z.ai] WAF 405 on direct exit; retrying once through Webshare proxy', JSON.stringify({
+          accountId: account.id,
+          proxy: webshareProxyUrlForLog(),
+        }))
+        adapter = new ZaiAdapter(provider, account)
+        adapter.setUseWebshareProxy(true)
+        ;({ response, chatId, requestId } = await adapter.chatCompletion(zaiPayload))
+      }
 
       const latency = Date.now() - startTime
 
@@ -4754,7 +4771,15 @@ export class RequestForwarder {
                 previousChatId: activeChatId,
                 contentLength: danglingContent.length,
               }))
-              const restarted = await adapter.chatCompletion({
+              // The replay re-issues the whole request shape, so it inherits
+              // the same upstream failure modes as the original call. 405 =
+              // exit-IP WAF verdict → one webshare attempt on the same
+              // account; 402 = per-account quota → rotate to a fresh account
+              // (observed live 2026-09-11 evening peak: both tiers landed on
+              // 402 accounts and the narration was delivered as a stall).
+              let replayAdapter = adapter
+              let replayAccount = account
+              const replayRequest = {
                 model: actualModel,
                 originalModel: request.model,
                 messages: [
@@ -4768,7 +4793,34 @@ export class RequestForwarder {
                 reasoning_effort: toThreeLevelReasoningEffort(request.reasoning_effort),
                 thinking_budget: request.thinking_budget,
                 deep_research: request.deep_research,
-              })
+              }
+              let restarted = await replayAdapter.chatCompletion(replayRequest)
+              for (let replayRetry = 0; replayRetry < 2 && restarted.response.status !== 200; replayRetry += 1) {
+                try { restarted.response.data?.destroy?.() } catch {}
+                if (restarted.response.status === 405 && isWebshareProxyEnabled()) {
+                  console.warn('[Z.ai] Fresh-chat continuation blocked by WAF 405; retrying through Webshare proxy')
+                  replayAdapter.setUseWebshareProxy(true)
+                } else if (restarted.response.status === 402) {
+                  loadBalancer.markAccountFailed(replayAccount.id)
+                  const rotated = loadBalancer.selectAccount(
+                    request.model,
+                    config.loadBalanceStrategy,
+                    provider.id,
+                    undefined,
+                    new Set([replayAccount.id]),
+                  )
+                  if (!rotated?.account || rotated.account.id === replayAccount.id) break
+                  console.warn('[Z.ai] Fresh-chat continuation hit quota 402; rotating account', JSON.stringify({
+                    from: replayAccount.id,
+                    to: rotated.account.id,
+                  }))
+                  replayAccount = rotated.account
+                  replayAdapter = new ZaiAdapter(provider, rotated.account)
+                } else {
+                  break
+                }
+                restarted = await replayAdapter.chatCompletion(replayRequest)
+              }
               if (restarted.response.status === 200 && restarted.response.data && typeof restarted.response.data.on === 'function') {
                 const previousChatId = activeChatId
                 activeChatId = restarted.chatId
