@@ -4002,10 +4002,20 @@ export class QwenAiAdapter {
       || this.isRiskControlMessage(upstreamMessage)
       || reason.includes('risk-control'))
     const isResponseEnded = isQwenAiResponseEndedError(envelopeError || upstreamMessage)
+    // A 402 whose body is the proxy pool's own quota notice ("Bandwidth limit
+    // reached. Please upgrade to continue using the proxy.") never originates
+    // from chat.qwen.ai: it is Webshare bandwidth exhaustion on the exit path.
+    // Classify it BEFORE the rate-limit heuristics — the word "limit" in that
+    // body otherwise maps the response onto qwen_ai_capacity_limit/429, which
+    // rotated Qwen accounts against a drained proxy pool (observed live
+    // 2026-09-11 evening: ~6 accounts burned with no effect).
+    const isWebshareBandwidthExhausted = response.status === 402
+      && /bandwidth limit reached/i.test(body)
     const isCapacityLimit = !isUpstreamBusy
       && !isRiskControl
       && !chatInProgress
       && !isResponseEnded
+      && !isWebshareBandwidthExhausted
       && (response.status === 429 || envelopeError?.status === 429)
     const upstreamStatus = response.status >= 400 && response.status <= 599
       ? response.status
@@ -4021,7 +4031,9 @@ export class QwenAiAdapter {
     // Preserve only retry pacing metadata. The governor uses Retry-After to
     // distinguish ordinary quota throttling without exposing upstream cookies
     // or transport headers to the client.
-    error.status = isResponseEnded
+    error.status = isWebshareBandwidthExhausted
+      ? 402
+      : isResponseEnded
       ? 502
       : isUpstreamBusy
         ? 503
@@ -4056,6 +4068,11 @@ export class QwenAiAdapter {
       // healthy account instead of surfacing an API error to the client.
       error.retryable = true
       markQwenAiNextAccountFailure(error)
+    } else if (isWebshareBandwidthExhausted) {
+      error.code = 'qwen_ai_webshare_bandwidth_exhausted'
+      error.retryable = false
+      error.accountFault = false
+      delete error.retryScope
     } else if (envelopeError?.code) {
       error.code = envelopeError.code
     }

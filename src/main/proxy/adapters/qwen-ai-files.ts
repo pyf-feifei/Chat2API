@@ -28,6 +28,12 @@ const OSS_STS_REFRESH_INTERVAL_MS = positiveIntegerFromEnv('QWEN_AI_OSS_STS_REFR
 const STS_REQUEST_MIN_INTERVAL_MS = positiveIntegerFromEnv('QWEN_AI_STS_REQUEST_MIN_INTERVAL_MS', 1500)
 const STS_RATE_LIMIT_MAX_RETRIES = positiveIntegerFromEnv('QWEN_AI_STS_RATE_LIMIT_MAX_RETRIES', 3)
 const STS_RATE_LIMIT_BASE_DELAY_MS = positiveIntegerFromEnv('QWEN_AI_STS_RATE_LIMIT_BASE_DELAY_MS', 15000)
+// A 502/503/504 from getstsToken is the gateway stalling behind the request's
+// exit path (observed 2026-09-11: a single 504 killed the upload outright and
+// surfaced as a stream disconnect), not a verdict on the file or credential —
+// retry in place like the parse POST before failing the attempt.
+const STS_TRANSIENT_MAX_RETRIES = positiveIntegerFromEnv('QWEN_AI_STS_TRANSIENT_MAX_RETRIES', 2)
+const STS_TRANSIENT_RETRY_DELAY_MS = positiveIntegerFromEnv('QWEN_AI_STS_TRANSIENT_RETRY_DELAY_MS', 2000)
 const QWEN_AI_FILE_CACHE_ENABLED = process.env.QWEN_AI_FILE_CACHE_ENABLED !== 'false'
 const QWEN_AI_FILE_CACHE_TTL_MS = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_TTL_MS', 47 * 60 * 60 * 1000)
 const QWEN_AI_FILE_CACHE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_MAX_ENTRIES', 512)
@@ -2739,25 +2745,53 @@ export class QwenAiFileUploader {
   ): Promise<QwenStsInfo> {
     throwIfQwenAiFileOperationStopped(options)
     let rateLimitRetries = 0
+    let transientRetries = 0
     while (true) {
       await acquireQwenAiStsDispatchSlot(options)
-      const response = await this.postJson(
-        `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
-        {
-          filename: file.filename,
-          filesize: String(file.sizeBytes),
-          filetype: file.coarseType,
-        },
-        () => ({
-          headers: this.getHeaders(),
-          timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
-          validateStatus: () => true,
-        }),
-        options,
-      )
+      let response: AxiosResponse
+      try {
+        response = await this.postJson(
+          `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
+          {
+            filename: file.filename,
+            filesize: String(file.sizeBytes),
+            filetype: file.coarseType,
+          },
+          () => ({
+            headers: this.getHeaders(),
+            timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
+            validateStatus: () => true,
+          }),
+          options,
+        )
+      } catch (error) {
+        if (
+          transientRetries < STS_TRANSIENT_MAX_RETRIES
+          && isQwenAiParsePostTransportRetry(error)
+          && canQwenAiFileParseRetry(options)
+        ) {
+          transientRetries += 1
+          console.warn(`[QwenAI][File] sts request transport error, retrying filename="${file.filename}" attempt=${transientRetries}/${STS_TRANSIENT_MAX_RETRIES}`)
+          await delay(STS_TRANSIENT_RETRY_DELAY_MS, options)
+          throwIfQwenAiFileOperationStopped(options)
+          continue
+        }
+        throw error
+      }
 
       throwIfQwenAiFileOperationStopped(options)
       if (response.status >= 400) {
+        if (
+          response.status >= 500
+          && transientRetries < STS_TRANSIENT_MAX_RETRIES
+          && canQwenAiFileParseRetry(options)
+        ) {
+          transientRetries += 1
+          console.warn(`[QwenAI][File] sts request HTTP ${response.status}, retrying filename="${file.filename}" attempt=${transientRetries}/${STS_TRANSIENT_MAX_RETRIES}`)
+          await delay(STS_TRANSIENT_RETRY_DELAY_MS, options)
+          throwIfQwenAiFileOperationStopped(options)
+          continue
+        }
         throw new Error(`Qwen AI upload STS request failed: HTTP ${response.status}`)
       }
 

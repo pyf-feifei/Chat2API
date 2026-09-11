@@ -5459,6 +5459,45 @@ test('Qwen AI preserves an HTTP 429 Chinese congestion response as capacity', as
   assert.equal(error.retryScope, 'next-account')
 })
 
+test('Qwen AI tags a webshare bandwidth-402 as proxy quota exhaustion, not an account fault', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const { isQwenAiAccountFault, qwenAiAccountRetryScope } = loadRealModule('src/main/proxy/qwenAiAccountPolicy.ts')
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: {} },
+  )
+
+  // Observed live 2026-09-11 evening: the drained webshare pool answered chat
+  // creation with its own quota notice over text/plain.
+  const error = await adapter.createInvalidStreamError({
+    status: 402,
+    headers: { 'content-type': 'text/plain; charset=utf-8' },
+    data: 'Bandwidth limit reached. Please upgrade to continue using the proxy.',
+  }, 'chat creation returned HTTP 402')
+
+  assert.equal(error.status, 402)
+  assert.equal(error.code, 'qwen_ai_webshare_bandwidth_exhausted')
+  assert.equal(error.retryable, false)
+  assert.equal(error.accountFault, false)
+  assert.equal(error.retryScope, undefined)
+  assert.match(error.message, /Bandwidth limit reached/)
+  // The account policy must not rotate Qwen accounts for a drained proxy pool.
+  assert.equal(isQwenAiAccountFault(error), false)
+  assert.equal(qwenAiAccountRetryScope(error), undefined)
+
+  // A genuine Qwen-side 402 (no proxy body) keeps the account-fault contract:
+  // the quota wording maps onto the existing capacity class, which rotates to
+  // a fresh account — the correct response to a real per-account quota wall.
+  const accountQuota = await adapter.createInvalidStreamError({
+    status: 402,
+    headers: { 'content-type': 'application/json' },
+    data: JSON.stringify({ error: { code: 'insufficient_quota', message: 'quota exceeded' } }),
+  }, 'chat creation returned HTTP 402')
+  assert.notEqual(accountQuota.code, 'qwen_ai_webshare_bandwidth_exhausted')
+  assert.equal(isQwenAiAccountFault(accountQuota), true)
+  assert.equal(qwenAiAccountRetryScope(accountQuota), 'next-account')
+})
+
 test('Qwen AI keeps an RGV587 busy JSON response account-neutral even with challenge headers', async () => {
   const { QwenAiAdapter } = loadQwenAiStreamHandler()
   const adapter = new QwenAiAdapter(

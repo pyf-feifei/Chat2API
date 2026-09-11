@@ -1694,14 +1694,24 @@ export class RequestForwarder {
           // >=400 status as an upstream decision (observed 2026-09-09: a
           // thrown ECONNREFUSED became a 502 result and the degrade check
           // missed it entirely).
-          degradedProxyTransport = isQwenAiTransientTransportError({
-            code: result.errorCode,
-            message: result.error,
-          })
-          if (degradedProxyTransport) {
-            disengageWebshareStickyMode('proxy transport failure — retrying via the direct exit')
+          if (result.errorCode === 'qwen_ai_webshare_bandwidth_exhausted') {
+            // Sticky mode must not keep feeding Qwen traffic into a drained
+            // pool: leave it now so this retry and the next request use the
+            // direct exit. The one-shot direct retry flag is NOT reset here —
+            // the bandwidth arm below consumes it exactly once.
+            degradedProxyTransport = true
+            disengageWebshareStickyMode('webshare bandwidth exhausted (402)')
             qwenAiWebshareProxy = false
-            qwenAiDirectRetryAfterProxyFailureUsed = false
+          } else {
+            degradedProxyTransport = isQwenAiTransientTransportError({
+              code: result.errorCode,
+              message: result.error,
+            })
+            if (degradedProxyTransport) {
+              disengageWebshareStickyMode('proxy transport failure — retrying via the direct exit')
+              qwenAiWebshareProxy = false
+              qwenAiDirectRetryAfterProxyFailureUsed = false
+            }
           }
         }
 
@@ -1713,6 +1723,34 @@ export class RequestForwarder {
         lastAccountFault = result.accountFault
         lastRetryScope = result.retryScope
         previousRecoveryHint = result.recoveryHint
+
+        // A webshare bandwidth-402 is pool quota exhaustion, not an account
+        // or Qwen fault: rotating accounts cannot add proxy bandwidth, and
+        // the degraded-proxy arm above already cooled the pool entry and
+        // disengaged sticky mode. Spend the one-shot direct-exit retry here
+        // instead of surfacing the raw 402 (observed 2026-09-11 evening:
+        // ~6 accounts × 2 busy retries burned ~5 minutes before the 402
+        // reached the client).
+        if (
+          isQwenAiProvider
+          && result.errorCode === 'qwen_ai_webshare_bandwidth_exhausted'
+          && qwenAiDirectRetryAfterProxyFailureUsed !== true
+          && qwenAiRequestDeadline !== undefined
+          && Date.now() < qwenAiRequestDeadline
+          && !context.signal?.aborted
+        ) {
+          qwenAiDirectRetryAfterProxyFailureUsed = true
+          qwenAiWebshareProxy = false
+          nextRetryDelayMs = 0
+          attempt += 1
+          console.warn('[QwenAI] webshare bandwidth exhausted (402), retrying once via the direct exit', JSON.stringify({
+            requestId: context.requestId,
+            accountId: account.id,
+            status: result.status,
+            attempt,
+          }))
+          continue
+        }
 
         const canRetryTransport = isQwenAiProvider
           && isQwenAiTransientTransportError({

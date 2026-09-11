@@ -3193,6 +3193,93 @@ test('a thrown proxy transport error disengages sticky mode and retries once dir
   assert.equal(disengagements.length, 1, 'the thrown proxy transport error must disengage sticky mode')
 })
 
+test('a webshare bandwidth-402 disengages sticky mode and retries once direct', async () => {
+  const disengagements = []
+  const reports = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    webshareStickyActive: true,
+    disengageSticky: reason => disengagements.push(reason),
+    reportWebshareFailure: () => reports.push('failure'),
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    if (attempts.length === 1) {
+      // The webshare exit itself bounced at chat creation: pool bandwidth
+      // exhaustion with the proxy vendor's quota body (observed live
+      // 2026-09-11 evening). Rotating Qwen accounts cannot add proxy
+      // bandwidth — the recovery must leave the pool for the direct exit.
+      return {
+        success: false,
+        status: 402,
+        error: 'Qwen AI upstream chat creation returned HTTP 402 (HTTP 402, content-type text/plain; charset=utf-8): Bandwidth limit reached. Please upgrade to continue using the proxy.',
+        errorCode: 'qwen_ai_webshare_bandwidth_exhausted',
+        retryable: false,
+        accountFault: false,
+      }
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true, 'the one-shot direct retry must recover the request')
+  assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [true, false], 'the retry must leave the drained proxy pool for the direct exit')
+  assert.equal(disengagements.length, 1, 'the bandwidth-402 must disengage sticky mode')
+  assert.deepEqual(reports, ['failure'], 'the drained pool entry must enter cooldown')
+})
+
+test('a webshare bandwidth-402 surfaces honestly once the direct retry is spent', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    webshareStickyActive: true,
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    // Both exits are dead: the drained pool AND a failing direct exit. The
+    // request must fail fast with the bandwidth verdict instead of rotating
+    // accounts into the same 402 (2026-09-11: ~5 minutes of account
+    // rotation surfaced the raw 402 to the client).
+    return {
+      success: false,
+      status: 402,
+      error: 'Qwen AI upstream chat creation returned HTTP 402 (HTTP 402, content-type text/plain; charset=utf-8): Bandwidth limit reached. Please upgrade to continue using the proxy.',
+      errorCode: 'qwen_ai_webshare_bandwidth_exhausted',
+      retryable: false,
+      accountFault: false,
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.status, 402)
+  assert.equal(result.accountFault, false, 'a drained proxy pool must not fault the account')
+  assert.equal(result.retryScope, undefined, 'a drained proxy pool must not rotate accounts')
+  assert.match(result.error, /Bandwidth limit reached/)
+  assert.equal(attempts.length, 2, 'exactly one direct retry after the bandwidth-402, then stop')
+})
+
 test('size-offloaded document parse failure rotates the account instead of replaying inline', async () => {
   const RequestForwarder = loadRequestForwarder()
   const forwarder = new RequestForwarder()
