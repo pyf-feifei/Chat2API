@@ -1723,6 +1723,41 @@ export class ZaiStreamHandler {
       )
     }
 
+    // Managed-workflow recovery exhausted with a dangling answer already on
+    // the wire. A clean `finish_reason: stop` here makes agentic clients
+    // record the dangling prose as the final assistant message and END THE
+    // TURN — the silent-stall family from 2026-09-11 22:24, where captcha →
+    // WAF 405 → webshare 402 burned every recovery tier and the promise
+    // sentence was then delivered as a normal completion. Ending with an
+    // explicit error chunk and NO finish_reason makes the Responses
+    // translator emit `response.failed`, so codex discards the partial
+    // answer and retries the request while upstream recovery (x5sec
+    // harvest, WAF verdict cool-down) runs its course. Chat-wire clients get
+    // the visible notice instead of a silently truncated answer.
+    const failStreamAfterExhaustedRecovery = (reason: string) => {
+      if (clientEnded) return
+      console.error('[Z.ai] Managed workflow recovery exhausted; failing the client stream for a client-side retry', JSON.stringify({
+        reason,
+        contentLength: this.content.length,
+      }))
+      writeVisibleNotice('\n\n[Z.ai] Workflow recovery exhausted upstream; failing this turn so the request can be retried.')
+      transStream.write(
+        `data: ${JSON.stringify({
+          id: this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          error: {
+            code: 'zai_workflow_recovery_exhausted',
+            message: `managed workflow recovery exhausted (dangling answer: ${reason}); retry the request`,
+            param: null,
+            type: 'upstream_error',
+          },
+        })}\n\n`
+      )
+      safeEnd('data: [DONE]\n\n')
+      notifyEnd()
+    }
+
     const attachUpstream = (upstreamStream: any) => {
       const branchParser = createParser({ onEvent: handleEvent })
       upstreamStream.on('data', (buffer: Buffer) => {
@@ -1802,19 +1837,20 @@ export class ZaiStreamHandler {
       if (this.toolCallingPlan?.shouldParseResponse && this.continuation) {
         // No same-chat anchor here: the upstream generation is still in
         // flight, so recovery replays the transcript in a fresh chat.
+        const idleVerdict = {
+          continuation: true,
+          completionProofMissing: false,
+          requireManagedToolCall: this.toolCallingPlan?.hasLiveToolWorkflow === true,
+          reason: 'upstream_idle_stall',
+        } as ZaiManagedAnswerVerdict
         void (async () => {
-          const attached = await attemptContinuation({
-            continuation: true,
-            completionProofMissing: false,
-            requireManagedToolCall: this.toolCallingPlan?.hasLiveToolWorkflow === true,
-            reason: 'upstream_idle_stall',
-          }, branchContent, '')
+          const attached = await attemptContinuation(idleVerdict, branchContent, '')
           if (clientEnded) return
           if (!attached) {
-            // Visibility over silence: tell the client the stream stalled
-            // instead of hanging the request open indefinitely.
-            writeVisibleNotice(`\n\n[Z.ai] Upstream stream was idle for ${Math.round(idleMs / 1000)}s; ending the response.`)
-            finishStream('stop')
+            // Recovery is configured but exhausted: a partial answer over a
+            // live workflow is still a stalled turn, so fail the stream for a
+            // client-side retry instead of delivering a fake-success stop.
+            failStreamAfterExhaustedRecovery(idleVerdict.reason)
           }
         })()
         return
@@ -1867,6 +1903,15 @@ export class ZaiStreamHandler {
           const attached = await attemptContinuation(verdict, branchContent, this.lastMessageId)
           if (clientEnded) return
           if (!attached) {
+            // Recovery configured but exhausted: a clean stop would deliver
+            // the dangling answer as a final message and end the agent turn
+            // silently — fail the stream for a client-side retry instead.
+            // Without a continuation handle (recovery explicitly absent) the
+            // legacy deliver-as-is contract stays.
+            if (this.continuation) {
+              failStreamAfterExhaustedRecovery(verdict.reason)
+              return
+            }
             finishStream('stop', usage)
           }
         })()

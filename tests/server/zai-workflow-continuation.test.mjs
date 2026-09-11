@@ -174,7 +174,13 @@ test('stream handler recovers a dangling progress answer via same-chat continuat
   )
 })
 
-test('stream handler delivers as-is when the continuation budget is spent', async () => {
+test('stream handler fails the client stream when recovery exhausts on a dangling answer (2026-09-11 22:24 incident)', async () => {
+  // Observed live: captcha → WAF 405 → webshare 402 burned every recovery
+  // tier and the 44-char promise sentence was then delivered with a clean
+  // finish_reason:stop — codex recorded it as the final assistant message
+  // and the turn stalled silently. The exhausted-recovery terminal must be a
+  // stream FAILURE (error chunk, no finish_reason) so the Responses
+  // translator emits response.failed and the client retries the request.
   const plan = createPlan()
 
   const upstream1 = createUpstreamSse([
@@ -198,11 +204,66 @@ test('stream handler delivers as-is when the continuation budget is spent', asyn
   const chunks = parseClientChunks(raw)
 
   assert.equal(continuationCalls.length, 1)
+  assert.equal(
+    chunks.find((c) => c.choices?.[0]?.finish_reason),
+    undefined,
+    'no finish_reason may be delivered — that would read as a completed turn',
+  )
+  const errorChunk = chunks.find((c) => c.error)
+  assert.ok(errorChunk, 'an explicit error chunk must be delivered')
+  assert.equal(errorChunk.error.code, 'zai_workflow_recovery_exhausted')
+  const combined = chunks.map((c) => c.choices?.[0]?.delta?.content ?? '').join('')
+  assert.ok(combined.includes('我来查看'), 'dangling prose stays visible for chat clients')
+  assert.ok(combined.includes('recovery exhausted'), 'a visible notice explains the failure')
+})
+
+test('dangling answer without a configured continuation handle keeps the legacy deliver-as-is contract', async () => {
+  const plan = createPlan()
+
+  const upstream1 = createUpstreamSse([
+    { id: 'assistant-msg-1', role: 'assistant' },
+    { phase: 'answer', delta_content: '我来查看 Codex 的 skill 注册目录和配置。' },
+    { phase: 'done', done: true },
+  ])
+
+  const handler = new ZaiStreamHandler('GLM-5.3-Flash', undefined, plan)
+  handler.setChatId('chat-1')
+  // No setContinuation: recovery explicitly absent → deliver with a clean stop.
+
+  const raw = await collect(await handler.handleStream(upstream1))
+  const chunks = parseClientChunks(raw)
+
   const finishChunk = chunks.find((c) => c.choices?.[0]?.finish_reason)
   assert.ok(finishChunk)
   assert.equal(finishChunk.choices[0].finish_reason, 'stop')
-  const combined = chunks.map((c) => c.choices?.[0]?.delta?.content ?? '').join('')
-  assert.ok(combined.includes('我来查看'), 'dangling answer must still be delivered')
+  assert.equal(chunks.find((c) => c.error), undefined)
+})
+
+test('idle watchdog fails the client stream when recovery is configured but exhausts', async () => {
+  process.env.CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS = '80'
+  try {
+    const plan = createPlan()
+    const silent = new PassThrough()
+    const handler = new ZaiStreamHandler('GLM-5.3-Flash', undefined, plan)
+    handler.setChatId('chat-1')
+    handler.setContinuation({
+      activeChatId: () => 'chat-1',
+      start: async () => null,
+    })
+
+    const raw = await collect(await handler.handleStream(silent), 5000)
+    const chunks = parseClientChunks(raw)
+    assert.equal(
+      chunks.find((c) => c.choices?.[0]?.finish_reason),
+      undefined,
+      'exhausted idle recovery must not end as a completed turn',
+    )
+    const errorChunk = chunks.find((c) => c.error)
+    assert.ok(errorChunk)
+    assert.equal(errorChunk.error.code, 'zai_workflow_recovery_exhausted')
+  } finally {
+    delete process.env.CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS
+  }
 })
 
 test('stream handler works without a continuation handle (non-tool / disabled plans)', async () => {
