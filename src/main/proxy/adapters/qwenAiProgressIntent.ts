@@ -77,8 +77,12 @@ export function isProgressStyleManagedAnswer(trimmedContent: string): boolean {
 // disables detection entirely).
 const MANAGED_TOOL_DENIAL_DEFAULT_PATTERN_SOURCES = [
   "i do not (?:have|currently have) access to",
-  "(?:do(?:es)? not|don't|doesn't|cannot|can't|unable to) (?:use|invoke|call|access) (?:the|any|this|your) (?:tool|function)",
-  "not (?:currently )?available in my (?:current )?(?:toolset|tool set|set of tools|environment)",
+  // Optional article + optional (possibly backticked) tool name between the
+  // verb and "tool/function": "can't use a `weather_lookup` tool" (observed
+  // live 2026-09-13, M365 consumer chat tone). "have" covers the possession
+  // variant ("don't have a `shell` tool") that the same turn family uses.
+  "(?:do(?:es)? not|don't|doesn't|cannot|can't|unable to) (?:use|invoke|call|access|have) (?:the|any|this|your|a)?\\s*(?:[`']?\\w[\\w.-]*[`']?\\s+)?(?:tool|function)",
+  "(?:(?:is|are|was|were)\\s*(?:n't|not)|not)\\s+(?:currently\\s+|actually\\s+)?available in (?:my|this|the) (?:current )?(?:toolset|tool set|set of tools|chat )?environment",
   "no (?:such )?tool (?:is )?(?:available|defined|declared|registered)",
   "tool (?:is )?not (?:available|accessible|defined|declared)",
   "tool (?:call was )?(?:skipped|omitted|dropped) because",
@@ -93,6 +97,10 @@ const MANAGED_TOOL_DENIAL_DEFAULT_PATTERN_SOURCES = [
   "retry in a new turn where [^\\n.]{0,60}?(?:is |are )?available",
   "[\"'`]?(?:is|are)(?: [a-z]+){0,2}? returning [\"'`]?does not exists",
   "我(?:没有|无法|不能)(?:访问|调用|使用)(?:该|这个|任何)?工具",
+  // Possession/availability variants insert modifiers between the denial verb
+  // and the noun ("我没有能够访问本地文件的 shell 工具"), so a bounded gap is
+  // tolerated instead of requiring adjacency.
+  "我(?:没有|无法|不能)[^，。\\n]{0,20}?工具",
   // Chinese variants insert modifiers between the noun and the denial
   // ("工具在当前环境中不可用"), so the gap is tolerated instead of requiring
   // adjacency.
@@ -151,7 +159,10 @@ export function isToolDenialManagedAnswer(trimmedContent: string): boolean {
   if (!trimmedContent || trimmedContent.length > MANAGED_PROGRESS_INTENT_MAX_CODE_POINTS) return false
   const regex = managedToolDenialRegex()
   if (!regex) return false
-  const firstParagraph = trimmedContent.split('\n\n')[0]
+  // Models emit typographic apostrophes ("can’t", "isn’t") that no ASCII
+  // pattern can match; normalize the quote family before testing.
+  const normalized = trimmedContent.replace(/[‘’ʼ]/g, "'")
+  const firstParagraph = normalized.split('\n\n')[0]
   return regex.test(firstParagraph)
 }
 

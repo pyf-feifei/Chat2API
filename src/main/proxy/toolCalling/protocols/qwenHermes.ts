@@ -23,11 +23,18 @@ import {
   LARGE_PAYLOAD_GUIDANCE_CHUNking,
   LARGE_PAYLOAD_GUIDANCE_RETRY,
   largePayloadGuidanceEnabled,
+  getLargePayloadGuidanceWithThreshold,
 } from '../promptGuidance.ts'
 
 function largePayloadSuffix(text: string): string {
   return largePayloadGuidanceEnabled() && text ? `
 ${text}` : ''
+}
+
+function largePayloadSuffixWithThreshold(type: 'retry' | 'chunking'): string {
+  const guidance = getLargePayloadGuidanceWithThreshold(type)
+  return guidance ? `
+${guidance}` : ''
 }
 
 const TOOL_CALL_START = '<tool_call>'
@@ -175,7 +182,7 @@ parameter_value
 </parameter>
 </function>
 </tool_call>
-Repeat the parameter block for every argument required by the selected function's JSON schema. Encode object and array values as JSON.${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_RETRY)}
+Repeat the parameter block for every argument required by the selected function's JSON schema. Encode object and array values as JSON.${largePayloadSuffixWithThreshold('retry')}
 Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this output must be function calls only.`
   },
 
@@ -186,7 +193,7 @@ The two endings are mutually exclusive: a response containing a <tool_call> bloc
 Do not answer with a plan, progress update, or a description of what you will do next — those are protocol violations on this turn and trigger a retry.
 Tool results are input only: never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this turn ends with the next call block or the final answer, nothing else.
 Declared function names (use only these): ${serializeHermesJson(tools.map((tool) => tool.name))}
-${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_CHUNking)}
+${largePayloadSuffixWithThreshold('chunking')}
 Exact call format:
 <tool_call>
 <function=exact_function_name>
@@ -373,7 +380,7 @@ parameter_value
 </function>
 </tool_call>
 
-Use only function and parameter names declared above. Include every required parameter and satisfy the selected function's JSON schema. Encode object and array parameter values as JSON. Emit one <tool_call> block per function call. You may provide reasoning before the first function call, but never add text after a function call. If completing the request requires a tool, emit the tool call in this response instead of describing or promising a later action. When no function is needed, answer normally without tool-call tags.${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_CHUNking)}
+Use only function and parameter names declared above. Include every required parameter and satisfy the selected function's JSON schema. Encode object and array parameter values as JSON. Emit one ${largePayloadSuffixWithThreshold('chunking')}<tool_call> block per function call. You may provide reasoning before the first function call, but never add text after a function call. If completing the request requires a tool, emit the tool call in this response instead of describing or promising a later action. When no function is needed, answer normally without tool-call tags.${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_CHUNking)}
 Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate a tool-result block, a fenced result envelope, or any result-wrapper tag in your own output; your output is only reasoning, a function-call block, or a final answer.`
 }
 

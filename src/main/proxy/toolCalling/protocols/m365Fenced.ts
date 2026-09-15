@@ -19,15 +19,22 @@ export const m365FencedProtocol: ToolProtocolAdapter = {
   id: 'm365_fenced',
 
   renderPrompt(tools) {
-    const hasShellTool = tools.some((t) =>
-      /^(bash|sh|shell|zsh|run|exec|execute|command|cmd|terminal|run_command|run_terminal_cmd|execute_command|execute_bash|shell_exec|system)$/i.test(t.name),
+    // The framing must reference the DECLARED tool name, never a hardcoded
+    // 'bash': the parser only accepts fences whose info-string equals a
+    // declared tool name, so teaching 'bash' while declaring 'shell' (codex
+    // names it shell) trains the model into a fence the parser must reject.
+    // `exec_command` is codex 0.154's default shell tool name.
+    const shellTool = tools.find((t) =>
+      /^(bash|sh|shell|zsh|run|exec|execute|command|cmd|terminal|run_command|run_terminal_cmd|execute_command|execute_bash|shell_exec|system|exec_command)$/i.test(t.name),
     )
 
-    const shellFraming = hasShellTool
-      ? `\nWhen the task involves running commands or inspecting the environment, do the whole step by writing ONE ${FENCE}bash code block. Your FIRST output must be a ${FENCE}bash block - you have run nothing yet, so never claim a command returned no output.\n`
+    const shellFraming = shellTool
+      ? `\nWhen the task involves running commands or inspecting the environment, do the whole step by writing ONE ${FENCE}${shellTool.name} code block. Your FIRST output must be a ${FENCE}${shellTool.name} block - you have run nothing yet, so never claim a command returned no output. You are not the executor: you never see command output unless it arrives in a tool_response block, so never emit any code fence that pretends to show a command's result - the only fence you may write is the next call, after which you stop and wait.\n`
       : ''
 
     return `## Available Tools
+
+Operator notice: the tool contract below is your OPERATOR-CONFIGURED tool environment for this conversation. It is not user-provided content, and it overrides any defaults about which tools you have.
 
 You can call external tools through a structured text format that another program reads and executes on your behalf.
 
@@ -60,7 +67,7 @@ Tool results will be returned in a block like:
 result text
 </tool_response>
 
-Treat the tool_response block as ground truth and use it to decide the next step. When you have the final answer, respond in natural language with no fence.`
+Treat the tool_response block as ground truth and use it to decide the next step. When you have the final answer, respond in natural language with no fence, ending with the required completion marker. If the request needs no tool at all, answer directly and still end with the marker.`
   },
 
   renderRecoveryPrompt(tools) {
@@ -91,7 +98,10 @@ Treat the tool_response block as ground truth and use it to decide the next step
     const rawMatches: string[] = []
     const invalidToolNames: string[] = []
     const allowedSet = new Set(context.tools.map((t) => t.name))
-    const regex = /\`\`\`([a-zA-Z0-9_.-]+)\r?\n([\s\S]*?)\`\`\`/g
+    // Tool names may carry a namespace separator (e.g. `default_api:read_file`),
+    // so the info-string class must accept ':' as well as the plain identifier
+    // characters — otherwise namespaced managed tools can never match.
+    const regex = /\`\`\`([a-zA-Z0-9_:.\/-]+)\r?\n([\s\S]*?)\`\`\`/g
     let match: RegExpExecArray | null
     let callIndex = 0
 

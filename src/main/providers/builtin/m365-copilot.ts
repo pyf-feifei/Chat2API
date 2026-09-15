@@ -13,15 +13,27 @@ export const m365CopilotConfig: BuiltinProviderConfig = {
   },
   "enabled": true,
   "description": "Microsoft 365 Copilot via ChatHub WebSocket protocol",
+  // The m365-* aliases are load-bearing for codex clients: codex derives its
+  // model family from the NAME, and "gpt-5.6-*" matches a first-party family
+  // for which codex ships NO client tools and NO instructions (verified live
+  // 2026-09-14: tools:[] with instructionsChars:0, while unknown names get 12
+  // function tools). An aliased name keeps codex in its normal agent mode and
+  // maps back to the same upstream model here.
   "supportedModels": [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
-    "gpt-5.6-luna"
+    "gpt-5.6-luna",
+    "m365-sol",
+    "m365-terra",
+    "m365-luna"
   ],
   "modelMappings": {
     "gpt-5.6-sol": "gpt-5.6-sol",
     "gpt-5.6-terra": "gpt-5.6-terra",
-    "gpt-5.6-luna": "gpt-5.6-luna"
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "m365-sol": "gpt-5.6-sol",
+    "m365-terra": "gpt-5.6-terra",
+    "m365-luna": "gpt-5.6-luna"
   },
   "credentialFields": [
     {

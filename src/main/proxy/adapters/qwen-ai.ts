@@ -6428,6 +6428,27 @@ export class QwenAiStreamHandler {
         console.log('[QwenAI] Recovered tool call from accumulated answer content')
       }
 
+      // The model may have drifted off the taught wire format into another
+      // managed protocol's syntax (hermes <tool_call>, m365 <function=…>, …).
+      // The plan-protocol parsers above never match those blocks; salvage any
+      // dispatchable call instead of spending a recovery round-trip.
+      if (!this.toolStreamParser?.hasEmittedToolCall()) {
+        const salvagedToolChunks = this.toolStreamParser?.salvageFromAlternateProtocols(
+          this.content,
+          baseChunk,
+          !initialChunkSent,
+        ) ?? []
+        for (const outputChunk of salvagedToolChunks) {
+          this.recordEmittedToolCallIdsFromChunk(outputChunk)
+          if (writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)) {
+            initialChunkSent = true
+          }
+        }
+        if (salvagedToolChunks.length > 0) {
+          console.log('[QwenAI] Salvaged tool call from alternate protocol syntax')
+        }
+      }
+
       if (hasToolUse(this.content)) {
         console.log('[QwenAI] Found legacy tool_use in stream, sending tool_calls')
         const usage = this.createEstimatedUsage(
@@ -7146,6 +7167,19 @@ export class QwenAiStreamHandler {
             if (strippedAnswer !== answerText) {
               answerText = strippedAnswer
               choice.message.content = strippedAnswer
+            }
+          }
+
+          // Same drift salvage as the stream path: a tool call written in
+          // another managed protocol's syntax would otherwise classify the
+          // answer as dangling and burn a recovery round-trip.
+          if ((managedParse.toolCalls?.length ?? 0) === 0) {
+            const salvaged = this.toolStreamParser?.salvageFromAlternateProtocols?.(answerText, {}) ?? []
+            if (salvaged.length > 0) {
+              console.info('[QwenAI] Salvaged tool call from alternate protocol syntax (non-stream)', JSON.stringify({
+                toolCallCount: salvaged.length,
+                requestId: this.toolCallingPlan.diagnostics?.requestId,
+              }))
             }
           }
         }

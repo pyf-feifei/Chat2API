@@ -227,6 +227,7 @@ class PassthroughToolStreamParser {
 
   flush() { return [] }
   recoverFromContent() { return [] }
+  salvageFromAlternateProtocols() { return [] }
   hasPendingToolProtocol() { return false }
   hasEmittedToolCall() { return false }
 }
@@ -235,6 +236,7 @@ class SwallowingToolStreamParser {
   push() { return [] }
   flush() { return [] }
   recoverFromContent() { return [] }
+  salvageFromAlternateProtocols() { return [] }
   hasPendingToolProtocol() { return false }
   hasEmittedToolCall() { return false }
 }
@@ -7172,6 +7174,7 @@ test('Qwen AI stream reports a managed tool validation failure through its failu
     push() { return [] }
     flush() { return [] }
     recoverFromContent() { return [] }
+    salvageFromAlternateProtocols() { return [] }
     hasPendingToolProtocol() { return true }
     hasEmittedToolCall() { return false }
   }

@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type { ToolCall } from '../types.ts'
 import type { ToolCallDiagnostics, ToolCallingPlan } from './types.ts'
-import { getToolProtocol } from './protocols/index.ts'
+import { getManagedProtocols, getToolProtocol } from './protocols/index.ts'
+import { getMissingRequiredArguments } from './protocols/shared.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 import {
   createManagedToolResultWrapperLeakError,
@@ -148,10 +149,14 @@ export class ToolStreamParser {
 
     // Hermes parallel calls are adjacent, individually delimited blocks. Wait
     // for stream completion so the first block does not suppress later calls.
-    if (this.plan.protocol === 'qwen_hermes' || this.plan.protocol === 'qwen_native') {
+    if (this.completionMarkerHoldEnabled()) {
       // A completion marker held as a partial prefix may have been completed by
       // this delta; confirm it while the buffer is still accumulating so the
-      // flush path knows the held text is protocol output, not prose.
+      // flush path knows the held text is protocol output, not prose. The hold
+      // itself (holdCompletionMarker) is protocol-agnostic, so this
+      // confirmation must be too: observed live 2026-09-13 (m365_fenced first
+      // turn via codex), a partial hold crossing a delta boundary was never
+      // confirmed and flush released the full marker as client-visible prose.
       if (this.heldCompletionMarkerEnd === undefined) {
         const tailStart = this.seenContent.length - this.buffer.length
         const confirmed = findStrayManagedWorkflowCompletionMarker(this.seenContent, tailStart)
@@ -179,7 +184,18 @@ export class ToolStreamParser {
           return chunks
         }
       }
-      return chunks
+      // Hermes-style protocols parse buffered tool blocks only at flush (see
+      // the parallel-calls comment above). Fence protocols fall through to the
+      // inline parse below, but never while a marker hold owns the buffer:
+      // marker text is not a tool block, and flush handles the held range.
+      if (
+        this.plan.protocol === 'qwen_hermes'
+        || this.plan.protocol === 'qwen_native'
+        || this.heldCompletionMarkerEnd !== undefined
+        || this.heldPartialCompletionMarker
+      ) {
+        return chunks
+      }
     }
 
     const parsed = parseFirstValidToolBlock(this.buffer, this.plan)
@@ -348,7 +364,7 @@ export class ToolStreamParser {
   /**
    * Whether stray completion-marker hold-back is active for this plan. The
    * marker is a managed-protocol token regardless of which protocol the plan
-   * teaches (qwen_hermes/qwen_native require it; managed_xml/m365_fenced and
+   * teaches (qwen_hermes/qwen_native/m365_fenced require it; managed_xml and
    * the other managed protocols never emit it legitimately), so the hold is
    * protocol-agnostic over every response-parsing managed plan. Literal
    * occurrences in code fences/quotes/indentation are preserved by the
@@ -512,6 +528,45 @@ export class ToolStreamParser {
     return chunks
   }
 
+  /**
+   * End-of-stream salvage for models that drifted off the taught wire format:
+   * the model emits another managed protocol's syntax (live 2026-09-14: a
+   * qwen3.8-max codex run under a managed_xml plan emitted qwen_hermes
+   * `<tool_call>` and m365_fenced `<function=…><parameter=…>` blocks, cut
+   * mid-block by the upstream generator). The plan-protocol parsers above
+   * never see those blocks, so the response would classify as a dangling
+   * answer and burn a continuation round-trip even when every required
+   * argument already parsed as a complete value. Try the remaining managed
+   * protocols once; dispatch only calls whose required arguments are all
+   * present. Never runs after any tool call was emitted for this response.
+   */
+  salvageFromAlternateProtocols(content: string, baseChunk: any, includeRole: boolean = false): any[] {
+    const salvaged = salvageAlternateProtocolToolCalls(content, this.plan)
+    if (!salvaged || this.emittedToolCall) return []
+
+    const chunks = uniqueResponseToolCalls(salvaged.toolCalls).map((toolCall, index) => {
+      const indexedToolCall = {
+        ...toolCall,
+        index: this.nextToolCallIndex + index,
+        id: this.scopedToolCallId(toolCall.id, this.nextToolCallIndex + index),
+      }
+      return createToolCallChunk(baseChunk, indexedToolCall, includeRole && index === 0)
+    })
+    if (chunks.length === 0) return []
+
+    this.nextToolCallIndex += chunks.length
+    this.emittedToolCall = true
+    this.clearBuffer()
+    console.warn(`[ToolCalling] Salvaged tool call(s) from alternate protocol syntax`, JSON.stringify({
+      protocol: salvaged.protocol,
+      planProtocol: this.plan.protocol,
+      requestId: this.diagnostics.requestId,
+      providerId: this.diagnostics.providerId,
+      toolCallCount: chunks.length,
+    }))
+    return chunks
+  }
+
   hasEmittedToolCall(): boolean {
     return this.emittedToolCall
   }
@@ -609,6 +664,66 @@ function parseBufferedToolCall(
     protocol: plan.protocol,
     allowPartial: options.allowPartial,
   })
+}
+
+export type SalvagedAlternateProtocolToolCalls = {
+  protocol: ToolCallingPlan['protocol']
+  toolCalls: ToolCall[]
+  rawText: string
+}
+
+/**
+ * Parse `content` with every managed protocol except the plan's own and return
+ * the first result whose calls are all name-valid with complete required
+ * arguments. `rawText` is the matched protocol block (partial blocks included),
+ * so callers can rewrite it into the plan's canonical syntax. Undefined when no
+ * alternate protocol yields a dispatchable call — the ordinary plan-protocol
+ * classification then proceeds unchanged.
+ */
+export function salvageAlternateProtocolToolCalls(
+  content: string,
+  plan: ToolCallingPlan,
+): SalvagedAlternateProtocolToolCalls | undefined {
+  if (
+    !content
+    || !plan.shouldParseResponse
+    || plan.allowedToolNames.size === 0
+  ) return undefined
+
+  const toolDefinitions = new Map(plan.tools.map((tool) => [tool.name, tool]))
+  for (const protocol of getManagedProtocols()) {
+    if (protocol.id === plan.protocol) continue
+
+    const parsed = protocol.parse(content, {
+      tools: plan.tools,
+      protocol: protocol.id,
+      allowPartial: true,
+    })
+    if (parsed.toolCalls.length === 0) continue
+
+    const validCalls = parsed.toolCalls.filter((toolCall) => {
+      const name = toolCall.name ?? toolCall.function?.name
+      const argsStr = toolCall.arguments ?? toolCall.function?.arguments
+      if (!name || !plan.allowedToolNames.has(name)) return false
+      const tool = toolDefinitions.get(name)
+      let args: unknown
+      try {
+        args = JSON.parse(argsStr)
+      } catch {
+        return false
+      }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) return false
+      return getMissingRequiredArguments(args as Record<string, unknown>, tool).length === 0
+    })
+    if (validCalls.length === 0) continue
+
+    return {
+      protocol: protocol.id,
+      toolCalls: validCalls,
+      rawText: parsed.rawMatches[parsed.rawMatches.length - 1] ?? '',
+    }
+  }
+  return undefined
 }
 
 /**

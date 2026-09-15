@@ -7,7 +7,7 @@
 import type { Account, Provider } from '../../store/types'
 import type { ChatCompletionRequest } from '../types'
 import type { ManagedToolTranscriptMessage } from '../toolCalling/m365Transcript.ts'
-import { flattenManagedTranscript, flattenPlainTranscript } from '../toolCalling/m365Transcript.ts'
+import { flattenManagedTranscript, flattenPlainTranscript, renderManagedTailRestatement } from '../toolCalling/m365Transcript.ts'
 import { sessionContinuations, type ContinuationTurn } from '../toolCalling/m365SessionContinuation.ts'
 import {
   decodeAccessTokenExp,
@@ -32,6 +32,47 @@ const CONSUMER_REFRESH_SCOPE =
 
 const refreshPromiseMap = new Map<string, Promise<TokenSet>>()
 const invalidatedAccessTokenMap = new Map<string, string>()
+
+/**
+ * Tone used for managed-tool requests. The consumer wire doubles the tone
+ * field as its model/mode selector, so deployments can opt into a
+ * reasoning-mode tone (cramt/m365-copilot-proxy benches 'Gpt_5_6_Reasoning'
+ * at near-100% fence compliance vs the chat tones' non-determinism) without
+ * a code change. Default keeps the validated 'Assist' persona.
+ */
+export function m365ManagedToneFromEnv(): string {
+  const raw = process.env.CHAT2API_M365_MANAGED_TONE
+  if (raw === undefined || raw.trim() === '') return 'Assist'
+  return raw.trim()
+}
+
+/**
+ * Managed workflow continuation budget (mirrors the zai/qwen default of 1):
+ * when a managed-tool turn finishes without any tool call while the active
+ * user request still needs work, the answer is a confabulation ("I can't
+ * access…" / false completion claims) and gets ONE forceful same-conversation
+ * re-prompt before being delivered as-is. Zero disables.
+ */
+export function m365WorkflowContinuationAttemptsFromEnv(): number {
+  const raw = process.env.CHAT2API_M365_WORKFLOW_CONTINUATION_ATTEMPTS
+  if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) return 1
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) return 1
+  return value
+}
+
+/** Absolute wall-clock budget across continuation rounds of one request. */
+export function m365WorkflowContinuationTimeoutMsFromEnv(): number {
+  const raw = Number(process.env.CHAT2API_M365_WORKFLOW_CONTINUATION_TIMEOUT_MS)
+  if (!Number.isFinite(raw) || raw <= 0) return 180000
+  return Math.floor(raw)
+}
+
+/** Raw branch-text logging for non-compliant managed branches (diagnostics). */
+export function m365DebugStreamEnabled(): boolean {
+  const raw = String(process.env.CHAT2API_M365_DEBUG_STREAM ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'on'
+}
 
 export interface M365ChatCredentials {
   accessToken: string
@@ -260,7 +301,9 @@ export class M365Adapter {
       const usePlainTranscript =
         !useManaged && request.messages.length > 1 && Boolean(plainText)
       text = useManaged
-        ? flattenManagedTranscript(managed!.messages)
+        ? [flattenManagedTranscript(managed!.messages), renderManagedTailRestatement(request.tools as Array<{ name?: string }>)]
+            .filter(Boolean)
+            .join('\n\n')
         : usePlainTranscript
           ? flattenPlainTranscript(request.messages as ManagedToolTranscriptMessage[])
           : plainText
@@ -272,12 +315,15 @@ export class M365Adapter {
 
     return {
       text,
-      // Managed tool calling needs the Assist persona: Magic (the default)
-      // confabulates answers instead of following the fenced-tool protocol
-      // (matches the cramt/m365-copilot-proxy observation of ~0% task
-      // compliance on Magic). Assist emits the fence reliably. Wire casing
-      // is Capitalized ('Assist'/'Magic').
-      tone: useManaged ? 'Assist' : 'magic',
+      // Managed tool calling rides the tone field, which doubles as the
+      // backend's model/mode selector on the consumer wire. 'Assist' is the
+      // validated prompt-injection persona (Magic confabulates instead of
+      // following the fenced-tool protocol — matches the cramt observation
+      // of ~0% task compliance on Magic). Deployments can point the knob at
+      // a reasoning-mode tone (e.g. 'Gpt_5_6_Reasoning', the cramt-benched
+      // near-100%-compliance mode) without a code change. Wire casing is
+      // Capitalized.
+      tone: useManaged ? m365ManagedToneFromEnv() : 'magic',
       conversationId,
       sessionId,
       started,

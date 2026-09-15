@@ -36,6 +36,12 @@ function loadTypeScriptModule(path, localModules = {}) {
           webshareProxyUrlForLog: () => undefined,
         }
       }
+      if (specifier === './adapters/qwenAiProgressIntent' || specifier === './adapters/qwenAiProgressIntent.ts') {
+        return { findManagedToolDenialClaim: () => undefined }
+      }
+      if (specifier === './toolCalling/m365Transcript' || specifier === './toolCalling/m365Transcript.ts') {
+        return { appendManagedReplayTurns: (replayText, _assistantText, nudgeContent) => replayText + '\n\n' + String(nudgeContent) }
+      }
       throw new Error(`Unexpected session bridge test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -1607,6 +1613,12 @@ function loadForwarderForBridgeTests(overrides = {}) {
         getWebshareProxyAgent: () => undefined,
         webshareProxyUrlForLog: () => undefined,
       }
+    }
+    if (specifier === './adapters/qwenAiProgressIntent' || specifier === './adapters/qwenAiProgressIntent.ts') {
+      return { findManagedToolDenialClaim: () => undefined }
+    }
+    if (specifier === './toolCalling/m365Transcript' || specifier === './toolCalling/m365Transcript.ts') {
+      return { appendManagedReplayTurns: (replayText, _assistantText, nudgeContent) => replayText + '\n\n' + String(nudgeContent) }
     }
     if (specifier.startsWith('.')) throw new Error(`Unexpected forwarder bridge import: ${specifier}`)
     return runtimeRequire(specifier)

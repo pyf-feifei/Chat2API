@@ -272,8 +272,19 @@ function hasRepeatedSnapshotPrefix(prefix: string, value: unknown): boolean {
 }
 
 export function unwrapCdata(value: string): string {
-  const cdata = value.match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/)
-  return cdata ? cdata[1] : value
+  const start = value.search(/\S/)
+  if (start === -1 || !value.startsWith('<![CDATA[', start)) return value
+
+  // A wrapped parameter body may be split across adjacent CDATA sections
+  // (a literal "]]>" cannot live inside one section, so models break the
+  // value at the "]]><![CDATA[" junction), and a cut stream can leave the
+  // final section unterminated. Strip the protocol boundaries and keep the
+  // text between them: a "]]>" that is not part of a junction or the final
+  // closer is embedded data (e.g. echoed tool-result text) and must survive.
+  let body = value.slice(start + 9)
+  body = body.split(']]><![CDATA[').join('')
+  body = body.replace(/\]\]>\s*$/, '')
+  return body
 }
 
 export function decodeXml(value: string): string {

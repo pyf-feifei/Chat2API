@@ -21,8 +21,10 @@ import { DeepSeekAdapter } from './adapters/deepseek'
 import { DeepSeekStreamHandler } from './adapters/deepseek-stream'
 import { GLMAdapter, GLMStreamHandler } from './adapters/glm'
 import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
-import { M365Adapter } from './adapters/m365'
+import { M365Adapter, m365DebugStreamEnabled, m365WorkflowContinuationAttemptsFromEnv, m365WorkflowContinuationTimeoutMsFromEnv } from './adapters/m365'
 import { isM365AuthIssue, isM365QuotaWall, m365FailureClassification } from './m365FailoverClassification'
+import { appendManagedReplayTurns } from './toolCalling/m365Transcript.ts'
+import { findManagedToolDenialClaim } from './adapters/qwenAiProgressIntent'
 import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
 import {
@@ -46,7 +48,7 @@ import type {
   QwenAiTranscriptTransportPolicy,
   QwenAiTransportProbe,
 } from './adapters/qwen-ai-files'
-import { ZaiAdapter, ZaiStreamHandler, zaiWorkflowContinuationAttemptsFromEnv, zaiWorkflowContinuationTimeoutMsFromEnv } from './adapters/zai'
+import { ZaiAdapter, ZaiStreamHandler, classifyZaiManagedAnswer, zaiWorkflowContinuationAttemptsFromEnv, zaiWorkflowContinuationTimeoutMsFromEnv } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
@@ -740,6 +742,14 @@ function qwenAiStreamPreflightMaxHoldMsFromEnv(): number | undefined {
   return Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647
     ? value
     : undefined
+}
+
+function qwenAiReplayTailBytesFromEnv(): number {
+  const fallback = 0 // 0 = disable slimming (full replay)
+  const raw = process.env.CHAT2API_QWEN_AI_REPLAY_TAIL_BYTES
+  if (raw === undefined || raw.trim() === '') return fallback
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value >= 0 ? value : fallback
 }
 
 function validatedSseMaxHoldMsFromEnv(): number {
@@ -2436,7 +2446,6 @@ export class RequestForwarder {
       const toolStreamParser = transformed.plan.shouldParseResponse
         ? new ToolStreamParser(transformed.plan)
         : undefined
-      let sentManagedRole = false
       const { ChatHubClient } = await import(
         '../providers/builtin/m365/chathub/client.ts'
       )
@@ -2454,9 +2463,27 @@ export class RequestForwarder {
         // A destroyed stream (protocol-leak failure) must not crash the
         // process on write-after-destroy; surface the error to the client.
         passThrough.on('error', () => {})
+        // Managed tool calling runs branch-buffered (cramt/m365-copilot-proxy
+        // parity): the branch stays off the wire until its COMPLETE text has
+        // been classified, because this backend's chat tones answer tool
+        // prompts with ever-varying capability-denial prose — a denial that
+        // already streamed cannot be recovered without duplicating text on
+        // the wire. Non-managed requests keep incremental streaming.
         let streamed = false
+        let streamWritten = false
         let streamFinished = false
         let streamedText = ''
+        let branchText = ''
+        let branchParser: ToolStreamParser | undefined = toolStreamParser ?? undefined
+        let branchOuts: any[] = []
+        let branchRoleSent = false
+        const startBranch = (): void => {
+          branchParser = toolStreamParser ? new ToolStreamParser(transformed.plan) : undefined
+          branchOuts = []
+          branchRoleSent = false
+          branchText = ''
+        }
+        startBranch()
         const onDelta = (delta: unknown): void => {
           // The ChatHub handler emits structured StreamEvents ({kind,text,…});
           // OpenAI clients expect plain string content chunks. When managed
@@ -2471,15 +2498,17 @@ export class RequestForwarder {
           if (!text) return
           streamed = true
           streamedText += text
+          branchText += text
           const baseChunk = adapter.transformStreamChunk({ text }, actualModel)
-          const outs = toolStreamParser
-            ? toolStreamParser.push(text, baseChunk, !sentManagedRole)
-            : [baseChunk]
-          if (!outs || outs.length === 0) return
-          sentManagedRole = true
-          for (const chunk of outs) {
-            passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+          if (!branchParser) {
+            streamWritten = true
+            passThrough.write(`data: ${JSON.stringify(baseChunk)}\n\n`)
+            return
           }
+          const outs = branchParser.push(text, baseChunk, !branchRoleSent)
+          if (!outs || outs.length === 0) return
+          branchRoleSent = true
+          branchOuts.push(...outs)
         }
         const finishStream = (): void => {
           if (streamFinished) return
@@ -2505,8 +2534,8 @@ export class RequestForwarder {
               finish_reason: null,
             }],
           }
-          if (toolStreamParser) {
-            const protoError = toolStreamParser.getProtocolError()
+          if (branchParser) {
+            const protoError = branchParser.getProtocolError()
             if (protoError) {
               // Fail loudly rather than emitting a clean-looking empty answer;
               // matches the kimi/deepseek wrapper-leak handling.
@@ -2514,7 +2543,11 @@ export class RequestForwarder {
               passThrough.destroy(protoError)
               return
             }
-            for (const chunk of toolStreamParser.flush(skeletonChunk)) {
+            streamWritten = true
+            for (const chunk of branchOuts) {
+              passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+            }
+            for (const chunk of branchParser.flush(skeletonChunk)) {
               passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
             }
           }
@@ -2523,15 +2556,61 @@ export class RequestForwarder {
             choices: [{
               index: 0,
               delta: {},
-              finish_reason: toolStreamParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop',
+              finish_reason: branchParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop',
             }],
           }
           passThrough.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
           passThrough.write('data: [DONE]\n\n')
           passThrough.end()
         }
+        const failClientStream = (code: string, message: string): void => {
+          // Nothing was delivered yet, so the client must see a typed failure
+          // instead of an empty answer with finish_reason 'stop' — an empty
+          // success ends agentic clients' turns silently. An explicit error
+          // chunk with no finish_reason makes the Responses translator emit
+          // `response.failed`, so codex-class clients discard and retry while
+          // account rotation / token recovery runs its course (mirrors the
+          // zai mid-stream failure contract).
+          if (streamFinished) return
+          streamFinished = true
+          console.error('[M365Copilot] failing client stream before any content:', JSON.stringify({ code }))
+          passThrough.write(
+            `data: ${JSON.stringify({
+              id: `chatcmpl-${Date.now()}`,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: actualModel,
+              error: { code, message, param: null, type: 'upstream_error' },
+            })}\n\n`,
+          )
+          passThrough.write('data: [DONE]\n\n')
+          passThrough.end()
+        }
         const startChat = (creds: { accessToken: string; oid: string; tid: string }) =>
           client.chat(creds, chatRequest, onDelta)
+        const startChatWithNudge = (
+          replayText: string,
+        ): ReturnType<typeof startChat> =>
+          // Fresh-conversation replay, not a same-conversation follow-up:
+          // re-invoking a managed conversation a second time was observed to
+          // return an empty upstream stream regardless of tone, nudge text,
+          // or settle delay (live-isolated 2026-09-13), while first
+          // invocations reliably answer. The replay carries the full
+          // managed transcript plus the non-compliant assistant turn and the
+          // continuation nudge, so no server-side conversation state is
+          // required (zai/qwen fresh-chat replay parity).
+          client.chat(chatHubAccount, {
+            ...chatRequest,
+            text: replayText,
+            conversationId: undefined,
+            sessionId: undefined,
+            started: true,
+          }, onDelta)
+        // Replay base for fresh-conversation continuation rounds: the
+        // original managed transcript, grown by each non-compliant assistant
+        // turn and its structured nudge (see startChatWithNudge).
+        let replayText = transformedRequest.text
+        let continuationAttemptsUsed = 0
         const recordContinuation = (result: { conversationId?: string; sessionId?: string; text?: string }): void => {
           // Only remember turns that produced content, so failed/empty chats
           // never poison the prefix-match for the next request.
@@ -2546,11 +2625,109 @@ export class RequestForwarder {
         }
         const runChat = async (): Promise<void> => {
           try {
-            const chatResult = await startChat(chatHubAccount)
+            let chatResult = await startChat(chatHubAccount)
+            // Managed workflow continuation on a branch-buffered stream: a
+            // managed-tool branch that finishes WITHOUT any tool call while
+            // the protocol prompt demanded action is a confabulated answer
+            // (capability denial, prose narration, or a false completion
+            // claim) — this backend's chat model emits those with endlessly
+            // varying phrasing, so the branch is classified COMPLETE (never
+            // mid-stream) and discarded off-wire when it is non-compliant,
+            // then re-prompted in the same conversation. The structured
+            // classifier is plan-protocol-driven and shared with the zai
+            // path; the denial detector is the shared intent component with
+            // deployment-tunable patterns.
+            if (branchParser && transformed.plan.shouldParseResponse) {
+              const continuationAttemptsLimit = m365WorkflowContinuationAttemptsFromEnv()
+              const continuationDeadlineAt = Date.now() + m365WorkflowContinuationTimeoutMsFromEnv()
+              while (Date.now() < continuationDeadlineAt) {
+                const verdict = classifyZaiManagedAnswer(branchText, transformed.plan)
+                // Cap-free denial locator, not the 300-codepoint capped
+                // classifier: this branch is already COMPLETE and parsed to
+                // zero tool calls, so the cap's stream-economy purpose does
+                // not apply, and the observed live failure (2026-09-13,
+                // 331-char Chinese "I cannot see your local files" first
+                // turn) sits past the cap. A match forces the re-prompt to
+                // demand the concrete tool call instead of offering the
+                // final-answer+marker alternative, which a denial model would
+                // satisfy by restating the denial with the marker appended.
+                // Deployment-tunable / disable via
+                // CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS=off.
+                const denial = Boolean(findManagedToolDenialClaim(branchText.trim()))
+                // The daily-quota wall arrives as ordinary answer text and can
+                // land on ANY branch (observed 2026-09-14: it replaced the
+                // final continuation replay). It is terminal for this account
+                // — re-prompting only burns the continuation budget — so fail
+                // immediately with the quota code; codex-class clients retry
+                // and the load balancer rotates to an account that still has
+                // quota.
+                if (isM365QuotaWall(branchText)) {
+                  console.warn('[M365Copilot] daily chat limit surfaced on a managed branch', JSON.stringify({
+                    accountId: account.id,
+                    attempt: continuationAttemptsUsed,
+                  }))
+                  failClientStream(
+                    'm365_quota_wall',
+                    'M365 daily chat limit reached for this account; retry to rotate accounts',
+                  )
+                  return
+                }
+                if (!verdict.continuation && !denial) break
+                if (continuationAttemptsUsed >= continuationAttemptsLimit) {
+                  // Recovery budget exhausted on a dangling branch: delivering
+                  // the denial/confabulation would end the agent turn on a
+                  // wrong answer, so fail the client stream for a client-side
+                  // retry (zai exhausted-recovery contract).
+                  console.error('[M365Copilot] managed workflow recovery exhausted; failing the client stream', JSON.stringify({
+                    reason: verdict.reason,
+                    denial,
+                    attempts: continuationAttemptsUsed,
+                  }))
+                  if (m365DebugStreamEnabled()) {
+                    console.error('[M365Copilot] exhausted final branch raw text', JSON.stringify(branchText.slice(0, 4000)))
+                  }
+                  failClientStream(
+                    'm365_workflow_recovery_exhausted',
+                    `managed-tool answer stayed non-compliant (${denial ? 'capability denial' : verdict.reason}) after ${continuationAttemptsUsed} re-prompt(s); retry the request`,
+                  )
+                  return
+                }
+                const nudge = createToolWorkflowContinuationMessage({
+                  activeUserRequest: extractLatestActiveUserRequest(request.messages as any),
+                  completionProofMissing: verdict.completionProofMissing
+                    && transformed.plan.failedToolResultPending !== true,
+                  failedToolResultPending: transformed.plan.failedToolResultPending === true,
+                  requireManagedToolCall: verdict.requireManagedToolCall
+                    || denial
+                    || transformed.plan.hasLiveToolWorkflow === true,
+                  plan: transformed.plan,
+                })
+                continuationAttemptsUsed += 1
+                console.warn('[M365Copilot] managed branch non-compliant; re-prompting via fresh-conversation replay', JSON.stringify({
+                  reason: verdict.reason,
+                  denial,
+                  attempt: continuationAttemptsUsed,
+                  limit: continuationAttemptsLimit,
+                }))
+                if (m365DebugStreamEnabled()) {
+                  console.warn('[M365Copilot] non-compliant branch raw text', JSON.stringify(branchText.slice(0, 4000)))
+                }
+                replayText = appendManagedReplayTurns(replayText, branchText, nudge.content)
+                startBranch()
+                chatResult = await startChatWithNudge(replayText)
+              }
+            }
+            if (m365DebugStreamEnabled()) {
+              console.warn('[M365Copilot] final branch raw text', JSON.stringify({
+                chars: branchText.length,
+                emittedToolCall: branchParser?.hasEmittedToolCall() === true,
+                text: branchText.slice(-4000),
+              }))
+            }
             recordContinuation(chatResult)
             finishStream()
           } catch (error) {
-            if (!streamed && isM365AuthIssue(error)) {
+            if (!streamWritten && isM365AuthIssue(error)) {
               console.warn(
                 '[M365Copilot] stream auth failure, retrying once with refreshed token:',
                 error instanceof Error ? error.message : error,
@@ -2558,6 +2735,7 @@ export class RequestForwarder {
               adapter.invalidateAccessToken(chatHubAccount.accessToken)
               try {
                 const refreshed = await adapter.acquireCredentials(true)
+                startBranch()
                 const retryResult = await startChat({
                   accessToken: refreshed.accessToken,
                   oid: refreshed.oid,
@@ -2578,11 +2756,25 @@ export class RequestForwarder {
                   account.id,
                   provider.id,
                 )
+                if (!streamed) {
+                  failClientStream(
+                    'm365_stream_auth_failed',
+                    `M365 upstream authentication failed after token refresh: ${retryError instanceof Error ? retryError.message : String(retryError)}`,
+                  )
+                  return
+                }
                 finishStream()
                 return
               }
             }
             console.error('[M365Copilot] ChatHub stream error:', error)
+            if (!streamed) {
+              failClientStream(
+                'm365_stream_failed',
+                `M365 upstream stream failed before any content: ${error instanceof Error ? error.message : String(error)}`,
+              )
+              return
+            }
             finishStream()
           }
         }
@@ -4239,10 +4431,36 @@ export class RequestForwarder {
         recoverySignal?: AbortSignal,
       ) => {
         const currentChatId = activeChatId || chatId
+        const replayTailBytes = qwenAiReplayTailBytesFromEnv()
+        let replayMessages = transformed.messages as ChatCompletionRequest['messages']
+
+        // Replay slimming: use head+tail instead of full history when configured
+        if (replayTailBytes > 0 && replayMessages.length > 2) {
+          const originalCount = replayMessages.length
+          const headMessages = replayMessages.slice(0, 2) // System + first user message
+          let tailBytes = 0
+          const tailMessages: ChatCompletionRequest['messages'] = []
+
+          // Build tail from end, respecting byte limit
+          for (let i = replayMessages.length - 1; i >= 2; i--) {
+            const msg = replayMessages[i]
+            const msgBytes = JSON.stringify(msg).length
+            if (tailBytes + msgBytes > replayTailBytes) break
+            tailBytes += msgBytes
+            tailMessages.unshift(msg)
+          }
+
+          replayMessages = [...headMessages, ...tailMessages]
+          console.warn('[QwenAI] Fresh-chat replay slimmed to head+tail', JSON.stringify({
+            originalCount,
+            slimmedCount: replayMessages.length,
+            tailBytes,
+            limit: replayTailBytes,
+          }))
+        }
+
         const restarted = await adapter.chatCompletion({
-          ...createChatCompletionRequest(
-            transformed.messages as ChatCompletionRequest['messages'],
-          ),
+          ...createChatCompletionRequest(replayMessages),
           signal: recoverySignal || context?.signal,
         })
         activeChatId = restarted.chatId
@@ -4328,9 +4546,37 @@ export class RequestForwarder {
                   const replayMessages = transformed.plan.workflowContinuation
                     ? transformed.messages.slice(0, -1)
                     : transformed.messages
+
+                  // Apply replay slimming to workflow continuation fresh chat restart
+                  const replayTailBytes = qwenAiReplayTailBytesFromEnv()
+                  let slimmedReplayMessages = replayMessages
+                  if (replayTailBytes > 0 && replayMessages.length > 2) {
+                    const originalCount = replayMessages.length
+                    const headMessages = replayMessages.slice(0, 2) // System + first user message
+                    let tailBytes = 0
+                    const tailMessages: ChatCompletionRequest['messages'] = []
+
+                    // Build tail from end, respecting byte limit
+                    for (let i = replayMessages.length - 1; i >= 2; i--) {
+                      const msg = replayMessages[i]
+                      const msgBytes = JSON.stringify(msg).length
+                      if (tailBytes + msgBytes > replayTailBytes) break
+                      tailBytes += msgBytes
+                      tailMessages.unshift(msg)
+                    }
+
+                    slimmedReplayMessages = [...headMessages, ...tailMessages]
+                    console.warn('[QwenAI] Workflow continuation fresh-chat replay slimmed to head+tail', JSON.stringify({
+                      originalCount,
+                      slimmedCount: slimmedReplayMessages.length,
+                      tailBytes,
+                      limit: replayTailBytes,
+                    }))
+                  }
+
                   const restarted = await adapter.chatCompletion({
                     ...createChatCompletionRequest([
-                      ...replayMessages,
+                      ...slimmedReplayMessages,
                       workflowContinuationMessage!,
                     ] as ChatCompletionRequest['messages']),
                     signal: recoverySignal || context?.signal,

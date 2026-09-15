@@ -17,6 +17,7 @@ import {
 } from '../utils/streamToolHandler'
 import { getProviderToolProfile, type ProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
+import { RepetitionLoopDetector, detectRepetitionLoopInText, type RepetitionLoopDetectorOptions } from '../toolCalling/RepetitionLoopDetector'
 import { getToolProtocol, hasRejectedToolCallBlock } from '../toolCalling/protocols'
 import { isColonTerminatedShortAnswer, isProgressStyleManagedAnswer, isToolDenialManagedAnswer } from './qwenAiProgressIntent.ts'
 import { isClientCancellationError } from '../utils/errors'
@@ -26,6 +27,7 @@ import {
 } from '../toolCalling/workflowCompletion'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
+import { zaiTranscriptTail } from './zaiTranscript'
 import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-captcha-solver'
 import { checkoutWebshareProxyAgent, webshareProxyUrlForLog } from '../webshareProxy'
 
@@ -75,6 +77,38 @@ export function zaiWorkflowContinuationTimeoutMsFromEnv(): number {
 function zaiStreamIdleTimeoutMsFromEnv(): number {
   const raw = Number(process.env.CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS)
   if (!Number.isFinite(raw) || raw < 0) return 180000
+  return Math.floor(raw)
+}
+
+/**
+ * Degenerate-output guards for Z.ai answers. A repetition loop (healthy
+ * streams keep flowing, so the idle watchdog cannot catch it) or an answer
+ * beyond the hard char cap aborts the upstream stream and routes to the
+ * same recovery path as the idle watchdog. 0/false disables a guard.
+ */
+function zaiLoopDetectionEnabledFromEnv(): boolean {
+  return zaiBooleanEnv('CHAT2API_ZAI_LOOP_DETECTION', true)
+}
+
+function zaiLoopDetectorOptionsFromEnv(): Partial<RepetitionLoopDetectorOptions> {
+  const numeric = (name: string, fallback: number): number | undefined => {
+    const raw = Number(process.env[name])
+    if (!Number.isFinite(raw) || raw <= 0) return undefined
+    return Math.floor(raw)
+  }
+  return {
+    exactRepeatThreshold: numeric('CHAT2API_ZAI_LOOP_EXACT_REPEATS', 8),
+    normalizedRepeatThreshold: numeric('CHAT2API_ZAI_LOOP_NORMALIZED_REPEATS', 10),
+    windowChars: numeric('CHAT2API_ZAI_LOOP_WINDOW_CHARS', 4000),
+    minPeriodChars: numeric('CHAT2API_ZAI_LOOP_MIN_PERIOD_CHARS', 24),
+    maxPeriodChars: numeric('CHAT2API_ZAI_LOOP_MAX_PERIOD_CHARS', 300),
+    checkIntervalChars: numeric('CHAT2API_ZAI_LOOP_CHECK_INTERVAL_CHARS', 512),
+  }
+}
+
+function zaiMaxAnswerCharsFromEnv(): number {
+  const raw = Number(process.env.CHAT2API_ZAI_MAX_ANSWER_CHARS)
+  if (!Number.isFinite(raw) || raw < 0) return 200000
   return Math.floor(raw)
 }
 
@@ -233,13 +267,7 @@ function renderZaiTranscript(messages: ZaiMessage[]): string {
     .join('\n')
 }
 
-function zaiTranscriptTail(transcript: string, maxBytes: number): string {
-  const buf = Buffer.from(transcript, 'utf8')
-  if (buf.byteLength <= maxBytes) return transcript
-  return buf.subarray(buf.byteLength - maxBytes).toString('utf8')
-}
-
-/** Flatten managed tool history into the provider tool profile wire format. */
+export /** Flatten managed tool history into the provider tool profile wire format. */
 function normalizeZaiToolMessage(msg: any, toolProfile: ProviderToolProfile): ZaiMessage {
   if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
     return {
@@ -1510,13 +1538,13 @@ function classifyZaiManagedAnswer(
     // wire-format call.
     return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'fenced_tool_argument_json' }
   }
-  const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
-  if (!midWorkflow) {
-    // Rejected protocol blocks already returned as 'rejected_tool_call_block'
-    // above; nothing reaches this branch with rawMatches left to inspect.
-    if (plan.toolChoiceMode === 'auto') return zaiManagedAnswerIdle('first_turn_auto_answer')
-    if (trimmed.length > 0) return zaiManagedAnswerIdle('first_turn_answer')
-  }
+  // Completion-proof gate BEFORE the first-turn fall-throughs below. Plans
+  // whose protocol requires the marker must never classify a marker-less,
+  // tool-call-less answer as deliverable — not on continuation turns and not
+  // on the first turn. Observed live 2026-09-13 (m365 gpt-5.6-luna first turn
+  // via codex): the first_turn_auto_answer fall-through delivered a denial
+  // confabulation and ended the agent turn. Protocols without marker support
+  // (managed_xml) skip this branch, so zai behavior is unchanged.
   if (requiresManagedWorkflowCompletionMarker(plan) && !hasManagedWorkflowCompletionMarker(content, plan)) {
     if (plan.hasLiveToolWorkflow === true) {
       // See the class-level comment: substantive marker-less finals are
@@ -1524,6 +1552,13 @@ function classifyZaiManagedAnswer(
       return zaiManagedAnswerIdle('completion_marker_missing_live_workflow')
     }
     return { continuation: true, completionProofMissing: true, requireManagedToolCall: false, reason: 'completion_marker_missing_short_answer' }
+  }
+  const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
+  if (!midWorkflow) {
+    // Rejected protocol blocks already returned as 'rejected_tool_call_block'
+    // above; nothing reaches this branch with rawMatches left to inspect.
+    if (plan.toolChoiceMode === 'auto') return zaiManagedAnswerIdle('first_turn_auto_answer')
+    if (trimmed.length > 0) return zaiManagedAnswerIdle('first_turn_answer')
   }
   return zaiManagedAnswerIdle('answer_delivered')
 }
@@ -1683,6 +1718,15 @@ export class ZaiStreamHandler {
     let continuationInFlight = false
     let continuationSeq = 0
     let idleTimer: NodeJS.Timeout | undefined
+    // Degenerate-output guards: a repetition loop streams continuously (the
+    // idle watchdog cannot fire) and grows far past any stall classifier's
+    // length rules, so it needs its own detector plus a hard answer cap.
+    const loopDetectionEnabled = zaiLoopDetectionEnabledFromEnv()
+    const maxAnswerChars = zaiMaxAnswerCharsFromEnv()
+    const createLoopDetector = () =>
+      loopDetectionEnabled ? new RepetitionLoopDetector(zaiLoopDetectorOptionsFromEnv()) : undefined
+    let branchLoopDetector = createLoopDetector()
+    let currentUpstreamStream: { destroy?: () => void } | undefined
 
     const stopIdleTimer = () => {
       if (idleTimer) {
@@ -1776,6 +1820,7 @@ export class ZaiStreamHandler {
     }
 
     const attachUpstream = (upstreamStream: any) => {
+      currentUpstreamStream = upstreamStream
       const branchParser = createParser({ onEvent: handleEvent })
       upstreamStream.on('data', (buffer: Buffer) => {
         if (clientEnded || continuationInFlight) return
@@ -1828,6 +1873,7 @@ export class ZaiStreamHandler {
         }))
         if (started.chatId && started.chatId !== this.chatId) this.setChatId(started.chatId)
         branchToolParser = this.toolCallingPlan?.shouldParseResponse ? new ToolStreamParser(this.toolCallingPlan) : undefined
+        branchLoopDetector = createLoopDetector()
         branchContentStart = this.content.length
         branchFinished = false
         attachUpstream(nextStream)
@@ -1883,6 +1929,44 @@ export class ZaiStreamHandler {
       idleTimer = setTimeout(() => handleIdleStall(idleMs), idleMs)
       // A stalled upstream must not keep the process alive by itself.
       idleTimer.unref?.()
+    }
+
+    // Degenerate-output guard fired mid-stream: the generation is actively
+    // producing junk (repetition loop) or has blown the answer cap. Kill the
+    // upstream immediately — every further token is waste — then recover the
+    // same way the idle watchdog does: continuation replay when configured,
+    // an explicit failed client stream (client retries) when exhausted, and
+    // the legacy notice-plus-stop only when recovery is absent entirely.
+    const handleDegenerateOutput = (reason: string, evidence?: unknown) => {
+      if (clientEnded || branchFinished || continuationInFlight) return
+      branchFinished = true
+      stopIdleTimer()
+      try { currentUpstreamStream?.destroy?.() } catch {}
+      console.error('[Z.ai] Degenerate output detected; aborting upstream stream', JSON.stringify({
+        reason,
+        evidence,
+        contentLength: this.content.length,
+        lastMessageId: this.lastMessageId,
+      }))
+      const branchContent = this.content.slice(branchContentStart)
+      void (async () => {
+        if (this.toolCallingPlan?.shouldParseResponse && this.continuation) {
+          const verdict = {
+            continuation: true,
+            completionProofMissing: false,
+            requireManagedToolCall: this.toolCallingPlan?.hasLiveToolWorkflow === true,
+            reason,
+          } as ZaiManagedAnswerVerdict
+          const attached = await attemptContinuation(verdict, branchContent, '')
+          if (clientEnded) return
+          if (!attached) {
+            failStreamAfterExhaustedRecovery(reason)
+          }
+          return
+        }
+        writeVisibleNotice(`\n\n[Z.ai] Degenerate upstream output detected (${reason}); ending the response.`)
+        finishStream('stop')
+      })()
     }
 
     const handleDone = (result: any) => {
@@ -1943,7 +2027,7 @@ export class ZaiStreamHandler {
       finishStream(emittedToolCalls ? 'tool_calls' : 'stop', usage)
     }
 
-    const handleUpstreamError = (result: any, data: any) => {
+    const handleUpstreamError = async (result: any, data: any) => {
       if (branchFinished || clientEnded) return
       branchFinished = true
       stopIdleTimer()
@@ -1951,25 +2035,40 @@ export class ZaiStreamHandler {
       console.error('[Z.ai] Stream error:', error)
       console.error('[Z.ai] Stream error event (full):', JSON.stringify(data))
       if (isCaptchaRequiredError(error) && !clientEnded) {
-        console.log('[Z.ai] Captcha required detected in stream, attempting auto-solve...')
+        // A mid-stream captcha challenge cannot be retried transparently
+        // (partial content is already on the wire), but the turn must not end
+        // as a normal completion: a placeholder answer ends the agent turn and
+        // interactive-class clients stop instead of retrying. Hold the client
+        // stream open while the solve runs (Responses progress events keep the
+        // client patient), then fail with an explicit error chunk — the client
+        // retries and the refreshed captcha param passes the next admission.
+        console.log('[Z.ai] Captcha required detected in stream; solving, then failing the client stream for a client-side retry...')
+        const acctId = this.accountId || ''
+        const acctToken = this.accountToken || ''
+        const solveResult = acctId && acctToken
+          ? await solveCaptchaAndUpdateAccount(acctId, acctToken).catch((solveErr) => {
+              console.error('[Z.ai] Mid-stream captcha solve error:', solveErr)
+              return false
+            })
+          : false
+        console.log('[Z.ai] Mid-stream captcha solve result:', solveResult ? 'success' : 'failed')
+        if (clientEnded) return
+        writeVisibleNotice('\n\n[Z.ai] Upstream requested captcha re-verification mid-answer; failing this turn so the request can be retried.')
         transStream.write(
           `data: ${JSON.stringify({
             id: this.chatId,
             model: this.model,
             object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: { content: '\n[Captcha required - auto-solving, please retry your request...]' }, finish_reason: 'stop' }],
-            created: this.created,
+            error: {
+              code: 'zai_captcha_reverify_required',
+              message: 'upstream requested captcha re-verification mid-answer; retry the request',
+              param: null,
+              type: 'upstream_error',
+            },
           })}\n\n`
         )
         safeEnd('data: [DONE]\n\n')
-        // Trigger background captcha solve
-        const acctId = this.accountId || ''
-        const acctToken = this.accountToken || ''
-        if (acctId && acctToken) {
-          solveCaptchaAndUpdateAccount(acctId, acctToken).then(ok => {
-            console.log('[Z.ai] Background captcha solve result:', ok ? 'success' : 'failed')
-          }).catch(e => console.error('[Z.ai] Background captcha solve error:', e))
-        }
+        notifyEnd()
       } else {
         transStream.write(
           `data: ${JSON.stringify({
@@ -2039,6 +2138,20 @@ export class ZaiStreamHandler {
           if (!cleanedContent) return
           this.content += cleanedContent
 
+          // Degenerate-output guards run before delivery: when they fire the
+          // current delta is junk by definition and must not reach the client.
+          if (branchLoopDetector) {
+            const loopEvidence = branchLoopDetector.push(cleanedContent)
+            if (loopEvidence) {
+              handleDegenerateOutput('upstream_repetition_loop', loopEvidence)
+              return
+            }
+          }
+          if (maxAnswerChars > 0 && this.content.length - branchContentStart > maxAnswerChars) {
+            handleDegenerateOutput('answer_length_cap', { branchContentChars: this.content.length - branchContentStart, cap: maxAnswerChars })
+            return
+          }
+
           // Process tool call interception
           const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
           const outputChunks = branchToolParser
@@ -2096,6 +2209,10 @@ export class ZaiStreamHandler {
       }
 
       let resolved = false
+      // Set while a mid-answer captcha solve is in flight; the timeout and
+      // socket-close fallbacks must not deliver the partial answer as a
+      // completed response during that window.
+      let captchaHold = false
       let reasoningContent = ''
       const resolveOnce = (result: any) => {
         if (resolved) return
@@ -2113,7 +2230,7 @@ export class ZaiStreamHandler {
       }
 
       setTimeout(() => {
-        if (!resolved) {
+        if (!resolved && !captchaHold) {
           console.log('[Z.ai] Non-stream timeout, resolving with current data, content length:', data.choices[0].message.content.length)
           resolveOnce(data)
         }
@@ -2154,6 +2271,32 @@ export class ZaiStreamHandler {
                 data.choices[0].message.content += cleanSearchCitationsWithBuffer(result.delta_content, answerBuffer)
               } else if (result.phase === 'done' && result.done) {
                 console.log('[Z.ai] Non-stream finished, content length:', data.choices[0].message.content.length)
+                // Same degenerate-output guards as the streaming path: a
+                // completed answer that is a repetition loop (or beyond the
+                // hard cap) must surface as an error so the client retries
+                // instead of consuming the junk as a final answer.
+                const loopEvidence = zaiLoopDetectionEnabledFromEnv()
+                  ? detectRepetitionLoopInText(data.choices[0].message.content, zaiLoopDetectorOptionsFromEnv())
+                  : null
+                if (loopEvidence) {
+                  console.error('[Z.ai] Non-stream repetition loop detected; failing the response', JSON.stringify({
+                    reason: 'upstream_repetition_loop',
+                    evidence: loopEvidence,
+                    contentLength: data.choices[0].message.content.length,
+                  }))
+                  rejectOnce(new Error('zai_repetition_loop_detected'))
+                  return
+                }
+                const maxAnswerChars = zaiMaxAnswerCharsFromEnv()
+                if (maxAnswerChars > 0 && data.choices[0].message.content.length > maxAnswerChars) {
+                  console.error('[Z.ai] Non-stream answer exceeded the length cap; failing the response', JSON.stringify({
+                    reason: 'answer_length_cap',
+                    contentLength: data.choices[0].message.content.length,
+                    cap: maxAnswerChars,
+                  }))
+                  rejectOnce(new Error('zai_answer_length_cap_exceeded'))
+                  return
+                }
                 if (result.usage) {
                   data.usage = result.usage
                 }
@@ -2162,18 +2305,27 @@ export class ZaiStreamHandler {
                 const error = result.error || eventData.error
                 console.error('[Z.ai] Non-stream error event (full):', JSON.stringify(eventData))
                 if (isCaptchaRequiredError(error)) {
-                  console.log('[Z.ai] Captcha required detected in non-stream, attempting auto-solve...')
+                  // Same contract as the streaming path: the account gets
+                  // refreshed, but the response fails instead of returning a
+                  // placeholder masquerading as a completed answer — the
+                  // client retries and the fresh param passes admission.
+                  captchaHold = true
+                  console.log('[Z.ai] Captcha required detected in non-stream; solving, then failing the response for a client-side retry...')
                   const acctId = this.accountId || ''
                   const acctToken = this.accountToken || ''
-                  if (acctId && acctToken) {
-                    solveCaptchaAndUpdateAccount(acctId, acctToken).then(ok => {
-                      console.log('[Z.ai] Non-stream captcha solve result:', ok ? 'success' : 'failed')
-                    }).catch(e => console.error('[Z.ai] Non-stream captcha solve error:', e))
-                  }
-                  data.choices[0].message.content += '\n[Captcha required - auto-solving, please retry your request]'
-                } else {
-                  data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
+                  void (async () => {
+                    const solveResult = acctId && acctToken
+                      ? await solveCaptchaAndUpdateAccount(acctId, acctToken).catch((solveErr) => {
+                          console.error('[Z.ai] Non-stream captcha solve error:', solveErr)
+                          return false
+                        })
+                      : false
+                    console.log('[Z.ai] Non-stream captcha solve result:', solveResult ? 'success' : 'failed')
+                    rejectOnce(new Error('zai_captcha_reverify_required: upstream requested captcha re-verification mid-answer; retry the request'))
+                  })()
+                  return
                 }
+                data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
                 resolveOnce(data)
               }
             } catch (err) {
@@ -2186,6 +2338,10 @@ export class ZaiStreamHandler {
         streamData.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
         streamData.once('error', rejectOnce)
         streamData.once('close', () => {
+          if (captchaHold) {
+            console.log('[Z.ai] Non-stream closed during captcha solve; waiting for the solve to settle the response')
+            return
+          }
           console.log('[Z.ai] Non-stream closed, resolving with current data, content length:', data.choices[0].message.content.length)
           resolveOnce(data)
         })

@@ -9,6 +9,7 @@
  * calls/results — is serialized into that single field here.
  */
 import { getProviderToolProfile } from './providerProfiles.ts'
+import { MANAGED_WORKFLOW_COMPLETE_MARKER } from './workflowCompletion.ts'
 
 export interface ManagedToolTranscriptMessage {
   role: string
@@ -106,4 +107,47 @@ export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[
     ? [...systemBlocks, ...blocks]
     : blocks
   return ordered.join('\n\n')
+}
+
+/**
+ * Turn-local contract restatement appended AFTER the user turn in the
+ * flattened transcript. The teaching contract sits at the very start of the
+ * blob while the active request sits at the end, and the consumer model was
+ * observed live (2026-09-13, gpt-5.6-luna) misreading the contract as
+ * "tools the USER described" instead of its own environment — then answering
+ * with capability-denial prose. Restating the declared tool names next to the
+ * active request re-anchors the contract at maximum recency, mirroring the
+ * continuation-reminder concept the qwen/zai engines use mid-workflow. Tool
+ * names derive from the client request; nothing is hardcoded.
+ */
+export function renderManagedTailRestatement(tools: Array<{ name?: string }>): string {
+  const names = tools.map((t) => t?.name).filter((n): n is string => Boolean(n))
+  if (names.length === 0) return ''
+  return [
+    'Tool contract reminder: the tools available in this conversation are exactly these - '
+      + names.join(', ')
+      + ' - and no others.',
+    'To use one, emit a single ```tool_name code fence with its arguments and stop; never simulate, describe, or fabricate tool output.',
+    'When the work is done, give the final answer in natural language ending with ' + MANAGED_WORKFLOW_COMPLETE_MARKER + '.',
+  ].join(' ')
+}
+
+/**
+ * Append a continuation round to the flattened transcript for fresh-conversation
+ * replay: the non-compliant assistant turn, then the structured nudge as the
+ * next user turn. Role labels come from the same `[role]` format the
+ * flattener uses above — the transcript shape is owned here, not by callers.
+ */
+export function appendManagedReplayTurns(
+  baseText: string,
+  assistantText: string,
+  nudgeText: string,
+): string {
+  const trimmed = assistantText.trim()
+  if (!trimmed) return baseText
+  return [
+    baseText,
+    `[assistant]\n${trimmed}`,
+    `[user]\n${nudgeText}`,
+  ].join('\n\n')
 }

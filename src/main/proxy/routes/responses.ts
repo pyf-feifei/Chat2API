@@ -367,6 +367,17 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     }))
   }
   const requestIntent = classifyChatRequest(chatRequest)
+  if (/^1|true|on$/i.test(String(process.env.CHAT2API_RESPONSES_DEBUG_REQUEST ?? '').trim())) {
+    // Raw client-visible tool types: codex switches its shell tool to the
+    // `local_shell` Responses type for gpt-5-family model names, and any type
+    // the translator drops silently zeroes the managed tool path.
+    console.info('[Responses] raw request tools', JSON.stringify({
+      requestId: responseId,
+      tools: (request?.tools ?? []).map((tool: any) => ({ type: tool?.type, name: tool?.name ?? tool?.function?.name })),
+      tool_choice: request?.tool_choice ?? null,
+      instructionsChars: typeof request?.instructions === 'string' ? request.instructions.length : 0,
+    }))
+  }
   const estimatedInputTokens = estimateQwenAiRequestInputTokens(chatRequest)
   const messageBytes = Buffer.byteLength(JSON.stringify(chatRequest.messages), 'utf8')
   const toolSchemaBytes = Buffer.byteLength(JSON.stringify(chatRequest.tools ?? []), 'utf8')

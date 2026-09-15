@@ -41,16 +41,16 @@ test('only qwen-ai selects the official Qwen Hermes managed protocol', () => {
   assert.equal(qwen.preferredManagedProtocol, 'managed_xml')
 })
 
-test('m365-copilot pins managed XML instead of riding the unknown-provider fallback', () => {
+test('m365-copilot pins the fenced protocol instead of riding the unknown-provider fallback', () => {
   const m365 = getProviderToolProfile('m365-copilot')
 
   assert.equal(m365.managedSupport, true)
   assert.equal(m365.supportsNativeTools, false)
-  assert.equal(m365.preferredManagedProtocol, 'managed_xml')
+  assert.equal(m365.preferredManagedProtocol, 'm365_fenced')
   assert.equal(m365.usesTranscriptDocumentTransport, false)
   assert.match(
     m365.formatAssistantToolCalls(calls),
-    /<\|CHAT2API\|invoke name="default_api:read_file"/,
+    /```default_api:read_file\n/,
   )
 })
 

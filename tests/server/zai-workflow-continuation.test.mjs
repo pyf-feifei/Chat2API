@@ -9,6 +9,7 @@ const vite = await createServer({
   logLevel: 'silent',
 })
 const { classifyZaiManagedAnswer, ZaiStreamHandler } = await vite.ssrLoadModule('/src/main/proxy/adapters/zai.ts')
+const { findManagedToolDenialClaim } = await vite.ssrLoadModule('/src/main/proxy/adapters/qwenAiProgressIntent.ts')
 
 after(async () => {
   await vite?.close()
@@ -110,6 +111,60 @@ test('recovery branches classify short marker-less answers wording-independently
 test('classifyZaiManagedAnswer passes through a long first-turn auto answer', () => {
   const longAnswer = '这里是完整的最终回答。'.repeat(60)
   const verdict = classifyZaiManagedAnswer(longAnswer, createPlan())
+  assert.equal(verdict.continuation, false)
+  assert.equal(verdict.reason, 'first_turn_auto_answer')
+})
+
+// 2026-09-13 incident: codex + m365 gpt-5.6-luna, first turn. The model
+// answered with this exact capability-denial prose (331 chars) instead of a
+// fenced tool call. It escaped the capped denial classifier (300-codepoint
+// cap) and the first_turn_auto_answer fall-through, was delivered as a final
+// answer, and the agent turn stopped. Marker-supporting protocols must never
+// classify a marker-less first-turn answer as deliverable.
+const M365_INCIDENT_DENIAL_ANSWER = '我看不到你电脑上的本地文件 `c:\\my\\games\\speed\\prompt.md`，也无法直接读取该路径内容。\n\n如果项目里 **GLB 3D 模型没有正确还原/显示异常**，请直接上传以下任意内容：\n\n- `prompt.md`\n- 相关报错日志\n- GLB 加载代码（Three.js、Babylon.js、Unity 等）\n- 模型截图或控制台错误信息\n\n收到文件后，我会直接分析具体原因，例如：\n\n- GLB 路径错误\n- 纹理丢失\n- 材质未加载\n- 动画未恢复\n- 坐标系转换问题\n- Draco/KTX2 解码配置问题\n- 导出参数错误\n- Three.js 版本兼容问题\n\n把 `prompt.md` 或相关文件发上来，我就根据实际内容排查。'
+
+function createM365Plan(overrides = {}) {
+  return createPlan({ protocol: 'm365_fenced', providerId: 'm365-copilot', ...overrides })
+}
+
+test('m365 first-turn denial answer triggers continuation via the completion-proof gate (2026-09-13 incident)', () => {
+  // The structural catch is the completion-proof gate: this phrasing family
+  // is NOT in the denial patterns, so the verdict is marker-missing.
+  const verdict = classifyZaiManagedAnswer(M365_INCIDENT_DENIAL_ANSWER, createM365Plan())
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.completionProofMissing, true)
+  assert.equal(verdict.requireManagedToolCall, false)
+  assert.equal(verdict.reason, 'completion_marker_missing_short_answer')
+})
+
+test('cap-free denial locator upgrades covered phrasings past the 300-codepoint cap', () => {
+  // The forwarder layers findManagedToolDenialClaim over the verdict: a
+  // covered denial family longer than the stream-economy cap still flips the
+  // re-prompt to demand the concrete tool call. Env-tunable via
+  // CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS; the mechanism stays structural.
+  const longQuotedDiagnosis = '执行诊断后确认：exec_command 工具在当前环境中不可用。'.repeat(20)
+  assert.equal(longQuotedDiagnosis.length > 300, true)
+  assert.equal(Boolean(findManagedToolDenialClaim(longQuotedDiagnosis)), true)
+})
+
+test('m365 first-turn plain marker-less answer triggers continuation with the final-answer option', () => {
+  const verdict = classifyZaiManagedAnswer('2 加 2 等于 4。', createM365Plan())
+  assert.equal(verdict.continuation, true)
+  assert.equal(verdict.completionProofMissing, true)
+  assert.equal(verdict.requireManagedToolCall, false)
+  assert.equal(verdict.reason, 'completion_marker_missing_short_answer')
+})
+
+test('m365 first-turn answer with the completion marker is delivered', () => {
+  const verdict = classifyZaiManagedAnswer('2 加 2 等于 4。<chat2api_workflow_complete/>', createM365Plan())
+  assert.equal(verdict.continuation, false)
+  assert.equal(verdict.reason, 'completion_marker_present')
+})
+
+test('zai (managed_xml) first-turn answers keep the deliver-as-is contract', () => {
+  // Regression guard: managed_xml has no marker support, so the relocated
+  // completion-proof gate must not change zai first-turn behavior.
+  const verdict = classifyZaiManagedAnswer('2 加 2 等于 4。', createPlan())
   assert.equal(verdict.continuation, false)
   assert.equal(verdict.reason, 'first_turn_auto_answer')
 })

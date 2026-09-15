@@ -699,3 +699,54 @@ test('stream collapses repeated identical tool_caller blocks to one call', () =>
   assert.equal(toolChunks.length, 1)
   assert.equal(toolChunks[0].choices[0].delta.tool_calls.length, 1)
 })
+
+// --- drift salvage: another managed protocol's syntax, end-of-stream ---
+
+test('salvages a complete qwen_hermes tool_call emitted under a managed_xml plan', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const content = 'I will run the command.\n<tool_call>\n{"name": "default_api:read_file", "arguments": {"filePath": "a.txt"}}\n</tool_call>'
+  const chunks = parser.salvageFromAlternateProtocols(content, baseChunk, true)
+  const toolChunks = chunks.filter(chunk => Array.isArray(chunk.choices?.[0]?.delta?.tool_calls))
+  assert.equal(toolChunks.length, 1)
+  assert.equal(toolChunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.deepEqual(
+    JSON.parse(toolChunks[0].choices[0].delta.tool_calls[0].function.arguments),
+    { filePath: 'a.txt' },
+  )
+})
+
+test('salvages an m365_fenced code-fence call emitted under a managed_xml plan', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  // Model drifted to the m365 code-fence contract instead of managed_xml.
+  const content = 'Running the read now.\n```default_api:read_file\nfilePath: a.txt\n```'
+  const chunks = parser.salvageFromAlternateProtocols(content, baseChunk, true)
+  const toolChunks = chunks.filter(chunk => Array.isArray(chunk.choices?.[0]?.delta?.tool_calls))
+  assert.equal(toolChunks.length, 1)
+  assert.equal(toolChunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+})
+
+test('refuses to salvage a call whose required argument is cut mid-value', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  // required `filePath` parameter is cut mid-CDATA — no complete value exists.
+  const content = '<tool_call>\n{"name": "default_api:read_file", "arguments": {"filePath": "a.t'
+  const chunks = parser.salvageFromAlternateProtocols(content, baseChunk, true)
+  assert.equal(chunks.length, 0)
+  assert.equal(parser.hasEmittedToolCall(), false)
+})
+
+test('refuses to salvage calls for tools outside the declared set', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const content = '<tool_call>\n{"name": "default_api:delete_file", "arguments": {"filePath": "a.txt"}}\n</tool_call>'
+  const chunks = parser.salvageFromAlternateProtocols(content, baseChunk, true)
+  assert.equal(chunks.length, 0)
+  assert.equal(parser.hasEmittedToolCall(), false)
+})
+
+test('salvage never runs twice for one response', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const content = '<tool_call>\n{"name": "default_api:read_file", "arguments": {"filePath": "a.txt"}}\n</tool_call>'
+  const first = parser.salvageFromAlternateProtocols(content, baseChunk, true)
+  assert.ok(first.length > 0)
+  const second = parser.salvageFromAlternateProtocols(content, baseChunk, true)
+  assert.equal(second.length, 0)
+})

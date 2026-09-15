@@ -88,9 +88,42 @@ services:
       # is a stalled generation (healthy thinking streams emit continuously).
       # Recovery replays in a fresh chat; 0 disables the watchdog.
       CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS: ${CHAT2API_ZAI_STREAM_IDLE_TIMEOUT_MS:-180000}
+      # Z.ai degenerate-output guards. A repetition loop (one phrase block
+      # repeating; digits are normalized so incrementing counters cannot
+      # defeat the scan) or an answer beyond the hard char cap aborts the
+      # upstream stream and routes to the same recovery path as the idle
+      # watchdog: continuation replay, then an explicit failed client stream
+      # so Codex-class clients discard the partial answer and retry. 2026-09-13
+      # incident: a preview-tier model streamed 365,537 chars of loop text for
+      # 12.8 minutes past both the idle watchdog and the stall classifier.
+      CHAT2API_ZAI_LOOP_DETECTION: ${CHAT2API_ZAI_LOOP_DETECTION:-true}
+      CHAT2API_ZAI_LOOP_EXACT_REPEATS: ${CHAT2API_ZAI_LOOP_EXACT_REPEATS:-8}
+      CHAT2API_ZAI_LOOP_NORMALIZED_REPEATS: ${CHAT2API_ZAI_LOOP_NORMALIZED_REPEATS:-10}
+      CHAT2API_ZAI_LOOP_WINDOW_CHARS: ${CHAT2API_ZAI_LOOP_WINDOW_CHARS:-4000}
+      CHAT2API_ZAI_LOOP_MIN_PERIOD_CHARS: ${CHAT2API_ZAI_LOOP_MIN_PERIOD_CHARS:-24}
+      CHAT2API_ZAI_LOOP_MAX_PERIOD_CHARS: ${CHAT2API_ZAI_LOOP_MAX_PERIOD_CHARS:-300}
+      CHAT2API_ZAI_LOOP_CHECK_INTERVAL_CHARS: ${CHAT2API_ZAI_LOOP_CHECK_INTERVAL_CHARS:-512}
+      # Hard answer cap in chars per branch. Set 0 to disable the cap; loop
+      # detection above still applies.
+      CHAT2API_ZAI_MAX_ANSWER_CHARS: ${CHAT2API_ZAI_MAX_ANSWER_CHARS:-200000}
       # Debug: log the first raw upstream chat:completion frames of each Z.ai
       # stream (Qwen parity with CHAT2API_QWEN_AI_DEBUG_REQUEST).
       CHAT2API_ZAI_DEBUG_STREAM: ${CHAT2API_ZAI_DEBUG_STREAM:-false}
+      # Managed-tool requests on the M365 consumer wire ride the tone field,
+      # which doubles as the backend's model/mode selector. Default 'Assist'
+      # is the validated prompt-injection persona; 'Gpt_5_6_Reasoning' opts
+      # into the reasoning mode cramt/m365-copilot-proxy benches at
+      # near-100% fenced-tool compliance (chat tones are non-deterministic).
+      CHAT2API_M365_MANAGED_TONE: ${CHAT2API_M365_MANAGED_TONE:-}
+      # A managed-tool turn that finishes without a tool call is a
+      # confabulated answer on this backend (prose / false completion /
+      # capability denial). Bounded same-conversation re-prompt, mirroring
+      # the zai/qwen workflow continuation contract.
+      CHAT2API_M365_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_M365_WORKFLOW_CONTINUATION_ATTEMPTS:-1}
+      CHAT2API_M365_WORKFLOW_CONTINUATION_TIMEOUT_MS: ${CHAT2API_M365_WORKFLOW_CONTINUATION_TIMEOUT_MS:-180000}
+      # Debug: log the raw managed-branch text whenever a branch classifies
+      # non-compliant (re-prompt or exhausted), for wire-format diagnosis.
+      CHAT2API_M365_DEBUG_STREAM: ${CHAT2API_M365_DEBUG_STREAM:-false}
       # Inline tail (bytes) of the archived transcript kept on the active turn
       # when complete managed document transport archives the pending user
       # message, so the operative task stays visible without a file read.
@@ -113,6 +146,10 @@ services:
       # Debug: log upstream request payload summaries (confirm injected texts).
       CHAT2API_QWEN_AI_DEBUG_REQUEST: ${CHAT2API_QWEN_AI_DEBUG_REQUEST:-false}
       CHAT2API_QWEN_AI_DEBUG_STREAM: ${CHAT2API_QWEN_AI_DEBUG_STREAM:-false}
+      # Debug: log the RAW client tool types on /v1/responses (codex switches
+      # shell to `local_shell` for gpt-5-family model names; dropped types
+      # silently zero the managed tool path).
+      CHAT2API_RESPONSES_DEBUG_REQUEST: ${CHAT2API_RESPONSES_DEBUG_REQUEST:-false}
       CHAT2API_QWEN_AI_RETRY_NONCE: ${CHAT2API_QWEN_AI_RETRY_NONCE:-true}
       CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE: ${CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE:-retry}
       # Complete tool docs remain attached; zero omits only inline routing summaries.
@@ -226,6 +263,12 @@ services:
       # first attempt so ordinary turns never batch-trigger that quota;
       # 'off' disables. KEEP_LAST counts image-bearing messages, not images.
       CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES: ${CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES:-on-busy}
+      # Fresh-chat replay slimming: head+tail message boundary in bytes.
+      # 0 = full replay (unchanged behavior). A positive value (e.g. 65536)
+      # keeps only the system prompt + first user message + last N bytes
+      # of the transcript for the replay generation, cutting a 7-10min
+      # re-think on a 300-message history down to 2-3min.
+      CHAT2API_QWEN_AI_REPLAY_TAIL_BYTES: ${CHAT2API_QWEN_AI_REPLAY_TAIL_BYTES:-0}
       # KEEP_LAST covers the current working renders, KEEP_FIRST pins the
       # earliest attachments as ground-truth reference anchors (prototype
       # views). PLACEHOLDER is the model-facing replacement text; it should

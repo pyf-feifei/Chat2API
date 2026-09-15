@@ -381,3 +381,51 @@ test('payload guidance and platform diagnostic are env-tunable (off sentinel)', 
     delete process.env.CHAT2API_TOOL_CALLING_PLATFORM_TOOL_DIAGNOSTIC
   }
 })
+
+// 2026-09-13 incident (m365 gpt-5.6-luna first turn via codex): the marker
+// hold confirmation block was gated to the qwen protocols, so an m365_fenced
+// partial hold crossing a delta boundary was never confirmed and flush
+// released the full marker as client-visible prose. The hold and its
+// confirmation must cover every protocol the hold engages on.
+test('m365_fenced marker holds survive every delta split boundary', () => {
+  const plan = managedPlan({
+    protocol: 'm365_fenced',
+    clientAdapterId: 'codex_responses',
+    providerId: 'm365-copilot',
+    tools: [{ name: 'shell', parameters: { type: 'object', properties: {} }, source: 'responses' }],
+    allowedToolNames: new Set(['shell']),
+  })
+  const text = '我无法读取你电脑上的文件。如果你希望我读取它，请上传。 <chat2api_workflow_complete/>'
+  const baseChunk = { id: 'x', choices: [{ index: 0, delta: {}, finish_reason: null }] }
+
+  for (let split = text.length - 32; split < text.length; split++) {
+    const parser = new ToolStreamParser(plan)
+    const chunks = [
+      ...parser.push(text.slice(0, split), baseChunk, true),
+      ...parser.push(text.slice(split), baseChunk, false),
+      ...parser.flush(baseChunk),
+    ]
+    const leaked = chunks.find((chunk) => JSON.stringify(chunk).includes('chat2api'))
+    assert.equal(leaked, undefined, `marker leaked at split ${split}: ${JSON.stringify(leaked)}`)
+  }
+})
+
+test('m365_fenced marker followed by a tool call still delivers the call', () => {
+  const plan = managedPlan({
+    protocol: 'm365_fenced',
+    clientAdapterId: 'codex_responses',
+    providerId: 'm365-copilot',
+    tools: [{ name: 'shell', parameters: { type: 'object', properties: {} }, source: 'responses' }],
+    allowedToolNames: new Set(['shell']),
+  })
+  const text = '先说明一下。<chat2api_workflow_complete/>\n```shell\ncommand: dir\n```'
+  const baseChunk = { id: 'x', choices: [{ index: 0, delta: {}, finish_reason: null }] }
+  const parser = new ToolStreamParser(plan)
+  const chunks = [
+    ...parser.push(text.slice(0, 20), baseChunk, true),
+    ...parser.push(text.slice(20), baseChunk, false),
+    ...parser.flush(baseChunk),
+  ]
+  assert.equal(chunks.some((chunk) => JSON.stringify(chunk).includes('chat2api')), false)
+  assert.equal(chunks.some((chunk) => JSON.stringify(chunk).includes('tool_calls')), true)
+})

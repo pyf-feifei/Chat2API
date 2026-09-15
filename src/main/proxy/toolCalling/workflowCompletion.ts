@@ -87,7 +87,16 @@ export function supportsManagedWorkflowCompletionMarker(
 ): boolean {
   return Boolean(
     plan?.shouldParseResponse
-    && (plan.protocol === 'qwen_hermes' || plan.protocol === 'qwen_native')
+    && (plan.protocol === 'qwen_hermes'
+      || plan.protocol === 'qwen_native'
+      // m365_fenced teaches natural-language finals ("respond with no
+      // fence"), which is indistinguishable from a capability-denial
+      // confabulation at classification time. Observed live 2026-09-13
+      // (gpt-5.6-luna first turn via codex): a 331-char denial escaped every
+      // capped prose detector and the first-turn fall-through delivered it,
+      // ending the agent turn. With marker support the m365 branch classifies
+      // proof-less finals the same way the qwen protocols do.
+      || plan.protocol === 'm365_fenced')
     && plan.allowedToolNames.size > 0
   )
 }
