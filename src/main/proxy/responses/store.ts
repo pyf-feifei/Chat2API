@@ -124,7 +124,13 @@ function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
 function cloneQwenAiSessionBinding(
   binding: QwenAiSessionBinding | undefined,
 ): QwenAiSessionBinding | undefined {
-  return binding ? { ...binding } : undefined
+  if (!binding) return undefined
+  return {
+    ...binding,
+    // Nested ticket object must be cloned too — a shallow spread would share
+    // the appendedTurn reference between the stored entry and caller reads.
+    ...(binding.appendedTurn ? { appendedTurn: { ...binding.appendedTurn } } : {}),
+  }
 }
 
 function cloneSidecarItems(items: ResponsesSidecarItem[] | undefined): ResponsesSidecarItem[] {

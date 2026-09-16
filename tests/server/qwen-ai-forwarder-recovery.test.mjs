@@ -127,6 +127,8 @@ function loadRequestForwarder(overrides = {}) {
       isQwenAiUpstreamBusyMessage: value => /qwen_ai_upstream_busy/i.test(String(value || '')),
       qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
+      qwenAiStickyMaxTurnsFromEnv: () => 40,
+      qwenAiStickyMaxBytesFromEnv: () => 1_500_000,
       resolveQwenAiNativeContinuationSystemPrompt: () => '',
       qwenAiTranscriptTransportPolicyFromEnv: () => ({
         enabled: false,

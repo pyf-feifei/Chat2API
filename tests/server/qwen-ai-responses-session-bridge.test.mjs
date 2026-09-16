@@ -500,6 +500,9 @@ function loadResponsesRouteHarness(options = {}) {
       },
     },
     '../stream': { streamHandler: { createTransformStream: () => new PassThrough() } },
+    '../../store/types': {
+      isQwenAiStickySessionMode: mode => mode === 'sticky',
+    },
     '../../store/store': {
       storeManager: {
         getConfig: () => ({
@@ -664,6 +667,17 @@ function loadResponsesRouteHarness(options = {}) {
       estimateQwenAiRequestInputTokens: () => 1,
     },
     '../qwenAiSessionBridge': sessionBridge,
+    '../qwenAiStickyRegistry': {
+      qwenAiStickyRegistry: {
+        register: () => {},
+        release: () => {},
+        countForAccount: () => 0,
+        touch: () => false,
+        acquire: () => () => {},
+        update: () => {},
+        get: () => undefined,
+      },
+    },
     '../qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
     },
@@ -1454,6 +1468,8 @@ function loadForwarderForBridgeTests(overrides = {}) {
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 4,
+      qwenAiStickyMaxTurnsFromEnv: () => 40,
+      qwenAiStickyMaxBytesFromEnv: () => 1_500_000,
     },
     './adapters/m365': {
       M365Adapter: adapterWithMatcher('isM365Provider'),

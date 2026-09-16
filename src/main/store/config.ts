@@ -363,8 +363,9 @@ export class ConfigManager {
       config.qwenAiSessionMode !== undefined
       && config.qwenAiSessionMode !== 'legacy'
       && config.qwenAiSessionMode !== 'tool-call-binding'
+      && config.qwenAiSessionMode !== 'sticky'
     ) {
-      errors.push('qwenAiSessionMode must be one of: legacy, tool-call-binding')
+      errors.push('qwenAiSessionMode must be one of: legacy, tool-call-binding, sticky')
     }
 
     if (config.toolCallingConfig) {

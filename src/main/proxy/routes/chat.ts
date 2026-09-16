@@ -61,6 +61,7 @@ import {
   qwenAiToolCallSessionStore,
   type QwenAiToolCallSessionClaim,
 } from '../qwenAiToolCallSessionStore'
+import { isQwenAiStickySessionMode } from '../../store/types'
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
   qwenAiAccountRetryScope,
@@ -471,6 +472,7 @@ router.post('/completions', async (ctx: Context) => {
   const preferredProviderId = qwenAiContinuationBinding?.providerId ?? mappedPreferredProviderId
   const preferredAccountId = qwenAiContinuationBinding?.accountId ?? mappedPreferredAccountId
 
+  const stickySessionEnabled = isQwenAiStickySessionMode(config.qwenAiSessionMode)
   const initialSelection = loadBalancer.selectAccount(
     request.model,
     config.loadBalanceStrategy,
@@ -479,7 +481,9 @@ router.post('/completions', async (ctx: Context) => {
     new Set<string>(),
     qwenAiContinuationBinding
       ? { allowQueuedQwenAiPreferredAccount: true }
-      : undefined,
+      : stickySessionEnabled
+        ? { preferLowStickyCount: true }
+        : undefined,
   )
 
   if (!initialSelection) {

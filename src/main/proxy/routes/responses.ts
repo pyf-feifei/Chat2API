@@ -53,11 +53,17 @@ import { classifyChatRequest } from '../requestIntent'
 import { estimateQwenAiRequestInputTokens } from '../qwenAiCompactionBoundary'
 import {
   createQwenAiSessionRequestFingerprint,
+  createQwenAiTranscriptHash,
+  createQwenAiDeltaHash,
+  createQwenAiChainKey,
+  qwenAiStickyChainHeadFromEnv,
   resolveQwenAiSessionBinding,
   type QwenAiSessionBridge,
   type QwenAiSessionBinding,
   type QwenAiSessionState,
 } from '../qwenAiSessionBridge'
+import { qwenAiStickyRegistry, type QwenAiStickyChainClaim } from '../qwenAiStickyRegistry'
+import { isQwenAiStickySessionMode } from '../../store/types'
 import {
   getTrailingQwenAiToolResultBatch,
   qwenAiToolCallSessionStore,
@@ -449,7 +455,16 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     && requestIntent.intent !== 'context_compaction'
     && Boolean(chatRequest.tools?.length)
     && chatRequest.tool_choice !== 'none'
-  const qwenAiRequestFingerprint = managedToolResponsesRequest
+  // Sticky chains need the fingerprint even when store:false gates the
+  // managed-tool flag — the tool contract must still be verified before a
+  // continuation is allowed.
+  const qwenAiRequestFingerprint = (managedToolResponsesRequest || (
+    isQwenAiStickySessionMode(config.qwenAiSessionMode)
+      && qwenAiToolCallSessionEnabled
+      && requestIntent.intent !== 'context_compaction'
+      && Boolean(chatRequest.tools?.length)
+      && chatRequest.tool_choice !== 'none'
+  ))
     ? createQwenAiSessionRequestFingerprint(chatRequest)
     : undefined
   let qwenAiContinuationInputMessages = translated.conversationMessages.slice(previousMessages.length)
@@ -542,6 +557,9 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       return
     }
     previousQwenAiSessionBindingCleared = true
+    if (previousQwenAiSessionBinding.lineageKey) {
+      qwenAiStickyRegistry.release(previousQwenAiSessionBinding.lineageKey)
+    }
     responsesConversationStore.clearQwenAiSessionBinding(previousResponseId)
     storeManager.addLog('debug', 'Cleared unusable Qwen Responses session binding', {
       requestId: responseId,
@@ -601,6 +619,223 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     }
   }
 
+  // --- Sticky session mode -------------------------------------------------
+  // Beyond pure tool-result turns, any delta (new user text, tool results,
+  // attachments) can be appended to the retained upstream chat, provided the
+  // client-sent history still prefixes the stored transcript and the tool
+  // contract fingerprint is unchanged.
+  const stickySessionEnabled = isQwenAiStickySessionMode(config.qwenAiSessionMode)
+    && qwenAiToolCallSessionEnabled
+  let qwenAiStickyResumeTicket: QwenAiSessionBinding['appendedTurn'] | undefined
+  if (
+    stickySessionEnabled
+    && !qwenAiContinuationBinding
+    && previousQwenAiSessionBinding
+    && responseStateEnabled
+    && previousResponseId
+    && managedToolResponsesRequest
+  ) {
+    const binding = previousQwenAiSessionBinding
+    const bindingAccount = storeManager.getAccountById(binding.accountId)
+    const bindingProvider = storeManager.getProviderById(binding.providerId)
+    const bindingOwnershipMatches = bindingAccount?.providerId === bindingProvider?.id
+      && bindingProvider !== undefined
+      && QwenAiAdapter.isQwenAiProvider(bindingProvider)
+
+    // Delta = messages the client added on top of the stored transcript.
+    const deltaMessages = translated.conversationMessages.slice(previousMessages.length)
+    const prefixMatches = previousMessages.length === 0
+      ? chatRequest.messages.length === 0
+      : Boolean(
+          binding.transcriptHash
+          && createQwenAiTranscriptHash(previousMessages)
+            === binding.transcriptHash,
+        )
+    // Cheap sanity check the cheap way first: the request's own history must
+    // actually contain the stored prefix (same length or longer, same head).
+    const historyExtendsStored = chatRequest.messages.length >= previousMessages.length
+      && (
+        previousMessages.length === 0
+        || createQwenAiTranscriptHash(chatRequest.messages.slice(0, previousMessages.length))
+          === binding.transcriptHash
+      )
+    const deltaNonEmpty = deltaMessages.length > 0
+
+    if (
+      bindingOwnershipMatches
+      && prefixMatches
+      && historyExtendsStored
+      && deltaNonEmpty
+      && hasUsableQwenAiSessionBinding(
+        binding,
+        qwenAiRequestFingerprint,
+        chatRequest.model,
+      )
+    ) {
+      const deltaHash = createQwenAiDeltaHash(deltaMessages)
+      const priorTicket = binding.appendedTurn
+      if (
+        priorTicket
+        && priorTicket.prevResponseId === previousResponseId
+        && priorTicket.deltaHash === deltaHash
+      ) {
+        // Idempotent retry: the delta was already appended upstream. Signal
+        // the forwarder to resume the existing generation instead of pushing
+        // the user message again.
+        qwenAiStickyResumeTicket = priorTicket
+        qwenAiContinuationBinding = binding
+        qwenAiContinuationInputMessages = []
+      } else if (
+        priorTicket
+        && priorTicket.prevResponseId === previousResponseId
+        && priorTicket.deltaHash !== deltaHash
+      ) {
+        // Same prev_response_id but a different delta = client rewrote the
+        // turn. Treat as history rewrite → full replay fallback.
+        clearPreviousQwenAiSessionBinding('sticky_delta_mismatch')
+      } else {
+        qwenAiContinuationBinding = binding
+        qwenAiContinuationInputMessages = deltaMessages
+        console.info('[Responses] Qwen sticky session continuation candidate', JSON.stringify({
+          requestId: responseId,
+          providerId: binding.providerId,
+          accountId: binding.accountId,
+          chatId: binding.chatId,
+          deltaMessageCount: deltaMessages.length,
+          turnCount: binding.turnCount ?? 0,
+        }))
+      }
+    } else if (bindingOwnershipMatches && deltaNonEmpty && !prefixMatches) {
+      // Client history diverged from what was stored — the delta cannot be
+      // appended without losing context.
+      clearPreviousQwenAiSessionBinding('sticky_transcript_prefix_mismatch')
+    }
+  }
+  // -------------------------------------------------------------------------
+
+  // --- Sticky chain mode (store:false clients like codex) --------------------
+  // Codex never sends previous_response_id and always sets store:false, so
+  // the conversation store is bypassed entirely. Instead we fingerprint the
+  // request by content: instructions + the first K messages identify the
+  // chain; the leading lastSeenCount messages prove the client is extending
+  // the same transcript rather than forking it.
+  let stickyChainClaim: QwenAiStickyChainClaim | undefined
+  let stickyChainEntry: import('../qwenAiStickyRegistry').StickyChainEntry | undefined
+  let pendingStickyChainKey: string | undefined
+  if (
+    stickySessionEnabled
+    && !qwenAiContinuationBinding
+    && !responseStateEnabled
+    && !previousResponseId
+    && !managedToolResponsesRequest // store:false excluded it, but tools exist
+    && Boolean(chatRequest.tools?.length)
+    && chatRequest.tool_choice !== 'none'
+    && requestIntent.intent !== 'context_compaction'
+  ) {
+    // Chain key = instructions + the first user message only. The head must
+    // have a fixed width — using messages[0..K] breaks when K exceeds the
+    // first turn's message count (system+user=2 vs later turns with more).
+    const firstUserMessage = chatRequest.messages.find(m => m.role === 'user')
+    const headMessages = firstUserMessage ? [firstUserMessage] : []
+    const instructions = typeof request.instructions === 'string'
+      ? request.instructions
+      : undefined
+    const chainKey = createQwenAiChainKey(instructions, headMessages)
+    const claimResult = qwenAiStickyRegistry.claimByChainKey(chainKey)
+
+    if (claimResult.status === 'busy') {
+      abort.cleanup()
+      ctx.set('Retry-After', String(Math.max(1, Math.ceil(claimResult.retryAfterMs / 1000))))
+      ctx.status = 429
+      ctx.body = {
+        error: {
+          message: 'The Qwen sticky chain is already in progress.',
+          type: 'api_error',
+          param: null,
+          code: 'CHAT_IN_PROGRESS',
+        },
+      }
+      return
+    }
+
+    if (claimResult.status === 'claimed') {
+      stickyChainClaim = claimResult.claim
+      stickyChainEntry = claimResult.entry
+      const entry = claimResult.entry
+
+      const bindingAccount = storeManager.getAccountById(entry.accountId)
+      const bindingProvider = storeManager.getProviderById(entry.providerId)
+      const bindingOwnershipMatches = bindingAccount?.providerId === bindingProvider?.id
+        && bindingProvider !== undefined
+        && QwenAiAdapter.isQwenAiProvider(bindingProvider)
+
+      // Verify the client's history prefix matches what was already pushed.
+      const prefixMessages = chatRequest.messages.slice(0, entry.lastSeenCount)
+      const prefixOk = entry.lastSeenCount <= chatRequest.messages.length
+        && createQwenAiTranscriptHash(prefixMessages) === entry.historyHash
+      const deltaMessages = chatRequest.messages.slice(entry.lastSeenCount)
+
+      if (bindingOwnershipMatches && prefixOk && deltaMessages.length > 0) {
+        const deltaHash = createQwenAiDeltaHash(deltaMessages)
+        const priorTicket = entry.appendedTurn
+        if (priorTicket && priorTicket.deltaHash === deltaHash) {
+          // Same delta already appended — resume the in-flight generation.
+          qwenAiStickyResumeTicket = {
+            prevResponseId: '',
+            deltaHash: priorTicket.deltaHash,
+            userFid: priorTicket.userFid,
+            state: priorTicket.state,
+          }
+          qwenAiContinuationInputMessages = []
+        } else {
+          qwenAiContinuationInputMessages = deltaMessages
+          console.info('[Responses] Qwen sticky chain continuation', JSON.stringify({
+            requestId: responseId,
+            chainKey: chainKey.slice(0, 16),
+            accountId: entry.accountId,
+            chatId: entry.chatId,
+            lastSeenCount: entry.lastSeenCount,
+            deltaMessageCount: deltaMessages.length,
+            turnCount: entry.turnCount,
+          }))
+        }
+      } else if (bindingOwnershipMatches && !prefixOk) {
+        // History rewritten (compact / edit) — the upstream chat still holds
+        // the old full transcript; append the whole current tail as the delta
+        // so the model sees the compacted summary plus new content.
+        qwenAiContinuationInputMessages = chatRequest.messages
+        console.info('[Responses] Qwen sticky chain prefix mismatch; appending full transcript as delta', JSON.stringify({
+          requestId: responseId,
+          chainKey: chainKey.slice(0, 16),
+          accountId: entry.accountId,
+          chatId: entry.chatId,
+        }))
+      } else {
+        // Dead chain — release both the claim and the entry so the next turn
+        // registers a fresh one.
+        qwenAiStickyRegistry.releaseChainClaim(stickyChainClaim)
+        stickyChainClaim = undefined
+        stickyChainEntry = undefined
+        if (bindingOwnershipMatches) {
+          qwenAiStickyRegistry.releaseChain(chainKey)
+        }
+      }
+    }
+    // 'missing' → fresh chain; will be registered after a successful turn.
+    // Keep the key for the post-success registration path below.
+    if (!stickyChainClaim) {
+      pendingStickyChainKey = chainKey
+    }
+    // The binding itself is assembled after account selection below — the
+    // forwarder requires actualModel to match the mapped model, which is only
+    // known once selection resolves. At this stage we only pin the account.
+    if (stickyChainEntry && (qwenAiContinuationInputMessages.length > 0 || qwenAiStickyResumeTicket)) {
+      // Use the chain's account as preferred so selection lands on it.
+      // The full binding is materialized post-selection.
+    }
+  }
+  // -------------------------------------------------------------------------
+
   if (qwenAiContinuationBinding) {
     console.info('[Responses] Qwen session continuation candidate', JSON.stringify({
       requestId: responseId,
@@ -613,21 +848,31 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   const imageResolver = createResponseImageResolver({ signal: abort.controller.signal })
   const mappedPreferredProviderId = modelMapper.getPreferredProvider(chatRequest.model)
   const mappedPreferredAccountId = modelMapper.getPreferredAccount(chatRequest.model)
-  const preferredProviderId = qwenAiContinuationBinding?.providerId ?? mappedPreferredProviderId
-  const preferredAccountId = qwenAiContinuationBinding?.accountId ?? mappedPreferredAccountId
+  const preferredProviderId = qwenAiContinuationBinding?.providerId
+    ?? stickyChainEntry?.providerId
+    ?? mappedPreferredProviderId
+  const preferredAccountId = qwenAiContinuationBinding?.accountId
+    ?? stickyChainEntry?.accountId
+    ?? mappedPreferredAccountId
   const initialSelection = loadBalancer.selectAccount(
     chatRequest.model,
     config.loadBalanceStrategy,
     preferredProviderId,
     preferredAccountId,
     new Set<string>(),
-    qwenAiContinuationBinding
+    qwenAiContinuationBinding || stickyChainEntry
       ? { allowQueuedQwenAiPreferredAccount: true }
-      : undefined,
+      : stickySessionEnabled
+        ? { preferLowStickyCount: true }
+        : undefined,
   )
   if (!initialSelection) {
     abort.cleanup()
     releaseQwenAiToolCallClaim('no_available_account')
+    if (stickyChainClaim) {
+      qwenAiStickyRegistry.releaseChainClaim(stickyChainClaim)
+      stickyChainClaim = undefined
+    }
     ctx.status = 503
     ctx.body = {
       error: {
@@ -638,6 +883,32 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       },
     }
     return
+  }
+
+  // Sticky chain: materialize the continuation binding now that selection has
+  // resolved the mapped actualModel. The claim already holds the chain entry;
+  // the binding just wraps it in the shape the forwarder validates against.
+  if (stickyChainEntry && !qwenAiContinuationBinding) {
+    const chainOnSelectedAccount = stickyChainEntry.accountId === initialSelection.account.id
+      && stickyChainEntry.providerId === initialSelection.provider.id
+    if (chainOnSelectedAccount) {
+      qwenAiContinuationBinding = qwenAiStickyRegistry.chainToBinding(stickyChainEntry, {
+        requestedModel: chatRequest.model,
+        actualModel: initialSelection.actualModel,
+        requestFingerprint: qwenAiRequestFingerprint ?? '',
+      })
+      console.info('[Responses] Qwen sticky chain binding materialized', JSON.stringify({
+        requestId: responseId,
+        accountId: initialSelection.account.id,
+        chatId: stickyChainEntry.chatId,
+        lastSeenCount: stickyChainEntry.lastSeenCount,
+        deltaMessageCount: qwenAiContinuationInputMessages.length,
+        resumeOnly: Boolean(qwenAiStickyResumeTicket),
+      }))
+    }
+    // If selection landed elsewhere (e.g. the preferred account was busy), the
+    // chain claim stays held — the write-back path re-registers a fresh chain
+    // on the new account once the turn succeeds.
   }
 
   let initialUsesQwenAiContinuation = Boolean(
@@ -671,8 +942,12 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
   const qwenAiSessionBridgeForSelection = (
     selection: AccountSelection,
   ): QwenAiSessionBridge | undefined => {
+    // Sticky chains bypass the managed-tool gate (store:false clients), but
+    // still need the fingerprint + continuation plumbing to reach the
+    // forwarder. The fingerprint itself is only computed when the request has
+    // tools, so its presence is sufficient proof the contract is intact.
     if (
-      !managedToolResponsesRequest
+      (!managedToolResponsesRequest && !stickyChainEntry && !pendingStickyChainKey)
       || !qwenAiRequestFingerprint
       || !QwenAiAdapter.isQwenAiProvider(selection.provider)
     ) {
@@ -685,12 +960,17 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       && selection.account.id === qwenAiContinuationBinding.accountId
       && selection.actualModel === qwenAiContinuationBinding.actualModel,
     )
+    const stickyDeltaHash = useContinuation && qwenAiContinuationInputMessages.length > 0
+      ? createQwenAiDeltaHash(qwenAiContinuationInputMessages)
+      : undefined
     return {
       requestFingerprint: qwenAiRequestFingerprint,
+      ...(stickyDeltaHash ? { stickyDeltaHash } : {}),
       ...(useContinuation ? {
         continuation: {
           binding: qwenAiContinuationBinding!,
           inputMessages: qwenAiContinuationInputMessages,
+          ...(qwenAiStickyResumeTicket ? { resumeOnly: true } : {}),
         },
       } : {}),
     }
@@ -799,6 +1079,12 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
 
   let outcomeRecorded = false
   const recordSuccess = () => {
+    // Release the sticky chain lease on success — the write-back in
+    // storeConversation already ran (or will run), the claim is done.
+    if (stickyChainClaim) {
+      qwenAiStickyRegistry.releaseChainClaim(stickyChainClaim)
+      stickyChainClaim = undefined
+    }
     if (outcomeRecorded) return
     refreshEffectiveStreamSelection()
     outcomeRecorded = true
@@ -824,6 +1110,13 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     penalizeAccount = true,
     deferredStreamFailure = false,
   ) => {
+    // Release the sticky chain lease BEFORE the outcomeRecorded guard — a
+    // mid-stream failure after recordSuccess still needs the lease freed so
+    // the client's retry can re-claim the chain.
+    if (stickyChainClaim) {
+      qwenAiStickyRegistry.releaseChainClaim(stickyChainClaim)
+      stickyChainClaim = undefined
+    }
     if (outcomeRecorded) return
     refreshEffectiveStreamSelection()
     outcomeRecorded = true
@@ -858,6 +1151,12 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
               ? 'terminal_account_failover'
             : 'terminal_stream_failure',
       )
+      // Sticky chain: the upstream chat is gone or the account failed — drop
+      // the chain so the next turn registers fresh on a different account.
+      if (stickyChainEntry) {
+        qwenAiStickyRegistry.releaseChain(stickyChainEntry.chainKey)
+        stickyChainEntry = undefined
+      }
     }
     finalizeFailedQwenAiToolCallClaim(
       claimErrorCode,
@@ -914,6 +1213,52 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     output: Array<Record<string, any>>,
     qwenAiSessionState?: QwenAiSessionState,
   ) => {
+    // --- Sticky chain write-back (store:false clients) ----------------------
+    // The conversation store is skipped, but the sticky chain registry still
+    // needs its tail pointer updated so the next turn can compute the delta.
+    if (request.store === false && stickySessionEnabled) {
+      const chainKey = pendingStickyChainKey ?? stickyChainEntry?.chainKey
+      if (chainKey && qwenAiSessionState) {
+        const binding = resolveQwenAiSessionBinding(qwenAiSessionState)
+        if (binding) {
+          const newLastSeenCount = chatRequest.messages.length
+          const transcriptBytes = Buffer.byteLength(JSON.stringify(chatRequest.messages), 'utf8')
+          qwenAiStickyRegistry.registerChain(chainKey, {
+            accountId: binding.accountId,
+            providerId: binding.providerId,
+            chatId: binding.chatId,
+            parentId: binding.parentId,
+            historyHash: createQwenAiTranscriptHash(chatRequest.messages),
+            lastSeenCount: newLastSeenCount,
+            toolProtocol: binding.toolProtocol,
+          })
+          qwenAiStickyRegistry.updateChain(chainKey, {
+            // approxBytes tracks the CURRENT transcript size — codex sends the
+            // full history every turn, so the upstream chat size ≈ this turn's
+            // bytes, not the cumulative sum (which would double-count).
+            approxBytes: transcriptBytes,
+            appendedTurn: initialUsesQwenAiContinuation && qwenAiContinuationInputMessages.length > 0
+              ? {
+                  deltaHash: createQwenAiDeltaHash(qwenAiContinuationInputMessages),
+                  state: 'done',
+                }
+              : undefined,
+          })
+          console.info('[Responses] Qwen sticky chain updated', JSON.stringify({
+            requestId: responseId,
+            chainKey: chainKey.slice(0, 16),
+            chatId: binding.chatId,
+            lastSeenCount: newLastSeenCount,
+          }))
+        }
+      }
+    }
+    if (stickyChainClaim) {
+      qwenAiStickyRegistry.releaseChainClaim(stickyChainClaim)
+      stickyChainClaim = undefined
+    }
+    // -------------------------------------------------------------------------
+
     if (request.store === false) {
       consumeQwenAiToolCallClaim('store_disabled')
       return
@@ -932,11 +1277,50 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       ...appendedMessages,
     ]
     const toolCallIds = responseOutputToolCallIds(output)
-    const qwenAiSessionBinding = request.store === false
-      ? undefined
-      : managedToolResponsesRequest && toolCallIds.length > 0
+    // In sticky mode every successful response keeps the lineage alive, not
+    // just tool-call turns — a plain-text reply still owns the chat tail that
+    // the next user turn will append under.
+    const wantsStickyBinding = stickySessionEnabled
+      && managedToolResponsesRequest
+    const resolvedBinding = managedToolResponsesRequest
+      && (toolCallIds.length > 0 || wantsStickyBinding)
         ? resolveQwenAiSessionBinding(qwenAiSessionState)
         : undefined
+    let qwenAiSessionBinding = request.store === false
+      ? undefined
+      : resolvedBinding
+    if (qwenAiSessionBinding && wantsStickyBinding) {
+      const lineageKey = previousQwenAiSessionBinding?.lineageKey
+        ?? previousResponseId
+        ?? responseId
+      const appendedDelta = translated.conversationMessages.slice(previousMessages.length)
+      const transcriptBytes = Buffer.byteLength(JSON.stringify(transcript), 'utf8')
+      qwenAiSessionBinding = {
+        ...qwenAiSessionBinding,
+        lineageKey,
+        transcriptHash: createQwenAiTranscriptHash(transcript),
+        turnCount: (previousQwenAiSessionBinding?.turnCount ?? 0) + 1,
+        approxBytes: (previousQwenAiSessionBinding?.approxBytes ?? 0) + transcriptBytes,
+        appendedTurn: qwenAiStickyResumeTicket
+          ? { ...qwenAiStickyResumeTicket, state: 'done' }
+          : appendedDelta.length > 0 && initialUsesQwenAiContinuation
+            ? {
+                prevResponseId: previousResponseId ?? '',
+                deltaHash: createQwenAiDeltaHash(appendedDelta),
+                state: 'done',
+              }
+            : undefined,
+      }
+      if (qwenAiSessionBinding.appendedTurn?.prevResponseId === '') {
+        // First turn of the lineage — nothing was "appended", the whole
+        // transcript was uploaded. Keep the ticket undefined.
+        qwenAiSessionBinding.appendedTurn = undefined
+      }
+      qwenAiStickyRegistry.register(lineageKey, qwenAiSessionBinding, {
+        turnCount: qwenAiSessionBinding.turnCount,
+        approxBytes: qwenAiSessionBinding.approxBytes,
+      })
+    }
     if (
       initialUsesQwenAiContinuation
       && qwenAiSessionBinding

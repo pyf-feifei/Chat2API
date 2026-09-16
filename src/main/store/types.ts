@@ -84,15 +84,27 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
  */
 export type Theme = 'light' | 'dark' | 'system'
 
-/** Qwen AI tool-result conversation handling strategy. */
-export type QwenAiSessionMode = 'legacy' | 'tool-call-binding'
+/**
+ * Qwen AI conversation handling strategy.
+ * - legacy: every request opens a fresh upstream chat with the full transcript.
+ * - tool-call-binding: only pure tool-result turns append to a retained chat.
+ * - sticky: every turn appends only its delta to a retained chat; upstream
+ *   rejection migrates the full transcript to the next account's chat.
+ */
+export type QwenAiSessionMode = 'legacy' | 'tool-call-binding' | 'sticky'
 
 export const DEFAULT_QWEN_AI_SESSION_MODE: QwenAiSessionMode = 'tool-call-binding'
 
 export function normalizeQwenAiSessionMode(value: unknown): QwenAiSessionMode {
-  return value === 'legacy' || value === 'tool-call-binding'
+  return value === 'legacy' || value === 'tool-call-binding' || value === 'sticky'
     ? value
     : DEFAULT_QWEN_AI_SESSION_MODE
+}
+
+/** Sticky mode can also be flipped on via env without editing the config file. */
+export function isQwenAiStickySessionMode(mode: QwenAiSessionMode | undefined): boolean {
+  if (mode === 'sticky') return true
+  return /^1|true|on|yes$/i.test(String(process.env.CHAT2API_QWEN_AI_STICKY_SESSION ?? '').trim())
 }
 
 /**

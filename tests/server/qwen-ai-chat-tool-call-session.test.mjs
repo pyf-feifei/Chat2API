@@ -279,6 +279,9 @@ function loadChatRouteHarness(options = {}) {
       },
     },
     '../../store/store': { storeManager },
+    '../../store/types': {
+      isQwenAiStickySessionMode: mode => mode === 'sticky',
+    },
     '../utils/toolFormatConverter': {
       isAnthropicToolFormat: () => false,
       transformResponseToAnthropic: value => value,

@@ -102,8 +102,11 @@ const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_BUDGET_MS = 120_000
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS = 1_000
 // Retained Responses tool-result continuations are followed immediately by
 // a client request. Keep transient busy states on the retained chat instead
-// of forcing a full-history replay on another account.
-const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 1
+// of forcing a full-history replay on another account. The default of five
+// attempts (1s,2s,4s,8s,16s = ~31s) absorbs the provider-side turn cleanup
+// delay observed after a stream completes; a single retry was too tight and
+// pushed every other turn into a full-transcript migration.
+const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 5
 // Recovery time is shared by response-id resumes and managed workflow
 // continuations. It pauses while a replacement stream is producing output,
 // so a valid long generation is not cut off by this guard.
@@ -545,6 +548,25 @@ export function qwenAiWorkflowRecoveryTimeoutMsFromEnv(): number {
       QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS,
     ),
   )
+}
+
+/**
+ * Sticky-session checkpoint ceiling. A retained upstream chat grows turn over
+ * turn; past these limits the proxy does a controlled full-transcript replay
+ * into a fresh chat on the same account instead of letting Qwen silently
+ * truncate the earliest messages (which hold the tool contract). Zero
+ * disables the cap.
+ */
+export function qwenAiStickyMaxTurnsFromEnv(): number {
+  return nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STICKY_MAX_TURNS', 200)
+}
+
+export function qwenAiStickyMaxBytesFromEnv(): number {
+  // 32MB covers codex sessions that grow to ~8MB of client transcript while
+  // still leaving headroom before the upstream model context limit (1M tokens).
+  // The byte ceiling is a proxy-side guard against unbounded chat growth, not
+  // a model limit — the real ceiling is enforced by Qwen's own context window.
+  return nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STICKY_MAX_BYTES', 32_000_000)
 }
 
 /**
@@ -2202,6 +2224,8 @@ export type QwenAiUpstreamError = Error & {
   accountFault?: boolean
   retryScope?: 'next-account'
   upstreamState?: 'no_events' | 'active_without_terminal' | 'completed_without_valid_output' | 'client_disconnected'
+  /** When CHAT_IN_PROGRESS carries the in-flight response id, resume-drain can consume it. */
+  inFlightResponseId?: string
 }
 
 type QwenAiErrorEnvelopeMetadata = {
@@ -2210,6 +2234,7 @@ type QwenAiErrorEnvelopeMetadata = {
   param?: string
   code?: string
   retryable?: boolean
+  responseId?: string
 }
 
 function markQwenAiNextAccountFailure(error: QwenAiUpstreamError): QwenAiUpstreamError {
@@ -3336,6 +3361,7 @@ function extractQwenAiErrorEnvelopeMetadata(
       retryable: metadata.retryable ?? (
         typeof value.retryable === 'boolean' ? value.retryable : undefined
       ),
+      responseId: metadata.responseId ?? stringValue(value.response_id),
     }
 
     queue.push(value.error, value.errors, value.data)
@@ -3503,6 +3529,9 @@ function createQwenAiStreamEnvelopeError(
     error.code = 'CHAT_IN_PROGRESS'
     error.retryable = true
     error.accountFault = false
+    if (envelopeMetadata.responseId) {
+      error.inFlightResponseId = envelopeMetadata.responseId
+    }
   } else if (isRateLimited) {
     error.code = 'qwen_ai_capacity_limit'
   } else if (envelopeMetadata.code) {
@@ -3935,6 +3964,85 @@ export class QwenAiAdapter {
     return Buffer.concat(chunks).toString('utf8')
   }
 
+  /**
+   * Consume an SSE stream until it ends, is aborted, or a `[DONE]` frame is
+   * seen. Used to drain an in-flight Qwen generation so the chat releases its
+   * busy flag before we retry a continuation append.
+   */
+  private async drainStreamToCompletion(
+    stream: any,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<{ completed: boolean; bytesConsumed: number }> {
+    if (!stream) return { completed: true, bytesConsumed: 0 }
+    if (typeof stream !== 'object' || typeof stream.on !== 'function') {
+      return { completed: true, bytesConsumed: 0 }
+    }
+
+    let bytesConsumed = 0
+    let sawDone = false
+
+    await new Promise<void>((resolve) => {
+      let done = false
+      let timer: NodeJS.Timeout | undefined
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer)
+          timer = undefined
+        }
+        options.signal?.removeEventListener('abort', onAbort)
+        if (typeof stream.removeListener === 'function') {
+          stream.removeListener('data', onData)
+          stream.removeListener('end', finish)
+          stream.removeListener('close', finish)
+          stream.removeListener('error', finish)
+        }
+      }
+
+      const finish = () => {
+        if (!done) {
+          done = true
+          cleanup()
+          resolve()
+        }
+      }
+
+      const onData = (chunk: Buffer | string) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+        bytesConsumed += text.length
+        if (!sawDone && text.includes('[DONE]')) {
+          sawDone = true
+        }
+      }
+
+      const onAbort = () => {
+        if (typeof stream.destroy === 'function' && !stream.destroyed) {
+          stream.destroy()
+        }
+        finish()
+      }
+
+      stream.on('data', onData)
+      stream.once('end', finish)
+      stream.once('close', finish)
+      stream.once('error', finish)
+
+      const timeoutMs = options.timeoutMs ?? QWEN_AI_REQUEST_TIMEOUT_MS
+      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        timer = setTimeout(() => {
+          if (typeof stream.destroy === 'function' && !stream.destroyed) {
+            stream.destroy()
+          }
+          finish()
+        }, timeoutMs)
+      }
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      if (options.signal?.aborted) onAbort()
+    })
+
+    return { completed: sawDone, bytesConsumed }
+  }
+
   private extractUpstreamErrorMessage(body: string): string {
     const trimmed = body.trim()
     if (!trimmed) return ''
@@ -3980,8 +4088,11 @@ export class QwenAiAdapter {
 
     let envelopeError: QwenAiUpstreamError | undefined
     let chatInProgress = false
+    // Hoisted so the chatInProgress branch below can deep-search the parsed
+    // envelope for the in-flight response id.
+    let parsedBody: unknown
     try {
-      const parsedBody = JSON.parse(body)
+      parsedBody = JSON.parse(body)
       envelopeError = createQwenAiStreamEnvelopeError(parsedBody, body, 'error')
       if (isObjectValue(parsedBody)) {
         chatInProgress = isQwenAiChatInProgressEnvelope(parsedBody)
@@ -4062,6 +4173,39 @@ export class QwenAiAdapter {
       error.retryable = true
       error.accountFault = false
       delete error.retryScope
+      // The envelope walker only descends into error/errors/data; Qwen can
+      // put the active response_id anywhere in the busy body. Deep-search the
+      // parsed envelope for any response_id-shaped string so the drain can
+      // attach to the in-flight generation.
+      const findResponseId = (value: unknown, depth = 0): string | undefined => {
+        if (depth > 6 || value === null || value === undefined) return undefined
+        if (typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+          return value
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const found = findResponseId(item, depth + 1)
+            if (found) return found
+          }
+          return undefined
+        }
+        if (typeof value === 'object') {
+          const record = value as Record<string, unknown>
+          const direct = record.response_id ?? record.responseId ?? record.id
+          if (typeof direct === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(direct)) {
+            return direct
+          }
+          for (const key of Object.keys(record)) {
+            const found = findResponseId(record[key], depth + 1)
+            if (found) return found
+          }
+        }
+        return undefined
+      }
+      const responseId = envelopeError?.inFlightResponseId ?? findResponseId(parsedBody)
+      if (responseId) {
+        error.inFlightResponseId = responseId
+      }
     } else if (isCapacityLimit) {
       error.code = 'qwen_ai_capacity_limit'
       // Capacity throttling is account-local and should fail over to another
@@ -4925,6 +5069,41 @@ export class QwenAiAdapter {
 
       if (request.signal?.aborted) {
         throw createQwenAiContinuationAbortError()
+      }
+
+      // Drain the in-flight generation before retrying the append. When the
+      // provider exposes the active response_id, resume-attaching to it consumes
+      // the stream so the chat releases its busy flag as soon as that turn
+      // finalizes — instead of waiting for a server-side cleanup timeout we
+      // cannot observe.
+      const inFlightResponseId = validation.error?.inFlightResponseId
+      if (inFlightResponseId && chatInProgressRetries === 0) {
+        try {
+          console.info('[QwenAI] Draining in-flight generation before retrying continuation', JSON.stringify({
+            chatId,
+            inFlightResponseId,
+            parentId,
+          }))
+          const drained = await this.resumeChatCompletion(chatId, inFlightResponseId, request.signal)
+          const drainResult = await this.drainStreamToCompletion(drained.data, {
+            signal: request.signal,
+            timeoutMs: Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, Math.max(30_000, continuationDeadline - Date.now())),
+          })
+          console.info('[QwenAI] In-flight generation drained; retrying continuation', JSON.stringify({
+            chatId,
+            inFlightResponseId,
+            completed: drainResult.completed,
+            bytesConsumed: drainResult.bytesConsumed,
+          }))
+        } catch (drainError) {
+          // A failed drain does not change the retry contract — the chat may
+          // still be busy. Log and fall through to the normal retry path.
+          console.warn('[QwenAI] In-flight generation drain failed; retrying continuation normally', JSON.stringify({
+            chatId,
+            inFlightResponseId,
+            error: describeErrorForLog(drainError),
+          }))
+        }
       }
 
       if (

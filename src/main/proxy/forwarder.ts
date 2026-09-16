@@ -38,6 +38,8 @@ import {
   isQwenAiTransientTransportError,
   qwenAiRequestTimeoutMsFromEnv,
   qwenAiResponsesContinuationRetryAttemptsFromEnv,
+  qwenAiStickyMaxTurnsFromEnv,
+  qwenAiStickyMaxBytesFromEnv,
   qwenAiTranscriptTransportPolicyFromEnv,
   resolveQwenAiNativeContinuationSystemPrompt,
   type QwenAiOutputStream,
@@ -4207,11 +4209,40 @@ export class RequestForwarder {
       const expectedToolProtocol = transformed.plan.shouldParseResponse
         ? transformed.plan.protocol
         : undefined
+      // Sticky checkpoint ceiling: a retained chat grows turn over turn. Past
+      // the configured caps, force a controlled full-transcript replay into a
+      // fresh chat on the same account rather than let Qwen silently truncate
+      // the earliest messages (which carry the tool contract).
+      const stickyMaxTurns = qwenAiStickyMaxTurnsFromEnv()
+      const stickyMaxBytes = qwenAiStickyMaxBytesFromEnv()
+      const stickyCheckpointNeeded = Boolean(
+        continuationBinding
+        && (
+          (stickyMaxTurns > 0 && (continuationBinding.turnCount ?? 0) >= stickyMaxTurns)
+          || (stickyMaxBytes > 0 && (continuationBinding.approxBytes ?? 0) >= stickyMaxBytes)
+        ),
+      )
+      if (stickyCheckpointNeeded && continuationBinding) {
+        console.info('[QwenAI] Sticky checkpoint ceiling reached; replaying transcript into a fresh chat on the same account', JSON.stringify({
+          requestId: context?.requestId,
+          accountId: continuationBinding.accountId,
+          chatId: continuationBinding.chatId,
+          turnCount: continuationBinding.turnCount,
+          approxBytes: continuationBinding.approxBytes,
+        }))
+      }
+
       const canContinueResponsesSession = Boolean(
         continuation
         && continuationBinding
+        && !stickyCheckpointNeeded
         && transformed.plan.shouldParseResponse
-        && continuation.inputMessages.length > 0
+        && (
+          continuation.inputMessages.length > 0
+          // Sticky resume-only: the delta was already appended upstream on a
+          // prior attempt; re-attach to that generation rather than re-append.
+          || continuation.resumeOnly === true
+        )
         && continuationBinding.providerId === provider.id
         && continuationBinding.accountId === account.id
         && continuationBinding.requestedModel === providerRequest.model
@@ -4227,7 +4258,64 @@ export class RequestForwarder {
 
       let response: AxiosResponse
       let chatId: string
-      if (canContinueResponsesSession && continuationBinding && continuation) {
+      if (canContinueResponsesSession && continuationBinding && continuation?.resumeOnly === true) {
+        // Sticky idempotent resume: the delta for this turn was already
+        // appended to the upstream chat on a prior attempt. Re-attach to the
+        // in-flight or completed generation rather than pushing the user
+        // message a second time.
+        activeChatId = continuationBinding.chatId
+        activeChatIsRetained = true
+        try {
+          response = await adapter.resumeChatCompletion(
+            continuationBinding.chatId,
+            continuationBinding.parentId,
+            context?.signal,
+          )
+          chatId = continuationBinding.chatId
+          console.info('[QwenAI] Sticky session resumed in place (delta already appended)', JSON.stringify({
+            requestId: context?.requestId,
+            accountId: account.id,
+            chatId,
+            parentId: continuationBinding.parentId,
+          }))
+        } catch (error) {
+          const resumeCode = errorCodeFromError(error)
+          const resumeStatus = statusFromError(error)
+          const resumeBusy = resumeCode === 'CHAT_IN_PROGRESS'
+            || resumeStatus === 429 && /chat\s+in\s+progress|still\s+in\s+progress/i.test(
+              error instanceof Error ? error.message : String(error),
+            )
+          if (!isQwenAiStaleSessionError(error) && !resumeBusy) throw error
+          if (resumeBusy) {
+            console.info('[QwenAI] Sticky session resume busy; retaining binding', JSON.stringify({
+              requestId: context?.requestId,
+              accountId: account.id,
+              chatId: continuationBinding.chatId,
+            }))
+            return {
+              success: false,
+              status: 429,
+              error: 'Qwen AI chat is still in progress; retry the request.',
+              errorCode: 'CHAT_IN_PROGRESS',
+              retryable: true,
+              accountFault: false,
+              retryScope: 'next-account',
+              latency: Date.now() - startTime,
+            }
+          }
+          // Stale — the chat/branch is gone upstream. Fall through to a fresh
+          // full-transcript replay on the same account below.
+          cleanupChat(continuationBinding.chatId)
+          activeChatId = undefined
+          activeChatIsRetained = false
+          const restarted = await adapter.chatCompletion(
+            createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
+          )
+          response = restarted.response
+          chatId = restarted.chatId
+          activeChatId = chatId
+        }
+      } else if (canContinueResponsesSession && continuationBinding && continuation) {
         activeChatId = continuationBinding.chatId
         activeChatIsRetained = true
         const workflowContinuationMessage = createToolWorkflowContinuationMessage({
@@ -4344,6 +4432,12 @@ export class RequestForwarder {
           activeChatId = chatId
         }
       } else {
+        // A sticky checkpoint re-stick replays the full transcript into a
+        // fresh chat on the same account — retire the old chat so the upstream
+        // sidebar does not accumulate dead branches.
+        if (stickyCheckpointNeeded && continuationBinding) {
+          cleanupChat(continuationBinding.chatId)
+        }
         const started = await adapter.chatCompletion(
           createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
         )

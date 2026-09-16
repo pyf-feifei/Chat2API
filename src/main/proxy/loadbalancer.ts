@@ -9,6 +9,7 @@ import { storeManager } from '../store/store'
 import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
 import { hasQwenAiSessionCookie } from './adapters/qwen-ai-token-refresh'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
+import { qwenAiStickyRegistry } from './qwenAiStickyRegistry'
 
 const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
 
@@ -20,6 +21,11 @@ export interface AccountSelectionConstraints {
    * governor queue that account instead of silently selecting another one.
    */
   allowQueuedQwenAiPreferredAccount?: boolean
+  /**
+   * Sticky-session mode: order candidates by ascending active-lineage count
+   * so new lineages land on accounts not already hosting sticky chats.
+   */
+  preferLowStickyCount?: boolean
 }
 
 type AccountFailureState = {
@@ -188,6 +194,14 @@ export class LoadBalancer {
     }
 
     if (candidates.length === 0) {
+      const providers = storeManager.getProviders().filter(p => p.enabled)
+      const providerInfo = providers.map(p => {
+        const accounts = storeManager.getAccountsByProviderId(p.id, true)
+        const activeCount = accounts.filter(a => this.isAccountAvailable(a)).length
+        const supportsModel = this.providerSupportsModel(p, model)
+        return `${p.id}:${supportsModel ? 'supports' : 'no-support'}:${activeCount}/${accounts.length} active`
+      }).join('; ')
+      console.warn(`[LoadBalancer] No candidates for model "${model}": ${providerInfo || 'no providers'}`)
       return null
     }
 
@@ -221,6 +235,15 @@ export class LoadBalancer {
     ))
     if (immediatelyAvailable.length > 0) {
       candidates = immediatelyAvailable
+    }
+
+    if (constraints.preferLowStickyCount === true) {
+      const stickyCount = (candidate: AccountSelection) => (
+        this.isQwenAiProvider(candidate.provider)
+          ? qwenAiStickyRegistry.countForAccount(candidate.account.id)
+          : 0
+      )
+      candidates = [...candidates].sort((a, b) => stickyCount(a) - stickyCount(b))
     }
 
     if (strategy === 'fill-first') {

@@ -126,3 +126,10 @@ scripts/zai-captcha/find_*.js
 
 # Local sync of the Docker data volume (encrypted credentials)
 .chat2api-docker-data/
+
+# Local dev runtime data (accounts/credentials/file cache/request logs — never commit)
+data.dev.json
+data.*.json
+data.corrupted.*.json
+dev-data/
+*dev-data/
