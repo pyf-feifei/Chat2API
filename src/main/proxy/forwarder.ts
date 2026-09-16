@@ -4383,28 +4383,51 @@ export class RequestForwarder {
           if (continuationBusy) {
             // The upstream chat is still finalizing a prior turn. Preserve
             // the binding so a client retry of the same previous_response_id
-            // continues the original provider lineage.
-            console.info('[QwenAI] Responses session continuation busy; retaining session binding', JSON.stringify({
-              requestId: context?.requestId,
-              accountId: account.id,
-              chatId: continuationBinding.chatId,
-              status: continuationStatus,
-              errorCode: continuationCode,
-            }))
-            return {
-              success: false,
-              status: 429,
-              error: 'Qwen AI chat is still in progress; retrying on another available account with the full transcript.',
-              errorCode: 'CHAT_IN_PROGRESS',
-              retryable: true,
-              accountFault: false,
-              // The retained chat has already had its bounded same-chat retry
-              // budget. Let the route failover layer select another healthy
-              // account and replay the complete transcript there. The old
-              // provider chat is deliberately left intact for a client retry
-              // when no replacement account is available.
-              retryScope: 'next-account',
-              latency: Date.now() - startTime,
+            // continues the original provider lineage — unless the drain
+            // proved the in-flight response is a dead remnant (no bytes, no
+            // [DONE]); that chat can never accept another turn, so retain
+            // would pin every client retry to a permanently busy dead branch.
+            const deadInFlight = (error as { deadInFlight?: unknown })?.deadInFlight === true
+            if (deadInFlight) {
+              console.info('[QwenAI] Responses session continuation hit a dead in-flight response; replaying full transcript into a fresh chat on the same account', JSON.stringify({
+                requestId: context?.requestId,
+                accountId: account.id,
+                chatId: continuationBinding.chatId,
+                status: continuationStatus,
+                errorCode: continuationCode,
+              }))
+              cleanupChat(continuationBinding.chatId)
+              activeChatId = undefined
+              activeChatIsRetained = false
+              const restarted = await adapter.chatCompletion(
+                createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
+              )
+              response = restarted.response
+              chatId = restarted.chatId
+              activeChatId = chatId
+            } else {
+              console.info('[QwenAI] Responses session continuation busy; retaining session binding', JSON.stringify({
+                requestId: context?.requestId,
+                accountId: account.id,
+                chatId: continuationBinding.chatId,
+                status: continuationStatus,
+                errorCode: continuationCode,
+              }))
+              return {
+                success: false,
+                status: 429,
+                error: 'Qwen AI chat is still in progress; retrying on another available account with the full transcript.',
+                errorCode: 'CHAT_IN_PROGRESS',
+                retryable: true,
+                accountFault: false,
+                // The retained chat has already had its bounded same-chat retry
+                // budget. Let the route failover layer select another healthy
+                // account and replay the complete transcript there. The old
+                // provider chat is deliberately left intact for a client retry
+                // when no replacement account is available.
+                retryScope: 'next-account',
+                latency: Date.now() - startTime,
+              }
             }
           }
 
@@ -4935,6 +4958,12 @@ export class RequestForwarder {
               : undefined
           : inferredErrorRetryScope,
         recoveryHint,
+        // Surface the dead-in-flight structural signal so the Responses route
+        // can drop the sticky chain binding instead of re-pinning every retry
+        // to a permanently busy dead branch.
+        ...((error as { deadInFlight?: unknown })?.deadInFlight === true
+          ? { deadInFlight: true }
+          : {}),
       }
     }
   }

@@ -96,6 +96,15 @@ const QWEN_AI_DEBUG_REQUEST_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_REQUEST ==
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS = 60_000
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS = 1
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS = 1_000
+// A resume-drain that consumes almost nothing and never sees [DONE] means the
+// upstream marked a response as in-flight but never started (or already
+// discarded) it — the chat-level busy flag is a stale remnant, not a live
+// generation. Keep the threshold env-tunable; a genuinely generating response
+// emits far more than this in any drain window.
+const QWEN_AI_DEAD_IN_FLIGHT_MAX_BYTES = positiveNumberFromEnv(
+  'CHAT2API_QWEN_AI_DEAD_IN_FLIGHT_MAX_BYTES',
+  512,
+)
 // Busy-chat admission is a short provider-state wait, not the generation
 // timeout. Keep the default bounded while allowing deployments to tune it.
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_BUDGET_MS = 120_000
@@ -416,12 +425,16 @@ export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
 export function qwenAiWrapperLeakRecoveryAttemptsFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS
   if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
-    return 1
+    // A wrapper leak replaces the branch in a FRESH chat (the replayed
+    // transcript no longer carries the assistant branch that echoed the
+    // marker), so a second attempt is cheap and frequently succeeds where the
+    // first retry re-drew the same poisoned context. Default 2.
+    return 2
   }
 
   const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) return 1
-  return Math.min(value, 2)
+  if (!Number.isSafeInteger(value) || value < 0) return 2
+  return Math.min(value, 3)
 }
 
 /**
@@ -2226,6 +2239,14 @@ export type QwenAiUpstreamError = Error & {
   upstreamState?: 'no_events' | 'active_without_terminal' | 'completed_without_valid_output' | 'client_disconnected'
   /** When CHAT_IN_PROGRESS carries the in-flight response id, resume-drain can consume it. */
   inFlightResponseId?: string
+  /**
+   * Structural signal: the upstream claimed the chat was busy on an in-flight
+   * response, but resume-draining that response produced (almost) no bytes and
+   * no [DONE] — the generation is a dead remnant, not a live turn. Callers
+   * should treat the chat as unrecoverable for continuation and replay fresh
+   * instead of retaining the binding.
+   */
+  deadInFlight?: boolean
 }
 
 type QwenAiErrorEnvelopeMetadata = {
@@ -5089,13 +5110,34 @@ export class QwenAiAdapter {
             signal: request.signal,
             timeoutMs: Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, Math.max(30_000, continuationDeadline - Date.now())),
           })
+          const deadInFlight = !drainResult.completed
+            && drainResult.bytesConsumed < QWEN_AI_DEAD_IN_FLIGHT_MAX_BYTES
           console.info('[QwenAI] In-flight generation drained; retrying continuation', JSON.stringify({
             chatId,
             inFlightResponseId,
             completed: drainResult.completed,
             bytesConsumed: drainResult.bytesConsumed,
+            ...(deadInFlight ? { deadInFlight: true } : {}),
           }))
+          if (deadInFlight) {
+            // The upstream pinned this chat to an in-flight response that
+            // produced no bytes and never finished — a stale busy flag, not a
+            // live generation. Surface it as an unrecoverable-for-continuation
+            // signal so the caller drops the sticky binding and replays fresh
+            // instead of burning the retry budget + account cooldown on a
+            // chat that will never accept another turn.
+            const dead = createBusyContinuationExhaustedError(validation.error)
+            dead.deadInFlight = true
+            dead.inFlightResponseId = inFlightResponseId
+            throw dead
+          }
         } catch (drainError) {
+          // A dead-in-flight signal thrown above must escape — it is a
+          // deliberate "drop the binding" verdict, not a drain transport
+          // failure to swallow.
+          if ((drainError as { deadInFlight?: unknown })?.deadInFlight === true) {
+            throw drainError
+          }
           // A failed drain does not change the retry contract — the chat may
           // still be busy. Log and fall through to the normal retry path.
           console.warn('[QwenAI] In-flight generation drain failed; retrying continuation normally', JSON.stringify({
@@ -6195,7 +6237,13 @@ export class QwenAiStreamHandler {
         return
       }
 
-      if (error.code === 'qwen_ai_wrapper_leak' && visibleFrameCommitted) {
+      // A leaked wrapper is a deterministic protocol violation on the answer
+      // branch. Reasoning/summary frames are a side-channel — they can be
+      // dropped and regenerated without splicing two different answers into
+      // the client's visible output, so they must not lock the branch in.
+      // Only a committed *answer* frame makes replay unsafe: at that point a
+      // replacement would splice a different generation into visible text.
+      if (error.code === 'qwen_ai_wrapper_leak' && answerFrameCommitted) {
         failStream(error)
         return
       }

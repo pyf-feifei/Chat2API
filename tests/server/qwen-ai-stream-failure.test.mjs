@@ -8994,6 +8994,88 @@ test('Qwen AI replaces a wrapper-leak branch immediately instead of parking it u
   assert.doesNotMatch(body, /event: error/)
 })
 
+test('Qwen AI recovers a wrapper leak when only reasoning frames were committed', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    isCompleteJsonText,
+    normalizeNativeFunctionCallDelta: declaredNativeToolFragments,
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    wrapperLeakManagedPlan('reasoning-only wrapper replacement test'),
+  )
+  handler.setChatId('reasoning-only-wrapper-chat')
+  const continuationErrorCodes = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => { throw new Error('wrapper recovery must use workflow continuation') },
+    continueWorkflow: async (_parentId, recoveryError) => {
+      continuationErrorCodes.push(recoveryError?.code)
+      setImmediate(() => {
+        continued.end([
+          `data: ${JSON.stringify({ 'response.created': { response_id: 'reasoning-only-corrected', response_index: 0 } })}\n\n`,
+          `data: ${JSON.stringify({ response_id: 'reasoning-only-corrected', choices: [{ delta: {
+            phase: 'answer',
+            status: 'finished',
+            tool_calls: [{
+              id: 'reasoning-only-corrected-call',
+              function: { name: 'declared_tool', arguments: '{"verified":true}' },
+            }],
+          } }] })}\n\ndata: [DONE]\n\n`,
+        ].join(''))
+      })
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  // Reasoning frames reach the client before the answer phase begins; the
+  // wrapper appears only in the answer content. Because no answer frame has
+  // committed yet, the leaked branch is still replaceable.
+  initial.write([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'reasoning-only-leaked', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'reasoning-only-leaked', choices: [{ delta: {
+      phase: 'think',
+      status: 'typing',
+      content: 'visible reasoning progress',
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'reasoning-only-leaked', choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      content: `preface ${MANAGED_TOOL_RESULT_WRAPPER} trailing prose`,
+    } }] })}\n\n`,
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(continuationErrorCodes, ['qwen_ai_wrapper_leak'])
+  assert.equal(failure, undefined)
+  assert.match(body, /visible reasoning progress/)
+  assert.doesNotMatch(body, /CHAT2API\|tool_result|fabricated wrapper result|trailing prose/)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.doesNotMatch(body, /event: error/)
+})
+
 test('Qwen AI fails fast once the wrapper-leak recovery budget is spent', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: RealToolStreamParser,
@@ -9070,14 +9152,14 @@ test('Qwen AI wrapper-leak recovery budget honors deployment configuration', () 
 
   try {
     const cases = [
-      { raw: undefined, expected: 1 },
-      { raw: '', expected: 1 },
-      { raw: 'auto', expected: 1 },
+      { raw: undefined, expected: 2 },
+      { raw: '', expected: 2 },
+      { raw: 'auto', expected: 2 },
       { raw: '0', expected: 0 },
       { raw: '2', expected: 2 },
-      { raw: '5', expected: 2 },
-      { raw: '-1', expected: 1 },
-      { raw: 'not-a-number', expected: 1 },
+      { raw: '5', expected: 3 },
+      { raw: '-1', expected: 2 },
+      { raw: 'not-a-number', expected: 2 },
     ]
     for (const { raw, expected } of cases) {
       if (raw === undefined) {

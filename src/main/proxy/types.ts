@@ -350,6 +350,13 @@ export interface ForwardResult {
   retryScope?: 'next-account'
   /** Internal hint for a narrowly scoped retry that may bypass one account interval. */
   recoveryHint?: 'managed_tool_stream_validation'
+  /**
+   * Qwen continuation hit a chat whose pinned in-flight response produced no
+   * bytes and no terminal event — a stale busy flag. Signal the sticky-chain
+   * layer to drop the binding so the next request starts a fresh chat instead
+   * of re-attaching to a permanently dead branch.
+   */
+  deadInFlight?: boolean
   providerSessionId?: string
   parentMessageId?: string
   /** Account that produced the client-visible result after internal routing. */

@@ -1126,13 +1126,22 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     const retryScope = streamFailureRetryScope(error, status)
     const errorCode = streamFailureCode(error)
     const claimErrorCode = status === 499 ? undefined : errorCode
+    // A dead in-flight remnant (upstream pinned the chat to a response that
+    // emitted no bytes and never terminated) makes the retained chat
+    // permanently busy — clear it like a stale branch even though the error
+    // code is still CHAT_IN_PROGRESS.
+    const deadInFlight = (error as { deadInFlight?: unknown } | undefined)?.deadInFlight === true
     const clearsPreviousBinding = (
       status !== 499
       &&
       initialUsesQwenAiContinuation
-      && !isQwenAiChatInProgressErrorCode(claimErrorCode)
       && (
-        isQwenAiSessionStaleErrorCode(claimErrorCode)
+        deadInFlight
+        || !isQwenAiChatInProgressErrorCode(claimErrorCode)
+      )
+      && (
+        deadInFlight
+        || isQwenAiSessionStaleErrorCode(claimErrorCode)
         || isQwenAiContinuationRejectedErrorCode(claimErrorCode)
         || deferredStreamFailure
         || (
@@ -1466,9 +1475,17 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
           && (
             result.accountFault === true
             || isQwenAiChatInProgressErrorCode(result.errorCode)
+            || result.deadInFlight === true
           )
         ) {
           clearQwenAiContinuationState('account_failover')
+          // A dead in-flight remnant pins the chain to a chat that can never
+          // accept another turn. Drop the chain entry too so the next account
+          // starts a fresh chat instead of inheriting the dead branch.
+          if (result.deadInFlight === true && stickyChainEntry) {
+            qwenAiStickyRegistry.releaseChain(stickyChainEntry.chainKey)
+            stickyChainEntry = undefined
+          }
         }
         storeManager.addLog('warn', 'Retrying Responses request with another account after upstream failure', {
           requestId: responseId,
