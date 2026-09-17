@@ -4003,7 +4003,7 @@ export class QwenAiAdapter {
   private async drainStreamToCompletion(
     stream: any,
     options: { signal?: AbortSignal; timeoutMs?: number } = {},
-  ): Promise<{ completed: boolean; bytesConsumed: number }> {
+  ): Promise<{ completed: boolean; bytesConsumed: number; preview?: string; sawDataFrame?: boolean }> {
     if (!stream) return { completed: true, bytesConsumed: 0 }
     if (typeof stream !== 'object' || typeof stream.on !== 'function') {
       return { completed: true, bytesConsumed: 0 }
@@ -4011,6 +4011,16 @@ export class QwenAiAdapter {
 
     let bytesConsumed = 0
     let sawDone = false
+    // True once any `data:` SSE frame arrives. A resumed response that the
+    // upstream still recognizes emits at least one event frame; a pinned dead
+    // remnant emits nothing. This distinguishes "the response finished/was
+    // discarded and the chat is now free" (frames seen, no [DONE]) from "the
+    // busy flag is stale" (no frames at all).
+    let sawDataFrame = false
+    // Capture a short preview of what the resume endpoint actually returned so
+    // a non-stream body (a fixed error/notice envelope, not a live SSE) can be
+    // distinguished from a genuinely idle in-flight generation in the log.
+    let preview = ''
 
     await new Promise<void>((resolve) => {
       let done = false
@@ -4041,6 +4051,12 @@ export class QwenAiAdapter {
       const onData = (chunk: Buffer | string) => {
         const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         bytesConsumed += text.length
+        if (preview.length < 240) {
+          preview = (preview + text).slice(0, 240)
+        }
+        if (!sawDataFrame && /(?:^|\n)\s*data\s*:/.test(text)) {
+          sawDataFrame = true
+        }
         if (!sawDone && text.includes('[DONE]')) {
           sawDone = true
         }
@@ -4071,7 +4087,7 @@ export class QwenAiAdapter {
       if (options.signal?.aborted) onAbort()
     })
 
-    return { completed: sawDone, bytesConsumed }
+    return { completed: sawDone, bytesConsumed, preview, sawDataFrame }
   }
 
   private extractUpstreamErrorMessage(body: string): string {
@@ -5022,6 +5038,10 @@ export class QwenAiAdapter {
       : Math.min(configuredContinuationDeadline, request.deadlineAt)
     let chatInProgressRetries = 0
     let lastChatInProgressError: QwenAiUpstreamError | undefined
+    // In-flight response ids that already had a truncated drain (frames seen,
+    // no [DONE]) and yet the append stayed busy. Re-draining the same dead id
+    // would loop to the deadline; cap it so the same id drains at most once.
+    const truncatedDrainIds = new Set<string>()
 
     const createContinuationOptions = () => ({
       headers: {
@@ -5107,40 +5127,95 @@ export class QwenAiAdapter {
       // the stream so the chat releases its busy flag as soon as that turn
       // finalizes — instead of waiting for a server-side cleanup timeout we
       // cannot observe.
+      //
+      // This runs on EVERY CHAT_IN_PROGRESS that names an in-flight response,
+      // not just the first. A live generation that is still producing bytes is
+      // drained to completion (or to the continuation deadline) and the loop
+      // retries the same binding immediately — the drain's own timeout provides
+      // the pacing, so no extra blind sleep is spent and the blind retry budget
+      // is reserved for the case where the busy signal carries no response_id.
       const inFlightResponseId = validation.error?.inFlightResponseId
-      if (inFlightResponseId && chatInProgressRetries === 0) {
+      // Skip re-draining an id whose earlier truncated drain already proved the
+      // upstream discarded it yet kept the chat busy — that would loop until
+      // the deadline. The blind retry path below handles it instead.
+      const shouldDrain = Boolean(inFlightResponseId)
+        && !truncatedDrainIds.has(inFlightResponseId as string)
+      if (inFlightResponseId && shouldDrain) {
         try {
           console.info('[QwenAI] Draining in-flight generation before retrying continuation', JSON.stringify({
             chatId,
             inFlightResponseId,
             parentId,
+            retry: chatInProgressRetries,
           }))
           const drained = await this.resumeChatCompletion(chatId, inFlightResponseId, request.signal)
           const drainResult = await this.drainStreamToCompletion(drained.data, {
             signal: request.signal,
             timeoutMs: Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, Math.max(30_000, continuationDeadline - Date.now())),
           })
+          // A pinned response is a dead remnant only when the resume returned
+          // no SSE data frames at all — the upstream never treated it as a live
+          // generation, so the busy flag is stale. A response that emits even a
+          // short truncated frame burst (the ~119-byte heads seen on every
+          // drain) means the upstream recognized the response and has finished
+          // or discarded it; the chat is free, so the same binding is retried
+          // instead of replaying the full transcript into a fresh chat.
           const deadInFlight = !drainResult.completed
+            && !drainResult.sawDataFrame
             && drainResult.bytesConsumed < QWEN_AI_DEAD_IN_FLIGHT_MAX_BYTES
           console.info('[QwenAI] In-flight generation drained; retrying continuation', JSON.stringify({
             chatId,
             inFlightResponseId,
             completed: drainResult.completed,
             bytesConsumed: drainResult.bytesConsumed,
+            sawDataFrame: drainResult.sawDataFrame === true,
+            retry: chatInProgressRetries,
+            // Surface the resume body's head so a fixed non-stream notice is
+            // visible instead of being misclassified as a dead remnant.
+            ...(drainResult.preview ? { drainPreview: drainResult.preview } : {}),
             ...(deadInFlight ? { deadInFlight: true } : {}),
           }))
           if (deadInFlight) {
             // The upstream pinned this chat to an in-flight response that
-            // produced no bytes and never finished — a stale busy flag, not a
-            // live generation. Surface it as an unrecoverable-for-continuation
-            // signal so the caller drops the sticky binding and replays fresh
-            // instead of burning the retry budget + account cooldown on a
-            // chat that will never accept another turn.
+            // produced no frames at all — a stale busy flag, not a live or
+            // recently-finished generation. Surface it as an
+            // unrecoverable-for-continuation signal so the caller drops the
+            // sticky binding and replays fresh.
             const dead = createBusyContinuationExhaustedError(validation.error)
             dead.deadInFlight = true
             dead.inFlightResponseId = inFlightResponseId
             throw dead
           }
+          if (!drainResult.completed) {
+            // A truncated drain (frames seen, no [DONE]): the response is gone
+            // but the busy flag may still be held. Remember the id so a second
+            // busy signal naming it drops to blind retry rather than re-draining
+            // the same dead stream to the deadline.
+            truncatedDrainIds.add(inFlightResponseId)
+          }
+          // A live or freshly-finished in-flight turn was drained. Whether it
+          // completed cleanly or was discarded mid-flight, the drain timeout
+          // already waited — retry the append on the same binding instead of
+          // spending a blind retry-budget slot. The continuationDeadline at the
+          // top of the loop still bounds total wait.
+          //
+          // One edge: a live response can emit a burst then complete almost
+          // immediately, so drain returns fast while Qwen has not yet cleared
+          // the busy flag. Without a floor this tight-loops POST/CHAT_IN_PROGRESS
+          // round-trips. Apply the base delay as a minimum inter-append pacing;
+          // when the drain genuinely blocked for its timeout the extra delay is
+          // negligible, and when it returned instantly this prevents a hot loop.
+          const postDrainDelayMs = Math.min(
+            QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
+            baseRetryDelayMs,
+            Math.max(0, continuationDeadline - Date.now()),
+          )
+          if (postDrainDelayMs > 0) {
+            if (!(await waitForQwenAiRetry(postDrainDelayMs, request.signal))) {
+              throw createQwenAiContinuationAbortError()
+            }
+          }
+          continue
         } catch (drainError) {
           // A dead-in-flight signal thrown above must escape — it is a
           // deliberate "drop the binding" verdict, not a drain transport

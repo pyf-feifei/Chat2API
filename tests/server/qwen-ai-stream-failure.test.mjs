@@ -10931,3 +10931,212 @@ test('Qwen AI stream stress: adversarial marker pattern never leaks across 60 cy
     assert.match(body, /"finish_reason":"tool_calls"/, `cycle ${cycle}: tool-call finish reason missing`)
   }
 })
+
+// --- CHAT_IN_PROGRESS live-drain regression -----------------------------------
+// Root fix 2026-09-17: when the upstream pins the chat to an in-flight
+// response_id, the continuation loop resume-drains THAT live generation to
+// completion on every CHAT_IN_PROGRESS (not only retry 0), then retries the same
+// binding. A drained live turn releases the busy flag → zero full-transcript
+// replay. A dead remnant (<deadInFlight bytes, no [DONE]) still marks
+// deadInFlight so the caller drops the binding and replays fresh.
+
+function createAdapterForContinuation(axiosBehavior) {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const account = {
+    id: 'acct-1',
+    credentials: { token: 'tok-abc', cookies: 'token=tok-abc' },
+  }
+  const provider = { id: 'qwen-ai', name: 'Qwen', models: [] }
+  const adapter = new QwenAiAdapter(provider, account)
+  adapter.tokenRefresher = {
+    refreshIfNeeded: async acct => acct,
+    refreshAfterUnauthorized: async acct => acct,
+  }
+  adapter.axiosInstance = {
+    post: axiosBehavior.post,
+    get: axiosBehavior.get,
+  }
+  return adapter
+}
+
+function chatInProgressJsonResponse(responseId) {
+  const body = JSON.stringify({
+    success: false,
+    data: { code: 'CHAT_IN_PROGRESS', details: 'chat is in progress', response_id: responseId },
+  })
+  const stream = new PassThrough()
+  stream.on('error', () => {})
+  setImmediate(() => stream.end(body))
+  return {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+    data: stream,
+  }
+}
+
+function sseOkResponse() {
+  const stream = new PassThrough()
+  stream.on('error', () => {})
+  setImmediate(() => stream.end('data: {"response_id":"final-1","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\ndata: [DONE]\n\n'))
+  return {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+    data: stream,
+  }
+}
+
+test('Qwen AI continuation drains a live in-flight response to completion then retries same binding', async () => {
+  const inFlightId = '11111111-2222-3333-4444-555555555555'
+  const calls = { posts: 0, gets: 0 }
+  const adapter = createAdapterForContinuation({
+    post: async () => {
+      calls.posts += 1
+      // First append is rejected busy; second (after drain) is accepted.
+      return calls.posts === 1 ? chatInProgressJsonResponse(inFlightId) : sseOkResponse()
+    },
+    get: async () => {
+      calls.gets += 1
+      const resumed = new PassThrough()
+      resumed.on('error', () => {})
+      setImmediate(() => {
+        // A live in-flight generation: produces bytes then completes with [DONE].
+        resumed.write('data: {"response_id":"' + inFlightId + '","choices":[{"delta":{"content":"partial"}}]}\n\n')
+        resumed.end('data: [DONE]\n\n')
+      })
+      return { status: 200, headers: { 'content-type': 'text/event-stream' }, data: resumed }
+    },
+  })
+
+  const response = await adapter.continueChatCompletion({
+    chatId: 'chat-live',
+    parentId: 'parent-1',
+    model: 'Qwen3.8-Max',
+    content: 'continue',
+    messages: [],
+    managedToolCalling: true,
+    managedToolWorkflowContinuation: true,
+    chatInProgressRetryAttempts: 1,
+  })
+
+  assert.equal(response.status, 200, 'continuation should be accepted after draining the live in-flight turn')
+  assert.equal(calls.gets, 1, 'live in-flight response should be resume-drained once')
+  assert.equal(calls.posts, 2, 'append retried on the same binding after the drain released the chat')
+})
+
+test('Qwen AI continuation drains a live in-flight response across repeated busy signals', async () => {
+  const inFlightId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+  const calls = { posts: 0, gets: 0 }
+  const adapter = createAdapterForContinuation({
+    post: async () => {
+      calls.posts += 1
+      // Two consecutive busy signals, each naming the same in-flight response;
+      // the drain must run on EVERY one (not only retry 0), then the third
+      // append succeeds.
+      return calls.posts <= 2 ? chatInProgressJsonResponse(inFlightId) : sseOkResponse()
+    },
+    get: async () => {
+      calls.gets += 1
+      const resumed = new PassThrough()
+      resumed.on('error', () => {})
+      setImmediate(() => resumed.end('data: {"choices":[{"delta":{"content":"x"}}]}\n\ndata: [DONE]\n\n'))
+      return { status: 200, headers: { 'content-type': 'text/event-stream' }, data: resumed }
+    },
+  })
+
+  const response = await adapter.continueChatCompletion({
+    chatId: 'chat-repeat',
+    parentId: 'parent-1',
+    model: 'Qwen3.8-Max',
+    content: 'continue',
+    messages: [],
+    managedToolCalling: true,
+    managedToolWorkflowContinuation: true,
+    // Even with a single blind retry slot, the live-drain path must not consume
+    // it: each drain loops back and re-appends on the same binding.
+    chatInProgressRetryAttempts: 1,
+  })
+
+  assert.equal(response.status, 200)
+  assert.equal(calls.gets, 2, 'drain must run on every CHAT_IN_PROGRESS naming a response_id')
+  assert.equal(calls.posts, 3, 'append retried until the drained chat accepted it')
+})
+
+test('Qwen AI continuation retries same binding when the in-flight drain returns a truncated frame burst', async () => {
+  // Regression for the live 2026-09-17 finding: every drain returned exactly
+  // 119 bytes (a single SSE data frame, no [DONE]) and was misclassified as a
+  // dead remnant → full-transcript replay. A frame-bearing truncated stream
+  // means the upstream recognized and discarded the response; the chat is free
+  // so the SAME binding must be retried, not replayed.
+  const inFlightId = '12121212-3434-5656-7878-909090909090'
+  const calls = { posts: 0, gets: 0 }
+  const adapter = createAdapterForContinuation({
+    post: async () => {
+      calls.posts += 1
+      return calls.posts === 1 ? chatInProgressJsonResponse(inFlightId) : sseOkResponse()
+    },
+    get: async () => {
+      calls.gets += 1
+      const resumed = new PassThrough()
+      resumed.on('error', () => {})
+      setImmediate(() => {
+        // Exactly the ~119-byte truncated head: one data frame then close, no [DONE].
+        resumed.end('data: {"response_id":"' + inFlightId + '","choices":[{"delta":{"phase":"answer","status":"finished"}}]}\n\n')
+      })
+      return { status: 200, headers: { 'content-type': 'text/event-stream' }, data: resumed }
+    },
+  })
+
+  const response = await adapter.continueChatCompletion({
+    chatId: 'chat-truncated',
+    parentId: 'parent-1',
+    model: 'Qwen3.8-Max',
+    content: 'continue',
+    messages: [],
+    managedToolCalling: true,
+    managedToolWorkflowContinuation: true,
+    chatInProgressRetryAttempts: 1,
+  })
+
+  assert.equal(response.status, 200, 'a truncated (frame-bearing) drain frees the chat → same binding retried')
+  assert.equal(calls.gets, 1, 'drained once')
+  assert.equal(calls.posts, 2, 'retried on the same binding, no fresh replay')
+})
+
+test('Qwen AI continuation marks a byte-less in-flight remnant as deadInFlight for fresh replay', async () => {
+  const inFlightId = '99999999-8888-7777-6666-555555555555'
+  const calls = { posts: 0, gets: 0 }
+  const adapter = createAdapterForContinuation({
+    post: async () => {
+      calls.posts += 1
+      return chatInProgressJsonResponse(inFlightId)
+    },
+    get: async () => {
+      calls.gets += 1
+      const resumed = new PassThrough()
+      resumed.on('error', () => {})
+      // Dead remnant: closes immediately with no bytes and no [DONE].
+      setImmediate(() => resumed.end(''))
+      return { status: 200, headers: { 'content-type': 'text/event-stream' }, data: resumed }
+    },
+  })
+
+  await assert.rejects(
+    () => adapter.continueChatCompletion({
+      chatId: 'chat-dead',
+      parentId: 'parent-1',
+      model: 'Qwen3.8-Max',
+      content: 'continue',
+      messages: [],
+      managedToolCalling: true,
+      managedToolWorkflowContinuation: true,
+      chatInProgressRetryAttempts: 5,
+    }),
+    error => {
+      assert.equal(error.code, 'CHAT_IN_PROGRESS')
+      assert.equal(error.deadInFlight, true, 'byte-less drain must be marked deadInFlight for fresh replay')
+      assert.equal(error.inFlightResponseId, inFlightId)
+      return true
+    },
+  )
+  assert.equal(calls.gets, 1, 'dead remnant drains once then gives up')
+})

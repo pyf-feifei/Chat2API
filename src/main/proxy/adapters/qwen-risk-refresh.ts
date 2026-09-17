@@ -9,43 +9,66 @@ const CHALLENGE_WINDOW_MS = 15 * 60_000
 const CHALLENGE_THRESHOLD = 3
 const REFRESH_COOLDOWN_MS = 30 * 60_000
 
-const challengeByAccount = new Map<string, number[]>()
-const lastRefreshAt = new Map<string, number>()
+// RGV587 (FAIL_SYS_USER_VALIDATE) is an exit-IP / browser-fingerprint verdict,
+// not an account verdict: rotating accounts behind the same flagged exit keeps
+// hitting the same challenge. Counting challenges per account can therefore
+// never reach the threshold — under "rotate on first busy" failover no single
+// account accumulates CHALLENGE_THRESHOLD hits in the window (observed live
+// 2026-09-17: 12 accounts × 2 hits each → zero refreshes). Count challenges
+// globally against the shared exit instead.
+const globalChallengeTimestamps: number[] = []
+// One refresh at a time for the whole pool — a single slider pass re-issues
+// the exit-level x5sec family that every account behind the exit can reuse.
+let globalRefreshInFlight: Promise<Account | null> | undefined
+let lastGlobalRefreshAt = 0
+// Per-account in-flight guard for the manual refresh entry point
+// (refreshQwenAiRiskSession), kept separate from the pool-wide gate so a manual
+// trigger on account A and an auto trigger on account B cannot both spawn a
+// browser at once.
 const inFlight = new Map<string, Promise<Account | null>>()
 
 /**
- * Record that an account's request hit the RGV587 validation envelope
+ * Record that a request hit the RGV587 validation envelope
  * (FAIL_SYS_USER_VALIDATE + 被挤爆). After CHALLENGE_THRESHOLD hits inside
- * the window, kick one background risk-session refresh — a real browser
- * passes the aliyun slider and re-issues the risk cookies (x5sec family),
- * which is the community-verified durable fix for content-flagged sessions.
+ * the window across ANY account on the shared exit, kick one background
+ * risk-session refresh — a real browser passes the aliyun slider and re-issues
+ * the risk cookies (x5sec family), which is the community-verified durable fix
+ * for content-flagged sessions.
  */
 export function noteQwenAiRiskChallenge(account: Account, evidence?: string): void {
   const envelope = /FAIL_SYS_USER_VALIDATE|RGV587/i.test(String(evidence ?? ''))
   if (!envelope) return
-  const id = account.id
   const now = Date.now()
-  const hits = (challengeByAccount.get(id) ?? []).filter(ts => now - ts < CHALLENGE_WINDOW_MS)
-  hits.push(now)
-  challengeByAccount.set(id, hits)
-  if (hits.length < CHALLENGE_THRESHOLD) return
-  const last = lastRefreshAt.get(id) ?? 0
-  if (now - last < REFRESH_COOLDOWN_MS) return
-  if (inFlight.has(id)) return
-  lastRefreshAt.set(id, now)
-  challengeByAccount.set(id, [])
+  // Global exit-level window: drop hits older than the window, then count.
+  while (globalChallengeTimestamps.length > 0 && now - globalChallengeTimestamps[0] >= CHALLENGE_WINDOW_MS) {
+    globalChallengeTimestamps.shift()
+  }
+  globalChallengeTimestamps.push(now)
+  if (globalChallengeTimestamps.length < CHALLENGE_THRESHOLD) return
+  if (now - lastGlobalRefreshAt < REFRESH_COOLDOWN_MS) return
+  if (globalRefreshInFlight) return
+  lastGlobalRefreshAt = now
+  globalChallengeTimestamps.length = 0
   console.warn('[QwenAI Risk Refresh] RGV587 challenge threshold hit, refreshing risk session', JSON.stringify({
-    accountId: id,
+    triggerAccountId: account.id,
     challenges: CHALLENGE_THRESHOLD,
     windowMs: CHALLENGE_WINDOW_MS,
   }))
-  void refreshQwenAiRiskSession(account).then(result => {
-    if (result) {
-      console.info('[QwenAI Risk Refresh] risk session updated', JSON.stringify({ accountId: id }))
-    }
-  }).catch(error => {
-    console.error('[QwenAI Risk Refresh] failed:', error instanceof Error ? error.message : String(error))
-  })
+  globalRefreshInFlight = refreshQwenAiRiskSession(account)
+    .then(result => {
+      if (result) {
+        console.info('[QwenAI Risk Refresh] risk session updated', JSON.stringify({ accountId: result.id }))
+      }
+      return result
+    })
+    .catch(error => {
+      console.error('[QwenAI Risk Refresh] failed:', error instanceof Error ? error.message : String(error))
+      return null
+    })
+    .finally(() => {
+      globalRefreshInFlight = undefined
+    })
+  void globalRefreshInFlight
 }
 
 /**
@@ -114,9 +137,32 @@ async function doRefresh(account: Account): Promise<Account | null> {
             resolve(null)
             return
           }
+          // The harvested x5sec family is bound to the shared exit/browser
+          // fingerprint, not to this one Qwen account. Fan it out to every
+          // other qwen-ai account so the whole pool behind the same flagged
+          // exit benefits from a single slider pass — otherwise each account
+          // would keep failing until it individually re-triggered a refresh.
+          let propagated = 0
+          try {
+            const peers = storeManager.getAccountsByProviderId('qwen-ai', true)
+            for (const peer of peers) {
+              if (peer.id === account.id) continue
+              storeManager.updateAccount(peer.id, {
+                credentials: {
+                  ...peer.credentials,
+                  cookies: parsed.cookies,
+                  cookie: parsed.cookies,
+                },
+              })
+              propagated += 1
+            }
+          } catch (propError) {
+            console.warn('[QwenAI Risk Refresh] x5sec fan-out failed:', propError instanceof Error ? propError.message : String(propError))
+          }
           console.info('[QwenAI Risk Refresh] credentials updated', JSON.stringify({
             accountId: account.id,
             solvedSlider: parsed.solved_slider === true,
+            propagatedToAccounts: propagated,
           }))
           resolve(updated)
           return

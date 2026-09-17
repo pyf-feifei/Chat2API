@@ -133,3 +133,7 @@ data.*.json
 data.corrupted.*.json
 dev-data/
 *dev-data/
+
+# Rebuilt codex replay payloads — large transcripts of real sessions, never commit
+codex-replay-payload.json
+codex-replay-*.json
