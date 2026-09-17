@@ -82,7 +82,12 @@ import {
 import type { QwenAiSessionState } from '../qwenAiSessionBridge'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
-const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 840000)
+// Cumulative wall-clock deadline for one logical client request including all
+// recovery rounds (same-chat continuation, fresh-chat replay, wrapper-leak
+// replacement). Long managed-tool sessions routinely spend 3-4 full reasoning
+// +answer generations inside that budget, so 14 minutes is too tight; 25
+// minutes covers the worst case while still bounding a genuinely stuck request.
+const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 1500000)
 const QWEN_AI_RESPONSE_TIMEOUT_MS = nonNegativeNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', 0)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
 const QWEN_AI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
@@ -407,11 +412,16 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
 export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
   if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
-    return 1
+    // A same-chat continuation is cheap (one appended user turn) compared to a
+    // fresh-chat escalation (full reasoning+answer regeneration). Long
+    // sessions with a live tool workflow can need more than one correction
+    // before the model converges on a tool call or a completion marker, so
+    // the default budget is 2 before escalating.
+    return 2
   }
 
   const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) return 1
+  if (!Number.isSafeInteger(value) || value < 0) return 2
   return value
 }
 

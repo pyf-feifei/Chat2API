@@ -96,6 +96,11 @@ export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'Do not infer the meaning of identifiers, UUIDs, models, or files from format alone; report that evidence is missing and continue only with information confirmed by tool results.',
   'If a previous tool call was rejected or had schema validation errors, discard that malformed call and retry it using the declared JSON Schema exactly: include every required field, use only declared properties when the schema is strict, and preserve the declared value types.',
   'Treat progress updates and plans as incomplete.',
+  // Long sessions dilute the teaching prompt; a dangling-answer retry is
+  // usually the model re-narrating its plan instead of acting. Anchor the
+  // current-turn contract explicitly: this turn's output is either a tool
+  // call or a completion-proved final answer, never a description of intent.
+  'This recovery turn was triggered because the previous response described or planned the work without performing it. Do not repeat that pattern: your entire output on this turn must be exactly one of — (a) the next tool call, or (b) the complete final answer — with no narration of what you are about to do.',
   'Return a final answer only after all requested operations are complete and verified by tool results.',
 ].join(' ')
 

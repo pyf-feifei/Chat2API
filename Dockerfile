@@ -90,11 +90,12 @@ ENV CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=2
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
-ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
+ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=2
 # A dangling same-chat continuation escalates once to a fresh-chat replay.
 ENV CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
-# One leaked tool-result wrapper is replaced once before fast-failing.
-ENV CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=1
+# A leaked tool-result wrapper is replaced in a fresh chat; a second attempt
+# covers the case where the first replay re-drew the same poisoned context.
+ENV CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS=2
 ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=600000
 # Semantic continuation branches also share an absolute wall-clock deadline.
 ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
@@ -129,7 +130,10 @@ ENV CHAT2API_ANTHROPIC_PING_INTERVAL_MS=15000
 # to finish when Docker sends SIGTERM during an update.
 ENV CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS=540000
 # Cumulative request deadline shared by upstream generation and recovery.
-ENV QWEN_AI_REQUEST_TIMEOUT_MS=840000
+# Long managed-tool sessions can spend several full reasoning+answer rounds
+# inside same-chat continuations and fresh-chat replays before converging;
+# 25 minutes covers that worst case while still bounding a stuck request.
+ENV QWEN_AI_REQUEST_TIMEOUT_MS=1500000
 # Zero disables only the additional post-admission response cap. The
 # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline still bounds the full request.
 ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0

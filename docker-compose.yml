@@ -175,14 +175,20 @@ services:
       # storm (floored at the account pacing interval). Never classifies the
       # credentials as faulty; expiry or clearAllCooldowns frees the account.
       CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS: ${CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS:-600000}
-      # Blank/default permits one same-chat semantic correction. Zero disables
-      # it; positive values remain bounded by the workflow recovery deadline.
-      CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1}
+      # Blank/default permits two same-chat semantic corrections. A same-chat
+      # continuation is cheap (one appended user turn) versus a fresh-chat
+      # replay (full reasoning+answer regeneration); long managed sessions
+      # often need a second correction before the model converges on a tool
+      # call or a completion marker. Zero disables; positive values remain
+      # bounded by the workflow recovery deadline.
+      CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-2}
       # A dangling same-chat semantic continuation escalates to one fresh-chat
       # replay before failing. Zero disables the escalation.
       CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS: ${CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS:-1}
-      # One leaked tool-result wrapper is replaced once before fast-failing.
-      CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS: ${CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS:-1}
+      # One leaked tool-result wrapper is replaced in a fresh chat before
+      # fast-failing; a second replacement attempt covers the case where the
+      # first replay re-drew the same poisoned context.
+      CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS: ${CHAT2API_QWEN_AI_WRAPPER_LEAK_RECOVERY_ATTEMPTS:-2}
       # Keep HTTP status mutable until the first visible frame by default.
       # Set a non-negative value only to impose an explicit preflight deadline.
       CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS: ${CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS-}
@@ -224,7 +230,11 @@ services:
       CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
       # Leave transport headroom for downstream clients and proxy layers to
       # receive a structured terminal response. Override per deployment.
-      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-840000}
+      # 25 minutes covers the worst case of a managed-tool request burning
+      # several same-chat continuations + a fresh-chat replay inside the
+      # cumulative deadline (observed 2026-09-16: 3 recovery rounds at ~200s
+      # each on a 400-message session hit the old 840s ceiling mid-recovery).
+      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-1500000}
       # Zero disables only the additional post-admission response cap. The
       # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline remains authoritative.
       QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-0}

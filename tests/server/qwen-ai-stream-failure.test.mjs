@@ -1233,6 +1233,7 @@ test('Qwen AI default workflow recovery stops after one semantic continuation', 
 
     assert.deepEqual(continuationParents, [
       'response-progress-0',
+      'response-progress-1',
     ])
     assert.equal(error.code, 'qwen_ai_semantic_incomplete')
     assert.equal(error.accountFault, false)
@@ -1258,10 +1259,10 @@ test('Qwen AI workflow continuation count honors non-negative deployment values'
     assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 12)
 
     process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = ''
-    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 1)
+    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 2)
 
     process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = 'invalid'
-    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 1)
+    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 2)
   } finally {
     if (previousAttempts === undefined) {
       delete process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
@@ -9100,6 +9101,8 @@ test('Qwen AI fails fast once the wrapper-leak recovery budget is spent', async 
     resume: async () => { throw new Error('wrapper recovery must use workflow continuation') },
     continueWorkflow: async (_parentId, recoveryError) => {
       continuationCalls.push(recoveryError?.code)
+      const relapsed = new PassThrough()
+      relapsed.on('error', () => {})
       setImmediate(() => {
         relapsed.write([
           `data: ${JSON.stringify({ 'response.created': { response_id: 'relapsed-branch', response_index: 0 } })}\n\n`,
@@ -9138,8 +9141,9 @@ test('Qwen AI fails fast once the wrapper-leak recovery budget is spent', async 
 
   await ended
   const body = Buffer.concat(chunks).toString()
-  // One replacement branch is attempted; the relapse must not buy another.
-  assert.deepEqual(continuationCalls, ['qwen_ai_wrapper_leak'])
+  // The default wrapper-leak budget is 2: the first replacement leaks again,
+  // a second replacement is attempted, and a third leak exhausts it.
+  assert.deepEqual(continuationCalls, ['qwen_ai_wrapper_leak', 'qwen_ai_wrapper_leak'])
   assert.equal(failure?.code, 'qwen_ai_wrapper_leak')
   assert.equal(failure?.status, 422)
   assert.match(body, /event: error/)
@@ -9205,14 +9209,14 @@ test('Qwen AI escalates an exhausted same-chat semantic continuation to a fresh 
 
   const output = createQwenAiResumableStream(initial, {
     getResponseId: () => `response-semantic-${branch}`,
-    getSemanticRecoveryError: () => (branch < 2 ? danglingSemantic() : undefined),
+    getSemanticRecoveryError: () => (branch < 3 ? danglingSemantic() : undefined),
     continueWorkflow: async parentResponseId => {
       continuationCalls.push(parentResponseId)
       branch += 1
       const next = new PassThrough()
       next.on('error', () => {})
       setImmediate(() => {
-        next.end(branch < 2
+        next.end(branch < 3
           ? 'data: provider narration branch\n\n'
           : 'data: final tool-call branch\n\ndata: [DONE]\n\n')
       })
@@ -9242,9 +9246,12 @@ test('Qwen AI escalates an exhausted same-chat semantic continuation to a fresh 
   initial.end('data: provider narration 0\n\n')
   await ended
 
-  // The same-chat continuation ran once and dangled; the escalation replayed
-  // the request in a fresh chat, and that branch completed the stream.
-  assert.deepEqual(continuationCalls, ['response-semantic-0'])
+  // The same-chat continuation budget is now 2; both parents dangle, the
+  // escalation replays the request in a fresh chat, and that branch completes.
+  assert.deepEqual(continuationCalls, [
+    'response-semantic-0',
+    'response-semantic-1',
+  ])
   assert.deepEqual(freshChatCalls, ['qwen_ai_semantic_incomplete'])
   const body = Buffer.concat(chunks).toString()
   assert.ok(body.includes('escalated clean branch'))
@@ -9293,8 +9300,13 @@ test('Qwen AI fails when the semantic fresh-chat escalation also dangles', async
   const [error] = await failed
 
   // The escalation budget is exactly one fresh chat; a second dangling branch
-  // there fails fast with the semantic code instead of looping.
-  assert.deepEqual(continuationCalls, ['response-semantic-exhaust-0'])
+  // there fails fast with the semantic code instead of looping. The default
+  // workflow continuation budget is now 2, so two same-chat parents are spent
+  // before the fresh-chat escalation runs.
+  assert.deepEqual(continuationCalls, [
+    'response-semantic-exhaust-0',
+    'response-semantic-exhaust-1',
+  ])
   assert.deepEqual(freshChatCalls, ['qwen_ai_semantic_incomplete'])
   assert.equal(error?.code, 'qwen_ai_semantic_incomplete')
   assert.equal(error.accountFault, false)
