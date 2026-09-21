@@ -101,10 +101,19 @@ export function normalizeQwenAiSessionMode(value: unknown): QwenAiSessionMode {
     : DEFAULT_QWEN_AI_SESSION_MODE
 }
 
-/** Sticky mode can also be flipped on via env without editing the config file. */
+/**
+ * Sticky session resolution. Default is tool-call-binding (the measured
+ * faster+stable mode for codex/claude tool-call loops — sticky's same-chat
+ * continuation collides with CHAT_IN_PROGRESS and falls back to a full
+ * transcript replay plus a wasted 429 round-trip, observed 2026-09-21).
+ * The env only opts INTO sticky when set to a truthy flag; an explicit 'off'
+ * value force-disables sticky even when the stored config asks for it.
+ */
 export function isQwenAiStickySessionMode(mode: QwenAiSessionMode | undefined): boolean {
-  if (mode === 'sticky') return true
-  return /^1|true|on|yes$/i.test(String(process.env.CHAT2API_QWEN_AI_STICKY_SESSION ?? '').trim())
+  const env = String(process.env.CHAT2API_QWEN_AI_STICKY_SESSION ?? '').trim()
+  if (/^(?:0|false|off|no)$/i.test(env)) return false
+  if (/^(?:1|true|on|yes|sticky)$/i.test(env)) return true
+  return mode === 'sticky'
 }
 
 /**
@@ -114,6 +123,38 @@ export function isQwenAiStickySessionMode(mode: QwenAiSessionMode | undefined): 
  * normalization helpers for the persisted config.
  */
 export type { WebshareProxyEntry, WebshareProxyConfig } from '../../shared/types'
+
+/**
+ * Optional vision model used to locate the Z.ai slider-captcha target.
+ * Z.ai serves the captcha background with the hole already inpainted, so local
+ * gap detection is unreliable; a vision model can still find the strip.
+ * Disabled by default - the solver falls back to local matching, then to a human.
+ */
+export interface CaptchaVisionConfig {
+  enabled: boolean
+  /** OpenAI-compatible base URL, e.g. https://host/v1 */
+  baseUrl: string
+  apiKey: string
+  model: string
+}
+
+export const DEFAULT_CAPTCHA_VISION_CONFIG: CaptchaVisionConfig = {
+  enabled: false,
+  baseUrl: '',
+  apiKey: '',
+  model: 'inclusionai/ling-3.0-flash-vl:free',
+}
+
+export function normalizeCaptchaVisionConfig(value: unknown): CaptchaVisionConfig {
+  if (!value || typeof value !== 'object') return { ...DEFAULT_CAPTCHA_VISION_CONFIG }
+  const r = value as Record<string, unknown>
+  return {
+    enabled: r.enabled === true,
+    baseUrl: typeof r.baseUrl === 'string' ? r.baseUrl.trim() : '',
+    apiKey: typeof r.apiKey === 'string' ? r.apiKey.trim() : '',
+    model: typeof r.model === 'string' && r.model.trim() ? r.model.trim() : DEFAULT_CAPTCHA_VISION_CONFIG.model,
+  }
+}
 
 export const DEFAULT_WEBSHARE_PROXY_CONFIG: WebshareProxyConfig = {
   enabled: false,
@@ -381,6 +422,8 @@ export interface AppConfig {
   managementApi: ManagementApiConfig
   /** Context management configuration */
   contextManagement: ContextManagementConfig
+  /** Vision model for solving the Z.ai slider captcha (optional; env fallback) */
+  captchaVision?: CaptchaVisionConfig
 }
 
 /**
@@ -1099,6 +1142,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   qwenAiSessionMode: DEFAULT_QWEN_AI_SESSION_MODE,
   managementApi: DEFAULT_MANAGEMENT_API_CONFIG,
   contextManagement: DEFAULT_CONTEXT_MANAGEMENT_CONFIG,
+  captchaVision: DEFAULT_CAPTCHA_VISION_CONFIG,
 }
 
 /**

@@ -137,3 +137,13 @@ dev-data/
 # Rebuilt codex replay payloads — large transcripts of real sessions, never commit
 codex-replay-payload.json
 codex-replay-*.json
+
+# Local test/debug artifacts
+.testimg/
+.workbuddy-ai/
+_long_session_probe.py
+_quota_probe.py
+scripts/zai-captcha/*.png
+scripts/zai-captcha/diag_*.py
+scripts/zai-captcha/zai-bundle.js
+scripts/zai-captcha/__pycache__/

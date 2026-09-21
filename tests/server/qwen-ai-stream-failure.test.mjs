@@ -19,6 +19,11 @@ import {
 import { createQwenAiFeatureConfig as realCreateQwenAiFeatureConfig } from '../../src/main/proxy/adapters/qwen-ai-feature-config.ts'
 import { mergeNativeToolName as realMergeNativeToolName } from '../../src/main/proxy/adapters/qwen-ai-native-tools.ts'
 import {
+  aliasAwareToolLookup as realAliasAwareToolLookup,
+  buildQwenAiToolNameAliasTable as realBuildQwenAiToolNameAliasTable,
+  clientToolNameFromAlias as realClientToolNameFromAlias,
+} from '../../src/main/proxy/toolCalling/qwenAiToolNameAlias.ts'
+import {
   applyQwenAiEffortToModelMode as realApplyQwenAiEffortToModelMode,
   normalizeQwenAiModelModeName as realNormalizeQwenAiModelModeName,
   resolveQwenAiModelMode as realResolveQwenAiModelMode,
@@ -171,6 +176,23 @@ function loadQwenAiStreamHandler(overrides = {}) {
       mergeNativeToolArguments: overrides.mergeNativeToolArguments || ((_current, next) => next),
       mergeNativeToolName: overrides.mergeNativeToolName || realMergeNativeToolName,
       normalizeNativeFunctionCallDelta: overrides.normalizeNativeFunctionCallDelta || (() => []),
+    },
+    // The upstream tool-name alias table (exec_command -> ch2_run_command).
+    // The adapter and the protocol parsers import this; loading the real module
+    // keeps the tests honest about the rename/restore round trip.
+    './toolCalling/qwenAiToolNameAlias': {
+      aliasAwareToolLookup: realAliasAwareToolLookup,
+      buildQwenAiToolNameAliasTable: realBuildQwenAiToolNameAliasTable,
+      clientToolNameFromAlias: realClientToolNameFromAlias,
+      hasQwenAiToolNameAliases: (table) => Boolean(table && table.toUpstream && table.toUpstream.size > 0),
+      aliasManagedToolDefinitions: (tools) => tools,
+    },
+    '../toolCalling/qwenAiToolNameAlias': {
+      aliasAwareToolLookup: realAliasAwareToolLookup,
+      buildQwenAiToolNameAliasTable: realBuildQwenAiToolNameAliasTable,
+      clientToolNameFromAlias: realClientToolNameFromAlias,
+      hasQwenAiToolNameAliases: (table) => Boolean(table && table.toUpstream && table.toUpstream.size > 0),
+      aliasManagedToolDefinitions: (tools) => tools,
     },
     './qwen-ai-feature-config': {
       createQwenAiFeatureConfig: overrides.createQwenAiFeatureConfig || realCreateQwenAiFeatureConfig,
@@ -5442,6 +5464,42 @@ test('Qwen AI invalid HTTP 200 non-SSE responses never become successful HTTP st
   assert.equal(quotaError.retryable, true)
 })
 
+test('Qwen AI HTML 405 remains terminal, account-neutral, and does not expose page text', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const { isQwenAiUpstreamBusyResult } = loadRealModule('src/main/proxy/qwenBusyClassification.ts')
+  const { isQwenAiAccountFault } = loadRealModule('src/main/proxy/qwenAiAccountPolicy.ts')
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: {} },
+  )
+  for (const contentType of ['text/html; charset=utf-8', 'application/xhtml+xml', '']) {
+    const error = await adapter.createInvalidStreamError({
+      status: 405,
+      headers: { 'content-type': contentType, 'set-cookie': 'private-cookie=value' },
+      data: '<!doctypehtml><html><script>var block_message="captcha quota exceeded"</script><textarea id="renderData">{"traceid":"private-page-id"}</textarea></html>',
+    }, 'chat creation returned HTTP 405')
+    assert.equal(error.status, 405)
+    assert.equal(error.code, 'qwen_ai_upstream_http_rejection')
+    assert.equal(error.retryable, false)
+    assert.equal(error.accountFault, false)
+    assert.equal(error.retryScope, undefined)
+    assert.match(error.message, /chat creation.*HTTP 405/)
+    assert.doesNotMatch(error.message, /<html|<script|private-page-id|private-cookie|quota exceeded/)
+    assert.equal(isQwenAiAccountFault(error), false)
+    assert.equal(isQwenAiUpstreamBusyResult({
+      success: false, errorCode: error.code, accountFault: error.accountFault,
+    }), false)
+    assert.equal(Object.keys(error.headers || {}).some(key => key.toLowerCase() === 'set-cookie'), false)
+  }
+  const structured = await adapter.createInvalidStreamError({
+    status: 405,
+    headers: { 'content-type': 'application/json' },
+    data: JSON.stringify({ error: { code: 'unsupported_method', message: 'Use the documented method' } }),
+  }, 'chat creation returned HTTP 405')
+  assert.notEqual(structured.code, 'qwen_ai_upstream_http_rejection')
+  assert.match(structured.message, /Use the documented method/)
+})
+
 test('Qwen AI preserves an HTTP 429 Chinese congestion response as capacity', async () => {
   const { QwenAiAdapter } = loadQwenAiStreamHandler()
   const adapter = new QwenAiAdapter(
@@ -6636,9 +6694,13 @@ test('Qwen AI busy-chat budget continues past the legacy five-attempt budget', a
   const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
   const previousBudget = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS
   const previousRequestTimeout = process.env.QWEN_AI_REQUEST_TIMEOUT_MS
+  const previousMinInterval = process.env.CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS
   delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
   delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS
   process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '0'
+  // Disable the anti-ban same-chat pacing floor so the retry loop can iterate
+  // without a 15s human-scale pause between appends.
+  process.env.CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS = '0'
   process.env.QWEN_AI_REQUEST_TIMEOUT_MS = '5000'
 
   const calls = []
@@ -6683,6 +6745,8 @@ test('Qwen AI busy-chat budget continues past the legacy five-attempt budget', a
     else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
     if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS
     else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS = previousBudget
+    if (previousMinInterval === undefined) delete process.env.CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS
+    else process.env.CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS = previousMinInterval
     if (previousRequestTimeout === undefined) delete process.env.QWEN_AI_REQUEST_TIMEOUT_MS
     else process.env.QWEN_AI_REQUEST_TIMEOUT_MS = previousRequestTimeout
     accepted?.destroy()
@@ -10940,6 +11004,12 @@ test('Qwen AI stream stress: adversarial marker pattern never leaks across 60 cy
 // replay. A dead remnant (<deadInFlight bytes, no [DONE]) still marks
 // deadInFlight so the caller drops the binding and replays fresh.
 
+const __savedSameChatMinInterval = process.env.CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS
+// Anti-ban same-chat pacing (default 15s) would stall every continuation test
+// at the request deadline. These unit tests exercise the retry/drain control
+// flow, not wall-clock pacing, so the floor is disabled for the whole block.
+process.env.CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS = '0'
+
 function createAdapterForContinuation(axiosBehavior) {
   const { QwenAiAdapter } = loadQwenAiStreamHandler()
   const account = {
@@ -11057,7 +11127,11 @@ test('Qwen AI continuation drains a live in-flight response across repeated busy
   })
 
   assert.equal(response.status, 200)
-  assert.equal(calls.gets, 2, 'drain must run on every CHAT_IN_PROGRESS naming a response_id')
+  // Anti-ban: the same in-flight id is drained at most once. A second busy
+  // signal naming it falls to a paced blind retry rather than re-draining the
+  // same dead stream — hammering one id is the request storm that got the
+  // local exit IP hard-405'd.
+  assert.equal(calls.gets, 1, 'a given in-flight id is drained once, not on every busy signal')
   assert.equal(calls.posts, 3, 'append retried until the drained chat accepted it')
 })
 
@@ -11139,4 +11213,112 @@ test('Qwen AI continuation marks a byte-less in-flight remnant as deadInFlight f
     },
   )
   assert.equal(calls.gets, 1, 'dead remnant drains once then gives up')
+})
+
+test('Qwen AI recovers a platform-rejected declared native tool call instead of idle-continuing', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-rejected-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['exec_command']),
+    tools: [{ name: 'exec_command', parameters: {}, source: 'openai' }],
+    toolChoiceMode: 'auto',
+    workflowContinuation: true,
+  })
+  handler.setChatId('test-chat')
+  const continuationParents = []
+  const recoveredCodes = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => {
+      throw new Error('rejected native call must not resume the same response')
+    },
+    continueWorkflow: async parentResponseId => {
+      continuationParents.push(parentResponseId)
+      continued.end([
+        `data: ${JSON.stringify({ 'response.created': { response_id: 'response-recovered', response_index: 0 } })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ delta: { phase: 'answer', status: 'finished', content: 'done.<chat2api_workflow_complete/>' } }] })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join(''))
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 3,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => {
+      recoveredCodes.push(error?.code)
+      return bridge.recoverFromIdle(error, onResume)
+    },
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  // The model emits a declared native function_call; the platform runtime
+  // answers it with a role:"function" "does not exists" rejection. That pair
+  // is a dead branch, not a normal tool-less answer.
+  initial.write(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-rejected', response_index: 0 },
+  })}\n\n`)
+  initial.write(`data: ${JSON.stringify({
+    response_id: 'response-rejected',
+    choices: [{ delta: {
+      role: 'assistant',
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'exec_command', arguments: '{"cmd":"dir"}' },
+    } }],
+  })}\n\n`)
+  initial.end([
+    `data: ${JSON.stringify({
+      response_id: 'response-rejected',
+      choices: [{ delta: {
+        role: 'function',
+        phase: 'answer',
+        status: 'typing',
+        name: 'exec_command',
+        content: 'Tool exec_command does not exists.',
+      } }],
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      response_id: 'response-rejected',
+      choices: [{ delta: { role: 'function', phase: 'answer', status: 'finished', content: '' } }],
+    })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+
+  await ended
+
+  assert.equal(failure, undefined)
+  assert.ok(continuationParents.length > 0, 'rejected native call must trigger a workflow continuation, not a silent finish')
+  assert.ok(
+    recoveredCodes.includes('rejected_native_tool_call'),
+    `expected rejected_native_tool_call recovery, got: ${JSON.stringify(recoveredCodes)}`,
+  )
 })

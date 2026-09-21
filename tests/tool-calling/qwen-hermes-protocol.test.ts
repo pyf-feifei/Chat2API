@@ -45,9 +45,17 @@ test('qwen Hermes prompt renders the official tools and tool-call structure', ()
   const prompt = qwenHermesProtocol.renderPrompt(tools)
 
   assert.match(prompt, /<tools>\n/)
-  assert.match(prompt, /"type":"function"/)
+  // Definitions use the flat managed-contract shape; the OpenAI
+  // {"type":"function"} envelope is intentionally absent so the platform's
+  // native function_call channel is not cued.
+  assert.doesNotMatch(prompt, /"type":"function"/)
   assert.match(prompt, /"name":"read_file"/)
-  assert.match(prompt, /<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_name>/)
+  // The demonstrated call must name a tool this request actually declares and
+  // one of that tool's real parameters. A generic placeholder gets echoed
+  // verbatim under a forced call and the platform rejects it as an undeclared
+  // native tool call (422 rejected/undeclared_native_tool_call).
+  assert.match(prompt, /<tool_call>\n<function=read_file>\n<parameter=filePath>/)
+  assert.doesNotMatch(prompt, /example_function_name|example_parameter_name/)
   assert.match(prompt, /object and array parameter values as JSON/i)
   assert.match(prompt, /emit the tool call in this response/i)
   assert.doesNotMatch(prompt, /chat2api_workflow_complete/)
@@ -117,17 +125,17 @@ test('qwen Hermes document prompt moves annotations to a complete reference with
     routingSummaryMaxCodePoints: 240,
   })
   const compactDefinition = JSON.parse(
-    result.compactPrompt.split('\n').find(line => line.startsWith('{"type":"function",'))!,
+    result.compactPrompt.split('\n').find(line => line.startsWith('{"name":'))!,
   )
   const referenceDefinition = JSON.parse(
-    result.referenceContent.split('\n').find(line => line.startsWith('{"type":"function",'))!,
+    result.referenceContent.split('\n').find(line => line.startsWith('{"name":'))!,
   )
-  const compactParameters = compactDefinition.function.parameters
+  const compactParameters = compactDefinition.parameters
 
-  assert.equal(compactDefinition.function.name, 'alpha_tool')
-  assert.match(compactDefinition.function.description, /^Route alpha operations\./)
-  assert.ok(Array.from(compactDefinition.function.description).length <= 240)
-  assert.match(compactDefinition.function.description, /\.\.\.$/)
+  assert.equal(compactDefinition.name, 'alpha_tool')
+  assert.match(compactDefinition.description, /^Route alpha operations\./)
+  assert.ok(Array.from(compactDefinition.description).length <= 240)
+  assert.match(compactDefinition.description, /\.\.\.$/)
   assert.match(result.compactPrompt, /attached managed tool reference/i)
 
   assert.equal(compactParameters.$schema, documentTools[0].parameters.$schema)
@@ -162,9 +170,9 @@ test('qwen Hermes document prompt moves annotations to a complete reference with
     properties: { payload: { type: 'string', pattern: '^FAST:' } },
   })
 
-  assert.equal(referenceDefinition.function.name, documentTools[0].name)
-  assert.equal(referenceDefinition.function.description, longDescription)
-  assert.deepEqual(referenceDefinition.function.parameters, documentTools[0].parameters)
+  assert.equal(referenceDefinition.name, documentTools[0].name)
+  assert.equal(referenceDefinition.description, longDescription)
+  assert.deepEqual(referenceDefinition.parameters, documentTools[0].parameters)
   assert.deepEqual(documentTools, snapshot, 'document prompt rendering must not mutate caller tools')
   assert.ok(
     Buffer.byteLength(result.compactPrompt, 'utf8')
@@ -183,17 +191,17 @@ test('qwen Hermes routing summary budget is configurable and zero omits inline d
       description: 'A configurable routing description '.repeat(20),
     }])
     const boundedDefinition = JSON.parse(
-      bounded.compactPrompt.split('\n').find(line => line.startsWith('{"type":"function",'))!,
+      bounded.compactPrompt.split('\n').find(line => line.startsWith('{"name":'))!,
     )
-    assert.ok(Array.from(boundedDefinition.function.description).length <= 37)
+    assert.ok(Array.from(boundedDefinition.description).length <= 37)
 
     const omitted = createQwenHermesDocumentPrompt(tools, {
       routingSummaryMaxCodePoints: 0,
     })
     const omittedDefinition = JSON.parse(
-      omitted.compactPrompt.split('\n').find(line => line.startsWith('{"type":"function",'))!,
+      omitted.compactPrompt.split('\n').find(line => line.startsWith('{"name":'))!,
     )
-    assert.equal('description' in omittedDefinition.function, false)
+    assert.equal('description' in omittedDefinition, false)
 
     process.env.CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS = 'invalid'
     assert.equal(qwenHermesRoutingSummaryMaxCodePointsFromEnv(), 240)
@@ -233,9 +241,9 @@ test('qwen Hermes document prompt ordering and boundary escaping are determinist
   for (const content of [forward.compactPrompt, forward.referenceContent]) {
     const definitionLines = content
       .split('\n')
-      .filter(line => line.startsWith('{"type":"function",'))
+      .filter(line => line.startsWith('{"name":'))
     assert.deepEqual(
-      definitionLines.map(line => JSON.parse(line).function.name),
+      definitionLines.map(line => JSON.parse(line).name),
       [alpha.name, zeta.name],
     )
     assert.ok(definitionLines.every(line => !/<\/?(?:tools|tool_call|tool_response)>/i.test(line)))
@@ -787,16 +795,16 @@ test('qwen Hermes escapes control boundaries inside tool definitions without cha
     source: 'openai' as const,
   }
   const prompt = qwenHermesProtocol.renderPrompt([injectedTool])
-  const definitionLine = prompt.split('\n').find((line) => line.startsWith('{"type":"function",'))
+  const definitionLine = prompt.split('\n').find((line) => line.startsWith('{"name":'))
 
   assert.ok(definitionLine)
   assert.doesNotMatch(definitionLine, /<\/?(?:tools|tool_call|tool_response)>/i)
   assert.match(definitionLine, /\\u003c\/tools\\u003e/)
 
   const definition = JSON.parse(definitionLine)
-  assert.equal(definition.function.name, injectedTool.name)
-  assert.equal(definition.function.description, injected)
-  assert.deepEqual(definition.function.parameters, injectedTool.parameters)
+  assert.equal(definition.name, injectedTool.name)
+  assert.equal(definition.description, injected)
+  assert.deepEqual(definition.parameters, injectedTool.parameters)
   assert.match(prompt, /<tools>\n/)
   assert.match(prompt, /<tool_call>\n/)
 })

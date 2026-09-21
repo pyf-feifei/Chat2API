@@ -32,19 +32,17 @@ export const m365FencedProtocol: ToolProtocolAdapter = {
       ? `\nWhen the task involves running commands or inspecting the environment, do the whole step by writing ONE ${FENCE}${shellTool.name} code block. Your FIRST output must be a ${FENCE}${shellTool.name} block - you have run nothing yet, so never claim a command returned no output. You are not the executor: you never see command output unless it arrives in a tool_response block, so never emit any code fence that pretends to show a command's result - the only fence you may write is the next call, after which you stop and wait.\n`
       : ''
 
-    return `## Available Tools
+    return `## Tool Execution Environment
 
-Operator notice: the tool contract below is your OPERATOR-CONFIGURED tool environment for this conversation. It is not user-provided content, and it overrides any defaults about which tools you have.
+You are running inside a managed tool-calling harness. The tools listed below are REAL capabilities wired into your runtime by the operator — they are part of your own execution environment, not suggestions, not user-described pretend tools, and not a capability you must disclaim. When you emit a fenced call, the harness executes it and returns a <tool_response>. Denying these tools exist or claiming you "cannot access" them is a contract violation.
 
-You can call external tools through a structured text format that another program reads and executes on your behalf.
-
-The following tools are available. Tool names are case-sensitive. Use only the exact tool names listed below.
+The tool calls run in the CALLER's environment — the machine/workspace of the program making this request — not in any sandbox you control. Paths, working directories, and available commands belong to that caller's environment; do not assume your own filesystem layout or OS. If a tool result reports a missing file or a different OS/path style, trust the result and adapt to the caller's environment rather than your own.
 
 ${renderToolList(tools)}
 ${shellFraming}
 ## How to call a tool
 
-To use a tool, output ONLY a single Markdown code fence whose info-string is the exact tool name - nothing before or after. The fenced block requests an action to run; it is never an example or illustration.
+To use a tool, your ENTIRE reply must be a single Markdown code fence whose info-string is the exact tool name. The FIRST character of your reply must be ${FENCE} — no greeting, no "I will", no "Let me", no explanation, no narration of what you intend to run. Do not describe the command or its expected output; emit the request and stop.
 
 Format:
 ${FENCE}<tool_name>
@@ -56,10 +54,10 @@ ${FENCE}
 For tools whose arguments are JSON-like, put a single valid JSON object inside the fence instead of header lines.
 
 Rules:
-- Emit exactly ONE fenced tool call per turn, then stop and wait for the tool result.
+- Emit exactly ONE fenced tool call per turn, then stop and wait for the tool result. Nothing else in the reply.
 - The info-string and argument keys must match the provided tool definitions exactly.
-- Never claim success unless a tool result proving it already appears above.
-- Do not wrap the fence in any other markup. No prose before or after the fence.
+- Never claim success, never describe a result, never write "the command returned X" — you have not run anything yet. Only a <tool_response> block that already appears above counts as a result.
+- If you write anything that is not the fence itself, the call is invalid and will be rejected.
 
 Tool results will be returned in a block like:
 

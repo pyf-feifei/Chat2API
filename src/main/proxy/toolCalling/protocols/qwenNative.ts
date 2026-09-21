@@ -17,8 +17,8 @@ import {
   parseToolCallerBlock,
   stripFencedCodeBlocks,
   TOOL_CALLER_START,
-  toolNames,
 } from './shared.ts'
+import { aliasAwareToolLookup } from '../qwenAiToolNameAlias.ts'
 import {
   renderQwenNativeFunctionCallsPrompt,
   renderQwenNativeContinuationReminder,
@@ -62,8 +62,10 @@ export const qwenNativeProtocol: ToolProtocolAdapter = {
 
   parse(content: string, context: ToolParseContext): ToolParseResult {
     const parsable = stripFencedCodeBlocks(content)
-    const allowedNames = toolNames(context.tools)
-    const toolDefinitions = new Map(context.tools.map((tool) => [tool.name, tool]))
+    const { definitions: toolDefinitions, allowedNames } = aliasAwareToolLookup(
+      context.tools,
+      context.toolNameAliases,
+    )
     const rawMatches: string[] = []
     const invalidToolNames: string[] = []
     const toolCalls: ReturnType<typeof buildToolCall>[] = []
@@ -112,6 +114,9 @@ export const qwenNativeProtocol: ToolProtocolAdapter = {
       }
 
       for (const envelope of envelopes) {
+        // A parsed name may be the upstream alias; emit the client's canonical
+        // name (alias entries point at the client-name definition).
+        const canonicalName = toolDefinitions.get(envelope.name)?.name ?? envelope.name
         if (!allowedNames.has(envelope.name)) {
           invalidToolNames.push(envelope.name)
           continue
@@ -127,7 +132,7 @@ export const qwenNativeProtocol: ToolProtocolAdapter = {
           buildToolCall(
             `call_${toolCalls.length}`,
             toolCalls.length,
-            envelope.name,
+            canonicalName,
             envelope.arguments,
             parsed.rawText,
             tool,

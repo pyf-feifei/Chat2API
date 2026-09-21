@@ -16,6 +16,7 @@ services:
       CHAT2API_MANAGEMENT_SECRET: ${CHAT2API_MANAGEMENT_SECRET}
       CHAT2API_STORAGE_ENCRYPTION_KEY: ${CHAT2API_STORAGE_ENCRYPTION_KEY}
       CHAT2API_LOG_LEVEL: info
+      CHAT2API_LOAD_BALANCER_DEBUG: "true"
       CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
       # Detect the protocol-level Claude context-summary turn from its
       # structural instructions. Set to off when a deployment owns this path.
@@ -185,6 +186,10 @@ services:
       # A dangling same-chat semantic continuation escalates to one fresh-chat
       # replay before failing. Zero disables the escalation.
       CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS: ${CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS:-1}
+      # Retain one upstream chat per client lineage and append only the delta
+      # each turn (sticky mode). Matches production so local docker exercises
+      # the same continuation/drain path the server runs.
+      CHAT2API_QWEN_AI_STICKY_SESSION: ${CHAT2API_QWEN_AI_STICKY_SESSION:-1}
       # One leaked tool-result wrapper is replaced in a fresh chat before
       # fast-failing; a second replacement attempt covers the case where the
       # first replay re-drew the same poisoned context.

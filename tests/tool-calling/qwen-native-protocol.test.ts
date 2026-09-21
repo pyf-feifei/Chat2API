@@ -51,8 +51,11 @@ test('native prompt renders the function_calls structure', () => {
   assert.match(prompt, /<tools>\n/)
   assert.match(prompt, /"name":"read_file"/)
   assert.match(prompt, /<function_calls>/)
-  assert.match(prompt, /<invoke name="example_function_name">/)
-  assert.match(prompt, /<parameter name="example_parameter_name">/)
+  // The example must use a real declared tool + parameter, never a generic
+  // placeholder the model can echo verbatim into an undeclared native call.
+  assert.match(prompt, /<invoke name="read_file">/)
+  assert.match(prompt, /<parameter name="filePath">/)
+  assert.doesNotMatch(prompt, /example_function_name|example_parameter_name/)
   assert.match(prompt, /Wrap ALL function calls in a single <function_calls> block/)
 })
 
@@ -60,7 +63,9 @@ test('native recovery prompt names available tools and exact format', () => {
   const prompt = renderQwenNativeRecoveryPrompt(tools)
   assert.match(prompt, /<function_calls>/)
   assert.match(prompt, /read_file/)
-  assert.match(prompt, /<invoke name="exact_function_name">/)
+  // The recovery template must also demonstrate a real declared call.
+  assert.match(prompt, /<invoke name="read_file">/)
+  assert.doesNotMatch(prompt, /exact_function_name|exact_parameter_name/)
 })
 
 test('native parses a canonical single call and strips it from content', () => {

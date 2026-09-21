@@ -120,6 +120,8 @@ export const IpcChannels = {
 
   CONTEXT_MANAGEMENT_GET_CONFIG: 'contextManagement:getConfig',
   CONTEXT_MANAGEMENT_UPDATE_CONFIG: 'contextManagement:updateConfig',
+
+  CAPTCHA_VISION_TEST: 'captchaVision:test',
 } as const
 
 export type IpcChannel = (typeof IpcChannels)[keyof typeof IpcChannels]

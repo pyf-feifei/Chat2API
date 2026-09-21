@@ -491,6 +491,32 @@ export class ZaiAdapter {
   }
 
   private async attemptTokenRefresh(): Promise<string | null> {
+    // Re-read from the store: credentials may have gained email/password or a
+    // newer token since this adapter instance was constructed.
+    const account = storeManager.getAccountById(this.account.id, true) || this.account
+
+    // 1. Credential re-login. Preferred: fully headless, works inside Docker,
+    //    and does not require a human to complete an interactive login.
+    try {
+      const { zaiTokenRefresher } = await import('./zai-token-refresh')
+      if (zaiTokenRefresher.canRefresh(account)) {
+        const newToken = await zaiTokenRefresher.refresh(account)
+        if (newToken) {
+          this.account = { ...this.account, credentials: { ...this.account.credentials, token: newToken } }
+          console.log('[Z.ai] Token refreshed successfully via credential re-login')
+          return newToken
+        }
+      } else {
+        console.log('[Z.ai] No stored email/password, credential re-login unavailable')
+      }
+    } catch (error) {
+      console.log(
+        '[Z.ai] Credential re-login failed:',
+        error instanceof Error ? error.message : error,
+      )
+    }
+
+    // 2. Interactive in-app browser login. Only viable on the desktop app.
     try {
       const { inAppLoginManager } = await import('../../oauth/inAppLogin')
       const result = await inAppLoginManager.startLogin({

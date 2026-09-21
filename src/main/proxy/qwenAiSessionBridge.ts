@@ -208,3 +208,25 @@ export function resolveQwenAiSessionBinding(
     ...(state.toolProtocol ? { toolProtocol: state.toolProtocol } : {}),
   }
 }
+
+/**
+ * Error codes that mean the retained upstream chat itself is poisoned — the
+ * failure is bound to THAT chatId, not to a transient condition, so a client
+ * reconnect that re-binds to the same chat hits the identical verdict and
+ * loops forever. The caller must release the sticky chain so the next request
+ * registers a fresh chain/chat instead of re-attaching to the dead branch.
+ *
+ * - internal_error: the upstream generation service crashed on this chat
+ *   (observed 2026-09-18: a chatId with 70+ accumulated turns returned
+ *   internal_error mid-stream; the same transcript in a fresh chat worked).
+ * - managed_tool_result_wrapper_leak: the model reproduced the tool-result
+ *   wrapper as its own output — a content poison tied to that chat's context.
+ * - qwen_ai_upstream_http_rejection: a WAF hard-block page (405); retrying the
+ *   same chat/exit cannot clear it.
+ */
+export function isQwenAiPoisonedChatErrorCode(errorCode: unknown): boolean {
+  const code = String(errorCode || '').trim().toLowerCase()
+  return code === 'internal_error'
+    || code === 'managed_tool_result_wrapper_leak'
+    || code === 'qwen_ai_upstream_http_rejection'
+}

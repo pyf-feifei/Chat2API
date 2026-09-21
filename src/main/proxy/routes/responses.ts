@@ -28,6 +28,7 @@ import type {
   AccountSelection,
   ChatMessage,
   ProxyContext,
+  QwenAiEgressRecoveryState,
   QwenAiLogicalRecoveryState,
 } from '../types'
 import { storeManager } from '../../store/store'
@@ -58,6 +59,7 @@ import {
   createQwenAiChainKey,
   qwenAiStickyChainHeadFromEnv,
   resolveQwenAiSessionBinding,
+  isQwenAiPoisonedChatErrorCode,
   type QwenAiSessionBridge,
   type QwenAiSessionBinding,
   type QwenAiSessionState,
@@ -225,6 +227,13 @@ function isQwenAiContinuationRejectedErrorCode(errorCode: unknown): boolean {
 function isQwenAiChatInProgressErrorCode(errorCode: unknown): boolean {
   return String(errorCode || '').trim().toUpperCase() === 'CHAT_IN_PROGRESS'
 }
+
+// isQwenAiPoisonedChatErrorCode lives in qwenAiSessionBridge (imported above):
+// error codes bound to the specific retained upstream chatId (internal_error,
+// managed_tool_result_wrapper_leak, qwen_ai_upstream_http_rejection) mean the
+// chat itself is poisoned — a reconnect re-binding to it loops the identical
+// verdict. clearsPreviousBinding releases the chain so the next request mints
+// a fresh chain/chat instead of re-attaching to the dead branch.
 
 function responseOutputToolCallIds(output: Array<Record<string, any>>): string[] {
   const ids = new Set<string>()
@@ -939,6 +948,16 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         semanticFreshChatEscalations: 0,
       }
     : undefined
+  // Egress-IP recovery must outlive a single account attempt: an aliyun verdict
+  // is an exit-IP flag, so once the request escalates to the Webshare proxy it
+  // must stay there for every later account of the SAME client request. One
+  // ledger per request, shared by all failover attempts.
+  const qwenAiEgressRecoveryState: QwenAiEgressRecoveryState | undefined = initialProviderIsQwenAi
+    ? {
+        webshareRetries: 0,
+        useWebshareProxy: false,
+      }
+    : undefined
   const qwenAiSessionBridgeForSelection = (
     selection: AccountSelection,
   ): QwenAiSessionBridge | undefined => {
@@ -993,6 +1012,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       signal: abort.controller.signal,
       requestIntent: requestIntent.intent,
       ...(qwenAiLogicalRecoveryState ? { qwenAiLogicalRecoveryState } : {}),
+      ...(qwenAiEgressRecoveryState ? { qwenAiEgressRecoveryState } : {}),
       ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
       ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
     }
@@ -1143,6 +1163,10 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         deadInFlight
         || isQwenAiSessionStaleErrorCode(claimErrorCode)
         || isQwenAiContinuationRejectedErrorCode(claimErrorCode)
+        // A poisoned upstream chat must release the chain so a reconnect gets
+        // a fresh chatId — otherwise the client re-binds to the same dead
+        // branch and loops the identical verdict forever.
+        || isQwenAiPoisonedChatErrorCode(claimErrorCode)
         || deferredStreamFailure
         || (
           accountFault === true
@@ -1156,6 +1180,8 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
           ? 'terminal_stale_session'
           : isQwenAiContinuationRejectedErrorCode(claimErrorCode)
             ? 'terminal_continuation_rejected'
+            : isQwenAiPoisonedChatErrorCode(claimErrorCode)
+              ? 'terminal_poisoned_chat'
             : accountFault === true && retryScope === 'next-account'
               ? 'terminal_account_failover'
             : 'terminal_stream_failure',
@@ -1175,6 +1201,8 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         ? 'terminal_stale_session'
         : isQwenAiContinuationRejectedErrorCode(claimErrorCode)
           ? 'terminal_continuation_rejected'
+          : isQwenAiPoisonedChatErrorCode(claimErrorCode)
+            ? 'terminal_poisoned_chat'
           : accountFault === true && retryScope === 'next-account'
             ? 'terminal_account_failover'
             : 'terminal_stream_failure',

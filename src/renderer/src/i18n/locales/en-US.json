@@ -360,7 +360,16 @@
     "description": "Z.ai - Free AI Chatbot powered by GLM-5.1, GLM-5, and GLM-4.7",
     "token": "Access Token",
     "tokenPlaceholder": "Enter Z.ai JWT Token",
-    "tokenHelp": "Get token from Z.ai web version, found in browser DevTools Application -> Cookie, starts with \"eyJ...\""
+    "tokenHelp": "Get token from Z.ai web version, found in browser DevTools Application -> Cookie, starts with \"eyJ...\"",
+    "captchaVerifyParam": "Captcha Verify Param",
+    "captchaVerifyParamPlaceholder": "Optional captcha_verify_param from chat.z.ai HAR",
+    "captchaVerifyParamHelp": "Optional. If Z.ai requires verification, copy captcha_verify_param from the latest /api/v2/chat/completions request body.",
+    "email": "Login Email (Optional)",
+    "emailPlaceholder": "Optional account email for automatic token refresh",
+    "emailHelp": "Used with password to re-login via /api/v1/auths/signin when the token is revoked",
+    "password": "Login Password (Optional)",
+    "passwordPlaceholder": "Optional account password for automatic token refresh",
+    "passwordHelp": "Stored in encrypted credentials when encryption is available; automatic refresh can fail if Z.ai rejects the captcha verification"
   },
   "mimo": {
     "name": "Mimo",
@@ -954,6 +963,39 @@
       "apiEndpoint": "API Endpoint",
       "exampleUsage": "Example Usage",
       "warning": "Keep your secret key secure. Do not share it with unauthorized parties."
+    },
+    "captchaVision": {
+      "title": "Captcha Vision",
+      "description": "Use a vision model to locate the Z.ai slider-captcha target. Z.ai inpaints the hole in the background image, so local pixel matching is unreliable.",
+      "enableToggle": "Enable vision solver",
+      "enableDescription": "When enabled, the Z.ai login solver asks the vision model where the puzzle strip starts before falling back to local matching or a human. Best effort only: on real 300px captchas the tested vision model answered 360 / 400 / 240 for the same image, so treat this as an experiment and keep the human fallback available.",
+      "baseUrl": "Base URL",
+      "baseUrlHelp": "OpenAI-compatible endpoint. /chat/completions is appended automatically (e.g. https://example.com/v1).",
+      "apiKey": "API Key",
+      "showKey": "Show API key",
+      "hideKey": "Hide API key",
+      "model": "Model",
+      "modelHelp": "Must be a vision-capable model. Reasoning models need a large token budget, so the request uses max_tokens 4000.",
+      "applyModel": "Use this model",
+      "test": "Test connection",
+      "testDisabledHint": "Fill in Base URL, API Key and Model first",
+      "unsaved": "Unsaved changes",
+      "saveSuccess": "Captcha vision settings saved",
+      "saveError": "Failed to save captcha vision settings",
+      "reply": "Model reply",
+      "warning": "When disabled, the solver falls back to local matching and then to manual captcha solving (requires a visible browser window). Docker deployments can also set ZAI_VISION_API_URL / ZAI_VISION_API_KEY / ZAI_VISION_MODEL instead.",
+      "result": {
+        "ok": "Vision model responded correctly and can read the probe image.",
+        "missingBaseUrl": "Base URL is empty.",
+        "missingApiKey": "API Key is empty.",
+        "missingModel": "Model is empty.",
+        "httpError": "Endpoint returned an HTTP error.",
+        "badJson": "Endpoint returned a non-JSON response.",
+        "emptyContent": "Model returned empty content. It is probably a reasoning model that used the whole token budget - try a non-reasoning model.",
+        "mismatch": "Model replied, but could not read the probe image. Check that the model is vision-capable.",
+        "timeout": "Request timed out after 60s.",
+        "networkError": "Network request failed."
+      }
     }
   },
   "common": {

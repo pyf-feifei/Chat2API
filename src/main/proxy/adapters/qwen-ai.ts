@@ -43,6 +43,7 @@ import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../uti
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { getToolProtocol } from '../toolCalling/protocols'
+import { clientToolNameFromAlias } from '../toolCalling/qwenAiToolNameAlias'
 import {
   ManagedToolResultGuard,
   stripManagedToolResultWrappers,
@@ -166,6 +167,73 @@ const DEFAULT_HEADERS = {
   Origin: 'https://chat.qwen.ai',
 }
 
+/**
+ * Per-account browser persona. A pool of N accounts all emitting the identical
+ * hardcoded Mac-Chrome UA is itself a bot fingerprint — the upstream sees one
+ * "device" juggling hundreds of logins. Deriving a stable UA+platform per
+ * account id makes each account look like a distinct user on a distinct
+ * machine, while keeping it CONSTANT across that account's requests (a real
+ * user does not change UA mid-session).
+ *
+ * Personas are real, current browser signatures only — invented version
+ * numbers or mismatched UA/sec-ch-ua pairs would be a worse fingerprint than
+ * a shared static one. Deterministic from account id so it survives restarts
+ * and does not need to be persisted.
+ */
+const QWEN_AI_PERSONAS: ReadonlyArray<{
+  userAgent: string
+  secChUa: string
+  platform: string
+  acceptLanguage: string
+}> = [
+  {
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    secChUa: '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    platform: '"macOS"',
+    acceptLanguage: 'zh-CN,zh;q=0.9',
+  },
+  {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    secChUa: '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    platform: '"Windows"',
+    acceptLanguage: 'zh-CN,zh;q=0.9',
+  },
+  {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+    secChUa: '"Not:A-Brand";v="99", "Google Chrome";v="144", "Chromium";v="144"',
+    platform: '"Windows"',
+    acceptLanguage: 'zh-CN,zh;q=0.9',
+  },
+  {
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+    secChUa: '"Not:A-Brand";v="99", "Google Chrome";v="144", "Chromium";v="144"',
+    platform: '"macOS"',
+    acceptLanguage: 'en-US,en;q=0.9,zh-CN;q=0.8',
+  },
+  {
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    secChUa: '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    platform: '"Linux"',
+    acceptLanguage: 'zh-CN,zh;q=0.9',
+  },
+  {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0',
+    secChUa: '"Not:A-Brand";v="99", "Microsoft Edge";v="145", "Chromium";v="145"',
+    platform: '"Windows"',
+    acceptLanguage: 'zh-CN,zh;q=0.9',
+  },
+]
+
+/** Deterministic small hash → persona index, stable across restarts. */
+function personaIndexForAccount(accountId: string | undefined): number {
+  if (!accountId) return 0
+  let h = 0
+  for (let i = 0; i < accountId.length; i += 1) {
+    h = (h * 31 + accountId.charCodeAt(i)) | 0
+  }
+  return Math.abs(h) % QWEN_AI_PERSONAS.length
+}
+
 const MODEL_ALIASES: Record<string, string> = {
   qwen: 'qwen3.7-max',
   qwen3: 'qwen3.7-max',
@@ -267,6 +335,8 @@ interface ChatCompletionRequest {
   thinking_budget?: number
   /** Client-declared tools are encoded in Chat2API's managed text protocol. */
   managedToolCalling?: boolean
+  /** Internal intent hint; 'context_compaction' switches tool history to plain prose rendering. */
+  requestIntent?: 'normal' | 'context_compaction'
   /** Keep the immediately preceding tool exchange inline with document transport. */
   managedToolWorkflowContinuation?: boolean
   /** Internal hint set by an OpenAI Responses image_generation tool request. */
@@ -334,6 +404,8 @@ interface QwenAiWorkflowContinuationRequest {
   reasoningEffort?: string | null
   managedToolCalling?: boolean
   managedToolWorkflowContinuation?: boolean
+  /** Internal intent hint; 'context_compaction' switches tool history to plain prose rendering. */
+  requestIntent?: 'normal' | 'context_compaction'
   messageTransport?: QwenAiMessageTransport
   /** Keep the inline escape retry inline even above the offload target. */
   messageTransportLocked?: boolean
@@ -590,6 +662,21 @@ export function qwenAiStickyMaxBytesFromEnv(): number {
   // The byte ceiling is a proxy-side guard against unbounded chat growth, not
   // a model limit — the real ceiling is enforced by Qwen's own context window.
   return nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STICKY_MAX_BYTES', 32_000_000)
+}
+
+/**
+ * Minimum wall-clock interval between two POST appends to the SAME upstream
+ * chatId. A CHAT_IN_PROGRESS busy signal previously looped back into an
+ * immediate re-POST, so a stuck turn could hammer one chat with sub-second
+ * append attempts until the budget ran out. A small floor smooths that burst
+ * into spaced retries without meaningfully slowing a healthy turn. 3s covers
+ * the provider's turn-cleanup latency; larger values only delay recovery.
+ */
+export function qwenAiStickySameChatMinIntervalMsFromEnv(): number {
+  return nonNegativeIntegerFromEnv(
+    'CHAT2API_QWEN_AI_STICKY_SAME_CHAT_MIN_INTERVAL_MS',
+    3_000,
+  )
 }
 
 /**
@@ -2762,6 +2849,7 @@ function isDanglingManagedToolAnswer(
     tools: plan.tools,
     protocol: plan.protocol,
     allowPartial: true,
+    toolNameAliases: plan.toolNameAliases,
   })
   if (parsed.toolCalls.length > 0) {
     return false
@@ -2945,6 +3033,15 @@ function logQwenAiManagedParseFailure(
     parsedToolCallCount: parsed.toolCalls?.length ?? 0,
     invalidToolNameCount: parsed.invalidToolNames?.length ?? 0,
     contentCodePoints: Array.from(content).length,
+    // The rejected identifier and the raw block are the only way to tell a
+    // placeholder echo from a name-collision cue, so capture them under the
+    // stream debug flag rather than guessing from counts.
+    ...(QWEN_AI_DEBUG_STREAM_LOGS
+      ? {
+          invalidToolNames: parsed.invalidToolNames ?? [],
+          rawBlocks: (parsed.rawMatches ?? []).slice(0, 2).map(block => String(block).slice(0, 400)),
+        }
+      : {}),
   }))
 }
 
@@ -3105,6 +3202,7 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
     || code === 'qwen_ai_wrapper_leak'
     || code === 'qwen_ai_invalid_tool_arguments'
     || code === 'undeclared_native_tool_call'
+    || code === 'rejected_native_tool_call'
     || code === 'malformed_tool_call'
     || code === 'missing_tool_call'
     || isQwenAiStaleSessionError(error)
@@ -3136,6 +3234,28 @@ function createQwenAiUndeclaredNativeToolError(names: string[]): QwenAiUpstreamE
   error.type = 'upstream_tool_error'
   error.param = 'tool_calls'
   error.code = 'undeclared_native_tool_call'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+/**
+ * The upstream platform intercepted a *declared* native tool call and rejected
+ * it at its own runtime ("Tool <name> does not exists."). Unlike an undeclared
+ * call the name is in the managed list, so it is not a contract violation by
+ * the model — it is the provider refusing to run a tool the client owns. The
+ * turn is semantically a dead branch: replaying it as-is reproduces the same
+ * rejection, so it escalates to a fresh-chat/account recovery.
+ */
+function createQwenAiRejectedNativeToolError(names: string[]): QwenAiUpstreamError {
+  const uniqueNames = [...new Set(names.filter(Boolean))]
+  const error = new Error(
+    `Provider runtime rejected declared native tool call${uniqueNames.length === 1 ? '' : 's'}: ${uniqueNames.join(', ')}`,
+  ) as QwenAiUpstreamError
+  error.status = 422
+  error.type = 'upstream_tool_error'
+  error.param = 'tool_calls'
+  error.code = 'rejected_native_tool_call'
   error.retryable = false
   error.accountFault = false
   return error
@@ -3649,14 +3769,41 @@ function resolveLegacyQwenThinkingMode(modelName: string): boolean | undefined {
   return undefined
 }
 
+/**
+ * Managed tool-call branches only need the model to emit a protocol tool call —
+ * a long "Auto" reasoning phase adds minutes of latency without improving the
+ * call. Force such requests into a deployment-tunable thinking mode (default
+ * Fast) unless the client pinned a mode via an explicit _Fast/_Thinking suffix.
+ */
+export function qwenAiManagedToolThinkingModeFromEnv(): 'Fast' | 'Auto' | 'Thinking' {
+  const raw = String(process.env.CHAT2API_QWEN_AI_MANAGED_TOOL_THINKING_MODE ?? 'auto')
+    .trim().toLowerCase()
+  if (raw === 'auto') return 'Auto'
+  if (raw === 'thinking') return 'Thinking'
+  return 'Fast'
+}
+
 export function resolveQwenAiFeatureMode(
   requestedModel: string,
   requestedThinking: boolean | undefined,
   capability: ProviderModelCapability | undefined,
   reasoningEffort?: string | null,
+  managedToolCalling?: boolean,
 ): { thinkingEnabled: boolean; autoThinking: boolean; thinkingMode?: 'Fast' | 'Auto' | 'Thinking' } {
   const modelMode = resolveQwenAiModelMode(requestedModel)
   if (modelMode.thinkingEnabled !== undefined) {
+    // Client effort wins: a managed tool-call branch only falls back to the
+    // managed-tool default when the client sent no effort at all. An explicit
+    // pinned suffix (_Fast/_Thinking) always keeps its mode.
+    const clientEffort = reasoningEffort?.trim()
+    if (managedToolCalling === true && modelMode.precedence !== 'pinned' && !clientEffort) {
+      const managedMode = qwenAiManagedToolThinkingModeFromEnv()
+      return {
+        thinkingEnabled: managedMode !== 'Fast',
+        autoThinking: managedMode === 'Auto',
+        thinkingMode: managedMode,
+      }
+    }
     // Floating aliases (_Auto / bare qwen3.8-max) let an explicit client
     // effort take over the mode; pinned suffixes (_Fast/_Thinking) win.
     const effective = applyQwenAiEffortToModelMode(modelMode, reasoningEffort)
@@ -3796,8 +3943,15 @@ export class QwenAiAdapter {
   private getHeaders(chatId?: string): Record<string, string> {
     const cookies = this.getCookies()
     const token = this.getToken()
+    // Per-account stable browser persona: breaks the "one device, hundreds of
+    // logins" aggregate fingerprint without inventing an inconsistent UA.
+    const persona = QWEN_AI_PERSONAS[personaIndexForAccount(this.account?.id)]
     const headers: Record<string, string> = {
       ...DEFAULT_HEADERS,
+      'User-Agent': persona.userAgent,
+      'sec-ch-ua': persona.secChUa,
+      'sec-ch-ua-platform': persona.platform,
+      'Accept-Language': persona.acceptLanguage,
       'X-Request-Id': uuid(),
       Timezone: currentTimezoneHeader(),
       ...resolveQwenAiAuthHeaders(token, cookies),
@@ -4130,6 +4284,24 @@ export class QwenAiAdapter {
   ): Promise<QwenAiUpstreamError> {
     const contentType = String(response.headers?.['content-type'] || 'unknown')
     const body = bodyPreview ?? await this.readStreamPreview(response.data, 4096, previewOptions)
+    // A gateway HTML rejection is not a provider JSON error envelope. Do not
+    // interpret scripts/page text as quota evidence or expose it to clients.
+    const isHtmlRejection = response.status === 405 && (
+      /(?:text\/html|application\/xhtml\+xml)/i.test(contentType)
+      || /^\s*(?:<!doctype\s*html|<html[\s>])/i.test(body)
+    )
+    if (isHtmlRejection) {
+      const error = new Error(
+        `Qwen AI upstream ${reason} (HTTP 405): received an HTML rejection page. `
+        + 'Automatic retry is disabled; verify access through the supported login flow or contact the provider.',
+      ) as QwenAiUpstreamError
+      error.status = 405
+      error.code = 'qwen_ai_upstream_http_rejection'
+      error.retryable = false
+      error.accountFault = false
+      error.headers = sanitizeForwardedErrorHeaders(response.headers)
+      return error
+    }
     const upstreamMessage = this.extractUpstreamErrorMessage(body)
     const detail = upstreamMessage ? `: ${upstreamMessage}` : ''
 
@@ -4592,6 +4764,7 @@ export class QwenAiAdapter {
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
           managedDocumentMode,
+          requestIntent: request.requestIntent,
           transcriptTransportPolicy,
           requestMaxBytes,
           systemPromptMode,
@@ -4600,6 +4773,11 @@ export class QwenAiAdapter {
           declaredToolNames: request.managedToolCalling
             ? (this.toolCallingPlan?.tools ?? []).map(tool => tool.name)
             : [],
+          // History must show the same aliased names the managed prompt
+          // teaches, or the model copies the platform-native client name out
+          // of the transcript and routes the call through the platform's
+          // native channel (422 rejected_native_tool_call).
+          toolNameAliases: this.toolCallingPlan?.toolNameAliases,
           retryNonce: request.attemptNumber,
           signal: scope.signal,
           deadlineAt: request.deadlineAt,
@@ -4623,6 +4801,7 @@ export class QwenAiAdapter {
         request.enable_thinking,
         modelCapability,
         request.reasoning_effort ?? request.reasoningEffort,
+        request.managedToolCalling,
       )
       const featureConfig = createQwenAiFeatureConfig({
         thinkingEnabled: featureMode.thinkingEnabled,
@@ -4910,6 +5089,7 @@ export class QwenAiAdapter {
       request.enable_thinking,
       modelCapability,
       request.reasoning_effort ?? request.reasoningEffort,
+      request.managedToolCalling,
     )
     const featureConfig = createQwenAiFeatureConfig({
       thinkingEnabled: featureMode.thinkingEnabled,
@@ -4936,12 +5116,14 @@ export class QwenAiAdapter {
         continuationMessages,
         uploader,
         {
+          requestIntent: request.requestIntent,
           transport: request.messageTransport,
           messageTransportLocked: request.messageTransportLocked,
           transcriptTransportPolicy: request.transcriptTransportPolicy
             ?? qwenAiTranscriptTransportPolicyFromEnv(),
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
+          toolNameAliases: this.toolCallingPlan?.toolNameAliases,
           requestMaxBytes: qwenAiRequestMaxBytesFromEnv(),
           systemPromptMode: qwenAiSystemPromptModeFromEnv(),
           nativeSystemPromptMaxBytes: qwenAiNativeSystemMaxBytesFromEnv(),
@@ -5038,9 +5220,9 @@ export class QwenAiAdapter {
       : Math.min(configuredContinuationDeadline, request.deadlineAt)
     let chatInProgressRetries = 0
     let lastChatInProgressError: QwenAiUpstreamError | undefined
-    // In-flight response ids that already had a truncated drain (frames seen,
-    // no [DONE]) and yet the append stayed busy. Re-draining the same dead id
-    // would loop to the deadline; cap it so the same id drains at most once.
+    // In-flight response ids already drained once this call. Re-draining the
+    // same id when a second busy signal names it would loop GETs to the
+    // deadline — cap it so a given response id drains at most once.
     const truncatedDrainIds = new Set<string>()
 
     const createContinuationOptions = () => ({
@@ -5085,10 +5267,33 @@ export class QwenAiAdapter {
       return exhausted
     }
 
+    // Anti-ban throttling: hammering ONE upstream chatId with rapid-fire
+    // append→drain→replay calls is the exact bot fingerprint that got the
+    // local exit IP hard-405'd (observed 2026-09-17/18). A real user turn is
+    // ONE append followed by a human-scale pause. Enforce a minimum inter-
+    // append interval per chat so a busy signal never produces a same-second
+    // re-POST — the chat either frees up after the pause or the bounded retry
+    // budget hands the transcript to the next account.
+    const minAppendIntervalMs = qwenAiStickySameChatMinIntervalMsFromEnv()
+    let lastAppendAt = 0
     while (true) {
       if (Date.now() >= continuationDeadline) {
         throw createBusyContinuationExhaustedError(lastChatInProgressError)
       }
+      // Human-scale pacing between POSTs to the SAME chatId. The first append
+      // is immediate; every subsequent POST waits out the floor so the upstream
+      // sees spaced turns, not a burst. The pause is capped by the deadline.
+      if (lastAppendAt > 0) {
+        const elapsed = Date.now() - lastAppendAt
+        const waitMs = Math.min(
+          minAppendIntervalMs - elapsed,
+          Math.max(0, continuationDeadline - Date.now()),
+        )
+        if (waitMs > 0 && !(await waitForQwenAiRetry(waitMs, request.signal))) {
+          throw createQwenAiContinuationAbortError()
+        }
+      }
+      lastAppendAt = Date.now()
 
       const response = await this.postWithRefreshRetry(url, payload, createContinuationOptions)
 
@@ -5135,12 +5340,14 @@ export class QwenAiAdapter {
       // the pacing, so no extra blind sleep is spent and the blind retry budget
       // is reserved for the case where the busy signal carries no response_id.
       const inFlightResponseId = validation.error?.inFlightResponseId
-      // Skip re-draining an id whose earlier truncated drain already proved the
-      // upstream discarded it yet kept the chat busy — that would loop until
-      // the deadline. The blind retry path below handles it instead.
+      // Drain a given in-flight response id at most once per call: a second
+      // busy signal naming the same id means the drain did not free the chat,
+      // so that id is dead — fall to the switch-account verdict below instead
+      // of re-draining to the deadline.
       const shouldDrain = Boolean(inFlightResponseId)
         && !truncatedDrainIds.has(inFlightResponseId as string)
       if (inFlightResponseId && shouldDrain) {
+        truncatedDrainIds.add(inFlightResponseId as string)
         try {
           console.info('[QwenAI] Draining in-flight generation before retrying continuation', JSON.stringify({
             chatId,
@@ -5163,6 +5370,14 @@ export class QwenAiAdapter {
           const deadInFlight = !drainResult.completed
             && !drainResult.sawDataFrame
             && drainResult.bytesConsumed < QWEN_AI_DEAD_IN_FLIGHT_MAX_BYTES
+          // A resume that emits a data frame can still be terminal: Qwen pins
+          // the chat busy, then answers the GET with a fixed
+          // `{"error": "The request is ended!"}` envelope. The response id is
+          // recognized but permanently closed, so retrying the same parent is
+          // a guaranteed no-op — treat it as dead and replay fresh.
+          const endedInFlight = !drainResult.completed
+            && drainResult.sawDataFrame === true
+            && isQwenAiResponseEndedError(drainResult.preview ?? '')
           console.info('[QwenAI] In-flight generation drained; retrying continuation', JSON.stringify({
             chatId,
             inFlightResponseId,
@@ -5174,8 +5389,9 @@ export class QwenAiAdapter {
             // visible instead of being misclassified as a dead remnant.
             ...(drainResult.preview ? { drainPreview: drainResult.preview } : {}),
             ...(deadInFlight ? { deadInFlight: true } : {}),
+            ...(endedInFlight ? { endedInFlight: true } : {}),
           }))
-          if (deadInFlight) {
+          if (deadInFlight || endedInFlight) {
             // The upstream pinned this chat to an in-flight response that
             // produced no frames at all — a stale busy flag, not a live or
             // recently-finished generation. Surface it as an
@@ -5186,25 +5402,13 @@ export class QwenAiAdapter {
             dead.inFlightResponseId = inFlightResponseId
             throw dead
           }
-          if (!drainResult.completed) {
-            // A truncated drain (frames seen, no [DONE]): the response is gone
-            // but the busy flag may still be held. Remember the id so a second
-            // busy signal naming it drops to blind retry rather than re-draining
-            // the same dead stream to the deadline.
-            truncatedDrainIds.add(inFlightResponseId)
-          }
-          // A live or freshly-finished in-flight turn was drained. Whether it
-          // completed cleanly or was discarded mid-flight, the drain timeout
-          // already waited — retry the append on the same binding instead of
-          // spending a blind retry-budget slot. The continuationDeadline at the
-          // top of the loop still bounds total wait.
-          //
-          // One edge: a live response can emit a burst then complete almost
-          // immediately, so drain returns fast while Qwen has not yet cleared
-          // the busy flag. Without a floor this tight-loops POST/CHAT_IN_PROGRESS
-          // round-trips. Apply the base delay as a minimum inter-append pacing;
-          // when the drain genuinely blocked for its timeout the extra delay is
-          // negligible, and when it returned instantly this prevents a hot loop.
+          // Whether the drain completed cleanly or was truncated mid-flight,
+          // the upstream recognized and released (or discarded) that response —
+          // the chat is free, so the same binding is retried. A truncated drain
+          // does NOT mean a broken session: it means the provider discarded the
+          // pinned response but the busy flag may lag. Retry the append on the
+          // same binding; the loop's pacing floor keeps it spaced instead of a
+          // hot POST/CHAT_IN_PROGRESS round-trip.
           const postDrainDelayMs = Math.min(
             QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
             baseRetryDelayMs,
@@ -5778,6 +5982,16 @@ export class QwenAiStreamHandler {
     return false
   }
 
+  /**
+   * Tool names the upstream native function_call channel may legally use:
+   * the client's declared names plus any upstream aliases for them.
+   */
+  private upstreamAllowedToolNames(): Set<string> {
+    return this.toolCallingPlan?.allowedUpstreamToolNames
+      ?? this.toolCallingPlan?.allowedToolNames
+      ?? new Set<string>()
+  }
+
   private ingestNativeToolCallFragments(delta: Record<string, any>): {
     sawFragment: boolean
   } {
@@ -5791,11 +6005,15 @@ export class QwenAiStreamHandler {
     for (const fragment of fragments) {
       sawFragment = true
       const existing = this.nativeToolCallStates.get(fragment.key)
-      const name = mergeNativeToolName(
+      const mergedName = mergeNativeToolName(
         existing?.name ?? '',
         fragment.name,
-        this.toolCallingPlan.allowedToolNames,
+        this.upstreamAllowedToolNames(),
       )
+      // The upstream wire may carry an alias for a colliding client tool name
+      // (e.g. run_command for codex's exec_command). Accept it, then present it
+      // to the client under the declared name so the client contract holds.
+      const name = clientToolNameFromAlias(mergedName, this.toolCallingPlan?.toolNameAliases)
       const allowed = Boolean(name && this.toolCallingPlan.allowedToolNames.has(name))
       const argumentsText = mergeNativeToolArguments(existing?.arguments ?? '', fragment.arguments)
       const nextState: NativeToolCallState = {
@@ -5824,6 +6042,23 @@ export class QwenAiStreamHandler {
     }
 
     return { sawFragment }
+  }
+
+  /**
+   * Detects the platform's runtime rejection of a native call it routed into
+   * its own tool executor. Qwen emits a role:"function" delta whose content is
+   * the literal diagnostic "Tool <name> does not exists." — a frame only the
+   * platform's tool runtime produces (the model never speaks with
+   * role:"function"), so it cannot be confused with assistant prose. The
+   * rejected name comes from the delta's own `name` field, falling back to the
+   * name parsed out of the diagnostic text.
+   */
+  private getRejectedNativeToolNames(delta: Record<string, any>, content: string): string[] {
+    if (delta?.role !== 'function' || typeof content !== 'string') return []
+    const match = /^\s*Tool\s+([A-Za-z0-9_.:-]+)\s+does not exists?\.?\s*$/i.exec(content.trim())
+    if (!match) return []
+    const deltaName = typeof delta.name === 'string' ? delta.name : undefined
+    return [deltaName ?? match[1]]
   }
 
   private getCompleteUndeclaredNativeToolNames(): string[] {
@@ -6268,6 +6503,55 @@ export class QwenAiStreamHandler {
       idleTimer = setTimeout(() => {
         void handleIdle()
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
+    }
+
+    // Runaway-generation watchdog: the upstream can flood `choices` events
+    // without ever producing new summary/answer content — observed 2026-09-21
+    // (28231 upstream events, summaryText frozen at 7017, only 18 downstream
+    // frames, then a 30min deadline burn). The idle watchdog never trips
+    // because events keep arriving, and semantic recovery never triggers
+    // because nothing reaches a terminal state. Track produced characters vs
+    // upstream event volume; when events explode while output is frozen, the
+    // generation is a loop — fail it so the client retries a fresh branch.
+    const RUNAWAY_EVENT_THRESHOLD = Number(
+      process.env.CHAT2API_QWEN_AI_RUNAWAY_EVENT_THRESHOLD ?? 400,
+    )
+    const RUNAWAY_STALL_WINDOW_MS = Number(
+      process.env.CHAT2API_QWEN_AI_RUNAWAY_STALL_MS ?? 90_000,
+    )
+    let lastProducedChars = 0
+    let lastProducedAt = Date.now()
+    const producedChars = () =>
+      reasoningText.length + summaryText.length + deliveredAnswerText.length
+    const checkRunawayGeneration = (): boolean => {
+      if (finalChunkSent) return true
+      const produced = producedChars()
+      if (produced > lastProducedChars) {
+        lastProducedChars = produced
+        lastProducedAt = Date.now()
+        return false
+      }
+      // Only a flood that produces nothing is a loop. A quiet-but-slow stream
+      // (few events, some output) is healthy reasoning, left to the idle
+      // watchdog instead.
+      const stalledMs = Date.now() - lastProducedAt
+      if (
+        upstreamEventCount >= RUNAWAY_EVENT_THRESHOLD
+        && stalledMs >= RUNAWAY_STALL_WINDOW_MS
+      ) {
+        console.warn('[QwenAI] Runaway generation detected — events flooding without new output', JSON.stringify({
+          upstreamEventCount,
+          producedChars: produced,
+          stalledMs,
+          downstreamFrameCount,
+          bufferedManagedFrameCount: managedBranchFrames.length,
+        }))
+        failStream(createQwenAiStreamFailure(
+          `Qwen AI produced ${upstreamEventCount} stream events without advancing output for ${Math.ceil(stalledMs / 1000)}s (runaway generation loop).`,
+        ))
+        return true
+      }
+      return false
     }
 
     const writeVisibleSse = (
@@ -6781,6 +7065,7 @@ export class QwenAiStreamHandler {
             tools: this.toolCallingPlan.tools,
             protocol: this.toolCallingPlan.protocol,
             allowPartial: true,
+            toolNameAliases: this.toolCallingPlan.toolNameAliases,
           })
         : undefined
       const validationFailure = getToolStreamValidationFailure({
@@ -7032,6 +7317,11 @@ export class QwenAiStreamHandler {
           lastUpstreamEventType = data['response.created']
             ? 'response.created'
             : Array.isArray(data.choices) ? 'choices' : 'json'
+          // Sampled runaway check — every 100 events, not per event, to keep
+          // the flood path cheap while still catching a loop within ~100 events.
+          if (upstreamEventCount % 100 === 0 && checkRunawayGeneration()) {
+            return
+          }
           if (QWEN_AI_DEBUG_STREAM_LOGS) {
             console.log('[QwenAI] Parsed JSON data keys:', Object.keys(data))
           }
@@ -7156,6 +7446,17 @@ export class QwenAiStreamHandler {
                 console.log('[QwenAI] Updated summaryText, length:', summaryText.length)
               }
             } else if (phase === 'answer') {
+              // The platform routes a declared native function_call into its own
+              // tool runtime, which rejects names it does not own with a
+              // role:"function" "Tool <name> does not exists." frame. That call
+              // can never produce a client-visible tool_call, so the branch is
+              // semantically dead: recover it instead of treating the turn as a
+              // normal finished answer that merely lacks tool calls.
+              const rejectedNativeToolNames = this.getRejectedNativeToolNames(delta, delta.content || '')
+              if (rejectedNativeToolNames.length > 0) {
+                recoverFromSemanticEmpty(createQwenAiRejectedNativeToolError(rejectedNativeToolNames))
+                return
+              }
               if (content && !initialChunkSent) sendInitialChunk()
               if (QWEN_AI_DEBUG_STREAM_LOGS) {
                 console.log('[QwenAI] Entering answer branch, content:', content)
@@ -7455,6 +7756,7 @@ export class QwenAiStreamHandler {
             tools: this.toolCallingPlan.tools,
             protocol: this.toolCallingPlan.protocol,
             allowPartial: true,
+            toolNameAliases: this.toolCallingPlan.toolNameAliases,
           })
           const managedValidationFailure = getToolStreamValidationFailure({
             plan: this.toolCallingPlan,

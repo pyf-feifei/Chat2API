@@ -306,6 +306,10 @@ function loadRequestForwarder(overrides = {}) {
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
+      // Mirror the production defaults from adapters/qwen-ai.ts, otherwise the
+      // sticky-session guard silently changes behavior under the mock.
+      qwenAiStickyMaxTurnsFromEnv: () => 200,
+      qwenAiStickyMaxBytesFromEnv: () => 32_000_000,
       qwenAiTranscriptTransportPolicyFromEnv: () => ({}),
       resolveQwenAiNativeContinuationSystemPrompt: () => '',
     },

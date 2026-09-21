@@ -11,9 +11,11 @@ import {
   ChatMessage,
   type AccountSelection,
   type ProxyContext,
+  type QwenAiEgressRecoveryState,
 } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
+import { QwenAiAdapter } from '../adapters/qwen-ai'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
 import {
@@ -521,6 +523,19 @@ router.post('/messages', async (ctx: Context) => {
     stream: anthropicReq.stream,
   }))
 
+  // Egress-IP recovery must outlive a single account attempt: an aliyun verdict
+  // (FAIL_SYS_USER_VALIDATE / RGV587 / `bxpunish`) flags the exit IP, not the
+  // account, so once a request escalates to the Webshare proxy it must stay
+  // there for every later account of the SAME client request. One ledger per
+  // request, shared by all failover attempts.
+  const qwenAiEgressRecoveryState: QwenAiEgressRecoveryState | undefined =
+    QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+      ? {
+          webshareRetries: 0,
+          useWebshareProxy: false,
+        }
+      : undefined
+
   const createProxyContext = (
     selection: AccountSelection,
   ): ProxyContext => ({
@@ -534,6 +549,7 @@ router.post('/messages', async (ctx: Context) => {
     clientIP,
     signal: clientSignal,
     requestIntent: requestIntent.intent,
+    ...(qwenAiEgressRecoveryState ? { qwenAiEgressRecoveryState } : {}),
   })
 
   // This route threads no Qwen recovery state, so account-neutral semantic

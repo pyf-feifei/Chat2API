@@ -27,6 +27,8 @@ import type {
   QwenAiSessionMode,
   WebshareProxyConfig,
   WebshareProxyListItem,
+  CaptchaVisionConfig,
+  CaptchaVisionTestResult,
 } from '../../../shared/types'
 
 export type {
@@ -59,6 +61,8 @@ export type {
   WebshareProxyConfig,
   WebshareProxyEntry,
   WebshareProxyListItem,
+  CaptchaVisionConfig,
+  CaptchaVisionTestResult,
 }
 
 export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
@@ -335,6 +339,8 @@ interface ConfigAPI {
   get: () => Promise<AppConfig>
   update: (updates: Partial<AppConfig>) => Promise<boolean>
   onConfigChanged: (callback: (config: AppConfig) => void) => () => void
+  /** Round-trip probe for the Z.ai captcha vision model (tests unsaved form values). */
+  testCaptchaVision: (config: Partial<CaptchaVisionConfig>) => Promise<CaptchaVisionTestResult>
 }
 
 interface PromptsAPI {

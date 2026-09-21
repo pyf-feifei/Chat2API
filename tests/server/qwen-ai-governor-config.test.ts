@@ -149,10 +149,15 @@ test('Qwen tool session mode validation rejects unknown values', () => {
   const valid = ConfigManager.validate({ qwenAiSessionMode: 'legacy' })
   const invalid = ConfigManager.validate({ qwenAiSessionMode: 'unknown' })
 
+  // `sticky` is a supported third mode (sticky upstream chat via the
+  // content-fingerprint chainKey), so it must validate cleanly.
+  assert.deepEqual(ConfigManager.validate({ qwenAiSessionMode: 'sticky' }), { valid: true, errors: [] })
+  assert.deepEqual(ConfigManager.validate({ qwenAiSessionMode: 'tool-call-binding' }), { valid: true, errors: [] })
+
   assert.deepEqual(valid, { valid: true, errors: [] })
   assert.deepEqual(invalid, {
     valid: false,
-    errors: ['qwenAiSessionMode must be one of: legacy, tool-call-binding'],
+    errors: ['qwenAiSessionMode must be one of: legacy, tool-call-binding, sticky'],
   })
 })
 

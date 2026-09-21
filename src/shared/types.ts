@@ -278,6 +278,8 @@ export interface AppConfig {
   managementApi: ManagementApiConfig
   contextManagement?: unknown
   language: 'zh-CN' | 'en-US'
+  /** Vision model for solving the Z.ai slider captcha (optional; env fallback) */
+  captchaVision?: CaptchaVisionConfig
 }
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -382,6 +384,40 @@ export interface ManagementApiConfig {
   enableManagementApi: boolean
   managementApiSecret: string
   managementApiPort?: number
+}
+
+/**
+ * Optional vision model used to locate the Z.ai slider-captcha target.
+ * Z.ai serves the captcha background with the hole already inpainted, so local
+ * gap detection is unreliable; a vision model can still find the strip.
+ */
+export interface CaptchaVisionConfig {
+  enabled: boolean
+  /** OpenAI-compatible base URL, e.g. https://host/v1 */
+  baseUrl: string
+  apiKey: string
+  model: string
+}
+
+/** Result of a round-trip connectivity probe against the captcha vision model. */
+export interface CaptchaVisionTestResult {
+  ok: boolean
+  /** Stable machine code; the renderer maps it to a localized message. */
+  message:
+    | 'ok'
+    | 'missingBaseUrl'
+    | 'missingApiKey'
+    | 'missingModel'
+    | 'httpError'
+    | 'badJson'
+    | 'emptyContent'
+    | 'mismatch'
+    | 'timeout'
+    | 'networkError'
+  /** Endpoint actually called (never includes the secret). */
+  endpoint?: string
+  /** Raw model reply, trimmed and truncated, for troubleshooting. */
+  reply?: string
 }
 
 export interface ManagementApiResponse<T = unknown> {

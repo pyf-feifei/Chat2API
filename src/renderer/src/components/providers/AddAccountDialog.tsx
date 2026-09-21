@@ -43,7 +43,6 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     'glm': 'chatglm_refresh_token',
     'deepseek': 'userToken',
     'qwen': 'tongyi_sso_ticket',
-    'zai': 'tongyi_sso_ticket',
     'perplexity': '__Secure-next-auth.session-token',
     'mimo': 'serviceToken',
   }
@@ -52,9 +51,18 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     'glm': 'refresh_token',
     'deepseek': 'token',
     'qwen': 'ticket',
-    'zai': 'ticket',
     'perplexity': 'sessionToken',
     'mimo': 'service_token',
+  }
+
+  // Z.ai's in-app login collects the session JWT under 'token' (plus 'cookies'
+  // when the cookie source wins). Map it onto the form's token field and keep
+  // cookies — the adapter uses them for captcha admission and refresh.
+  if (providerId === 'zai') {
+    return {
+      token: credentials.token || '',
+      ...(credentials.cookies ? { cookies: credentials.cookies } : {}),
+    }
   }
 
   if (providerId === 'qwen-ai') {
@@ -258,7 +266,9 @@ export function AddAccountDialog({
   const isEditing = !!editingAccount
   const builtinProvider = provider as BuiltinProviderConfig | null
   const credentialFields: CredentialField[] = builtinProvider?.credentialFields || getDefaultCredentialFields(provider?.authType, t)
-  const oauthRefreshCredentialFields = provider?.id === 'qwen-ai'
+  // Providers whose credential re-login needs email/password get the fields in
+  // the OAuth tab too, so a browser-login account can still enable auto-refresh.
+  const oauthRefreshCredentialFields = provider && ['qwen-ai', 'zai'].includes(provider.id)
     ? credentialFields.filter(field => ['email', 'password'].includes(field.name))
     : []
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
@@ -482,7 +492,7 @@ export function AddAccountDialog({
         console.log('[AddAccountDialog] MiniMax realUserID provided:', credentials.realUserID)
       }
 
-      const accountEmail = provider?.id === 'qwen-ai'
+      const accountEmail = provider && ['qwen-ai', 'zai'].includes(provider.id)
         ? finalCredentials.email?.trim() || undefined
         : undefined
 
@@ -1144,6 +1154,21 @@ function CredentialFieldsForm({ fields, credentials, onChange, t, providerId }: 
           label: t('zai.token'),
           placeholder: t('zai.tokenPlaceholder'),
           helpText: t('zai.tokenHelp'),
+        },
+        captcha_verify_param: {
+          label: t('zai.captchaVerifyParam'),
+          placeholder: t('zai.captchaVerifyParamPlaceholder'),
+          helpText: t('zai.captchaVerifyParamHelp'),
+        },
+        email: {
+          label: t('zai.email'),
+          placeholder: t('zai.emailPlaceholder'),
+          helpText: t('zai.emailHelp'),
+        },
+        password: {
+          label: t('zai.password'),
+          placeholder: t('zai.passwordPlaceholder'),
+          helpText: t('zai.passwordHelp'),
         },
       },
       mimo: {

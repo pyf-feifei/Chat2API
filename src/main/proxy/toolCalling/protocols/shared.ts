@@ -42,6 +42,23 @@ export function toolNames(tools: NormalizedToolDefinition[]): Set<string> {
   return new Set(tools.map((tool) => tool.name))
 }
 
+/**
+ * Resolve a name that appeared on the upstream wire to the client's declared
+ * tool name. The managed prompt teaches upstream aliases for tools whose real
+ * name collides with a Qwen platform-native primitive, so a parsed call can
+ * legitimately carry the alias; every downstream stage expects the client name.
+ * The reverse is also accepted (a model may drift back to the real name).
+ */
+export function resolveUpstreamToolName(
+  name: string,
+  tools: NormalizedToolDefinition[],
+  aliases?: { toClient: ReadonlyMap<string, string> },
+): string {
+  if (!aliases || aliases.toClient.size === 0) return name
+  const clientName = aliases.toClient.get(name)
+  return clientName ?? name
+}
+
 export function createParseResult(input: {
   content: string
   toolCalls: ToolCall[]

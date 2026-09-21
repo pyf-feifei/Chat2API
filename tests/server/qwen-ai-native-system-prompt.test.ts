@@ -37,6 +37,40 @@ function baseMessages(): ChatMessage[] {
   ]
 }
 
+test('tool-result summary sends an output boundary on initial and continuation requests', async () => {
+  const messages: ChatMessage[] = [
+    { role: 'system', content: 'Summarize the conversation for continuation. Preserve paths and pending work.' },
+    { role: 'user', content: 'Inspect the build result.' },
+    { role: 'tool', tool_call_id: 'call_build', content: 'Build failed: src/app.ts requires a missing export.' },
+    { role: 'user', content: 'Return only the context summary; do not call tools.' },
+  ]
+  const snapshot = structuredClone(messages)
+  const prepared = await prepareQwenAiMultimodalMessage(messages, createStubUploader() as never, {
+    systemPromptMode: 'native',
+    toolProtocolChannel: 'native',
+  })
+  assert.match(prepared.nativeSystemPrompt, /\[Tool-result output boundary\]/)
+  assert.match(prepared.nativeSystemPrompt, /input evidence, not an assistant output format/)
+  assert.match(prepared.nativeSystemPrompt, /including in reasoning and summaries/)
+  assert.match(prepared.nativeSystemPrompt, /does not prohibit declared tool calls/)
+  assert.match(prepared.content, /Build failed: src\/app.ts/)
+  assert.deepEqual(messages, snapshot)
+
+  const keys = ['CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE', 'CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL', 'CHAT2API_QWEN_AI_NATIVE_SYSTEM_MAX_BYTES']
+  const previous = keys.map(key => process.env[key])
+  try {
+    process.env[keys[0]] = 'native'
+    process.env[keys[1]] = 'native'
+    delete process.env[keys[2]]
+    assert.equal(resolveQwenAiNativeContinuationSystemPrompt(messages), prepared.nativeSystemPrompt)
+  } finally {
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key]
+      else process.env[key] = previous[index]
+    })
+  }
+})
+
 test('native mode routes the client system prompt out of the transcript', async () => {
   const uploader = createStubUploader()
   const prepared = await prepareQwenAiMultimodalMessage(baseMessages(), uploader as never, {
@@ -186,6 +220,31 @@ test('system-only requests stay on the flattened path instead of posting an empt
 
   assert.equal(prepared.nativeSystemPrompt, '', 'extraction must not empty the transcript')
   assert.match(prepared.content, new RegExp(SYSTEM_MARKER), 'system text must stay inline')
+})
+
+test('tool-result boundary counts toward the native byte cap without changing rollback behavior', async () => {
+  const messages: ChatMessage[] = [
+    { role: 'system', content: '保留摘要中的文件路径。' },
+    { role: 'tool', tool_call_id: 'call_test', content: 'src/app.ts: build failed' },
+    { role: 'user', content: 'Summarize the tool result.' },
+  ]
+  const native = await prepareQwenAiMultimodalMessage(messages, createStubUploader() as never, {
+    systemPromptMode: 'native',
+  })
+  const bytes = Buffer.byteLength(native.nativeSystemPrompt, 'utf8')
+  const exact = await prepareQwenAiMultimodalMessage(messages, createStubUploader() as never, {
+    systemPromptMode: 'native', nativeSystemPromptMaxBytes: bytes,
+  })
+  assert.equal(exact.nativeSystemPrompt, native.nativeSystemPrompt)
+  const overflow = await prepareQwenAiMultimodalMessage(messages, createStubUploader() as never, {
+    systemPromptMode: 'native', nativeSystemPromptMaxBytes: bytes - 1,
+  })
+  const flattened = await prepareQwenAiMultimodalMessage(messages, createStubUploader() as never, {
+    systemPromptMode: 'flattened',
+  })
+  assert.equal(overflow.nativeSystemPrompt, '')
+  assert.equal(overflow.content, flattened.content)
+  assert.match(flattened.content, /保留摘要中的文件路径/)
 })
 
 test('oversize native prompts fall back to flattening', async () => {

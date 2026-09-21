@@ -16,6 +16,8 @@ import { sessionManager } from '../proxy/sessionManager'
 import { TrayManager } from '../tray/TrayManager'
 import { ConfigManager } from '../store/config'
 import { generateManagementSecret } from '../proxy/middleware/managementAuth'
+import { testCaptchaVisionConnection } from '../lib/captchaVision'
+import type { CaptchaVisionConfig } from '../store/types'
 import { UpdaterManager } from '../updater'
 import { DeepSeekAdapter } from '../proxy/adapters/deepseek'
 import { GLMAdapter } from '../proxy/adapters/glm'
@@ -1010,6 +1012,19 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     ConfigManager.update({ contextManagement: newContextConfig })
     
     return newContextConfig
+  })
+
+  // ==================== Captcha Vision Handlers ====================
+
+  ipcMain.handle(IpcChannels.CAPTCHA_VISION_TEST, async (_, config: Partial<CaptchaVisionConfig>) => {
+    const current = ConfigManager.get().captchaVision
+    const merged: CaptchaVisionConfig = {
+      enabled: true,
+      baseUrl: config?.baseUrl ?? current?.baseUrl ?? '',
+      apiKey: config?.apiKey ?? current?.apiKey ?? '',
+      model: config?.model ?? current?.model ?? '',
+    }
+    return testCaptchaVisionConnection(merged)
   })
   
   oauthManager.on('progress', (event) => {

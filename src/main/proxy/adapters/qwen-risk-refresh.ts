@@ -1,9 +1,40 @@
 import { execFile } from 'child_process'
+import { existsSync } from 'fs'
 import { platform } from 'os'
+import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
 import { storeManager } from '../../store/store'
 import type { Account } from '../../../shared/types'
 
-const REFRESH_SCRIPT = process.env.QWEN_CAPTCHA_SOLVER_PATH || '/app/scripts/qwen-captcha/refresh.py'
+// Resolve the bundled solver so the default works in every layout:
+//   dev/tsx   : this file sits at <repo>/src/main/proxy/adapters -> repo/scripts
+//   built srv : bundled into <repo>/out-server/...              -> repo/scripts
+//   container : /app/out-server/...                            -> /app/scripts
+// Try candidates in order; the first that exists wins. The env var remains an
+// explicit override for non-standard layouts.
+function defaultRefreshScriptPath(): string {
+  const rel = join('scripts', 'qwen-captcha', 'refresh.py')
+  const candidates: string[] = []
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    // Walk up: dev needs 4 levels (adapters->proxy->main->src->repo), the built
+    // bundle needs 1-2 (out-server/<chunk> -> repo). Probe every ancestor.
+    let dir = here
+    for (let depth = 0; depth < 6; depth += 1) {
+      candidates.push(join(dir, rel))
+      dir = dirname(dir)
+    }
+  } catch {
+    // import.meta unavailable — fall through to absolute candidates
+  }
+  candidates.push(join('/app', rel))
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return '/app/scripts/qwen-captcha/refresh.py'
+}
+
+const REFRESH_SCRIPT = process.env.QWEN_CAPTCHA_SOLVER_PATH || defaultRefreshScriptPath()
 const REFRESH_TIMEOUT_MS = 180_000
 const CHALLENGE_WINDOW_MS = 15 * 60_000
 const CHALLENGE_THRESHOLD = 3
@@ -36,7 +67,11 @@ const inFlight = new Map<string, Promise<Account | null>>()
  * for content-flagged sessions.
  */
 export function noteQwenAiRiskChallenge(account: Account, evidence?: string): void {
-  const envelope = /FAIL_SYS_USER_VALIDATE|RGV587/i.test(String(evidence ?? ''))
+  // bxpunish is the same aliyun (baxia) verdict family as RGV587 but arrives as
+  // a response header on a 503 busy body, not as error text — the caller folds
+  // it into the evidence string so the shared-exit counter can trip the same
+  // browser x5sec refresh. Without it, bxpunish hits never refreshed cookies.
+  const envelope = /FAIL_SYS_USER_VALIDATE|RGV587|bxpunish/i.test(String(evidence ?? ''))
   if (!envelope) return
   const now = Date.now()
   // Global exit-level window: drop hits older than the window, then count.
@@ -124,12 +159,39 @@ async function doRefresh(account: Account): Promise<Account | null> {
         try {
           const parsed = JSON.parse(lines[i]) as { cookies?: string; token?: string; solved_slider?: boolean }
           if (!parsed.cookies) continue
+          // Strip Chat2API's own encrypted credential artifacts (`c2a:` values)
+          // from the harvested cookie jar. The refresher runs in a browser that
+          // may have stored encrypted creds from a prior injection; replaying
+          // that ciphertext as a live Cookie value breaks every account it is
+          // fanned out to (observed 2026-09-19: propagatedToAccounts=339 →
+          // qwen_ai_token_refresh_failed on the whole pool). A part is dropped
+          // when it has no `=` (a bare ciphertext blob) or its value is a `c2a:`
+          // blob — neither is a real `name=value` browser cookie.
+          const harvestedCookies = String(parsed.cookies)
+            .split(';')
+            .map(part => part.trim())
+            .filter(part => {
+              if (!part) return false
+              const eq = part.indexOf('=')
+              if (eq < 0) return false                       // bare blob (e.g. a lone ciphertext)
+              if (/^c2a:/i.test(part)) return false          // whole-blob ciphertext
+              if (/=c2a:/i.test(part)) return false          // name=c2a:ciphertext
+              return true
+            })
+            .join('; ')
+          // The harvested token is only usable when it's a real JWT — a `c2a:`
+          // blob is Chat2API's own ciphertext from a prior injection, not a
+          // credential the upstream can verify. Skip writing it back so the
+          // account keeps its previous (working) token.
+          const harvestedToken = parsed.token && !/^c2a:/i.test(String(parsed.token).trim())
+            ? parsed.token
+            : undefined
           const updated = storeManager.updateAccount(account.id, {
             credentials: {
               ...account.credentials,
-              cookies: parsed.cookies,
-              cookie: parsed.cookies,
-              ...(parsed.token ? { token: parsed.token } : {}),
+              cookies: harvestedCookies,
+              cookie: harvestedCookies,
+              ...(harvestedToken ? { token: harvestedToken } : {}),
             },
           })
           if (!updated) {
@@ -150,8 +212,8 @@ async function doRefresh(account: Account): Promise<Account | null> {
               storeManager.updateAccount(peer.id, {
                 credentials: {
                   ...peer.credentials,
-                  cookies: parsed.cookies,
-                  cookie: parsed.cookies,
+                  cookies: harvestedCookies,
+                  cookie: harvestedCookies,
                 },
               })
               propagated += 1

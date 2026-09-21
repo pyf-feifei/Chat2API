@@ -19,6 +19,8 @@ import type {
   QwenAiGovernorStatus,
   ProviderModelCapability,
   WebshareProxyConfig,
+  CaptchaVisionConfig,
+  CaptchaVisionTestResult,
 } from '../shared/types'
 
 export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
@@ -528,6 +530,13 @@ const configAPI = {
     ipcRenderer.on(IpcChannels.CONFIG_CHANGED, handler)
     return () => ipcRenderer.removeListener(IpcChannels.CONFIG_CHANGED, handler)
   },
+
+  /**
+   * Round-trip probe for the Z.ai captcha vision model.
+   * Pass the unsaved form values so the user can test before saving.
+   */
+  testCaptchaVision: (config: Partial<CaptchaVisionConfig>): Promise<CaptchaVisionTestResult> =>
+    ipcRenderer.invoke(IpcChannels.CAPTCHA_VISION_TEST, config),
 }
 
 const promptsAPI = {

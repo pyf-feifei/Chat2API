@@ -663,6 +663,7 @@ function parseBufferedToolCall(
     tools: plan.tools,
     protocol: plan.protocol,
     allowPartial: options.allowPartial,
+    toolNameAliases: plan.toolNameAliases,
   })
 }
 
@@ -698,6 +699,7 @@ export function salvageAlternateProtocolToolCalls(
       tools: plan.tools,
       protocol: protocol.id,
       allowPartial: true,
+      toolNameAliases: plan.toolNameAliases,
     })
     if (parsed.toolCalls.length === 0) continue
 

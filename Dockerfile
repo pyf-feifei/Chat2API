@@ -157,6 +157,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CHROME_PATH=/usr/bin/chromium
 ENV ZAI_CAPTCHA_SOLVER_PATH=/app/scripts/zai-captcha/solve.py
 ENV ZAI_CAPTCHA_ARTIFACT_DIR=/tmp/zai-captcha
+# No display and nobody in front of it: never park a refresh waiting on a human.
+# (The desktop app defaults this to on; pinned here so container behaviour is
+# explicit rather than left to runtime detection.)
+ENV ZAI_REFRESH_ALLOW_HUMAN=0
 # Qwen RGV587 risk-session refresher (aliyun slider solve -> x5sec cookie harvest)
 ENV QWEN_CAPTCHA_SOLVER_PATH=/app/scripts/qwen-captcha/refresh.py
 ENV QWEN_CAPTCHA_ARTIFACT_DIR=/tmp/qwen-captcha

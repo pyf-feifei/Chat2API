@@ -302,6 +302,27 @@ export interface QwenAiLogicalRecoveryState {
   semanticFreshChatEscalations: number
 }
 
+/**
+ * Request-wide egress-IP recovery ledger for Qwen AI.
+ *
+ * The Webshare egress switch and its one-shot direct-retry companion outlive a
+ * single account attempt: an aliyun verdict (FAIL_SYS_USER_VALIDATE / RGV587 /
+ * `bxpunish`) is an exit-IP flag, so the exit must stay switched for every
+ * later account on the SAME client request. Keeping this on the context — not
+ * in per-attempt locals — is what makes the switch survive the account
+ * failover boundary (observed 2026-09-20: the flag was set inside
+ * forwardChatCompletion, which the failover loop re-enters per account, so a
+ * fresh `false` discarded the switch before the retry reached the adapter).
+ */
+export interface QwenAiEgressRecoveryState {
+  /** Proxy-routed recovery attempts consumed for this client request. */
+  webshareRetries: number
+  /** Force every remaining attempt of this request through the Webshare proxy. */
+  useWebshareProxy: boolean
+  /** One-shot direct-exit retry granted after a proxy transport failure. */
+  directRetryAfterProxyFailureUsed?: boolean
+}
+
 export interface ProxyContext {
   requestId: string
   providerId?: string
@@ -316,6 +337,8 @@ export interface ProxyContext {
   requestIntent?: 'normal' | 'context_compaction'
   /** Mutable recovery budget shared by all Qwen account attempts in this request. */
   qwenAiLogicalRecoveryState?: QwenAiLogicalRecoveryState
+  /** Mutable egress-IP recovery ledger shared by all Qwen account attempts. */
+  qwenAiEgressRecoveryState?: QwenAiEgressRecoveryState
   /**
    * The HTTP route already owns a keep-alive stream, so a managed Qwen branch
    * can remain private until terminal validation and account failover finish.

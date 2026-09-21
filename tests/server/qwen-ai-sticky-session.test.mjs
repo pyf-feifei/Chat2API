@@ -175,3 +175,51 @@ test('responses conversation store preserves sticky binding fields through clone
     'done',
   )
 })
+
+// ---------------------------------------------------------------------------
+// Poisoned-chat circuit breaker
+// ---------------------------------------------------------------------------
+
+test('poisoned-chat error codes are classified for chain release', () => {
+  const { isQwenAiPoisonedChatErrorCode } = sessionBridge
+
+  // Poisoned codes — must release the chain so a reconnect gets a fresh chat.
+  assert.equal(isQwenAiPoisonedChatErrorCode('internal_error'), true)
+  assert.equal(isQwenAiPoisonedChatErrorCode('managed_tool_result_wrapper_leak'), true)
+  assert.equal(isQwenAiPoisonedChatErrorCode('qwen_ai_upstream_http_rejection'), true)
+
+  // Non-poisoned / transient codes — the chain must be RETAINED.
+  assert.equal(isQwenAiPoisonedChatErrorCode('CHAT_IN_PROGRESS'), false)
+  assert.equal(isQwenAiPoisonedChatErrorCode('qwen_ai_session_stale'), false)
+  assert.equal(isQwenAiPoisonedChatErrorCode('qwen_ai_upstream_busy'), false)
+  assert.equal(isQwenAiPoisonedChatErrorCode('qwen_ai_capacity_limit'), false)
+  assert.equal(isQwenAiPoisonedChatErrorCode(undefined), false)
+  assert.equal(isQwenAiPoisonedChatErrorCode(''), false)
+})
+
+test('a poisoned chain released via releaseChain lets the next claim mint fresh', () => {
+  const registry = new QwenAiStickyRegistry({ idleTtlMs: 60_000 })
+  const chainKey = 'chain-poisoned-1'
+  registry.registerChain(chainKey, {
+    accountId: 'account-a',
+    providerId: 'qwen-ai',
+    chatId: 'chat-poisoned',
+    parentId: 'resp-old',
+    historyHash: 'hash-1',
+    lastSeenCount: 10,
+  })
+
+  // Claim shows the chain bound to the poisoned chat.
+  const first = registry.claimByChainKey(chainKey)
+  assert.equal(first.status, 'claimed')
+  assert.equal(first.entry.chatId, 'chat-poisoned')
+  registry.releaseChainClaim(first.claim)
+
+  // The poisoned-chat verdict releases the chain entirely.
+  registry.releaseChain(chainKey)
+
+  // The next claim on the same chainKey is 'missing' — the route then
+  // registers a fresh chain/chat instead of re-binding to the dead branch.
+  const second = registry.claimByChainKey(chainKey)
+  assert.equal(second.status, 'missing', 'released chain must not re-bind to the dead chat')
+})

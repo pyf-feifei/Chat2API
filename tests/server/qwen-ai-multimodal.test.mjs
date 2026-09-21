@@ -122,7 +122,7 @@ test('Qwen AI does not forge or rewrite tool arguments from document evidence', 
 test('Qwen AI multimodal helper preserves full tool-call transcript instead of only the last user message', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
 
-  assert.match(source, /function buildQwenAiTranscript\(messages: ChatMessage\[\]\)/)
+  assert.match(source, /function buildQwenAiTranscript\(\s*messages: ChatMessage\[\],/)
   assert.match(source, /getProviderToolProfile\('qwen-ai'\)/)
   assert.match(source, /msg\.role === 'assistant'/)
   assert.match(source, /msg\.tool_calls\?\.length/)
@@ -134,12 +134,20 @@ test('Qwen AI multimodal helper preserves full tool-call transcript instead of o
   assert.match(source, /formatToolResult\(\{/)
   assert.match(source, /isError,/)
   assert.doesNotMatch(source, /Use this result to decide the next step\./)
-  assert.doesNotMatch(source, /<\|CHAT2API\|tool_result/)
+  // The prompt must never WRAP a tool result in the envelope token. Since
+  // 2026-09 the boundary instruction deliberately NAMES the token in order to
+  // forbid the model from emitting it, so the assertion targets the wrapping
+  // form (`<|CHAT2API|tool_result>` opening a rendered result) rather than any
+  // mention of the token at all.
+  assert.doesNotMatch(source, /['"`]<\|CHAT2API\|tool_result['"`]/)
+  assert.doesNotMatch(source, /`<\|CHAT2API\|tool_result|<\/(?:tool_result|function_results)\$?\{?/)
+  assert.match(source, /Do not emit or copy <\|CHAT2API\|tool_result>/)
   assert.doesNotMatch(source, /renderCompletedToolState|Authoritative completed tool ledger|Do not repeat an already successful operation/)
   assert.match(source, /fileParts\.push\(\.\.\.messageFileParts\)/)
   // Native system-prompt mode derives effectiveMessages from the full list
   // before rendering; either variable satisfies the full-transcript contract.
-  assert.match(source, /buildQwenAiTranscript\((effectiveMessages|messages)\)/)
+  // The call site also passes a transport/options object as a second argument.
+  assert.match(source, /buildQwenAiTranscript\((effectiveMessages|messages),\s*\{/)
   assert.doesNotMatch(source, /userContent = textFromContent\(msg\.content\)/)
   assert.doesNotMatch(source, /fileParts\.splice\(0,\s*fileParts\.length/)
 })

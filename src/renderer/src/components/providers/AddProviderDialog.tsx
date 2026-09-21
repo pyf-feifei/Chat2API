@@ -69,7 +69,6 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     'glm': 'chatglm_refresh_token',
     'deepseek': 'userToken',
     'qwen': 'tongyi_sso_ticket',
-    'zai': 'tongyi_sso_ticket',
     'perplexity': '__Secure-next-auth.session-token',
   }
 
@@ -77,8 +76,17 @@ function mapOAuthCredentials(providerId: string | undefined, credentials: Record
     'glm': 'refresh_token',
     'deepseek': 'token',
     'qwen': 'ticket',
-    'zai': 'ticket',
     'perplexity': 'sessionToken',
+  }
+
+  // Z.ai's in-app login collects the session JWT under 'token' (plus 'cookies'
+  // when the cookie source wins). Keep cookies so the adapter can use them for
+  // captcha admission and credential re-login.
+  if (providerId === 'zai') {
+    return {
+      token: credentials.token || '',
+      ...(credentials.cookies ? { cookies: credentials.cookies } : {}),
+    }
   }
 
   if (providerId === 'qwen-ai') {

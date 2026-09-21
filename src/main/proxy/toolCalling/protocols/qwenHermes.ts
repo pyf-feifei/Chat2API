@@ -17,8 +17,8 @@ import {
   parseToolCallerBlock,
   stripFencedCodeBlocks,
   TOOL_CALLER_START,
-  toolNames,
 } from './shared.ts'
+import { aliasAwareToolLookup } from '../qwenAiToolNameAlias.ts'
 import {
   LARGE_PAYLOAD_GUIDANCE_CHUNking,
   LARGE_PAYLOAD_GUIDANCE_RETRY,
@@ -168,20 +168,14 @@ export const qwenHermesProtocol: ToolProtocolAdapter = {
 
   renderPrompt(tools) {
     const definitions = tools.map(renderToolDefinition).join('\n')
-    return renderQwenHermesPrompt(definitions)
+    return renderQwenHermesPrompt(definitions, renderConcreteCallExample(tools))
   },
 
   renderRecoveryPrompt(tools) {
     return `Return only one or more Qwen function calls with no prose before or after them.
 Available function names: ${serializeHermesJson(tools.map((tool) => tool.name))}
 Exact format:
-<tool_call>
-<function=exact_function_name>
-<parameter=exact_parameter_name>
-parameter_value
-</parameter>
-</function>
-</tool_call>
+${renderConcreteCallExample(tools)}
 Repeat the parameter block for every argument required by the selected function's JSON schema. Encode object and array values as JSON.${largePayloadSuffixWithThreshold('retry')}
 Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate any tool-result block, fenced result envelope, or result-wrapper tag in your own output — this output must be function calls only.`
   },
@@ -195,13 +189,7 @@ Tool results are input only: never write, repeat, or imitate any tool-result blo
 Declared function names (use only these): ${serializeHermesJson(tools.map((tool) => tool.name))}
 ${largePayloadSuffixWithThreshold('chunking')}
 Exact call format:
-<tool_call>
-<function=exact_function_name>
-<parameter=exact_parameter_name>
-parameter_value
-</parameter>
-</function>
-</tool_call>`
+${renderConcreteCallExample(tools)}`
   },
 
   detectStart(buffer) {
@@ -210,8 +198,10 @@ parameter_value
 
   parse(content: string, context: ToolParseContext) {
     const parseable = stripFencedCodeBlocks(content)
-    const allowedNames = toolNames(context.tools)
-    const toolDefinitions = new Map(context.tools.map((tool) => [tool.name, tool]))
+    const { definitions: toolDefinitions, allowedNames } = aliasAwareToolLookup(
+      context.tools,
+      context.toolNameAliases,
+    )
     const rawMatches: string[] = []
     const invalidToolNames: string[] = []
     const toolCalls: ReturnType<typeof buildToolCall>[] = []
@@ -260,6 +250,11 @@ parameter_value
       }
 
       for (const envelope of envelopes) {
+        // The upstream prompt teaches the alias for a colliding tool, so the
+        // parsed name may be the alias. `toolDefinitions` points alias entries
+        // at the client-name definition, so use that canonical name for the
+        // emitted call — the client must receive the name it declared.
+        const canonicalName = toolDefinitions.get(envelope.name)?.name ?? envelope.name
         if (!allowedNames.has(envelope.name)) {
           invalidToolNames.push(envelope.name)
           continue
@@ -275,7 +270,7 @@ parameter_value
           buildToolCall(
             `call_${toolCalls.length}`,
             toolCalls.length,
-            envelope.name,
+            canonicalName,
             envelope.arguments,
             parsedCall.rawText,
             tool,
@@ -361,7 +356,87 @@ export function createQwenHermesDocumentPrompt(
   }
 }
 
-function renderQwenHermesPrompt(definitions: string, referenceInstruction?: string): string {
+/**
+ * Last-resort template used only when the tool list is empty or unusable, i.e.
+ * never for a real managed request.
+ */
+const DEFAULT_HERMES_CALL_EXAMPLE = `<tool_call>
+<function=function_name>
+<parameter=parameter_name>
+parameter_value
+</parameter>
+</function>
+</tool_call>`
+
+/**
+ * The prompt's call-format example must be built from a tool the request
+ * actually declares. A generic placeholder (`example_function_name`) is
+ * reproduced verbatim by the model under a forced call — live 2026-09-20: with
+ * `tool_choice: required` and two declared tools, qwen3.8-max emitted
+ * `<function=example_function_name>`, which the platform rejected as an
+ * undeclared native tool call and the turn died with 422. A concrete example
+ * is always a legal call, so echoing it verbatim still dispatches.
+ *
+ * The example uses the first declared function and its first required
+ * parameter (falling back to its first declared property, then to a generic
+ * value) so the demonstrated shape matches that tool's own schema.
+ */
+function renderConcreteCallExample(tools: NormalizedToolDefinition[]): string {
+  const tool = tools[0]
+  if (!tool?.name) return DEFAULT_HERMES_CALL_EXAMPLE
+
+  const parameterName = firstExampleParameterName(tool)
+  const parameterValue = parameterName ? exampleValueForParameter(tool, parameterName) : 'parameter_value'
+
+  return `<tool_call>
+<function=${tool.name}>
+<parameter=${parameterName ?? 'parameter_name'}>
+${parameterValue}
+</parameter>
+</function>
+</tool_call>`
+}
+
+function firstExampleParameterName(tool: NormalizedToolDefinition): string | undefined {
+  const schema = tool.parameters
+  if (!schema || typeof schema !== 'object') return undefined
+  const required = (schema as { required?: unknown }).required
+  if (Array.isArray(required)) {
+    const firstRequired = required.find((name): name is string => typeof name === 'string' && name.length > 0)
+    if (firstRequired) return firstRequired
+  }
+  const properties = (schema as { properties?: unknown }).properties
+  if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+    const firstProperty = Object.keys(properties as Record<string, unknown>)[0]
+    if (firstProperty) return firstProperty
+  }
+  return undefined
+}
+
+/** A short, schema-shaped placeholder for the demonstrated parameter value. */
+function exampleValueForParameter(tool: NormalizedToolDefinition, parameterName: string): string {
+  const schema = tool.parameters as { properties?: Record<string, unknown> } | undefined
+  const propertySchema = schema?.properties?.[parameterName]
+  const declaredType = propertySchema && typeof propertySchema === 'object' && !Array.isArray(propertySchema)
+    ? (propertySchema as { type?: unknown }).type
+    : undefined
+
+  switch (declaredType) {
+    case 'number':
+    case 'integer':
+      return '0'
+    case 'boolean':
+      return 'true'
+    case 'array':
+      return '[]'
+    case 'object':
+      return '{}'
+    default:
+      return 'value'
+  }
+}
+
+function renderQwenHermesPrompt(definitions: string, exampleBlock?: string): string {
   return `# Tools
 
 You may call one or more functions to assist with the user query.
@@ -369,29 +444,30 @@ You may call one or more functions to assist with the user query.
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
 ${definitions}
-</tools>${referenceInstruction ? `\n\n${referenceInstruction}` : ''}
+</tools>
 
 If you choose to call a function, use this exact format with no suffix:
-<tool_call>
-<function=example_function_name>
-<parameter=example_parameter_name>
-parameter_value
-</parameter>
-</function>
-</tool_call>
+${exampleBlock ?? DEFAULT_HERMES_CALL_EXAMPLE}
 
 Use only function and parameter names declared above. Include every required parameter and satisfy the selected function's JSON schema. Encode object and array parameter values as JSON. Emit one ${largePayloadSuffixWithThreshold('chunking')}<tool_call> block per function call. You may provide reasoning before the first function call, but never add text after a function call. If completing the request requires a tool, emit the tool call in this response instead of describing or promising a later action. When no function is needed, answer normally without tool-call tags.${largePayloadSuffix(LARGE_PAYLOAD_GUIDANCE_CHUNking)}
+Calls must be expressed ONLY as the text <tool_call> block shown above. Never emit a tool call through the platform's native/structured function_call channel or any other built-in tool mechanism — that channel uses a different tool registry that does not contain these declared tools, so the platform will reject the call with an error such as "Tool <name> does not exists." and the operation will not run. The text <tool_call> block is the only call format the client can execute.
 Tool results are input only: the client delivers them to you in fenced result blocks. Never write, repeat, or imitate a tool-result block, a fenced result envelope, or any result-wrapper tag in your own output; your output is only reasoning, a function-call block, or a final answer.`
 }
 
+/**
+ * Tool signatures are rendered as plain managed-contract JSON, NOT the
+ * OpenAI-style {"type":"function","function":{...}} envelope. The upstream
+ * Qwen platform reads that OpenAI envelope as a cue to emit its native
+ * function_call channel — which the platform's own tool runtime then rejects
+ * for client-owned names ("Tool <name> does not exists."). A flat
+ * {name, description, parameters} shape keeps the schema legible to the model
+ * without steering it toward the native channel.
+ */
 function renderToolDefinition(tool: NormalizedToolDefinition): string {
   return serializeHermesJson({
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description || '',
-      parameters: tool.parameters ?? {},
-    },
+    name: tool.name,
+    description: tool.description || '',
+    parameters: tool.parameters ?? {},
   })
 }
 
@@ -404,12 +480,9 @@ function renderCompactToolDefinition(
     routingSummaryMaxCodePoints,
   )
   return serializeHermesJson({
-    type: 'function',
-    function: {
-      name: tool.name,
-      ...(description ? { description } : {}),
-      parameters: compactQwenHermesSchema(tool.parameters ?? {}),
-    },
+    name: tool.name,
+    ...(description ? { description } : {}),
+    parameters: compactQwenHermesSchema(tool.parameters ?? {}),
   })
 }
 

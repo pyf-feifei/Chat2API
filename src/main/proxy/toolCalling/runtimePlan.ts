@@ -1,6 +1,7 @@
 import type { ToolCallingConfig } from '../../../shared/toolCalling.ts'
 import type { NormalizedClientToolRequest } from './clientAdapters/types.ts'
 import { getProviderToolProfile } from './providerProfiles.ts'
+import { buildQwenAiToolNameAliasTable, hasQwenAiToolNameAliases } from './qwenAiToolNameAlias.ts'
 import type { ToolCallingPlan } from './types.ts'
 
 export function buildToolCallingRuntimePlan(input: {
@@ -23,6 +24,28 @@ export function buildToolCallingRuntimePlan(input: {
 
   const allowedToolNames = forcedName ? new Set([forcedName]) : toolNames
   const allowedTools = forcedName ? tools.filter((tool) => tool.name === forcedName) : tools
+  // Qwen's platform owns a native tool registry, and a client tool whose name
+  // collides with it makes the model emit the platform's native function_call
+  // channel — which the platform then rejects (422). Rename colliding tools on
+  // the upstream wire only; the client contract keeps the original names.
+  //
+  // The rename is applied where the PROMPT is rendered (see
+  // `aliasManagedToolDefinitions`), never to `plan.tools`: the parser must keep
+  // validating parsed calls against the client's own names, so that a tool call
+  // reaches the client under the name it declared. Keeping the plan in client
+  // space means no reverse translation is needed on the response path, and no
+  // parsed call can silently miss the allowed-name allowlist.
+  const toolNameAliases = profile.preferredManagedProtocol === 'qwen_hermes'
+      || profile.preferredManagedProtocol === 'qwen_native'
+    ? buildQwenAiToolNameAliasTable(allowedTools.map((tool) => tool.name))
+    : undefined
+  // The alias must be an allowed name too: the upstream model may legitimately
+  // echo the taught alias back over the native function_call channel, and
+  // rejecting it there would strand the tool call as "undeclared" instead of
+  // dispatching it to the client under the original name.
+  const allowedUpstreamToolNames = hasQwenAiToolNameAliases(toolNameAliases)
+    ? new Set([...allowedToolNames, ...toolNameAliases!.toUpstream.values()])
+    : allowedToolNames
   const disabledReason = getDisabledReason(
     input.config,
     allowedTools.length,
@@ -40,10 +63,17 @@ export function buildToolCallingRuntimePlan(input: {
     clientAdapterId: input.clientRequest.clientAdapterId,
     providerId: input.providerId,
     tools: allowedTools,
+    toolNameAliases,
     shouldInjectPrompt,
     shouldParseResponse,
     toolChoiceMode: input.clientRequest.toolChoice.mode,
     allowedToolNames,
+    /**
+     * Client names plus their upstream aliases. Used only where the UPSTREAM
+     * native function_call channel is validated against declared tools; the
+     * response path and the client contract use `allowedToolNames`.
+     */
+    allowedUpstreamToolNames,
     workflowContinuation: false,
     failedToolResultPending: false,
     forcedToolName: forcedName,

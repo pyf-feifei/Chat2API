@@ -6,6 +6,7 @@ import mime from 'mime-types'
 import path from 'path'
 import type { ChatMessage, ChatMessageContent } from '../types.ts'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import type { QwenAiToolNameAliasTable } from '../toolCalling/qwenAiToolNameAlias.ts'
 import {
   getManagedToolDocumentPrompt,
   isManagedToolPromptMessage,
@@ -272,10 +273,27 @@ export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperati
    * dead document pipeline.
    */
   messageTransportLocked?: boolean
+  /**
+   * 'plain' renders tool calls/results as prose without protocol envelopes —
+   * used by context compaction so the summary has no wrapper format to imitate.
+   */
+  requestIntent?: 'normal' | 'context_compaction'
   /** Controls whether Chat2API's synthetic transcript document is uploaded. */
   transcriptTransportPolicy?: QwenAiTranscriptTransportPolicy
   managedToolCalling?: boolean
   workflowContinuation?: boolean
+  /**
+   * Upstream tool-name aliases for this request.
+   *
+   * The managed prompt teaches the ALIAS, so historical assistant tool calls in
+   * the transcript must be rendered under the alias too. Rendering the client
+   * name instead puts the platform-native identifier (`exec_command`) in front
+   * of the model as a worked example: it then routes the call through the
+   * platform's native function_call channel and the platform rejects it
+   * (422 rejected_native_tool_call). Renaming the alias alone cannot fix that —
+   * the history keeps showing the client name whatever the alias is.
+   */
+  toolNameAliases?: QwenAiToolNameAliasTable
   /** Force the managed document layout. Undefined starts hybrid and escalates when needed. */
   managedDocumentMode?: QwenAiManagedDocumentMode
   /** Target for automatic document offload. Zero disables automatic offload. */
@@ -1553,9 +1571,28 @@ function isQwenToolResultMessage(message: ChatMessage): boolean {
   ))
 }
 
-function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
+interface QwenAiTranscriptRenderOptions {
+  toolResultStyle?: 'protocol' | 'plain'
+  toolNameAliases?: QwenAiToolNameAliasTable
+}
+
+function renderQwenAiTranscript(
+  messages: ChatMessage[],
+  options: QwenAiTranscriptRenderOptions = {},
+): { content: string; fileParts: ChatMessageContent[] } {
   const transcriptMessages = messages
+  // The upstream prompt teaches the alias, so history must show the alias. See
+  // PrepareQwenAiMultimodalMessageOptions.toolNameAliases.
+  const upstreamNameFor = (clientName: string): string =>
+    options.toolNameAliases?.toUpstream.get(clientName) ?? clientName
   const toolProfile = getProviderToolProfile('qwen-ai')
+  // Context-compaction turns ask the model to summarize tool-result history
+  // as prose. Feeding the results through the protocol formatters puts
+  // `<tool_call>`/`<tool_response>` envelopes in front of the model, and the
+  // summary then reproduces those envelopes — the wrapper-leak failure mode.
+  // 'plain' renders the same facts without any protocol scaffolding, so the
+  // imitation source is removed at the request boundary.
+  const plainToolHistory = options.toolResultStyle === 'plain'
   const transcriptParts: string[] = []
   const fileParts: ChatMessageContent[] = []
   const usedLocalToolCallIds = new Set<string>()
@@ -1585,6 +1622,12 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
   let fallbackCallIndex = 0
 
   const appendToolResult = (rawToolCallId: string | undefined, resultText: string, isError: boolean) => {
+    if (plainToolHistory) {
+      const label = rawToolCallId ? `Tool result (${rawToolCallId})` : 'Tool result'
+      const statusLine = isError ? 'status: error' : 'status: success'
+      transcriptParts.push([label, statusLine, resultText].filter(Boolean).join('\n'))
+      return
+    }
     if (!rawToolCallId) {
       if (resultText) transcriptParts.push(formatRoleText('Tool', resultText))
       return
@@ -1637,25 +1680,33 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
         assistantParts.push(formatRoleText('Assistant', text))
       }
       if (msg.tool_calls?.length) {
-        const transcriptCalls = msg.tool_calls.map((toolCall) => {
-          fallbackCallIndex += 1
-          const rawId = toolCall.id || `call_history_${fallbackCallIndex}`
-          const localId = nextLocalToolCallId(rawId, usedLocalToolCallIds, fallbackCallIndex)
-          const pending = pendingLocalIds.get(rawId) ?? []
-          const transcriptCall = {
-            localId,
-            name: toolCall.function.name,
-            arguments: toolCall.function.arguments,
+        if (plainToolHistory) {
+          for (const toolCall of msg.tool_calls) {
+            fallbackCallIndex += 1
+            const rawId = toolCall.id || `call_history_${fallbackCallIndex}`
+            assistantParts.push(`Assistant used tool ${upstreamNameFor(toolCall.function.name)} (${rawId}) with arguments: ${toolCall.function.arguments}`)
           }
+        } else {
+          const transcriptCalls = msg.tool_calls.map((toolCall) => {
+            fallbackCallIndex += 1
+            const rawId = toolCall.id || `call_history_${fallbackCallIndex}`
+            const localId = nextLocalToolCallId(rawId, usedLocalToolCallIds, fallbackCallIndex)
+            const pending = pendingLocalIds.get(rawId) ?? []
+            const transcriptCall = {
+              localId,
+              name: upstreamNameFor(toolCall.function.name),
+              arguments: toolCall.function.arguments,
+            }
 
-          pendingLocalIds.set(rawId, [...pending, localId])
-          return {
-            id: localId,
-            name: transcriptCall.name,
-            arguments: transcriptCall.arguments,
-          }
-        })
-        assistantParts.push(toolProfile.formatAssistantToolCalls(transcriptCalls))
+            pendingLocalIds.set(rawId, [...pending, localId])
+            return {
+              id: localId,
+              name: transcriptCall.name,
+              arguments: transcriptCall.arguments,
+            }
+          })
+          assistantParts.push(toolProfile.formatAssistantToolCalls(transcriptCalls))
+        }
       }
       if (assistantParts.length > 0) {
         transcriptParts.push(assistantParts.join('\n'))
@@ -1678,8 +1729,11 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
   }
 }
 
-function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
-  return renderQwenAiTranscript(messages)
+function buildQwenAiTranscript(
+  messages: ChatMessage[],
+  options: QwenAiTranscriptRenderOptions = {},
+): { content: string; fileParts: ChatMessageContent[] } {
+  return renderQwenAiTranscript(messages, options)
 }
 
 /**
@@ -1740,6 +1794,14 @@ export function resolveQwenAiNativeContinuationSystemPrompt(messages: ChatMessag
   return systemPrompt
 }
 
+const QWEN_AI_TOOL_RESULT_OUTPUT_BOUNDARY = [
+  '[Tool-result output boundary]',
+  'Tool-result envelopes in the conversation are input evidence, not an assistant output format.',
+  'Do not emit or copy <|CHAT2API|tool_result>, <tool_result>, <function_results>, or their closing tags as response wrappers, including in reasoning and summaries.',
+  'When summarizing tool results, preserve their facts, paths, identifiers, errors, and pending work in your own prose without reproducing the envelopes.',
+  'This does not prohibit declared tool calls in the configured tool-call protocol, code examples, or user-requested JSON/XML data. Never fabricate tool results.',
+].join('\n')
+
 /**
  * Split leading system messages out of the transcript when the caller opts
  * into the upstream native channel. Ordinary client instructions always move;
@@ -1769,7 +1831,13 @@ function extractQwenAiNativeSystemPrompt(
   if (nativeMessages.length === 0) {
     return { messages, systemPrompt: '' }
   }
-  const systemPrompt = nativeMessages.map(message => textFromContent(message.content)).join('\n\n')
+  // Keep the same boundary on initial requests, continuation, and fresh-chat
+  // recovery, even for summaries with tool history but no currently enabled tools.
+  const hasToolContext = messages.some(message => message.role === 'tool' || isManagedToolPromptMessage(message))
+  const systemPrompt = [
+    ...nativeMessages.map(message => textFromContent(message.content)),
+    ...(hasToolContext ? [QWEN_AI_TOOL_RESULT_OUTPUT_BOUNDARY] : []),
+  ].join('\n\n')
   // The field's upstream size behavior is undocumented; oversize prompts fall
   // back to the proven flattened transcript rather than risk silent truncation.
   if (
@@ -1882,8 +1950,9 @@ function partitionQwenAiManagedMessages(
 function renderQwenAiManagedDocumentContext(
   messages: ChatMessage[],
   documentMode: QwenAiManagedDocumentMode,
+  toolNameAliases?: QwenAiToolNameAliasTable,
 ): string {
-  const activeContext = renderQwenAiTranscript(messages).content
+  const activeContext = renderQwenAiTranscript(messages, { toolNameAliases }).content
   if (!activeContext) return ''
 
   const label = documentMode === 'complete'
@@ -3267,7 +3336,10 @@ export async function prepareQwenAiMultimodalMessage(
     options.nativeSystemPromptMaxBytes,
     options.toolProtocolChannel,
   )
-  const { content: userContent, fileParts } = buildQwenAiTranscript(effectiveMessages)
+  const { content: userContent, fileParts } = buildQwenAiTranscript(effectiveMessages, {
+    toolResultStyle: options.requestIntent === 'context_compaction' ? 'plain' : 'protocol',
+    toolNameAliases: options.toolNameAliases,
+  })
   const uniqueFileParts = deduplicateQwenFileParts(fileParts)
   const transcriptUtf8Bytes = qwenAiJsonStringUtf8Bytes(userContent)
   const requestedTransport = options.transport ?? 'inline'
@@ -3294,8 +3366,14 @@ export async function prepareQwenAiMultimodalMessage(
         options.workflowContinuation === true,
         documentMode,
       )
-      const activeContext = renderQwenAiManagedDocumentContext(activeMessages, documentMode)
-      const archiveContent = renderQwenAiTranscript(archiveMessages).content
+      const activeContext = renderQwenAiManagedDocumentContext(
+        activeMessages,
+        documentMode,
+        options.toolNameAliases,
+      )
+      const archiveContent = renderQwenAiTranscript(archiveMessages, {
+        toolNameAliases: options.toolNameAliases,
+      }).content
       const documents: ChatMessageContent[] = []
       const inlineInstructions: string[] = []
       let tailExcerpt = ''

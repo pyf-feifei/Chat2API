@@ -12,6 +12,7 @@ import { getProviderToolProfile } from './providerProfiles.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
+import { aliasManagedToolDefinitions } from './qwenAiToolNameAlias.ts'
 import {
   createManagedToolResultWrapperLeakError,
   stripManagedToolResultWrappers,
@@ -114,6 +115,20 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
   'Retry with an appropriate declared tool only when another attempt can make progress; otherwise explain the blocking failure clearly in the final answer instead of repeating the same operation.',
 ].join(' ')
 
+/**
+ * The platform intercepted a declared native function_call and rejected it at
+ * its own tool runtime ("Tool <name> does not exists."). The model is told the
+ * exact reason it failed — the native channel does not own these client-side
+ * tools — and directed to reissue the call in the managed text-block format,
+ * which is the only channel the client can actually execute.
+ */
+const REJECTED_NATIVE_TOOL_CONTINUATION_PROMPT = [
+  'Your previous tool call was emitted through the platform native function_call channel and was rejected by the platform runtime: it reported that the tool does not exist there.',
+  'Those tools are client-side tools — they exist only in the managed tool list, not in the platform tool registry — so the native channel can never run them.',
+  'Reissue the SAME operation now using ONLY the managed text tool-call block format declared for this conversation. Do not describe the call, do not switch to a different undeclared tool, and do not answer in prose instead.',
+  'Call only a function name listed in this conversation, exactly as written; any other identifier — including one that resembles a built-in platform tool — will be rejected again.',
+].join(' ')
+
 const SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT_TAIL = [
   'The immediately preceding matched tool-result batch completed successfully, so those corresponding tool calls have already run.',
   'Use their returned results and do not repeat a completed call merely to satisfy the original request.',
@@ -136,6 +151,7 @@ export function createToolWorkflowContinuationMessage(options: {
   completionProofMissing?: boolean
   failedToolResultPending?: boolean
   requireManagedToolCall?: boolean
+  rejectedNativeToolCall?: boolean
   plan?: Pick<
     ToolCallingPlan,
     | 'protocol'
@@ -146,8 +162,13 @@ export function createToolWorkflowContinuationMessage(options: {
     | 'failedToolResultPending'
   >
 } = {}): ChatMessage {
+  // Every prompt rendered from the plan's tool list must carry the UPSTREAM
+  // (aliased) names, because that is what the model was taught on round 1 and
+  // what it will echo back. `plan.tools` itself stays in client space so the
+  // parser keeps validating against the client's declared names.
+  const promptTools = promptFacingTools(options.plan)
   const recoveryPrompt = options.requireManagedToolCall && options.plan
-    ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(options.plan.tools)
+    ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(promptTools)
     : undefined
   // Turn-local contract restatement for continuation turns. The teaching
   // system prompt sits many turns back in provider-side session history; on
@@ -162,7 +183,7 @@ export function createToolWorkflowContinuationMessage(options: {
   const continuationReminder = options.plan?.workflowContinuation
     && options.plan.failedToolResultPending !== true
     && options.plan.tools.length > 0
-    ? getToolProtocol(options.plan.protocol).renderContinuationReminder?.(options.plan.tools)
+    ? getToolProtocol(options.plan.protocol).renderContinuationReminder?.(promptTools)
     : undefined
   const completionPrompt = options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
     ? MANAGED_WORKFLOW_COMPLETION_PROMPT
@@ -181,6 +202,7 @@ export function createToolWorkflowContinuationMessage(options: {
       TOOL_WORKFLOW_CONTINUATION_PROMPT,
       activeUserRequestPrompt,
       options.completionProofMissing ? MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT : undefined,
+      options.rejectedNativeToolCall ? REJECTED_NATIVE_TOOL_CONTINUATION_PROMPT : undefined,
       options.plan?.workflowContinuation
         ? options.failedToolResultPending
           ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT
@@ -696,6 +718,19 @@ function safeContentPartTypes(content: ChatMessage['content']): string[] {
   })
 }
 
+/**
+ * The tool list as it must appear in any prompt sent upstream: client tools
+ * whose names collide with Qwen's platform-native registry are renamed to a
+ * neutral alias (see `qwenAiToolNameAlias.ts`). Parsing and response framing
+ * keep using `plan.tools` (client names) so the client contract is unchanged.
+ */
+function promptFacingTools(
+  plan: Pick<ToolCallingPlan, 'tools' | 'toolNameAliases'> | undefined,
+): NormalizedToolDefinition[] {
+  if (!plan) return []
+  return aliasManagedToolDefinitions(plan.tools, plan.toolNameAliases)
+}
+
 function renderPrompt(
   plan: ToolCallingPlan,
   config: ToolCallingConfig,
@@ -724,11 +759,11 @@ function renderPrompt(
 
     return customPromptTemplate
       .replace(/\{\{tools\}\}/g, prompt)
-      .replace(/\{\{tool_names\}\}/g, plan.tools.map((tool) => tool.name).join(', '))
+      .replace(/\{\{tool_names\}\}/g, promptFacingTools(plan).map((tool) => tool.name).join(', '))
       .replace(/\{\{format\}\}/g, plan.protocol)
   }
 
-  const content = finishPrompt(getToolProtocol(plan.protocol).renderPrompt(plan.tools))
+  const content = finishPrompt(getToolProtocol(plan.protocol).renderPrompt(promptFacingTools(plan)))
   if (plan.protocol !== 'qwen_hermes' && plan.protocol !== 'qwen_native') return { content }
 
   // Keep the complete, request-scoped tool contract in the inline control
@@ -813,5 +848,6 @@ function parseSelectedProtocol(
     tools: plan.tools,
     protocol: plan.protocol,
     allowPartial: options.allowPartial,
+    toolNameAliases: plan.toolNameAliases,
   })
 }

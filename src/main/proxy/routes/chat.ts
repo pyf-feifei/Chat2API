@@ -11,6 +11,7 @@ import {
   ChatCompletionResponse,
   ProxyContext,
   type AccountSelection,
+  type QwenAiEgressRecoveryState,
   type QwenAiLogicalRecoveryState,
 } from '../types'
 import { loadBalancer } from '../loadbalancer'
@@ -550,6 +551,16 @@ router.post('/completions', async (ctx: Context) => {
         semanticFreshChatEscalations: 0,
       }
     : undefined
+  // Egress-IP recovery must outlive a single account attempt: an aliyun verdict
+  // is an exit-IP flag, so once the request escalates to the Webshare proxy it
+  // must stay there for every later account of the SAME client request. One
+  // ledger per request, shared by all failover attempts.
+  const qwenAiEgressRecoveryState: QwenAiEgressRecoveryState | undefined = initialProviderIsQwenAi
+    ? {
+        webshareRetries: 0,
+        useWebshareProxy: false,
+      }
+    : undefined
   const createProxyContext = (
     selection: AccountSelection,
     deferManagedStreamCommit = false,
@@ -567,6 +578,7 @@ router.post('/completions', async (ctx: Context) => {
       signal: clientSignal,
       requestIntent: requestIntent.intent,
       ...(qwenAiLogicalRecoveryState ? { qwenAiLogicalRecoveryState } : {}),
+      ...(qwenAiEgressRecoveryState ? { qwenAiEgressRecoveryState } : {}),
       ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
       ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
     }

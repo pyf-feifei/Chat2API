@@ -862,6 +862,36 @@ test('an explicit retry count does not enable ordinary Qwen stream retries', asy
   }
 })
 
+test('capacity retry must not schedule a wait beyond the cumulative deadline', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 1_500_000, webshareEnabled: true })
+  const forwarder = new RequestForwarder()
+  const delays = []
+  let attempts = 0
+  forwarder.delay = async ms => { delays.push(ms); return true }
+  forwarder.doForward = async () => {
+    attempts += 1
+    return {
+      success: false, status: 429, error: 'Capacity unavailable',
+      errorCode: 'qwen_ai_capacity_limit', retryable: true, accountFault: false,
+      headers: { 'retry-after': '39601' },
+    }
+  }
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1', { signal: new AbortController().signal },
+  )
+  // The upstream Retry-After (11h) must NOT be slept through. The Webshare
+  // exit switch is bounded to 5s: the proxy tries a different egress instead
+  // of sleeping to the deadline or returning a premature 429.
+  assert.deepEqual(delays, [5000], 'webshare retry waits at most 5s, never the end-of-day backoff')
+  assert.equal(attempts, 2)
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'qwen_ai_capacity_limit')
+  assert.equal(result.headers['retry-after'], '39601', 'preserve upstream backoff for the caller')
+})
+
 test('Qwen upstream busy retries only when explicitly configured', async () => {
   const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
   const forwarder = new RequestForwarder()
@@ -912,12 +942,14 @@ test('Qwen upstream busy recovery honors the configured retry count', async () =
     const forwarder = new RequestForwarder()
     let attempts = 0
     let delayCalls = 0
+    const bypassFlags = []
     forwarder.delay = async () => {
       delayCalls += 1
       return true
     }
-    forwarder.doForward = async () => {
+    forwarder.doForward = async (...args) => {
       attempts += 1
+      bypassFlags.push(args.at(-1).qwenAiRecoveryBypassAccountInterval)
       return {
         success: false,
         status: 503,
@@ -942,6 +974,9 @@ test('Qwen upstream busy recovery honors the configured retry count', async () =
     assert.equal(result.retryScope, 'next-account')
     assert.equal(attempts, 3)
     assert.equal(delayCalls, 2)
+    // Every recovery attempt must ride the admission bypass — a one-shot
+    // flag re-exposed attempt 3+ to the 120s account-interval queue wait.
+    assert.deepEqual(bypassFlags, [false, true, true])
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
@@ -1734,10 +1769,14 @@ test('deferred managed-tool validation has no time-based release threshold', asy
 
 test('Qwen AI forwarder keeps malformed-tool recovery in the same chat', async (t) => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  const previousBranchBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_BRANCH
   process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_BRANCH = 'true'
   t.after(() => {
     if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
     else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer
+    if (previousBranchBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_BRANCH
+    else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_BRANCH = previousBranchBuffer
   })
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
@@ -2842,7 +2881,10 @@ test('Qwen Responses bridge continues the pinned chat with only the tool-result 
   output.destroy()
 })
 
-test('Qwen Responses bridge replays full history on the same account after stale chat state', async () => {
+for (const scenario of [
+  { name: 'stale chat state', error: Object.assign(new Error('Qwen chat parent is no longer available'), { status: 404 }) },
+  { name: 'dead in-flight state', error: Object.assign(new Error('chat is still in progress'), { status: 429, code: 'CHAT_IN_PROGRESS', deadInFlight: true }) },
+]) test(`Qwen Responses bridge replays full history exactly once after ${scenario.name}`, async () => {
   const output = new PassThrough()
   const continuationCalls = []
   const freshChatCalls = []
@@ -2854,7 +2896,7 @@ test('Qwen Responses bridge replays full history on the same account after stale
 
     async continueChatCompletion(request) {
       continuationCalls.push(request)
-      throw Object.assign(new Error('Qwen chat parent is no longer available'), { status: 404 })
+      throw scenario.error
     }
 
     async chatCompletion(request) {

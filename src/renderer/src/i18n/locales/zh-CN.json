@@ -360,7 +360,16 @@
     "description": "Z.ai - 免费AI聊天机器人，由 GLM-5.1、GLM-5 和 GLM-4.7 驱动",
     "token": "访问令牌",
     "tokenPlaceholder": "请输入 Z.ai JWT Token",
-    "tokenHelp": "从Z.ai 网页版获取token，可在浏览器开发者工具 Application -> Cookie 中找到，以\"eyJ...\"为开头"
+    "tokenHelp": "从Z.ai 网页版获取token，可在浏览器开发者工具 Application -> Cookie 中找到，以\"eyJ...\"为开头",
+    "captchaVerifyParam": "验证码参数",
+    "captchaVerifyParamPlaceholder": "可选，从 chat.z.ai 的 HAR 中复制 captcha_verify_param",
+    "captchaVerifyParamHelp": "可选。若 Z.ai 要求验证，请从最近一次 /api/v2/chat/completions 请求体中复制 captcha_verify_param。",
+    "email": "登录邮箱（可选）",
+    "emailPlaceholder": "可选，用于自动刷新令牌的账号邮箱",
+    "emailHelp": "与密码配合，在令牌被吊销时通过 /api/v1/auths/signin 重新登录",
+    "password": "登录密码（可选）",
+    "passwordPlaceholder": "可选，用于自动刷新令牌的账号密码",
+    "passwordHelp": "加密可用时会存入加密凭据；若 Z.ai 拒绝验证码校验，自动刷新可能失败"
   },
   "mimo": {
     "name": "Mimo",
@@ -954,6 +963,39 @@
       "apiEndpoint": "API 端点",
       "exampleUsage": "使用示例",
       "warning": "请妥善保管您的密钥，不要与未授权方共享。"
+    },
+    "captchaVision": {
+      "title": "验证码视觉模型",
+      "description": "使用视觉大模型定位 Z.ai 滑块验证码的目标位置。Z.ai 会对背景图的缺口做修复（inpainting），本地像素匹配不可靠。",
+      "enableToggle": "启用视觉识别",
+      "enableDescription": "启用后，Z.ai 登录脚本会先询问视觉模型拼图缺口的起始位置，失败时再回退到本地匹配或人工处理。仅为尽力而为：实测同一张 300px 验证码图，视觉模型分别回答 360 / 400 / 240，请把这里当作实验性功能，并保留人工兜底。",
+      "baseUrl": "接口地址",
+      "baseUrlHelp": "OpenAI 兼容接口，会自动拼接 /chat/completions（例如 https://example.com/v1）。",
+      "apiKey": "API Key",
+      "showKey": "显示 API Key",
+      "hideKey": "隐藏 API Key",
+      "model": "模型",
+      "modelHelp": "必须是支持视觉的模型。推理类模型会先把 token 消耗在思维链上，因此请求固定使用 max_tokens 4000。",
+      "applyModel": "使用此模型",
+      "test": "测试连接",
+      "testDisabledHint": "请先填写接口地址、API Key 和模型",
+      "unsaved": "有未保存的修改",
+      "saveSuccess": "验证码视觉模型设置已保存",
+      "saveError": "保存验证码视觉模型设置失败",
+      "reply": "模型回复",
+      "warning": "关闭时，脚本会回退到本地匹配，再失败则需要人工滑块（需要可见的浏览器窗口）。Docker 部署也可改用环境变量 ZAI_VISION_API_URL / ZAI_VISION_API_KEY / ZAI_VISION_MODEL。",
+      "result": {
+        "ok": "视觉模型响应正常，能够正确读取测试图片。",
+        "missingBaseUrl": "接口地址为空。",
+        "missingApiKey": "API Key 为空。",
+        "missingModel": "模型为空。",
+        "httpError": "接口返回 HTTP 错误。",
+        "badJson": "接口返回的不是 JSON。",
+        "emptyContent": "模型返回内容为空，很可能是推理类模型把 token 全部用在思维链上，请换用非推理模型。",
+        "mismatch": "模型有回复，但无法读取测试图片，请确认该模型支持视觉。",
+        "timeout": "请求超时（60 秒）。",
+        "networkError": "网络请求失败。"
+      }
     }
   },
   "common": {

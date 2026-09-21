@@ -36,6 +36,7 @@ import {
   normalizeQwenAiGovernorConfig,
   normalizeQwenAiSessionMode,
   normalizeWebshareProxyConfig,
+  normalizeCaptchaVisionConfig,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -260,6 +261,7 @@ class StoreManager {
       webshareProxyConfig: rawConfig.webshareProxyConfig === undefined
         ? undefined
         : normalizeWebshareProxyConfig(rawConfig.webshareProxyConfig),
+      captchaVision: normalizeCaptchaVisionConfig(rawConfig.captchaVision),
     }
   }
 
@@ -991,6 +993,10 @@ class StoreManager {
       newConfig.webshareProxyConfig = updates.webshareProxyConfig === undefined
         ? undefined
         : normalizeWebshareProxyConfig(updates.webshareProxyConfig)
+    }
+
+    if ('captchaVision' in updates) {
+      newConfig.captchaVision = normalizeCaptchaVisionConfig(updates.captchaVision)
     }
 
     const normalized = this.normalizeConfig(newConfig)

@@ -238,8 +238,13 @@ function isQwenRiskControl(error?: string, status?: number, errorCode?: string):
   const riskText = `${error || ''} ${errorCode || ''}`
   return Boolean(
     errorCode === 'qwen_ai_risk_control' ||
-    ((status === 403 || status === 429) &&
-      /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|x5sec|baxia|punish/i.test(riskText)),
+    // The busy family (upstream-busy 503 with accountFault:false) carries the
+    // same aliyun challenge verdict in its error text — FAIL_SYS_USER_VALIDATE
+    // and bxpunish appear on a 503 upstream-busy body, not only on 403/429.
+    // Match on the text across any non-2xx status so those branches still open
+    // the risk cooldown instead of falling through the accountFault gate.
+    (/FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|baxia|x5sec|punish|risk-control/i.test(riskText)
+      || ((status === 403 || status === 429) && /qwen_ai_risk_control|challenge|captcha/i.test(riskText))),
   )
 }
 
@@ -849,14 +854,18 @@ export class QwenAiRequestGovernor {
       return withRetryAfterHeader(result, cooldownMs)
     }
 
-    if (result.accountFault === false) {
-      return result
-    }
-
-    if (
-      isQwenAiAccountFault(result)
-      && isQwenRiskControl(result.error, result.status, result.errorCode)
-    ) {
+    // A risk-control verdict is itself the signal to bench the account, even
+    // when the busy-family result is deliberately account-neutral
+    // (accountFault:false). The busy-family gate below would otherwise return
+    // early and never reach the cooldown, leaving a FAIL_SYS_USER_VALIDATE'd
+    // account selectable — which is exactly the sticky-chain wedging seen live.
+    // `bxpunish` arrives as a response header on a 503 upstream-busy body, not
+    // in the error text — fold it into the risk signal here.
+    const bxpunishHeader = Object.entries(result.headers || {})
+      .find(([key]) => key.toLowerCase() === 'bxpunish')?.[1]
+    const riskControlled = isQwenRiskControl(result.error, result.status, result.errorCode)
+      || (bxpunishHeader !== undefined && bxpunishHeader !== '' && bxpunishHeader !== '0')
+    if (riskControlled) {
       const config = this.getConfig()
       const current = this.accountCooldowns.get(accountId)
       const failures = (current?.failures || 0) + 1
@@ -878,6 +887,9 @@ export class QwenAiRequestGovernor {
     // the next request into `no_available_account`. Capacity 429 is the
     // deliberate exception: Qwen reports that the account cannot accept the
     // generation, so the forwarder may fail over to another account.
+    if (result.accountFault === false) {
+      return result
+    }
     const capacity429 = isQwenAiAccountFault(result)
       && result.status === 429
       && result.errorCode === 'qwen_ai_capacity_limit'

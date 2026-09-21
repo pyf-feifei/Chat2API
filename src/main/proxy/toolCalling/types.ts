@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatCompletionTool, ToolCall } from '../types.ts'
+import type { QwenAiToolNameAliasTable } from './qwenAiToolNameAlias.ts'
 
 export type ToolCallingMode = 'managed' | 'disabled'
 export type ToolProtocolId =
@@ -71,6 +72,13 @@ export interface ToolCallingPlan {
   shouldParseResponse: boolean
   toolChoiceMode: 'auto' | 'none' | 'required' | 'forced'
   allowedToolNames: Set<string>
+  /**
+   * `allowedToolNames` plus the upstream aliases of any renamed tools. Only the
+   * upstream native function_call channel validates against this set; the
+   * response path, the parser, and anything client-visible use
+   * `allowedToolNames`.
+   */
+  allowedUpstreamToolNames?: Set<string>
   workflowContinuation: boolean
   failedToolResultPending: boolean
   /**
@@ -82,6 +90,13 @@ export interface ToolCallingPlan {
    */
   hasLiveToolWorkflow?: boolean
   forcedToolName?: string
+  /**
+   * Upstream-wire renames for client tools whose names collide with Qwen's
+   * platform-native tool registry. `tools` carries the aliased (upstream)
+   * names; parsed calls are translated back through this table before they
+   * reach the client, so the client contract is unchanged.
+   */
+  toolNameAliases?: QwenAiToolNameAliasTable
   diagnostics: ToolCallDiagnostics
 }
 
@@ -95,6 +110,13 @@ export interface ToolParseContext {
   tools: NormalizedToolDefinition[]
   protocol: ToolProtocolId
   allowPartial?: boolean
+  /**
+   * Upstream alias -> client name. The prompt teaches the model the alias, so a
+   * parsed call may carry the alias; resolving it here means the parser emits
+   * the client's declared name and the rest of the pipeline stays in client
+   * space. Without this the alias is rejected as an undeclared tool name.
+   */
+  toolNameAliases?: QwenAiToolNameAliasTable
 }
 
 export interface ToolParseResult {

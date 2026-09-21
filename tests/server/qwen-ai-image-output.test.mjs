@@ -13,6 +13,11 @@ import {
   normalizeQwenAiModelModeName as realNormalizeQwenAiModelModeName,
   resolveQwenAiModelMode as realResolveQwenAiModelMode,
 } from '../../src/main/providers/qwen-ai-model-mode.ts'
+import {
+  aliasAwareToolLookup as realAliasAwareToolLookup,
+  buildQwenAiToolNameAliasTable as realBuildQwenAiToolNameAliasTable,
+  clientToolNameFromAlias as realClientToolNameFromAlias,
+} from '../../src/main/proxy/toolCalling/qwenAiToolNameAlias.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3xkAAAAASUVORK5CYII='
@@ -131,6 +136,15 @@ function loadQwenAiModule() {
       isCompleteJsonText: () => true,
       mergeNativeToolArguments: (_current, next) => next,
       normalizeNativeFunctionCallDelta: () => [],
+    },
+    // Real alias table: the adapter resolves colliding client tool names
+    // (exec_command -> ch2_run_command) through this module.
+    '../toolCalling/qwenAiToolNameAlias': {
+      aliasAwareToolLookup: realAliasAwareToolLookup,
+      buildQwenAiToolNameAliasTable: realBuildQwenAiToolNameAliasTable,
+      clientToolNameFromAlias: realClientToolNameFromAlias,
+      hasQwenAiToolNameAliases: (table) => Boolean(table && table.toUpstream && table.toUpstream.size > 0),
+      aliasManagedToolDefinitions: (tools) => tools,
     },
     './qwen-ai-feature-config': {
       createQwenAiFeatureConfig: ({ thinkingEnabled, autoThinking, thinkingBudget }) => ({
