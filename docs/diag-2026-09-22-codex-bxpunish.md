@@ -230,6 +230,107 @@ create chat**。这是"服务活着但完全不可用"的状态。
 **没有被真实触发**，只有代码级验证（编译产物 grep + 容器 env 生效）。
 要复现 bxpunish 需要当时那个 493 条 / 210 tool result 的真实 codex 会话形态，代价是烧账号。
 
+## 6d. 重连指纹免疫：retry-nonce scope 默认改 `always`（2026-09-22 12:08）
+
+### 为什么改
+
+`applyQwenAiRetryNonce()` 会给上传的 transcript 追加一行惰性标记，让每次尝试的
+文档内容哈希不同，从而躲开上游"按内容指纹缓存风控结论"的机制。但它的生效条件
+（`CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE`）默认是 `retry`：
+
+```ts
+const shouldPerturb = scope === 'always' ? Boolean(nonce) : Boolean(nonce && nonce >= 2)
+```
+
+`retry` 只扰动 attempt ≥ 2。而 **codex 的 Reconnecting 重连每次都是一次全新的
+attempt 1**，于是重发时逐字节相同 → 命中上游指纹缓存 → 换账号也无效（账号轮换
+不改变 payload 哈希）。这正是 493 条会话连续 6 个账号拿到同一个 bxpunish 的原因。
+
+改成 `always`：每次尝试都扰动。代价是丢掉 transcript 的上传缓存命中，换回指纹免疫。
+
+### 怎么证明生效
+
+上传的 transcript 会变成一个文档，**文件名里嵌了内容 sha256 的前 16 位**
+（`qwen-ai-files.ts: createQwenAiTextDocument`）：
+
+```ts
+filename: `${prefix}-${contentHash.slice(0, 16)}.${format.extension}`
+```
+
+所以"同样的请求字节发两次 → 文档哈希是否相同"就是直接可观测的判据。
+用 `dev-data/nonce_proof.py` 发两次**逐字节相同**的 401 条消息请求
+（`request_sha256 2f07e0986675a23d`）：
+
+| 版本 | scope | 请求 A | 请求 B | 文档哈希 |
+|---|---|---|---|---|
+| `toolfix26-unauth` | `retry` | 200 / 42.4s | 502 / 321.1s | **1 个**：`1dd7627bc61da088` |
+| `toolfix27-nonce-always` | `always` | 200 / 48.3s | 200 / 76.6s | **2 个**：`760b63e8e6ab2cb5` / `b3f5031c759c0dbb` |
+
+改前两次同哈希、改后两次异哈希 —— 生效确认。
+
+### 一个坑：别用 `cache hit|miss` 当判据
+
+`qwenAiFileCache` 的 key 是 `(cacheScope.accountId, content)`，账号池在请求间轮换，
+所以**逐字节相同的重发也会打印 `cache miss`**（上面 toolfix26 那组就是：同一个哈希
+两次，都是 `cache miss`）。只有文件名哈希是内容的纯函数，才是可靠判据。
+
+### 部署
+
+- 镜像 `skatef/chat2api:toolfix27-nonce-always`（digest `sha256:8b346a674548…`，与本地构建一致）
+- `/opt/chat2api/env.chat2api` 里**没有** `..._NONCE_SCOPE` 覆盖，所以生效的是**镜像默认值**
+  本身（脚本里加了 guard，若存在覆盖会先剥掉，否则会掩盖新默认）
+- 容器内实测 env：`CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=always`
+- 旧容器 `chat2api-old-toolfix26` 留作回滚
+- 回滚/退回旧行为：`CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=retry`
+
+### 顺带观察（样本量 1，不当结论）
+
+改前请求 B 在 321s 后 502 `Internal Error`，改后 A/B 都是 200。方向上与"扰动后
+不再命中指纹缓存"一致，但单次样本不足以断言因果。
+
+### 已知覆盖缺口：inline 传输路径没有扰动（待决策）
+
+`prepareQwenAiMultimodalMessage` 里 nonce 只在**两个 document 分支**生效：
+
+| 行 | 分支 | 是否扰动 |
+|---|---|---|
+| 3388 | `buildManagedDocument` → `applyQwenAiRetryNonce(archiveContent, …)` | ✅ |
+| 3450 | `shouldUseDocument` → `applyQwenAiRetryNonce(userContent, …)` | ✅ |
+| 3362 | 兜底 `let inlineContent = userContent` | ❌ **无扰动** |
+
+也就是说 transcript 小于 `requestMaxBytes`（默认 90 KB）而走 **inline** 时，
+重发的 payload 仍然逐字节相同 → 还是会被内容指纹缓存钉住。
+
+**为什么没顺手改**：把 nonce 加到 `inlineContent` 上，等于给**每一个小请求**的用户消息
+尾部都追加一行标记（`always` 下 attempt 1 也加），影响面比 document 路径大得多 ——
+document 路径只是给附件加一行，inline 路径是改用户消息本体。这是个需要拍板的取舍，
+不是顺手能定的。
+
+**影响面评估**：观测到的 48 次 verdict 全部来自大 transcript（493 条那种），
+小请求触发 verdict 没被观测到。但错误文案里提到
+"automated signup/captcha/credential flow" —— **小 transcript 只要内容命中这个模式
+一样会被拒**，而那时重试完全没有扰动。所以是潜在缺口，不是已证实故障。
+
+**可选做法**（按侵入性排序）：
+1. 只在 attempt ≥ 2 时扰动 inline（保留小请求 attempt 1 原样，但 reconnect 仍盲）
+2. `always` 时也扰动 inline（一致，但每个小请求都带标记）
+3. 不动 —— 接受小请求无扰动
+
+### 顺带确认：CHAT_IN_PROGRESS 已是历史问题
+
+`CHAT_IN_PROGRESS` 在结构化日志里共 148 次，但**最后一次是 2026-09-20T14:35:48Z**，
+当前容器日志里 **0 次**。已被之前的 binding-mode 相关改动修掉，不是现存风险。
+
+### 为什么"生产环境确认"还没做完
+
+结构化日志最后一条写入是 **2026-09-22T04:10:27Z**，正好是本次实测的时间 ——
+之后代理**没收到任何真实请求**。所以：
+
+- 机制层面：已证（文档哈希改前 1 个、改后 2 个）
+- 结果层面：**未证**。要证需要"改前会被拒、改后能过"的同一个 payload。
+  但 verdict 日志只记 `{status: 503, accountFault: false, attempt: N}`，
+  **不记内容哈希**，所以历史被拒的 payload 无法回放。只能等 codex 新会话的真实流量。
+
 ## 7. 附：codex 多个 tool-call 是怎么发给 API 的
 
 实测这一轮的 response_item：

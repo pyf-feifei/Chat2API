@@ -226,8 +226,15 @@ let refreshRiskGateHits = 0
 let refreshRiskGateLogged = 0
 
 function qwenAiRefreshRiskGateBaseMs(): number {
-  const raw = Number(process.env.CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS ?? '')
-  return Number.isSafeInteger(raw) && raw >= 0 ? raw : 300_000
+  // NOTE: `Number(process.env.X ?? '')` is a trap — Number('') is 0, and 0 passes
+  // a `>= 0` guard, so an UNSET variable silently collapsed the window to 0ms
+  // (a no-op gate). That was masked in production only because the Dockerfile
+  // happens to set this variable, which is exactly how a safety mechanism rots.
+  // Treat unset/empty/0/negative/non-numeric as "use the default".
+  const raw = String(process.env.CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS ?? '').trim()
+  if (raw === '') return 300_000
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : 300_000
 }
 
 export function openQwenAiRefreshRiskGate(now: number = Date.now()): number {
