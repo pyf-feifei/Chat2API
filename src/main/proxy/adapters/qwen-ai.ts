@@ -3859,28 +3859,6 @@ export class QwenAiAdapter {
     this.account = await this.tokenRefresher.refreshIfNeeded(this.account, signal)
   }
 
-  /**
-   * Qwen reports a revoked credential inside an HTTP 200 envelope:
-   * `{"success":false,"data":{"code":"unauthorized","details":"Token has
-   * expired, please log in again."}}`. The 401-only refresh path never fires on
-   * that, and the local JWT `exp` can still be in the future when the server
-   * revokes the session — so `refreshIfNeeded` also declines. Result: every
-   * request dies on "no chat ID returned" while the pool looks healthy
-   * (observed 2026-09-22: all 340 accounts serving this envelope). Detect the
-   * envelope so the caller can force a refresh and retry once.
-   */
-  private isUnauthorizedPayload(data: unknown): boolean {
-    if (!data || typeof data !== 'object') return false
-    const outer = data as Record<string, any>
-    const inner = (outer.data && typeof outer.data === 'object')
-      ? outer.data as Record<string, any>
-      : {}
-    const code = String(inner.code ?? outer.code ?? '').toLowerCase()
-    const details = String(inner.details ?? outer.details ?? outer.message ?? '')
-    return code === 'unauthorized'
-      || /token has expired|please log in again|not logged in|unauthorized/i.test(details)
-  }
-
   private async postWithRefreshRetry(
     url: string,
     payload: unknown,
@@ -4613,23 +4591,12 @@ export class QwenAiAdapter {
       project_id: '',
     }
 
-    const createOptions = (): Record<string, any> => ({
-      headers: this.getHeaders(),
-      signal,
-      validateStatus: () => true,
-    })
-
     try {
-      let response = await this.postWithRefreshRetry(url, payload, createOptions)
-
-      // A revoked credential arrives as a 200 envelope, not a 401, so the
-      // refresh-retry above cannot see it. Force one refresh and retry before
-      // giving up on "no chat ID returned".
-      if (response.status < 400 && this.isUnauthorizedPayload(response.data)) {
-        console.warn('[QwenAI] create chat reported an unauthorized payload inside HTTP 200 — forcing token refresh')
-        this.account = await this.tokenRefresher.refreshAfterUnauthorized(this.account, signal)
-        response = await this.postWithRefreshRetry(url, payload, createOptions)
-      }
+      const response = await this.postWithRefreshRetry(url, payload, () => ({
+        headers: this.getHeaders(),
+        signal,
+        validateStatus: () => true,
+      }))
 
       if (response.status >= 400) {
         throw await this.createInvalidStreamError(response, `chat creation returned HTTP ${response.status}`)

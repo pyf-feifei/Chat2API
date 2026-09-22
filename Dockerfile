@@ -46,10 +46,6 @@ ENV CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED=true
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_INTERVAL_MS=25000
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_RESCAN_MS=60000
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS=180000
-# Token-refresh risk control is an egress/WAF verdict (aliyun challenge page),
-# not a credential problem: stop issuing refreshes for this window after the
-# first hit so healthy accounts are not frozen one by one.
-ENV CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS=300000
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_FAILURE_RETRY_MS=300000
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_CREDENTIAL_RETRY_MS=21600000
 # Docker deployments allow long active generations within the cumulative
@@ -88,10 +84,6 @@ ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
 # one logical request is a storm: cool those accounts for the configured
 # window and feed the existing global risk circuit + recovery probe.
 ENV CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX=0
-# An aliyun content verdict (bxpunish/RGV587) is decided by the request payload:
-# -1 stops account rotation on the FIRST hit (measured: 6 accounts and ~79s
-# burned per request for an identical, unmovable verdict).
-ENV CHAT2API_QWEN_AI_CONTENT_VERDICT_ROTATION_MAX=-1
 ENV CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD=2
 ENV CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
 # A transport reset can continue the same Qwen response without resubmitting
@@ -175,12 +167,6 @@ ENV QWEN_CAPTCHA_ARTIFACT_DIR=/tmp/qwen-captcha
 # Perturb uploaded transcripts on retries (>= 2) so RGV587's content-verdict
 # cache cannot pin identical resubmissions. 'false' disables.
 ENV CHAT2API_QWEN_AI_RETRY_NONCE=true
-# Perturb EVERY attempt, not just attempt >= 2. The upstream content-fingerprint
-# verdict cache persists across requests, so a client reconnect that resubmits
-# an unchanged transcript is pinned even though account rotation changed the
-# account: rotating accounts does not change the payload hash. 'always' costs
-# the transcript upload-cache hit and buys fingerprint immunity.
-ENV CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=always
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/out-server ./out-server

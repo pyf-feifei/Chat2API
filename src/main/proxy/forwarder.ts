@@ -1637,12 +1637,6 @@ export class RequestForwarder {
       return true
     }
 
-    // Declared once for the whole retry loop: an inner `let` used to be created
-    // mid-loop, and a ReferenceError (`modifiedRequest is not defined`) was
-    // observed in production (2026-09-21 20:42, chat route) — hoisting removes
-    // any temporal-dead-zone exposure for the bundled build.
-    let modifiedRequest: ChatCompletionRequest = request
-
     while (true) {
       // Sticky mode's direct-IP probe is opportunistic and fire-and-forget:
       // never on the request path, only while sticky traffic is flowing.
@@ -1700,7 +1694,7 @@ export class RequestForwarder {
         return createQwenAiRequestTimeoutResult(startTime)
       }
 
-      modifiedRequest = request
+      let modifiedRequest = request
 
       if (
         requestIntent !== 'context_compaction'

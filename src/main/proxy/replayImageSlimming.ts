@@ -72,19 +72,13 @@ function isEnabledFromEnv(): boolean {
 }
 
 function keepLastFromEnv(): number {
-  // Distinguish unset from empty: Number('') is 0, which would silently turn
-  // "keep the last image" into "keep none" when the variable is declared empty.
-  const raw = process.env.CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES
-  if (raw === undefined || raw.trim() === '') return 1
-  const parsed = Number(raw)
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 1
+  const raw = Number(process.env.CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES)
+  return Number.isSafeInteger(raw) && raw >= 0 ? raw : 1
 }
 
 function keepFirstFromEnv(): number {
-  const raw = process.env.CHAT2API_QWEN_AI_REPLAY_KEEP_FIRST_IMAGE_MESSAGES
-  if (raw === undefined || raw.trim() === '') return 0
-  const parsed = Number(raw)
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
+  const raw = Number(process.env.CHAT2API_QWEN_AI_REPLAY_KEEP_FIRST_IMAGE_MESSAGES)
+  return Number.isSafeInteger(raw) && raw >= 0 ? raw : 0
 }
 
 // Tell the model how to recover a slimmed image, otherwise it judges visual
