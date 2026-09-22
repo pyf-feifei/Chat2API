@@ -3168,24 +3168,30 @@ let retryNonceSequence = 0
 
 /**
  * CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE controls when the perturbation applies:
- * - 'retry' (default): attempt >= 2 only — first attempts keep the upload
- *   cache hit path (unchanged historical behavior);
- * - 'always': every attempt is perturbed, including attempt 1. The upstream
- *   content-fingerprint verdict cache persists ACROSS requests, so a client
- *   reconnect that resubmits an unchanged conversation byte-for-byte is
- *   pinned by that cache even though it is a brand-new request (2026-09-10
- *   evening-peak quota_limit storm: codex reconnect loop, 12 rejections on 1
- *   unique document hash). 'always' trades the transcript upload-cache hit
- *   for fingerprint immunity;
+ * - 'always' (**default**): every attempt is perturbed, including attempt 1.
+ *   The upstream content-fingerprint verdict cache persists ACROSS requests,
+ *   so a client reconnect that resubmits an unchanged conversation
+ *   byte-for-byte is pinned by that cache even though it is a brand-new
+ *   request (2026-09-10 evening-peak quota_limit storm: codex reconnect loop,
+ *   12 rejections on 1 unique document hash; 2026-09-22: a 493-message codex
+ *   transcript drew the identical bxpunish verdict on 6 consecutive accounts
+ *   across 8 reconnects, because account rotation does NOT change the
+ *   payload hash). 'always' trades the transcript upload-cache hit for
+ *   fingerprint immunity — a slower first byte beats a verdict that cannot
+ *   be escaped by rotating accounts;
+ * - 'retry': attempt >= 2 only — first attempts keep the upload cache hit
+ *   path. Safe only when the client retries through the SAME logical request;
+ *   it is blind to reconnect-driven resubmissions, which is the common codex
+ *   failure shape;
  * - 'off': disables perturbation entirely (same as CHAT2API_QWEN_AI_RETRY_NONCE=false).
  */
 export function qwenAiRetryNonceScopeFromEnv(): 'retry' | 'always' | 'off' {
   const disabled = String(process.env.CHAT2API_QWEN_AI_RETRY_NONCE ?? 'true').trim().toLowerCase() === 'false'
   if (disabled) return 'off'
   const raw = String(process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE ?? '').trim().toLowerCase()
-  if (raw === 'always') return 'always'
+  if (raw === 'retry') return 'retry'
   if (raw === 'off') return 'off'
-  return 'retry'
+  return 'always'
 }
 
 export function applyQwenAiRetryNonce(content: string, nonce?: number): string {

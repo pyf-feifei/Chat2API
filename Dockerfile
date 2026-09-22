@@ -175,6 +175,12 @@ ENV QWEN_CAPTCHA_ARTIFACT_DIR=/tmp/qwen-captcha
 # Perturb uploaded transcripts on retries (>= 2) so RGV587's content-verdict
 # cache cannot pin identical resubmissions. 'false' disables.
 ENV CHAT2API_QWEN_AI_RETRY_NONCE=true
+# Perturb EVERY attempt, not just attempt >= 2. The upstream content-fingerprint
+# verdict cache persists across requests, so a client reconnect that resubmits
+# an unchanged transcript is pinned even though account rotation changed the
+# account: rotating accounts does not change the payload hash. 'always' costs
+# the transcript upload-cache hit and buys fingerprint immunity.
+ENV CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=always
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/out-server ./out-server
