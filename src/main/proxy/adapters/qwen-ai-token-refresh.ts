@@ -171,7 +171,31 @@ export function extractQwenAiRefreshDetail(body: unknown): string | undefined {
   return undefined
 }
 
-function isRiskControlled(body: unknown): boolean {
+function isHtmlChallengeBody(body: unknown): boolean {
+  const text = typeof body === 'string' ? body : (() => {
+    try {
+      return JSON.stringify(body || '')
+    } catch {
+      return ''
+    }
+  })()
+  // Aliyun WAF challenge pages are HTML, not the JSON error envelope Qwen's
+  // signin API returns for bad credentials. Match the page signature first so a
+  // pure challenge page (no RGV587/captcha keywords) still opens the egress gate
+  // instead of falling through to accountFault:true and freezing the account.
+  return /^\s*<!doctype\s+html|^\s*<html[\s>]|aliyun_waf_a[ab]/i.test(text)
+}
+
+function isRiskControlled(body: unknown, contentType?: string): boolean {
+  const type = String(contentType || '').toLowerCase()
+  if (type.includes('text/html') || type.includes('application/xhtml+xml')) {
+    return true
+  }
+
+  if (isHtmlChallengeBody(body)) {
+    return true
+  }
+
   try {
     return /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(
       JSON.stringify(body || {}),
@@ -282,7 +306,12 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
   const upstreamStatus = response.status
   const detail = extractQwenAiRefreshDetail(response.data)
   const detailSuffix = detail ? `: ${detail}` : ''
-  const riskControlled = isRiskControlled(response.data)
+  const contentType = String(
+    (response.headers as Record<string, unknown> | undefined)?.['content-type']
+    || (response.headers as Record<string, unknown> | undefined)?.['Content-Type']
+    || '',
+  )
+  const riskControlled = isRiskControlled(response.data, contentType)
   const unregistered = isUnregisteredAccountResponse(response.data, detail)
 
   if (riskControlled) {

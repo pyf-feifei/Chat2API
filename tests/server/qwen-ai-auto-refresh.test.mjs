@@ -421,6 +421,96 @@ test('Qwen AI refresh treats a WAF challenge as account-neutral and stops accoun
   assert.equal(persisted, undefined)
 })
 
+test('Qwen AI refresh treats a pure aliyun_waf HTML page (no JSON keywords) as account-neutral', async () => {
+  let persisted
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
+    },
+    post: async () => ({
+      status: 403,
+      data: '<!doctype html> <meta charset="UTF-8"> <meta name="aliyun_waf_aa" content="ff926c7f"><meta name="aliyun_waf_bb" content="eade7145">',
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    }),
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: 'cnaui=auxiliary-cookie',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  await assert.rejects(
+    new QwenAiTokenRefresher().refreshIfNeeded(account),
+    error => error.status === 403
+      && error.code === 'qwen_ai_token_refresh_failed'
+      && error.retryable === false
+      && error.accountFault === false
+      && error.retryScope === undefined
+      && /risk-control/.test(error.message),
+  )
+  assert.equal(persisted, undefined)
+})
+
+test('Qwen AI refresh treats HTML content-type without body keywords as account-neutral', async () => {
+  let persisted
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
+    },
+    post: async () => ({
+      status: 403,
+      data: '',
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    }),
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: 'cnaui=auxiliary-cookie',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  await assert.rejects(
+    new QwenAiTokenRefresher().refreshIfNeeded(account),
+    error => error.status === 403
+      && error.accountFault === false
+      && error.retryScope === undefined
+      && /risk-control/.test(error.message),
+  )
+  assert.equal(persisted, undefined)
+})
+
+test('Qwen AI refresh still treats JSON invalid credentials as account fault', async () => {
+  let persisted
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
+    },
+    post: async () => ({
+      status: 401,
+      data: { message: 'invalid password' },
+      headers: { 'content-type': 'application/json' },
+    }),
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: 'cnaui=auxiliary-cookie',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  await assert.rejects(
+    new QwenAiTokenRefresher().refreshIfNeeded(account),
+    error => error.status === 401
+      && error.accountFault === true
+      && error.retryScope === 'next-account',
+  )
+  assert.ok(persisted === null || persisted === undefined || persisted.status !== 'inactive')
+})
 test('Qwen AI refresh distinguishes upstream failure and cancellation', async () => {
   const credentials = {
     token: jwtExpiringAt(Date.now() + 60 * 60 * 1000),
