@@ -331,6 +331,100 @@ document 路径只是给附件加一行，inline 路径是改用户消息本体�
   但 verdict 日志只记 `{status: 503, accountFault: false, attempt: N}`，
   **不记内容哈希**，所以历史被拒的 payload 无法回放。只能等 codex 新会话的真实流量。
 
+## 6e. 真实上下文测试 + 单元测试挖出的闸门默认值 bug（2026-09-22 13:50）
+
+### 背景：用户追问「你修改后都测试过吗 真实上下文请求测试」
+
+诚实的回答是**没有全测**。逐条对账：
+
+| 改动 | 之前的验证程度 |
+|---|---|
+| A `qwen_ai_content_verdict` 停止规则 | ❌ 只有代码级 + 容器 env 存在，**从没触发过** |
+| B refresh WAF 闸门 | ❌ 同上，`qwen_ai_token_refresh_gated` = 0 |
+| C `modifiedRequest` 提升 | ⚠️ 只是"没再复现"（弱证据） |
+| D HTTP-200 unauthorized 强制刷新 | ✅ 线上真跑过（3 次 `forcing token refresh` 全成功） |
+| E nonce scope `always` | ⚠️ 只有合成 payload 的机制证明，**不是真实上下文** |
+
+### 真实上下文测试（补上 E 的短板）
+
+**① 实时流量**：用户 13:14 重启 codex，真实请求 05:14:11Z 起进来，
+`sourceMessageCount` 4 → 46，`transcriptUtf8Bytes` 到 139951。
+**`outcome":"completed" × 18，`qwen_ai_*` 风控码 × 0。**
+
+**② 真上下文双发**：从**实时会话 rollout** 重建 Responses payload
+（`build_live_context.py`：按 Codex 客户端行为把 tool output 截到 8KB、取尾部窗口，
+51 items / 155538 bytes，`request_sha256 55e151d6c8baf3aa`），POST 两次：
+
+```
+[A] 200 / 16.9s  status=completed   [B] 200 / 27.4s  status=completed
+两个请求都是 sourceMessageCount=38 transcriptUtf8Bytes=105682   ← 内容逐字节相同
+却得到两个不同文档哈希: df690dc1522478d5 / 58156e6d5a604e62
+```
+
+**内容相同 → 指纹不同 → nonce 在真实 codex 上下文上生效，两次都 completed。**
+
+**手法要点**：光看"两次哈希不同"不够（内容本来就不同也会不同）。必须用
+`docker logs -t` 拿到时间戳、再用 requestId 反查该请求的 shape 行，
+证明**两次的 `transcriptUtf8Bytes` 完全一致** —— 这才是把"输入相同"钉死的证据。
+
+### 单元测试挖出的真 bug：闸门默认值
+
+对 A / B 这两个"从没触发过"的分支跑断言（用 esbuild 把**真源码模块**打成 CJS 在 Node 里跑），
+**B 当场红了**：
+
+```ts
+const raw = Number(process.env.CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS ?? '')
+return Number.isSafeInteger(raw) && raw >= 0 ? raw : 300_000
+```
+
+`Number('') === 0`，而 `0 >= 0` 成立 → **变量未设置时闸门窗口解析成 0ms，等于没有闸门**。
+
+生产没暴露，**只因为 Dockerfile 恰好设了这个变量**。也就是说：代码默认值和线上默认值
+早就分叉了，而且**没有任何东西在跑前者** —— 这正是"只在线上验证"必然漏掉的那类 bug。
+一旦某条部署路径没带上这个 env，闸门会静默失效，回到"28 个账号被冻结一夜"的老路。
+
+修复：
+
+```ts
+const raw = String(process.env.CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS ?? '').trim()
+if (raw === '') return 300_000
+const value = Number(raw)
+return Number.isSafeInteger(value) && value > 0 ? value : 300_000
+```
+
+未设置/空/空白/`0`/负数/非数字 一律回落 300000；只有正整数才覆盖。
+**0 故意不认** —— 0ms 闸门和"没有闸门"无法区分，不该给它这个语义。
+
+`replayImageSlimming.ts` 同类问题一并硬化：显式空串会把
+`CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES` 从"保留最后 1 张图"变成"一张不留"，
+现在区分 `undefined` 与 `''`。
+
+### 单元测试结果（27/27 通过）
+
+`dev-data/unit/run.js`，产物见 `unit-test-result.txt`：
+
+- **A**：`isQwenAiContentVerdictFailure` 正负例；默认 `-1` 首次命中即停；
+  `=2` 时 `history.length===2` 继续、`===3` 停止；`off` 时禁用
+- **B**：7 种 env 形态的默认值解析（未设置/空/空白/`0`/负数/垃圾/显式 5000）
+- **B**：退避 `300000 → 600000 → 1200000`，封顶 1h
+- **B**：闸门内 `refresh()` 必须**快速失败**（<300ms ⇒ 没走网络）、
+  `code === 'qwen_ai_token_refresh_gated'`、`accountFault === false`（**不能冻结健康账号**）
+
+### 本轮交付
+
+- commit `e3e5550`，已 push 到 origin
+- 镜像 `skatef/chat2api:toolfix28-gate-default`（digest `sha256:87d8a7bab60b…` 与本地一致）
+  已部署：容器 `Up`、`root=200`、产物含修复、错误计数 0；旧容器 `chat2api-old-toolfix27` 可回滚
+- 部署窗口选在实时会话**空闲 34 分钟**时，避免打断用户
+- 新构建上复跑真实上下文双发：仍是 **2 个不同哈希 + 两次 200 completed**
+
+### 仍然没有覆盖的
+
+A 和 B 的**端到端触发**依然没测到 —— 触发它们需要真实的 bxpunish verdict 或真实的
+WAF 拦截。单元测试覆盖的是**逻辑**，不是"故障真的来了会怎样"。
+要端到端验证只能等线上真出现，或者加一个显式的测试钩子（如
+`..._REFRESH_RISK_GATE_FORCE=1` 强制开门）。这一步留给用户决定。
+
 ## 7. 附：codex 多个 tool-call 是怎么发给 API 的
 
 实测这一轮的 response_item：
