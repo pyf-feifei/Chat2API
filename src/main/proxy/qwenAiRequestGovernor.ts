@@ -869,13 +869,29 @@ export class QwenAiRequestGovernor {
       const config = this.getConfig()
       const current = this.accountCooldowns.get(accountId)
       const failures = (current?.failures || 0) + 1
-      const cooldownMs = Math.min(config.riskCooldownMs * (2 ** (failures - 1)), config.maxRiskCooldownMs)
-      this.openCooldown(accountId, cooldownMs, 'qwen_ai_risk_control', failures)
+      // A token-refresh risk-control hit is an egress/WAF verdict (the refresh
+      // endpoint answers with an aliyun challenge page): the credentials are
+      // healthy, so the ordinary risk ladder (600s → 1200s → …) drains the pool
+      // for an IP problem. Bench the account only briefly and leave its failure
+      // counter untouched — observed 2026-09-22: 28 accounts frozen overnight
+      // by refresh hits alone while the chat path was fine.
+      const isRefreshRisk = result.errorCode === 'qwen_ai_token_refresh_failed'
+        || result.errorCode === 'qwen_ai_token_refresh_gated'
+      const cooldownMs = isRefreshRisk
+        ? Math.max(30_000, Math.min(config.failureCooldownMs, 120_000))
+        : Math.min(config.riskCooldownMs * (2 ** (failures - 1)), config.maxRiskCooldownMs)
+      this.openCooldown(
+        accountId,
+        cooldownMs,
+        isRefreshRisk ? 'qwen_ai_refresh_risk_control' : 'qwen_ai_risk_control',
+        isRefreshRisk ? current?.failures ?? 1 : failures,
+      )
       // One context compaction can fan out into correlated map/reduce calls.
       // Keep each affected account out of rotation, but do not mistake those
       // internal calls for independent evidence that ordinary traffic must be
-      // stopped globally.
-      if (requestClass === 'normal') {
+      // stopped globally. A gated refresh never reached the network, so it
+      // carries no new evidence about the egress either.
+      if (requestClass === 'normal' && !isRefreshRisk) {
         this.recordGlobalRiskControl(accountId, config, this.getQwenAiAccountScope())
       }
       return result

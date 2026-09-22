@@ -34,6 +34,35 @@ export function isQwenAiContentDeterminedFailure(result: ForwardResult): boolean
     && result.accountFault === false
 }
 
+// An aliyun content verdict (bxpunish / RGV587) survives every axis we can
+// move: account rotation, exit-IP switch, cookie refresh, document offload and
+// transcript collapsing were all observed to reproduce it (2026-09-21). It is
+// decided by the request payload itself, so rotating accounts only multiplies
+// the damage — measured 2026-09-22: one 493-message transcript drew the
+// identical verdict on 6 consecutive accounts, across 8 client reconnects,
+// burning ~41 account slots and ~79s per request for nothing. Stop rotating on
+// the FIRST hit so the verdict reaches the client immediately.
+const QWEN_AI_CONTENT_VERDICT_ROTATION_CODES = new Set([
+  'qwen_ai_content_verdict',
+])
+
+export function isQwenAiContentVerdictFailure(result: ForwardResult): boolean {
+  return QWEN_AI_CONTENT_VERDICT_ROTATION_CODES.has(result.errorCode ?? '')
+}
+
+/**
+ * Cap for content-verdict rotations. Default -1 = stop on the first hit (no
+ * second account at all). 'off' disables the verdict rule; any N >= 0 allows
+ * at most N extra rotations (comparison shape matches the other rules).
+ */
+export function qwenAiContentVerdictRotationMaxFromEnv(): number | undefined {
+  const raw = String(process.env.CHAT2API_QWEN_AI_CONTENT_VERDICT_ROTATION_MAX ?? '').trim()
+  if (raw === '') return -1
+  if (raw.toLowerCase() === 'off') return undefined
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value >= -1 ? value : -1
+}
+
 /**
  * Stop rule for the content-failure pattern: when EVERY failure in this
  * request has been a content-determined account-neutral 422, the rejection
@@ -56,9 +85,16 @@ export function qwenAiContentFailoverRotationMaxFromEnv(): number | undefined {
 
 export function createQwenAiContentFailoverStopRule(
   maxRotations = qwenAiContentFailoverRotationMaxFromEnv(),
+  verdictMaxRotations = qwenAiContentVerdictRotationMaxFromEnv(),
 ): ((result: ForwardResult, history: readonly ForwardResult[]) => boolean) | undefined {
-  if (maxRotations === undefined) return undefined
+  if (maxRotations === undefined && verdictMaxRotations === undefined) return undefined
   return (result, history) => {
+    // A content verdict is terminal by construction: never spend another
+    // account on it (default -1 stops on the first hit).
+    if (verdictMaxRotations !== undefined && isQwenAiContentVerdictFailure(result)) {
+      return history.length > verdictMaxRotations
+    }
+    if (maxRotations === undefined) return false
     if (!isQwenAiContentDeterminedFailure(result)) return false
     if (!history.every(prior => isQwenAiContentDeterminedFailure(prior))) return false
     return history.length > maxRotations

@@ -213,6 +213,53 @@ function persistUnregisteredAccount(account: Account, error: QwenAiRefreshError)
   }
 }
 
+// A token-refresh risk-control hit is an aliyun WAF verdict against the EGRESS
+// (the refresh endpoint returns a `aliyun_waf_aa/aliyun_waf_bb` challenge page),
+// not a statement about this account's credentials. Every account retried
+// through the same flagged egress reproduces it, so a refresh storm freezes
+// accounts one after another — observed 2026-09-22: 28 accounts cooled down
+// overnight purely from refresh hits, while the chat path stayed healthy.
+// A global gate stops issuing refresh requests for a bounded window after the
+// first WAF verdict, so the pool is preserved and the egress gets time to cool.
+let refreshRiskGateUntil = 0
+let refreshRiskGateHits = 0
+let refreshRiskGateLogged = 0
+
+function qwenAiRefreshRiskGateBaseMs(): number {
+  // NOTE: `Number(process.env.X ?? '')` is a trap — Number('') is 0, and 0 passes
+  // a `>= 0` guard, so an UNSET variable silently collapsed the window to 0ms
+  // (a no-op gate). That was masked in production only because the Dockerfile
+  // happens to set this variable, which is exactly how a safety mechanism rots.
+  // Treat unset/empty/0/negative/non-numeric as "use the default".
+  const raw = String(process.env.CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS ?? '').trim()
+  if (raw === '') return 300_000
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : 300_000
+}
+
+export function openQwenAiRefreshRiskGate(now: number = Date.now()): number {
+  refreshRiskGateHits += 1
+  // Bounded exponential backoff: 1x, 2x, 4x, 8x of the base window, capped at
+  // one hour so a long WAF ban cannot park the refresher forever.
+  const windowMs = Math.min(
+    qwenAiRefreshRiskGateBaseMs() * (2 ** Math.min(refreshRiskGateHits - 1, 3)),
+    3_600_000,
+  )
+  refreshRiskGateUntil = now + windowMs
+  if (now - refreshRiskGateLogged > 30_000) {
+    refreshRiskGateLogged = now
+    console.warn('[QwenAI] token-refresh risk-control hit — gating refreshes', JSON.stringify({
+      hits: refreshRiskGateHits,
+      gateMs: windowMs,
+    }))
+  }
+  return windowMs
+}
+
+export function qwenAiRefreshRiskGateRemainingMs(now: number = Date.now()): number {
+  return Math.max(0, refreshRiskGateUntil - now)
+}
+
 function createRefreshError(options: {
   message: string
   status: number
@@ -239,8 +286,10 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
   const unregistered = isUnregisteredAccountResponse(response.data, detail)
 
   if (riskControlled) {
+    const gateMs = openQwenAiRefreshRiskGate()
     return createRefreshError({
-      message: `Qwen AI token refresh failed (risk-control)${detailSuffix}`,
+      message: `Qwen AI token refresh failed (risk-control)${detailSuffix}`
+        + ` — refreshes gated for ${Math.ceil(gateMs / 1000)}s`,
       status: 403,
       retryable: false,
       accountFault: false,
@@ -379,6 +428,22 @@ export class QwenAiTokenRefresher {
   }
 
   private async refresh(account: Account, signal?: AbortSignal): Promise<Account> {
+    // Inside a WAF gate the refresh endpoint is answering challenge pages, not
+    // credentials. Asking again only deepens the egress flag and freezes one
+    // more healthy account, so fail locally without touching the network.
+    const gateRemainingMs = qwenAiRefreshRiskGateRemainingMs()
+    if (gateRemainingMs > 0) {
+      const gateError = createRefreshError({
+        message: `Qwen AI token refresh skipped: egress is under risk-control; `
+          + `${Math.ceil(gateRemainingMs / 1000)}s left before the next attempt`,
+        status: 403,
+        retryable: false,
+        accountFault: false,
+      })
+      gateError.code = 'qwen_ai_token_refresh_gated'
+      throw gateError
+    }
+
     const payload = {
       email: account.credentials.email,
       password: sha256Hex(account.credentials.password),
