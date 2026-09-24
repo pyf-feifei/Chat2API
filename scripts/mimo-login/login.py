@@ -102,7 +102,18 @@ def _capture_geetest_assets(resp) -> None:
                 log(f"[mimo-login] geetest image captured {len(body)}B {u[:120]}")
             return
         if "gt/load" in u or "getCode" in u:
-            raw = resp.text() or ""
+            body_bytes = resp.body() or b""
+            if not body_bytes:
+                return
+            ctype_lower = ctype.lower()
+            textish = any(token in ctype_lower for token in ("json", "text", "javascript", "xml"))
+            if not textish and body_bytes[:1] in (b"\xff", b"\x89", b"\x1f", b"\x00"):
+                if "bg" in u:
+                    GEETEST_ASSETS["bg_bytes"] = body_bytes
+                if "slice" in u:
+                    GEETEST_ASSETS["slice_bytes"] = body_bytes
+                return
+            raw = body_bytes.decode("utf-8", errors="ignore")
             m = re.search(r"\((\{.*\})\)", raw, re.S)
             payload = json.loads(m.group(1) if m else raw)
             data = payload.get("data") or payload
