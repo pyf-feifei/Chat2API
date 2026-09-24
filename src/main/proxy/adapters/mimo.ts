@@ -528,23 +528,27 @@ export class MimoAdapter {
     }
 
     const modelLower = request.model.toLowerCase()
+    const isUltraspeed = modelLower.includes('ultraspeed')
     let enableThinking = false
     if (modelLower.includes('think') || modelLower.includes('r1')) {
       enableThinking = true
     }
 
+    const modelConfig: Record<string, unknown> = {
+      enableThinking,
+      webSearchStatus: 'disabled',
+      model: request.model,
+    }
+    if (!isUltraspeed) {
+      modelConfig.temperature = request.temperature ?? 0.8
+      modelConfig.topP = 0.95
+    }
     const requestBody = {
       msgId,
       conversationId,
       query,
       isEditedQuery: false,
-      modelConfig: {
-        enableThinking,
-        webSearchStatus: 'disabled',
-        model: request.model,
-        temperature: request.temperature ?? 0.8,
-        topP: 0.95,
-      },
+      modelConfig,
       multiMedias: [],
     }
 

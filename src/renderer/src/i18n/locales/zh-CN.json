@@ -389,7 +389,15 @@
     "password": "登录密码（可选）",
     "passwordPlaceholder": "用于自动刷新 serviceToken 的小米账号密码",
     "passwordHelp": "密码会按当前存储策略保存到加密凭证中；如果小米要求验证码、两步验证或身份核验，自动刷新会失败",
-    "tokenExpiryNote": "serviceToken 约 24 小时过期。填写邮箱和密码后会自动重新登录；否则请网页端退出重登，并更新全部三项 Cookie。"
+    "tokenExpiryNote": "serviceToken 约 24 小时过期。填写邮箱和密码后会自动重新登录；否则请网页端退出重登，并更新全部三项 Cookie。",
+    "models": {
+      "MiMo-V2.6-Pro": "MiMo-V2.6-Pro",
+      "MiMo-V2.6-Flash": "MiMo-V2.6-Flash",
+      "MiMo-V2.6-Pro-Ultraspeed": "MiMo-V2.6-Pro-Ultraspeed",
+      "MiMo-V2.5-Pro": "MiMo-V2.5-Pro",
+      "MiMo-V2.5": "MiMo-V2.5",
+      "MiMo-V2-Flash": "MiMo-V2-Flash"
+    }
   },
   "perplexity": {
     "name": "Perplexity",

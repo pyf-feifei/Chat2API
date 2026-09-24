@@ -12,6 +12,9 @@
 
 | 显示名称 | 实际模型 ID |
 | --- | --- |
+| MiMo-V2.6-Pro | mimo-v2.6-pro |
+| MiMo-V2.6-Flash | mimo-v2.6-flash |
+| MiMo-V2.6-Pro-Ultraspeed | mimo-v2.6-pro-ultraspeed-studio |
 | MiMo-V2.5-Pro | mimo-v2.5-pro |
 | MiMo-V2.5 | mimo-v2.5 |
 | MiMo-V2-Flash | mimo-v2-flash |

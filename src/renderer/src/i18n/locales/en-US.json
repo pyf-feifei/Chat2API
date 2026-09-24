@@ -389,7 +389,15 @@
     "password": "Login Password (Optional)",
     "passwordPlaceholder": "Xiaomi account password for automatic serviceToken refresh",
     "passwordHelp": "Stored in encrypted credentials when available. Automatic refresh can fail if Xiaomi requires captcha, 2FA, or identity verification.",
-    "tokenExpiryNote": "serviceToken lasts about 24 hours. With email+password it re-logins automatically; otherwise log out/in at aistudio.xiaomimimo.com and update all three cookies."
+    "tokenExpiryNote": "serviceToken lasts about 24 hours. With email+password it re-logins automatically; otherwise log out/in at aistudio.xiaomimimo.com and update all three cookies.",
+    "models": {
+      "MiMo-V2.6-Pro": "MiMo-V2.6-Pro",
+      "MiMo-V2.6-Flash": "MiMo-V2.6-Flash",
+      "MiMo-V2.6-Pro-Ultraspeed": "MiMo-V2.6-Pro-Ultraspeed",
+      "MiMo-V2.5-Pro": "MiMo-V2.5-Pro",
+      "MiMo-V2.5": "MiMo-V2.5",
+      "MiMo-V2-Flash": "MiMo-V2-Flash"
+    }
   },
   "perplexity": {
     "name": "Perplexity",
