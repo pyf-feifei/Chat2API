@@ -13,6 +13,11 @@ import type { ChatMessage } from '../types.ts'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser.ts'
 import type { ToolCallingPlan } from '../toolCalling/types.ts'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import {
+  prepareMimoAttachments,
+  mimoRequestTimeoutMs,
+  type MimoMediaEntry,
+} from './mimo-files.ts'
 
 const MIMO_API_BASE = 'https://aistudio.xiaomimimo.com'
 
@@ -33,6 +38,17 @@ interface ChatCompletionRequest {
   messages: MimoMessage[]
   stream?: boolean
   temperature?: number
+  signal?: AbortSignal
+  enableThinking?: boolean
+  enableWebSearch?: boolean
+  reasoningEffort?: string
+}
+
+export type MimoUpstreamError = Error & {
+  status?: number
+  retryable?: boolean
+  accountFault?: boolean
+  errorCode?: string
 }
 
 interface MimoUsage {
@@ -434,23 +450,49 @@ export class MimoAdapter {
   }> {
     const conversationId = uuid(false)
     const msgId = uuid(false).slice(0, 32)
-    const query = buildMimoQuery(request.messages)
+    const { serviceToken, userId, phToken } = this.getCredentials()
+    const attachments = await prepareMimoAttachments({
+      messages: request.messages,
+      credentials: { serviceToken, userId, phToken },
+      model: request.model,
+      signal: request.signal,
+    })
+    if (attachments.offloadedFiles.length > 0) {
+      console.log(
+        `[Mimo] offloaded oversized context to ${attachments.offloadedFiles.length} attachment(s): ${attachments.offloadedFiles.join(', ')}`,
+      )
+    }
+    const query = buildMimoQuery(attachments.messages)
 
-    let response = await this.sendChatRequest(request, conversationId, msgId, query, false)
+    let response = await this.sendChatRequest(
+      request,
+      conversationId,
+      msgId,
+      query,
+      attachments.multiMedias,
+      false,
+    )
 
     if (response.status === 401 || response.status === 403) {
       console.log(`[Mimo] chat auth error (${response.status}), attempting credential refresh...`)
       const refreshed = await this.attemptCredentialsRefresh()
       if (refreshed) {
-        response = await this.sendChatRequest(request, conversationId, msgId, query, true)
+        response = await this.sendChatRequest(
+          request,
+          conversationId,
+          msgId,
+          query,
+          attachments.multiMedias,
+          true,
+        )
       }
     }
 
     if (response.status === 401 || response.status === 403) {
-      const err = new Error(
+      const err: MimoUpstreamError = new Error(
         `Mimo credentials expired (HTTP ${response.status}). serviceToken lasts ~24h. `
         + 'Store Xiaomi email+password on the account to auto-relogin, or log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.',
-      ) as Error & { status?: number; retryable?: boolean; accountFault?: boolean }
+      )
       err.status = response.status
       err.retryable = false
       err.accountFault = true
@@ -458,12 +500,10 @@ export class MimoAdapter {
     }
 
     if (response.status >= 400) {
-      const err = new Error(`Mimo chat request failed: HTTP ${response.status}`) as Error & {
-        status?: number
-        retryable?: boolean
-      }
+      const err: MimoUpstreamError = new Error(`Mimo chat request failed: HTTP ${response.status}`)
       err.status = response.status
       err.retryable = response.status >= 500 || response.status === 429
+      err.accountFault = false
       throw err
     }
 
@@ -506,6 +546,7 @@ export class MimoAdapter {
     conversationId: string,
     msgId: string,
     query: string,
+    multiMedias: MimoMediaEntry[],
     isRetry: boolean,
   ): Promise<AxiosResponse> {
     const { serviceToken, userId, phToken } = this.getCredentials()
@@ -529,14 +570,13 @@ export class MimoAdapter {
 
     const modelLower = request.model.toLowerCase()
     const isUltraspeed = modelLower.includes('ultraspeed')
-    let enableThinking = false
-    if (modelLower.includes('think') || modelLower.includes('r1')) {
-      enableThinking = true
-    }
+    const enableThinking = request.enableThinking
+      ?? (modelLower.includes('think') || modelLower.includes('r1'))
+    const webSearchStatus = request.enableWebSearch === true ? 'enabled' : 'disabled'
 
     const modelConfig: Record<string, unknown> = {
       enableThinking,
-      webSearchStatus: 'disabled',
+      webSearchStatus,
       model: request.model,
     }
     if (!isUltraspeed) {
@@ -549,7 +589,7 @@ export class MimoAdapter {
       query,
       isEditedQuery: false,
       modelConfig,
-      multiMedias: [],
+      multiMedias,
     }
 
     return axios({
@@ -558,6 +598,8 @@ export class MimoAdapter {
       data: requestBody,
       responseType: 'stream',
       headers: this.buildHeaders(serviceToken, userId, phToken),
+      timeout: mimoRequestTimeoutMs(),
+      signal: request.signal,
       validateStatus: () => true,
     })
   }
@@ -687,6 +729,42 @@ export class MimoAdapter {
   }
 }
 
+function isMimoUpstreamErrorEvent(event: string, payload: Record<string, unknown>): boolean {
+  if (event === 'error' || /error/i.test(event)) return true
+  if (payload.code === undefined || payload.code === null || Number(payload.code) === 0) return false
+  const detail = String(payload.msg || payload.message || payload.error || payload.content || '').trim()
+  return detail.length > 0
+}
+
+function buildMimoUpstreamError(payload: Record<string, unknown>, event: string): MimoUpstreamError {
+  const code = payload.code
+  const detail = String(
+    payload.msg || payload.message || payload.error || payload.content || 'unknown upstream error',
+  ).slice(0, 300)
+  const error: MimoUpstreamError = new Error(`Mimo upstream error (${event}${code === undefined || code === null ? '' : ` ${code}`}): ${detail}`)
+  const numericCode = Number(code)
+  error.status = Number.isFinite(numericCode) && numericCode >= 400 ? numericCode : undefined
+  error.errorCode = 'mimo_upstream_error'
+  error.accountFault = false
+  error.retryable = !/封禁|禁用|额度|余额|unauthorized|forbidden|\b401\b|\b403\b/i.test(detail)
+  return error
+}
+
+function readMimoUsage(payload: Record<string, unknown>): MimoUsage | null {
+  const nativeUsage = (payload.nativeUsage || {}) as Record<string, unknown>
+  const completionDetails = (nativeUsage.completion_tokens_details || {}) as Record<string, unknown>
+  const promptTokens = Number(payload.promptTokens ?? nativeUsage.prompt_tokens ?? 0)
+  const completionTokens = Number(payload.completionTokens ?? nativeUsage.completion_tokens ?? 0)
+  const totalTokens = Number(payload.totalTokens ?? nativeUsage.total_tokens ?? 0)
+  if (!promptTokens && !completionTokens && !totalTokens) return null
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: totalTokens || promptTokens + completionTokens,
+    reasoningTokens: Number(completionDetails.reasoning_tokens ?? 0),
+  }
+}
+
 export class MimoStreamHandler {
   private model: string
   private conversationId: string
@@ -703,6 +781,7 @@ export class MimoStreamHandler {
   private citationBuffer: { value: string } = { value: '' }
   private thinkingCitationBuffer: { value: string } = { value: '' }
   private toolStreamParser?: ToolStreamParser
+  private malformedEvents = 0
 
   constructor(
     model: string,
@@ -744,10 +823,18 @@ export class MimoStreamHandler {
         if (trimmed.startsWith('event:')) {
           currentEvent = trimmed.slice(6).trim()
         } else if (trimmed.startsWith('data:')) {
+          const dataStr = trimmed.slice(5).trim()
+          if (dataStr === '[DONE]') {
+            continue
+          }
           try {
-            const dataStr = trimmed.slice(5).trim()
-            const data = JSON.parse(dataStr)
-            const mimoChunk: MimoChunk = { type: currentEvent as any, ...data }
+            const payload = JSON.parse(dataStr) as Record<string, unknown>
+            const eventName = currentEvent || String(payload.type || '')
+            const mimoChunk: MimoChunk = { ...payload, type: eventName as MimoChunk['type'] }
+
+            if (isMimoUpstreamErrorEvent(eventName, payload)) {
+              throw buildMimoUpstreamError(payload, eventName || 'unknown')
+            }
 
             if ((mimoChunk.type === 'message' || mimoChunk.type === 'text') && mimoChunk.content) {
               const newText = (mimoChunk.content ?? '').replace(/\u0000/g, '')
@@ -828,13 +915,23 @@ export class MimoStreamHandler {
                 
                 lastProcessedIndex = totalContent.length
               }
-            } else if (mimoChunk.type === 'usage' && mimoChunk.usage) {
-              this.usage = mimoChunk.usage
+            } else if (mimoChunk.type === 'usage') {
+              const usage = readMimoUsage(payload)
+              if (usage) this.usage = usage
             } else if (mimoChunk.type === 'dialogId' && mimoChunk.content) {
               this.dialogId = mimoChunk.content
             }
-          } catch {
-            // Skip malformed SSE data
+          } catch (error) {
+            if ((error as { errorCode?: string })?.errorCode === 'mimo_upstream_error') {
+              throw error
+            }
+            this.malformedEvents += 1
+            if (this.malformedEvents <= 3) {
+              console.warn(
+                `[Mimo] skipping malformed SSE data (${this.malformedEvents}):`,
+                dataStr.slice(0, 200),
+              )
+            }
           }
         }
       }
@@ -852,6 +949,8 @@ export class MimoStreamHandler {
     if (this.usage) {
       yield this.formatOpenAIUsageChunk(id, created, this.usage)
     }
+
+    yield 'data: [DONE]\n\n'
   }
 
   async handleNonStream(stream: NodeJS.ReadableStream): Promise<string> {
@@ -869,20 +968,39 @@ export class MimoStreamHandler {
         if (trimmed.startsWith('event:')) {
           currentEvent = trimmed.slice(6).trim()
         } else if (trimmed.startsWith('data:')) {
+          const dataStr = trimmed.slice(5).trim()
+          if (dataStr === '[DONE]') {
+            continue
+          }
           try {
-            const data = JSON.parse(trimmed.slice(5).trim())
-            const mimoChunk: MimoChunk = { type: currentEvent as any, ...data }
+            const payload = JSON.parse(dataStr) as Record<string, unknown>
+            const eventName = currentEvent || String(payload.type || '')
+            const mimoChunk: MimoChunk = { ...payload, type: eventName as MimoChunk['type'] }
+
+            if (isMimoUpstreamErrorEvent(eventName, payload)) {
+              throw buildMimoUpstreamError(payload, eventName || 'unknown')
+            }
 
             if ((mimoChunk.type === 'message' || mimoChunk.type === 'text') && mimoChunk.content) {
               const text = (mimoChunk.content ?? '').replace(/\u0000/g, '')
               this.content += text
-            } else if (mimoChunk.type === 'usage' && mimoChunk.usage) {
-              this.usage = mimoChunk.usage
+            } else if (mimoChunk.type === 'usage') {
+              const usage = readMimoUsage(payload)
+              if (usage) this.usage = usage
             } else if (mimoChunk.type === 'dialogId' && mimoChunk.content) {
               this.dialogId = mimoChunk.content
             }
-          } catch {
-            // Skip malformed SSE data
+          } catch (error) {
+            if ((error as { errorCode?: string })?.errorCode === 'mimo_upstream_error') {
+              throw error
+            }
+            this.malformedEvents += 1
+            if (this.malformedEvents <= 3) {
+              console.warn(
+                `[Mimo] skipping malformed SSE data (${this.malformedEvents}):`,
+                dataStr.slice(0, 200),
+              )
+            }
           }
         }
       }
@@ -933,6 +1051,9 @@ export class MimoStreamHandler {
             prompt_tokens: this.usage.promptTokens,
             completion_tokens: this.usage.completionTokens,
             total_tokens: this.usage.totalTokens,
+            ...(this.usage.reasoningTokens > 0
+              ? { completion_tokens_details: { reasoning_tokens: this.usage.reasoningTokens } }
+              : {}),
           }
         : undefined,
     }
@@ -1034,6 +1155,9 @@ export class MimoStreamHandler {
         prompt_tokens: usage.promptTokens,
         completion_tokens: usage.completionTokens,
         total_tokens: usage.totalTokens,
+        ...(usage.reasoningTokens > 0
+          ? { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } }
+          : {}),
       },
     }
     return `data: ${JSON.stringify(chunk)}\n\n`

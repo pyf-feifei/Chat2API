@@ -540,7 +540,17 @@ test('README Supported Providers model lists mirror current defaults with Perple
 })
 
 test('Mimo model names and conversation flow match Xiaomi AI Studio web requests', () => {
-  assert.deepEqual(mimoConfig.supportedModels, ['MiMo-V2.5-Pro', 'MiMo-V2.5', 'MiMo-V2-Flash'])
+  assert.deepEqual(mimoConfig.supportedModels, [
+    'MiMo-V2.6-Pro',
+    'MiMo-V2.6-Flash',
+    'MiMo-V2.6-Pro-Ultraspeed',
+    'MiMo-V2.5-Pro',
+    'MiMo-V2.5',
+    'MiMo-V2-Flash',
+  ])
+  assert.equal(mimoConfig.modelMappings?.['MiMo-V2.6-Pro'], 'mimo-v2.6-pro')
+  assert.equal(mimoConfig.modelMappings?.['MiMo-V2.6-Flash'], 'mimo-v2.6-flash')
+  assert.equal(mimoConfig.modelMappings?.['MiMo-V2.6-Pro-Ultraspeed'], 'mimo-v2.6-pro-ultraspeed-studio')
   assert.equal(mimoConfig.modelMappings?.['MiMo-V2.5-Pro'], 'mimo-v2.5-pro')
   assert.equal(mimoConfig.modelMappings?.['MiMo-V2.5'], 'mimo-v2.5')
   assert.equal(mimoConfig.modelMappings?.['MiMo-V2-Flash'], 'mimo-v2-flash')

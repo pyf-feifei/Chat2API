@@ -125,3 +125,30 @@ python scripts/mimo-login/login.py \
 | POST | `/v0/management/gmail/code` | body `{ email, sinceMs }`，返回最新验证码 |
 
 Maton 默认：`gateway=https://gateway.maton.ai/google-mail`，`control=https://ctrl.maton.ai`。
+
+## 图片与文件附件
+
+请求里的 `image_url`（含 `data:` base64 与 http(s) 链接）和 `file`（`file_data` base64 / `file_url`）会被上传到小米对象存储后注入 `multiMedias`：
+
+1. `POST /open-apis/resource/genUploadInfo` 取签名 URL（body 带 `fileName` + `fileContentMd5`）
+2. `PUT` 原始字节到签名 URL（必须 `Content-Type: application/octet-stream` **且** `Content-MD5: <hex>`，否则 FDS 报 `Signature Does Not Match`）
+3. `POST /open-apis/resource/parse` 轮询直到返回资源 id；`model` 参数决定解析管线，先用请求模型，失败后按 `MIMO_MEDIA_PARSE_MODELS`（默认 `mimo-v2.6-flash,mimo-v2.5`）回落——`mimo-v2.5-pro` 的图片管线是纯 OCR，无文字图片会返回 `6002 图片中未识别到文字`
+4. 等待 `MIMO_UPLOAD_SETTLE_MS`（默认 3s）让解析落盘，再带 `multiMedias` 调 `/fastchat/open-apis/bot/chat`
+
+超长上下文自动转文件：文本总量超过 `MIMO_FILE_OFFLOAD_THRESHOLD_CHARS`（默认 60000）时，把最大的若干条消息按 `chat2api-context-N.md` 上传为附件，正文替换为引用行；上传失败则回退为内联原文。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MIMO_FILE_OFFLOAD_THRESHOLD_CHARS` | `32000` | 超过则转文件附件；`0` 关闭 |
+| `MIMO_MEDIA_MAX_BYTES` | `10485760` | 单个附件上限（10MB） |
+| `MIMO_MEDIA_MAX_ITEMS` | `8` | 单次请求最多附件数 |
+| `MIMO_MEDIA_PARSE_MODELS` | `mimo-v2.6-flash,mimo-v2.5` | `resource/parse` 的回落模型链 |
+| `MIMO_UPLOAD_TIMEOUT_MS` | `120000` | 上传/解析请求超时 |
+| `MIMO_UPLOAD_SETTLE_MS` | `3000` | parse 成功后等待时间 |
+| `MIMO_REQUEST_TIMEOUT_MS` | `300000` | chat 请求超时（并随客户端取消中断） |
+
+已知限制（实测 2026-09-25）：
+
+- 上游 `query` 长度上限约在 44k–52k 字符之间（44k 通过、52k 返回 `query is too long`），因此转文件阈值默认取 32k。
+- 附件内容注入与模型有关：`mimo-v2.5-pro` 会把文件计入 prompt（2239 → 3110 tokens），`mimo-v2.6-flash` 忽略 `multiMedias`（prompt 不变，模型回答「没有附件」）。图片若在 parse 后立即提问，上游可能返回 `event:error 服务器繁忙`，此时按可重试错误处理（换账号/重试），不会判定账号故障。
+- 客户端的 `web_search` / `reasoning_effort` 会透传（`webSearchStatus` / `enableThinking`），但网页接口的联网开关未观察到生效（模型仍声明无法联网），仅 thinking 与 usage 已验证生效。

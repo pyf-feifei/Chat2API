@@ -1189,8 +1189,8 @@ export class RequestForwarder {
     {
       profileKey: 'mimo',
       matches: MimoAdapter.isMimoProvider,
-      forward: (request, account, provider, actualModel, startTime) =>
-        this.forwardMimo(request, account, provider, actualModel, startTime),
+      forward: (request, account, provider, actualModel, startTime, context) =>
+        this.forwardMimo(request, account, provider, actualModel, startTime, context),
     },
     {
       profileKey: 'perplexity',
@@ -5783,7 +5783,8 @@ export class RequestForwarder {
     account: Account,
     provider: Provider,
     actualModel: string,
-    startTime: number
+    startTime: number,
+    context: ProxyContext,
   ): Promise<ForwardResult> {
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
@@ -5793,6 +5794,8 @@ export class RequestForwarder {
         tools: transformed.tools,
       }
       const adapter = new MimoAdapter(provider, account)
+      const reasoningEffort = request.reasoning_effort ?? request.reasoningEffort
+      const enableWebSearch = request.web_search === true || Boolean(request.web_search_options)
 
       const { response, conversationId, query } = await adapter.chatCompletion({
         model: actualModel,
@@ -5800,6 +5803,10 @@ export class RequestForwarder {
         messages: transformedRequest.messages as any,
         stream: transformedRequest.stream,
         temperature: transformedRequest.temperature,
+        signal: context.signal,
+        enableThinking: reasoningEffort ? reasoningEffort !== 'none' : undefined,
+        enableWebSearch,
+        reasoningEffort: reasoningEffort ? String(reasoningEffort) : undefined,
       })
 
       const latency = Date.now() - startTime
@@ -5892,13 +5899,30 @@ export class RequestForwarder {
       }
     } catch (error) {
       const latency = Date.now() - startTime
-      console.error('[Mimo] Forward error:', error)
       const message = error instanceof Error ? error.message : 'Unknown error'
       const status = (error as { status?: number })?.status
+      const errorCode = (error as { errorCode?: string })?.errorCode
+      const explicitAccountFault = (error as { accountFault?: boolean })?.accountFault
+      const explicitRetryable = (error as { retryable?: boolean })?.retryable
+      console.error('[Mimo] Forward error:', error)
+
+      if (errorCode === 'mimo_upstream_error' || explicitAccountFault === false) {
+        return {
+          success: false,
+          error: message,
+          status: status ?? 502,
+          errorCode,
+          accountFault: false,
+          retryable: explicitRetryable ?? true,
+          latency,
+        }
+      }
+
       const isAuth =
-        status === 401 ||
-        status === 403 ||
-        /credentials expired|serviceToken|401|403/i.test(message)
+        explicitAccountFault === true
+        || status === 401
+        || status === 403
+        || /credentials expired|serviceToken|\b401\b|\b403\b/i.test(message)
       if (isAuth) {
         return {
           success: false,
@@ -5917,7 +5941,9 @@ export class RequestForwarder {
         success: false,
         error: message,
         status,
-        retryable: (error as { retryable?: boolean })?.retryable,
+        errorCode,
+        accountFault: explicitAccountFault ?? false,
+        retryable: explicitRetryable,
         latency,
       }
     }
