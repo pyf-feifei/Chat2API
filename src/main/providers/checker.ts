@@ -199,7 +199,17 @@ export class ProviderChecker {
         }
       }
       if (response.status === 401 || payload?.code === 401) {
-        return { valid: false, error: 'Mimo credentials are invalid or expired' }
+        return {
+          valid: false,
+          error:
+            'Mimo credentials expired. Log out and back in at aistudio.xiaomimimo.com, then update service_token/user_id/ph_token (serviceToken lasts ~24h).',
+        }
+      }
+      if (payload?.code !== 0 && payload?.code !== undefined) {
+        return {
+          valid: false,
+          error: `Mimo credentials rejected (code ${payload.code}). Re-import cookies from aistudio.xiaomimimo.com if this persists.`,
+        }
       }
       return {
         valid: false,

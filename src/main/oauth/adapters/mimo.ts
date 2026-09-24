@@ -105,6 +105,11 @@ export class MimoAdapter extends BaseOAuthAdapter {
     }
   }
 
+  /**
+   * Mimo's serviceToken expires in ~24h and has no official refresh endpoint.
+   * This pass-through returns the existing cookies unchanged; callers must
+   * re-import credentials (web logout + login) when auth fails.
+   */
   async refreshToken(credentials: Record<string, string>): Promise<CredentialInfo | null> {
     const serviceToken = credentials['service_token'] || credentials['serviceToken']
     const userId = credentials['user_id'] || credentials['userId']

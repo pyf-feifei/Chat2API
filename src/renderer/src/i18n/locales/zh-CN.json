@@ -376,13 +376,14 @@
     "description": "XiaomiMIMO - 小米通用智能基座 MiMo",
     "serviceToken": "Service Token",
     "serviceTokenPlaceholder": "请输入 serviceToken",
-    "serviceTokenHelp": "从浏览器 DevTools -> Application -> Cookies -> serviceToken 获取",
+    "serviceTokenHelp": "DevTools -> Application -> Cookies -> serviceToken。约 24 小时过期，请在 aistudio.xiaomimimo.com 退出重登后更新。",
     "userId": "User ID",
     "userIdPlaceholder": "请输入 userId",
     "userIdHelp": "从浏览器 DevTools -> Application -> Cookies -> userId 获取",
     "phToken": "PH Token",
     "phTokenPlaceholder": "请输入 xiaomichatbot_ph",
-    "phTokenHelp": "从浏览器 DevTools -> Application -> Cookies -> xiaomichatbot_ph 获取"
+    "phTokenHelp": "DevTools -> Application -> Cookies -> xiaomichatbot_ph。认证失败时请与另两项 Cookie 一并重新导入。",
+    "tokenExpiryNote": "serviceToken 约 24 小时过期且无法自动续期。出现 401 时请网页端退出重登，并更新全部三项 Cookie。"
   },
   "perplexity": {
     "name": "Perplexity",

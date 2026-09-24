@@ -477,7 +477,27 @@ export class MimoAdapter {
       data: requestBody,
       responseType: 'stream',
       headers: this.buildHeaders(serviceToken, userId, phToken),
+      validateStatus: () => true,
     })
+
+    if (response.status === 401 || response.status === 403) {
+      const err = new Error(
+        `Mimo credentials expired (HTTP ${response.status}). serviceToken lasts ~24h and cannot auto-refresh — log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`,
+      ) as Error & { status?: number; retryable?: boolean }
+      err.status = response.status
+      err.retryable = false
+      throw err
+    }
+
+    if (response.status >= 400) {
+      const err = new Error(`Mimo chat request failed: HTTP ${response.status}`) as Error & {
+        status?: number
+        retryable?: boolean
+      }
+      err.status = response.status
+      err.retryable = response.status >= 500 || response.status === 429
+      throw err
+    }
 
     return { response, conversationId, query }
   }

@@ -53,7 +53,8 @@ export const mimoConfig: BuiltinProviderConfig = {
       type: 'password',
       required: true,
       placeholder: 'Enter serviceToken from Cookie',
-      helpText: 'Found in browser DevTools -> Application -> Cookies -> serviceToken',
+      helpText:
+        'DevTools -> Application -> Cookies -> serviceToken. Expires ~24h; log out/in at aistudio.xiaomimimo.com to renew.',
     },
     {
       name: 'user_id',
@@ -69,7 +70,8 @@ export const mimoConfig: BuiltinProviderConfig = {
       type: 'password',
       required: true,
       placeholder: 'Enter xiaomichatbot_ph from Cookie',
-      helpText: 'Found in browser DevTools -> Application -> Cookies -> xiaomichatbot_ph',
+      helpText:
+        'DevTools -> Application -> Cookies -> xiaomichatbot_ph. Re-import with serviceToken when the account is rejected.',
     },
   ],
 }

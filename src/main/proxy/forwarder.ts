@@ -5790,11 +5790,17 @@ export class RequestForwarder {
       const latency = Date.now() - startTime
 
       if (response.status >= 400) {
-        let errorMessage = `HTTP ${response.status}`
+        const isAuth = response.status === 401 || response.status === 403
+        const errorMessage = isAuth
+          ? `Mimo credentials expired (HTTP ${response.status}). serviceToken lasts ~24h and cannot auto-refresh — log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`
+          : `HTTP ${response.status}`
         return {
           success: false,
           status: response.status,
           error: errorMessage,
+          errorCode: isAuth ? 'mimo_credentials_expired' : undefined,
+          accountFault: isAuth,
+          retryable: false,
           latency,
         }
       }
@@ -5872,9 +5878,31 @@ export class RequestForwarder {
     } catch (error) {
       const latency = Date.now() - startTime
       console.error('[Mimo] Forward error:', error)
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      const status = (error as { status?: number })?.status
+      const isAuth =
+        status === 401 ||
+        status === 403 ||
+        /credentials expired|serviceToken|401|403/i.test(message)
+      if (isAuth) {
+        return {
+          success: false,
+          status: status ?? 401,
+          error:
+            /log out\/in/i.test(message)
+              ? message
+              : `Mimo credentials expired (HTTP ${status ?? 401}). serviceToken lasts ~24h and cannot auto-refresh — log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`,
+          errorCode: 'mimo_credentials_expired',
+          accountFault: true,
+          retryable: false,
+          latency,
+        }
+      }
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: message,
+        status,
+        retryable: (error as { retryable?: boolean })?.retryable,
         latency,
       }
     }

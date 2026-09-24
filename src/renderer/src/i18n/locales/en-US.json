@@ -376,13 +376,14 @@
     "description": "XiaomiMIMO - Xiaomi General Intelligence Foundation Model",
     "serviceToken": "Service Token",
     "serviceTokenPlaceholder": "Enter serviceToken",
-    "serviceTokenHelp": "Get from browser DevTools -> Application -> Cookies -> serviceToken",
+    "serviceTokenHelp": "DevTools -> Application -> Cookies -> serviceToken. Expires ~24h; log out/in at aistudio.xiaomimimo.com to renew.",
     "userId": "User ID",
     "userIdPlaceholder": "Enter userId",
     "userIdHelp": "Get from browser DevTools -> Application -> Cookies -> userId",
     "phToken": "PH Token",
     "phTokenPlaceholder": "Enter xiaomichatbot_ph",
-    "phTokenHelp": "Get from browser DevTools -> Application -> Cookies -> xiaomichatbot_ph"
+    "phTokenHelp": "DevTools -> Application -> Cookies -> xiaomichatbot_ph. Re-import all three cookies together when auth fails.",
+    "tokenExpiryNote": "serviceToken lasts about 24 hours and cannot be auto-refreshed. On 401, log out and back in, then update all three cookies."
   },
   "perplexity": {
     "name": "Perplexity",
