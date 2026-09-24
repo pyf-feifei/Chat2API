@@ -756,6 +756,23 @@ function qwenAiBusyRetryCountFromEnv(): number {
   return value
 }
 
+/**
+ * How many distinct Webshare proxy exits may draw the content verdict
+ * (bxpunish/RGV587) before the request fail-fasts. A single proxy miss is
+ * NOT proof the payload is dead: the same 4-msg/23k body succeeds on some
+ * egress IPs and is rejected on others (observed 2026-09-24: identical
+ * shapes alternating completed / content_verdict across pool keys). Each
+ * miss cools that exit and rotates to a different key.
+ */
+function qwenAiVerdictProxyExitMaxFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX
+  const fallback = 3
+  if (raw === undefined || raw.trim() === '') return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 1) return fallback
+  return value
+}
+
 function qwenAiValidatedStreamMaxBytesFromEnv(): number {
   const fallback = 16 * 1024 * 1024
   const raw = process.env.CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES
@@ -1557,27 +1574,33 @@ export class RequestForwarder {
         || (bxpunishHeader !== undefined && bxpunishHeader !== '' && bxpunishHeader !== '0')
       // Content-verdict / exit-IP risk control: the SAME direct exit always
       // reproduces the verdict, so a same-exit busy retry or account rotation
-      // only burns the pool. Prefer the one-shot Webshare egress switch (same
-      // as capacity_limit) — the dead-code bug was fail-fast returning BEFORE
-      // that branch. Fail fast only when the proxy cannot help (disabled,
-      // already spent, aborted, or out of deadline). riskVerdictSeen is set
+      // only burns the pool. Prefer a Webshare egress switch (same as
+      // capacity_limit). One proxy miss is not a global verdict: identical
+      // payloads alternate success/failure across pool keys (2026-09-24), so
+      // allow up to N distinct proxy exits to each draw the verdict before
+      // fail-fast. Each miss cools that exit (reportWebshareProxyFailure) so
+      // the next attempt lands on a different key. riskVerdictSeen is set
       // ONLY on give-up so a successful proxy recovery never rewrites the
       // final error as a content verdict.
       //
       // Bandwidth-402 exception: a proxy attempt that died at chat creation
       // with HTTP 402 never tested the verdict on a healthy exit. Allow one
-      // extra escalation so a different pool key can retest before give-up
-      // (observed 2026-09-23: direct verdict → proxy 402 → direct verdict
-      // fail-fasted with the wrong "proxy also received the verdict" note).
+      // extra escalation beyond the exit budget so a different pool key can
+      // retest before give-up.
+      const verdictProxyExitMax = qwenAiVerdictProxyExitMaxFromEnv()
       if (directExitRiskControlled) {
-        if (getQwenAiWebshareProxy() && qwenAiEgressRecoveryState && getQwenAiWebshareRetries() >= 1) {
-          qwenAiEgressRecoveryState.webshareVerdictSeen = true
+        if (getQwenAiWebshareProxy() && qwenAiEgressRecoveryState) {
+          const verdictExits = (qwenAiEgressRecoveryState.webshareVerdictExits ?? 0) + 1
+          qwenAiEgressRecoveryState.webshareVerdictExits = verdictExits
+          if (verdictExits >= verdictProxyExitMax) {
+            qwenAiEgressRecoveryState.webshareVerdictSeen = true
+          }
         }
         const bandwidthSpentOneExtra = qwenAiEgressRecoveryState?.webshareBandwidthExhausted === true
-          && getQwenAiWebshareRetries() < 2
+          && getQwenAiWebshareRetries() < verdictProxyExitMax + 1
         const canEscalateVerdictToWebshare = isWebshareProxyEnabled()
           && !qwenAiEgressRecoveryState?.webshareVerdictSeen
-          && (getQwenAiWebshareRetries() < 1 || bandwidthSpentOneExtra)
+          && (getQwenAiWebshareRetries() < verdictProxyExitMax || bandwidthSpentOneExtra)
           && !context.signal?.aborted
           && observedAt + webshareDelayMs < qwenAiRequestDeadline
         if (!canEscalateVerdictToWebshare) {
@@ -1592,23 +1615,31 @@ export class RequestForwarder {
             webshareEnabled: isWebshareProxyEnabled(),
             webshareBandwidthExhausted: qwenAiEgressRecoveryState?.webshareBandwidthExhausted === true,
             webshareVerdictSeen: qwenAiEgressRecoveryState?.webshareVerdictSeen === true,
+            webshareVerdictExits: qwenAiEgressRecoveryState?.webshareVerdictExits ?? 0,
+            verdictProxyExitMax,
           }))
           return false
         }
-        // Fall through: the Webshare branch below schedules the one-shot exit switch.
+        // Fall through: the Webshare branch below schedules the exit switch.
       }
       if (
-        (result.errorCode === 'qwen_ai_capacity_limit' || directExitRiskControlled)
-        && isWebshareProxyEnabled()
+        isWebshareProxyEnabled()
         && (
-          getQwenAiWebshareRetries() < 1
+          (
+            result.errorCode === 'qwen_ai_capacity_limit'
+            && getQwenAiWebshareRetries() < 1
+          )
+          || (
+            directExitRiskControlled
+            && getQwenAiWebshareRetries() < verdictProxyExitMax
+          )
           // A prior proxy 402 never tested the verdict on a healthy exit:
           // allow exactly one extra escalation onto a different pool key.
           || (
             directExitRiskControlled
             && qwenAiEgressRecoveryState?.webshareBandwidthExhausted === true
             && !qwenAiEgressRecoveryState?.webshareVerdictSeen
-            && getQwenAiWebshareRetries() < 2
+            && getQwenAiWebshareRetries() < verdictProxyExitMax + 1
           )
         )
         && !context.signal?.aborted
@@ -1673,7 +1704,9 @@ export class RequestForwarder {
         // Request-scoped egress ledger: proves the switch survives the account
         // failover boundary. If this fires but no adapter-side
         // 'routing request through Webshare proxy' follows, the flag is being
-        // cleared between here and the adapter.
+        // cleared between here and the adapter. On a proxy verdict miss the
+        // prior exit is already cooled, so the next checkout lands on a
+        // different pool key (multi-exit verdict retest).
         console.warn('[QwenAI] engaging Webshare egress for this request', JSON.stringify({
           requestId: context.requestId,
           accountId: account.id,
@@ -1681,6 +1714,10 @@ export class RequestForwarder {
           useWebshareProxy: getQwenAiWebshareProxy(),
           stickyMode: isWebshareStickyActive(),
           attempt: attempt + 1,
+          ...(directExitRiskControlled ? {
+            webshareVerdictExits: qwenAiEgressRecoveryState?.webshareVerdictExits ?? 0,
+            verdictProxyExitMax: qwenAiVerdictProxyExitMaxFromEnv(),
+          } : {}),
         }))
       } else {
         qwenAiBusyRetries += 1
@@ -2263,11 +2300,13 @@ export class RequestForwarder {
     if (riskVerdictSeen) {
       lastStatus = 503
       lastErrorCode = 'qwen_ai_content_verdict'
-      const proxySawVerdict = qwenAiEgressRecoveryState?.webshareVerdictSeen === true
+      const verdictProxyExitDraws = qwenAiEgressRecoveryState?.webshareVerdictExits ?? 0
+      const proxySawVerdict = verdictProxyExitDraws > 0
+        || qwenAiEgressRecoveryState?.webshareVerdictSeen === true
         || getQwenAiWebshareProxy()
       const bandwidthBlocked = qwenAiEgressRecoveryState?.webshareBandwidthExhausted === true
       const webshareNote = proxySawVerdict
-        ? 'Webshare proxy recovery also received the verdict. '
+        ? `Webshare proxy recovery also received the verdict on ${verdictProxyExitDraws} exit(s). `
         : bandwidthBlocked
           ? 'Webshare proxy recovery hit a bandwidth limit (HTTP 402) before it could retest this verdict on a different exit. '
           : getQwenAiWebshareRetries() > 0

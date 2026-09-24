@@ -3494,7 +3494,7 @@ test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast
   }
 })
 
-test('a proxy-routed bxpunish verdict fail-fasts as content_verdict (one proxy attempt)', async () => {
+test('a proxy-routed bxpunish verdict rotates exits then fail-fasts as content_verdict', async () => {
   const reports = []
   const RequestForwarder = loadRequestForwarder({
     qwenAiRequestTimeoutMs: 600_000,
@@ -3503,14 +3503,16 @@ test('a proxy-routed bxpunish verdict fail-fasts as content_verdict (one proxy a
     reportWebshareFailure: () => reports.push('failure'),
   })
   const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  const previousExitMax = process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX
   process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX = '3'
   try {
     const forwarder = new RequestForwarder()
     const attempts = []
     forwarder.delay = async () => true
     forwarder.doForward = async (...args) => {
       attempts.push(args.at(-1))
-      // Both exits draw the same verdict: escalate once, then give up.
+      // Every exit draws the same verdict: direct + 3 proxy draws, then stop.
       return {
         success: false,
         status: 503,
@@ -3536,10 +3538,68 @@ test('a proxy-routed bxpunish verdict fail-fasts as content_verdict (one proxy a
     assert.equal(result.retryable, false, 'a content verdict must not invite further client retries')
     assert.equal(result.retryScope, undefined, 'a content verdict must not rotate accounts')
     assert.match(result.error, /risk-control verdict/i)
-    assert.match(result.error, /Webshare proxy recovery also received the verdict/i)
-    assert.equal(attempts.length, 2, 'exactly one direct miss then one proxy miss, then stop')
-    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
-    assert.deepEqual(reports, ['failure'], 'the proxy miss must cool the pool entry')
+    assert.match(result.error, /also received the verdict/i)
+    assert.match(result.error, /on 3 exit/i, 'the give-up note reports how many proxy exits drew the verdict')
+    assert.equal(attempts.length, 4, 'direct miss then three proxy exits before give-up')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true, true, true])
+    assert.deepEqual(reports, ['failure', 'failure', 'failure'], 'each proxy miss must cool its pool entry')
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+    if (previousExitMax === undefined) delete process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX
+    else process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX = previousExitMax
+  }
+})
+
+test('a proxy verdict on the first exit retries a second exit and recovers', async () => {
+  const reports = []
+  const engagements = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    engageSticky: reason => engagements.push(reason),
+    reportWebshareSuccess: () => reports.push('success'),
+    reportWebshareFailure: () => reports.push('failure'),
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      attempts.push(args.at(-1))
+      // direct verdict → first proxy exit verdict → second proxy exit OK.
+      // A single proxy miss must not fail-fast: identical payloads succeed
+      // on other pool keys (2026-09-24 live observation).
+      if (attempts.length <= 2) {
+        return {
+          success: false,
+          status: 503,
+          headers: { bxpunish: '1' },
+          error: 'Qwen AI upstream is busy',
+          errorCode: 'qwen_ai_upstream_busy',
+          retryable: true,
+          accountFault: false,
+        }
+      }
+      return { success: true, status: 200, body: { choices: [] } }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true, 'the second proxy exit must clear the request')
+    assert.equal(result.errorCode, undefined)
+    assert.equal(attempts.length, 3, 'direct miss, first proxy miss, second proxy success')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true, true])
+    assert.deepEqual(reports, ['failure', 'success'], 'the first proxy miss cools its exit before the rotation')
+    assert.equal(engagements.length, 1, 'proxy recovery success must engage sticky mode')
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
@@ -3662,7 +3722,11 @@ test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwid
     webshareEnabled: true,
   })
   const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  const previousExitMax = process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX
   process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  // Pin the multi-exit budget to 1 so the bandwidth+verdict give-up path is
+  // exercised without waiting for two more healthy-key verdict draws.
+  process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX = '1'
   try {
     const forwarder = new RequestForwarder()
     const attempts = []
@@ -3671,7 +3735,7 @@ test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwid
       const options = args.at(-1)
       attempts.push(options)
       // Direct verdict → proxy 402 → direct verdict → second proxy also
-      // draws the verdict (webshareVerdictSeen). Give up with an honest note.
+      // draws the verdict (exit budget spent). Give up with an honest note.
       if (attempts.length === 2) {
         return {
           success: false,
@@ -3711,9 +3775,12 @@ test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwid
       [false, true, false, true],
     )
     assert.match(result.error, /also received the verdict/i, 'the second proxy draw is a real verdict')
+    assert.match(result.error, /on 1 exit/i, 'the give-up note reports the single tested proxy exit')
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+    if (previousExitMax === undefined) delete process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX
+    else process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX = previousExitMax
   }
 })
 

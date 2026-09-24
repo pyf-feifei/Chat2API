@@ -327,8 +327,14 @@ export interface QwenAiEgressRecoveryState {
    * one extra proxy recovery may still switch to a healthy key.
    */
   webshareBandwidthExhausted?: boolean
-  /** A Webshare-routed attempt itself received the bxpunish/RGV587 verdict. */
+  /**
+   * A Webshare-routed attempt itself received the bxpunish/RGV587 verdict.
+   * Set only when the multi-exit budget is spent — not on the first proxy
+   * miss, so later healthy exits can still retest the same payload.
+   */
   webshareVerdictSeen?: boolean
+  /** Distinct proxy-routed draws that returned the content verdict. */
+  webshareVerdictExits?: number
 }
 
 export interface ProxyContext {
