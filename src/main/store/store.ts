@@ -825,9 +825,17 @@ class StoreManager {
 
         const current = this.getProviderById(provider.id)
         if (!current) return
+        const builtin = BUILTIN_PROVIDERS.find(item => item.id === provider.id)
+        const supportedModels = [...new Set([
+          ...(builtin?.supportedModels || []),
+          ...result.supportedModels,
+        ])]
         this.updateProvider(provider.id, {
-          supportedModels: [...result.supportedModels],
-          modelMappings: { ...result.modelMappings },
+          supportedModels,
+          modelMappings: {
+            ...(builtin?.modelMappings || {}),
+            ...result.modelMappings,
+          },
           modelCapabilities: mergeProviderModelCapabilities(
             current.modelCapabilities,
             result.modelCapabilities,
@@ -836,6 +844,7 @@ class StoreManager {
         console.info('[Store] Dynamic model catalogue synchronized', JSON.stringify({
           providerId: provider.id,
           modelsCount: result.supportedModels.length,
+          totalModels: supportedModels.length,
         }))
       } catch (error) {
         console.warn('[Store] Dynamic model catalogue sync failed; keeping persisted models', JSON.stringify({
