@@ -217,3 +217,33 @@ test('parse POST in-place retry stays abortable by the client', async () => {
   assert.equal(error.status, 499)
   assert.equal(parseCalls(calls).length, 1, 'abort must cut the retry loop before the next parse call')
 })
+
+test('waitForParse re-POSTs parse to kick a stuck running status', async () => {
+  process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS = '5'
+  process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS = '80'
+  process.env.QWEN_AI_FILE_PARSE_KICK_INTERVAL_MS = '1'
+  process.env.QWEN_AI_FILE_PARSE_KICK_MAX = '2'
+  try {
+    const { uploader, calls } = createUploader(async url => {
+      if (url === PARSE_URL) return { status: 200, data: { success: true } }
+      assert.equal(url, PARSE_STATUS_URL)
+      return { status: 200, data: { data: { [FILE_ID]: { status: 'running' } } } }
+    })
+
+    const error = await uploader.waitForParse(FILE_ID).then(
+      () => null,
+      err => err,
+    )
+
+    assert.ok(error, 'a permanently running parse must still time out')
+    assert.equal(error.code, 'qwen_ai_file_parse_timeout')
+    const kicks = parseCalls(calls).length
+    assert.ok(kicks >= 2, `expected re-POST kicks while status stayed running, got ${kicks}`)
+    assert.ok(kicks <= 3, `kick max must bound re-POSTs, got ${kicks}`)
+  } finally {
+    delete process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS
+    delete process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS
+    delete process.env.QWEN_AI_FILE_PARSE_KICK_INTERVAL_MS
+    delete process.env.QWEN_AI_FILE_PARSE_KICK_MAX
+  }
+})

@@ -50,6 +50,19 @@ test('recovery still honors account cooldowns', () => {
   }), 301_000)
 })
 
+test('a readyAt beyond the queue budget is not a valid queue wait', () => {
+  // Governor fail-fast contract: when readyAt - now exceeds the queue
+  // timeout the request must surface next-account immediately instead of
+  // parking until queue_timeout (activeRequests:0 dead-wait).
+  const cooldownReadyAt = calculateQwenAiRequestReadyAt({
+    ...baseInput,
+    accountCooldownUntil: 601_000,
+    recoveryBypassAccountInterval: true,
+  })
+  assert.equal(cooldownReadyAt, 601_000)
+  assert.ok(cooldownReadyAt - 1_000 > 120_000, '600s cooldown exceeds the 120s queue budget')
+})
+
 test('an active account remains unavailable until its stream is released', () => {
   assert.equal(calculateQwenAiRequestReadyAt({
     ...baseInput,

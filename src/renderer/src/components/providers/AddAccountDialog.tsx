@@ -271,9 +271,11 @@ export function AddAccountDialog({
   const oauthRefreshCredentialFields = provider && ['qwen-ai', 'zai'].includes(provider.id)
     ? credentialFields.filter(field => ['email', 'password'].includes(field.name))
     : []
-  const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
   const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi', 'zai'].includes(provider.id)
+  // Docker web admin has no in-app login window; only keep the OAuth tab when a
+  // browser-import flow can actually complete the login there.
+  const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id) && (!isDockerWebAdmin || !!supportsBrowserImport)
   const supportsM365OAuth = !!provider && provider.id === 'm365-copilot' && !isEditing && (isDockerWebAdmin || !!window.electronAPI?.m365OAuth)
   const [m365AccountType, setM365AccountType] = useState<'personal' | 'work'>('personal')
   const [m365DeviceSession, setM365DeviceSession] = useState<{

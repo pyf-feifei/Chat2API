@@ -212,11 +212,27 @@ test('content stop rule caps content-determined 422 rotations', () => {
   assert.equal(isQwenAiContentDeterminedFailure({ ...content(), accountFault: undefined }), false)
   assert.equal(isQwenAiContentDeterminedFailure(content('qwen_ai_wrapper_leak')), true)
 
-  // 'off' disables; invalid values fall back to the default 0
+  // 'off' disables content-422 rotations; the content-verdict rule stays
+  // active (default -1 = stop on first hit) unless its own env is off.
+  // Invalid content-rotation values fall back to the default 0.
+  process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX = 'off'
+  process.env.CHAT2API_QWEN_AI_CONTENT_VERDICT_ROTATION_MAX = 'off'
+  try {
+    assert.equal(createQwenAiContentFailoverStopRule(), undefined, 'both rules off yields no stop rule')
+  } finally {
+    delete process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX
+    delete process.env.CHAT2API_QWEN_AI_CONTENT_VERDICT_ROTATION_MAX
+  }
   process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX = 'off'
   try {
-    assert.equal(createQwenAiContentFailoverStopRule(), undefined)
-    process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX = 'bogus'
+    const offRule = createQwenAiContentFailoverStopRule()
+    assert.ok(offRule, 'verdict rule remains when only content-422 max is off')
+    assert.equal(offRule(content(), [content(), content()]), false, 'off disables content-422 rotations')
+  } finally {
+    delete process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX
+  }
+  process.env.CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX = 'bogus'
+  try {
     const fallback = createQwenAiContentFailoverStopRule()
     assert.ok(fallback)
     assert.equal(fallback(content(), [content(), content()]), true, 'invalid env falls back to cap 0')
@@ -349,7 +365,7 @@ test('retry nonce scope: always perturbs attempt 1, retry preserves cache path, 
   assert.equal(qwenAiRetryNonceScopeFromEnv(), 'off')
 
   delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
-  assert.equal(qwenAiRetryNonceScopeFromEnv(), 'retry', 'default scope unchanged')
+  assert.equal(qwenAiRetryNonceScopeFromEnv(), 'always', 'default scope is always (reconnect fingerprint immunity)')
 })
 
 test('capacity_limit (429 quota_limit) classifies as busy-family for the webshare recovery lever', async (t) => {

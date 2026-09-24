@@ -225,6 +225,9 @@ function loadChatRoute({
       },
     },
     '../../store/store': { storeManager },
+    '../../store/types': {
+      isQwenAiStickySessionMode: mode => mode === 'sticky',
+    },
     '../utils/toolFormatConverter': {
       isAnthropicToolFormat: () => false,
       transformResponseToAnthropic: value => value,
@@ -237,7 +240,7 @@ function loadChatRoute({
     '../utils/sseKeepAlive': { SseKeepAliveStream: MockSseKeepAliveStream },
     '../requestIntent': {
       classifyChatRequest: () => ({
-        intent: 'context_compaction',
+        intent: 'normal',
         reason: 'test',
         messageCount: 2,
         toolCount: 0,

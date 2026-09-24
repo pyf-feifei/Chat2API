@@ -347,6 +347,42 @@ export class QwenAiRequestGovernor {
           resolve(this.createAdmissionDeferredResult(waitMs, requestClass))
           return
         }
+      } else {
+        // A readyAt beyond the queue budget can never admit in time — a
+        // 600s risk cooldown (or a recovery pinned behind one) used to sit
+        // for the full 120s queue timeout with activeRequests:0 before
+        // failing. Surface the wait immediately as next-account failover.
+        const readyAt = calculateQwenAiRequestReadyAt({
+          lastGlobalStartAt: this.lastGlobalStartAt,
+          globalMinIntervalMs: this.getEffectiveConfig().globalMinIntervalMs,
+          recoveryBypassGlobalInterval: options.recoveryBypassGlobalInterval === true,
+          accountNextAvailableAt: this.accountNextAvailableAt.get(accountId) || 0,
+          accountCooldownUntil: this.accountCooldowns.get(accountId)?.until || 0,
+          recoveryBypassAccountInterval: options.recoveryBypassAccountInterval === true,
+          accountActive: (this.activeByAccount.get(accountId) || 0) > 0,
+        })
+        if (
+          readyAt !== Number.POSITIVE_INFINITY
+          && readyAt - now > QWEN_AI_QUEUE_TIMEOUT_MS
+        ) {
+          if (options.requestId) {
+            this.logLifecycle(
+              {
+                id: 'account-not-ready',
+                accountId,
+                enqueuedAt: now,
+                requestClass,
+                requestId: options.requestId,
+                attempt: options.attempt ?? 1,
+                queueDepthAtEnqueue: this.queue.length,
+              } as QueueItem,
+              'queue_timeout',
+              { queueWaitMs: 0, activeRequests: this.active, accountWaitMs: readyAt - now },
+            )
+          }
+          resolve(this.createAccountNotReadyResult(readyAt - now, requestClass))
+          return
+        }
       }
 
       const item: QueueItem = {
@@ -466,6 +502,27 @@ export class QwenAiRequestGovernor {
       // No upstream generation was started. A normal client request can be
       // routed to another account; internal compaction keeps its pipeline
       // failure local so it does not churn the whole account pool.
+      ...(requestClass === 'normal' ? { retryScope: 'next-account' as const } : {}),
+    }
+  }
+
+  /**
+   * The account cannot become ready within the queue budget (risk/failure
+   * cooldown, or a recovery pinned behind one). Fail over immediately instead
+   * of parking the request until queue_timeout.
+   */
+  private createAccountNotReadyResult(waitMs: number, requestClass: QwenAiRequestClass): ForwardResult {
+    const retryAfterSeconds = Math.max(1, Math.ceil(waitMs / 1000))
+    return {
+      success: false,
+      status: 429,
+      headers: {
+        'Retry-After': String(retryAfterSeconds),
+      },
+      error: `Qwen AI account is not ready for another ${retryAfterSeconds}s (cooldown or pacing).`,
+      errorCode: 'qwen_ai_queue_timeout',
+      retryable: true,
+      accountFault: false,
       ...(requestClass === 'normal' ? { retryScope: 'next-account' as const } : {}),
     }
   }

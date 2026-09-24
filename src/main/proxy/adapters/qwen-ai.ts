@@ -267,6 +267,12 @@ type StreamHandlingOptions = {
   allowReasoningOnlyOutput?: boolean
   /** Emit accepted reasoning-only text as assistant content for summary turns. */
   reasoningOnlyAsContent?: boolean
+  /**
+   * Context compaction: strip leaked tool-result wrappers without failing
+   * the branch (the model is summarizing history that legitimately contains
+   * those envelopes).
+   */
+  stripWrapperLeaks?: boolean
   onFailure?: (error: Error) => void
   recoverFromIdle?: QwenAiRecoveryCallback
   recoverFromSemanticEmpty?: QwenAiRecoveryCallback
@@ -5563,6 +5569,7 @@ export class QwenAiStreamHandler {
   private summaryToolResultGuard: ManagedToolResultGuard
   private wrapperLeakDetected = false
   private wrapperLeakLogged = false
+  private stripWrapperLeaks = false
   private pendingSemanticRecoveryError?: QwenAiUpstreamError
   private readonly promptTokens: number
 
@@ -5571,6 +5578,7 @@ export class QwenAiStreamHandler {
     onEnd?: (chatId: string) => void,
     toolCallingPlan?: ToolCallingPlan,
     promptTokens = 1,
+    options: { stripWrapperLeaks?: boolean } = {},
   ) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
@@ -5579,10 +5587,11 @@ export class QwenAiStreamHandler {
     this.promptTokens = Number.isSafeInteger(promptTokens) && promptTokens > 0
       ? promptTokens
       : 1
+    this.stripWrapperLeaks = options.stripWrapperLeaks === true
     this.toolCallIdPrefix = `call_${uuid().replace(/-/g, '')}`
     this.answerToolResultGuard = this.createAnswerToolResultGuard()
-    this.reasoningToolResultGuard = new ManagedToolResultGuard(null)
-    this.summaryToolResultGuard = new ManagedToolResultGuard(null)
+    this.reasoningToolResultGuard = this.createReasoningToolResultGuard()
+    this.summaryToolResultGuard = this.createSummaryToolResultGuard()
     this.resetToolStreamParser()
   }
 
@@ -5642,13 +5651,22 @@ export class QwenAiStreamHandler {
       this.toolCallingPlan?.shouldParseResponse
         ? this.toolCallingPlan.protocol
         : null,
+      { stripOnly: this.stripWrapperLeaks },
     )
+  }
+
+  private createReasoningToolResultGuard(): ManagedToolResultGuard {
+    return new ManagedToolResultGuard(null, { stripOnly: this.stripWrapperLeaks })
+  }
+
+  private createSummaryToolResultGuard(): ManagedToolResultGuard {
+    return new ManagedToolResultGuard(null, { stripOnly: this.stripWrapperLeaks })
   }
 
   private resetToolResultGuards(): void {
     this.answerToolResultGuard = this.createAnswerToolResultGuard()
-    this.reasoningToolResultGuard = new ManagedToolResultGuard(null)
-    this.summaryToolResultGuard = new ManagedToolResultGuard(null)
+    this.reasoningToolResultGuard = this.createReasoningToolResultGuard()
+    this.summaryToolResultGuard = this.createSummaryToolResultGuard()
     this.wrapperLeakDetected = false
     this.wrapperLeakLogged = false
   }
@@ -5689,13 +5707,15 @@ export class QwenAiStreamHandler {
     // A cumulative snapshot may be rewritten rather than appended. Inspect
     // the complete replacement before changing the incremental baseline so a
     // rewritten prefix cannot hide the beginning of a reserved wrapper.
-    const inspected = stripManagedToolResultWrappers(snapshot, null)
+    const inspected = stripManagedToolResultWrappers(snapshot, null, {
+      stripOnly: this.stripWrapperLeaks,
+    })
     if (inspected.wrapperLeakDetected) {
       this.markWrapperLeakDetected('summary')
       return { sourceText: snapshot, content: '' }
     }
 
-    this.summaryToolResultGuard = new ManagedToolResultGuard(null)
+    this.summaryToolResultGuard = this.createSummaryToolResultGuard()
     return {
       sourceText: snapshot,
       content: '',
@@ -5712,6 +5732,7 @@ export class QwenAiStreamHandler {
   }
 
   private currentBranchHasWrapperLeak(): boolean {
+    if (this.stripWrapperLeaks) return false
     return this.wrapperLeakDetected
       || this.answerToolResultGuard.hasDetectedWrapperLeak()
       || this.reasoningToolResultGuard.hasDetectedWrapperLeak()
@@ -5719,6 +5740,20 @@ export class QwenAiStreamHandler {
   }
 
   private markWrapperLeakDetected(channel: 'answer' | 'reasoning' | 'summary'): void {
+    if (this.stripWrapperLeaks) {
+      if (this.wrapperLeakLogged) return
+      this.wrapperLeakLogged = true
+      console.info('[ToolCalling] Stripped leaked managed tool-result wrapper without failing the branch', JSON.stringify({
+        stripOnly: true,
+        providerId: this.toolCallingPlan?.diagnostics.providerId || 'qwen-ai',
+        model: this.toolCallingPlan?.diagnostics.actualModel
+          || this.toolCallingPlan?.diagnostics.model
+          || this.model,
+        protocol: this.toolCallingPlan?.protocol,
+        channel,
+      }))
+      return
+    }
     this.wrapperLeakDetected = true
     if (this.toolCallingPlan) {
       this.toolCallingPlan = {
@@ -6234,6 +6269,10 @@ export class QwenAiStreamHandler {
   }
 
   async handleStream(stream: any, options: StreamHandlingOptions = {}): Promise<QwenAiOutputStream> {
+    if (options.stripWrapperLeaks === true && !this.stripWrapperLeaks) {
+      this.stripWrapperLeaks = true
+      this.resetToolResultGuards()
+    }
     const transStream: QwenAiOutputStream = new PassThrough()
 
     if (QWEN_AI_DEBUG_STREAM_LOGS) {
@@ -7601,6 +7640,10 @@ export class QwenAiStreamHandler {
   }
 
   async handleNonStream(stream: any, options: StreamHandlingOptions = {}): Promise<any> {
+    if (options.stripWrapperLeaks === true && !this.stripWrapperLeaks) {
+      this.stripWrapperLeaks = true
+      this.resetToolResultGuards()
+    }
     return new Promise((resolve, reject) => {
       const data = {
         id: '',

@@ -247,7 +247,7 @@ services:
       # A parse-stage timeout is account-neutral and may continue on another
       # account while the cumulative request deadline still has budget.
       QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS: ${QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS:-2000}
-      QWEN_AI_FILE_PARSE_TIMEOUT_MS: ${QWEN_AI_FILE_PARSE_TIMEOUT_MS:-120000}
+      QWEN_AI_FILE_PARSE_TIMEOUT_MS: ${QWEN_AI_FILE_PARSE_TIMEOUT_MS:-180000}
       # Emit protocol-neutral SSE comments while a downstream stream is quiet.
       # Zero disables keep-alives for deployments that manage them elsewhere.
       CHAT2API_SSE_KEEPALIVE_INTERVAL_MS: ${CHAT2API_SSE_KEEPALIVE_INTERVAL_MS:-15000}

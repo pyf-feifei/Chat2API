@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   Account,
   AppConfig,
   EffectiveModel,
@@ -522,6 +522,33 @@ ${buildBrowserImportFallbackBlock()}
 })();`
 }
 
+function buildMimoImportScript(session: BrowserImportSession): string {
+  const completeUrl = `${window.location.origin}${MANAGEMENT_BASE}/browser-import/complete`
+  return `(() => {
+  const importId = ${JSON.stringify(session.id)};
+  const providerId = 'mimo';
+  const completeUrl = ${JSON.stringify(completeUrl)};
+  const readCookie = (name) => {
+    const prefix = name + '=';
+    const entry = (document.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix));
+    if (!entry) return '';
+    let value = entry.slice(prefix.length);
+    try { value = decodeURIComponent(value); } catch (readError) {}
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+    return value;
+  };
+  const serviceToken = readCookie('xiaomichatbot_serviceToken') || readCookie('serviceToken');
+  const userId = readCookie('userId') || readCookie('cUserId');
+  const phToken = readCookie('xiaomichatbot_ph');
+  const payload = {
+    importId,
+    providerId,
+    credentials: { service_token: serviceToken, user_id: userId, ph_token: phToken },
+    error: serviceToken && userId && phToken ? '' : 'MiMo cookies were not readable from document.cookie (they may be HttpOnly). Copy serviceToken/userId/xiaomichatbot_ph from DevTools into Manual Input instead.',
+  };
+  ${buildBrowserImportFallbackBlock()}
+})();`
+}
 function buildBrowserImportScript(session: BrowserImportSession): string {
   if (session.providerId === 'qwen-ai') {
     return buildQwenAiImportScript(session)
@@ -535,7 +562,10 @@ function buildBrowserImportScript(session: BrowserImportSession): string {
   if (session.providerId === 'zai') {
     return buildZaiImportScript(session)
   }
-  throw new Error('Browser-assisted import is only available for Qwen, Kimi and Z.ai providers in Docker.')
+  if (session.providerId === 'mimo') {
+    return buildMimoImportScript(session)
+  }
+  throw new Error('Browser-assisted import is only available for Qwen, Kimi, Z.ai and Mimo providers in Docker.')
 }
 
 const defaultUpdateStatus = {

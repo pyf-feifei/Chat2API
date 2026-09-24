@@ -38,6 +38,8 @@ const WEBSHARE_ENTRY_COOLDOWN_BASE_MS = 60_000
 const WEBSHARE_ENTRY_COOLDOWN_MAX_MS = 30 * 60_000
 /** Doubling backoff per consecutive failure, capped. */
 const WEBSHARE_ENTRY_COOLDOWN_BACKOFF_FACTOR = 2
+/** Quota verdicts (HTTP 402) reset on hour-scale windows; the short transport backoff rediscovers drained keys. */
+const WEBSHARE_KEY_BANDWIDTH_COOLDOWN_MS = 60 * 60_000
 
 /**
  * Sticky mode (mode B): once a recovery retry proves the direct exit IP
@@ -259,6 +261,12 @@ function coolEntryForFailure(entry: PoolEntryState): void {
   entry.cooldownUntil = Date.now() + backoff
 }
 
+/** Bandwidth verdicts cool for the quota window, not the transport backoff. */
+function coolEntryForBandwidth(entry: PoolEntryState): void {
+  entry.failureCount += 1
+  entry.cooldownUntil = Date.now() + WEBSHARE_KEY_BANDWIDTH_COOLDOWN_MS
+}
+
 /**
  * Record a failure for the entry matching `proxyUrl` (or the last one
  * handed out): doubling cooldown so a bad exit stops receiving
@@ -288,7 +296,7 @@ export function reportWebshareKeyBandwidthExhausted(proxyUrl?: string): void {
   const keyExits = entry.sourceKeyId
     ? poolEntries.filter(candidate => candidate.sourceKeyId === entry.sourceKeyId)
     : [entry]
-  for (const exit of keyExits) coolEntryForFailure(exit)
+  for (const exit of keyExits) coolEntryForBandwidth(exit)
   console.warn('[WebshareProxy] bandwidth 402 — cooled every exit of the drained key', JSON.stringify({
     sourceKeyId: entry.sourceKeyId ?? '(unkeyed exit)',
     cooledExits: keyExits.length,

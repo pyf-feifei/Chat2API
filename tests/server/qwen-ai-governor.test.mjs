@@ -46,6 +46,7 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
     input.recoveryBypassAccountInterval ? 0 : input.accountNextAvailableAt,
     input.accountCooldownUntil,
   )
+  // Expose for source-regex pins that assert the real policy module is used.
   const calculateQwenAiAdaptiveLimits = input => ({
     maxConcurrent: input.configuredMaxConcurrent,
     globalMinIntervalMs: input.configuredGlobalMinIntervalMs,
@@ -166,6 +167,8 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(forwarderSource, /const useRecoveryBypass = attempt > 0/)
   assert.match(forwarderSource, /qwenAiRecoveryBypassAccountInterval: useRecoveryBypass/)
   assert.match(forwarderSource, /recoveryBypassAccountInterval: options\.qwenAiRecoveryBypassAccountInterval/)
+  assert.match(forwarderSource, /recoveryBypassGlobalInterval: options\.qwenAiRecoveryBypassAccountInterval === true/)
+  assert.match(forwarderSource, /webshareBandwidthExhausted\) \{\s*\n\s*setQwenAiDirectRetryUsed\(false\)/)
   assert.match(qwenAiForwarderSource, /const retryable = status === 499[\s\S]*status === 504[\s\S]*\? false/)
   assert.match(forwarderSource, /lastHeaders = result\.headers/)
   assert.match(forwarderSource, /headers: lastHeaders/)
@@ -196,6 +199,8 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(governorSource, /parseQwenAiRetryAfterMs/)
   assert.match(governorSource, /http_429_retry_after_/)
   assert.match(governorSource, /createQueueTimeoutResult/)
+  assert.match(governorSource, /createAccountNotReadyResult/)
+  assert.match(governorSource, /readyAt - now > QWEN_AI_QUEUE_TIMEOUT_MS/)
   assert.match(governorSource, /status: 429/)
   assert.match(governorSource, /'Retry-After'/)
   assert.match(governorSource, /retryable: true/)
@@ -597,6 +602,43 @@ test('Qwen AI recovery pacing bypass still respects capacity cooldowns', { timeo
   assert.equal(recovery.success, false)
   assert.equal(recoveryStarted, false)
   assert.equal(governor.isAccountImmediatelyAvailable('account-1'), false)
+})
+
+test('Qwen AI fails over immediately when a cooldown exceeds the queue budget', { timeout: 5_000 }, async () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    failureCooldownMs: 600_000,
+    maxRiskCooldownMs: 600_000,
+  })
+  const governor = new Governor()
+
+  const first = await governor.run('account-1', async () => ({
+    success: false,
+    status: 429,
+    error: 'Qwen AI upstream capacity limit',
+    errorCode: 'qwen_ai_capacity_limit',
+    retryable: true,
+    accountFault: true,
+    retryScope: 'next-account',
+  }))
+  assert.equal(first.errorCode, 'qwen_ai_capacity_limit')
+
+  let recoveryStarted = false
+  const startedAt = Date.now()
+  const recovery = await governor.run('account-1', async () => {
+    recoveryStarted = true
+    return { success: true, status: 200, body: {} }
+  }, {
+    recoveryBypassAccountInterval: true,
+    requestId: 'recovery-cooldown',
+    attempt: 2,
+  })
+  const elapsed = Date.now() - startedAt
+
+  assert.equal(recovery.success, false)
+  assert.equal(recoveryStarted, false, 'must not enter the run callback while cooling')
+  assert.equal(recovery.errorCode, 'qwen_ai_queue_timeout')
+  assert.equal(recovery.retryScope, 'next-account')
+  assert.ok(elapsed < 500, `account-not-ready must fail fast, not queue: ${elapsed}ms`)
 })
 
 test('Qwen AI managed-tool recovery is not blocked by the provider failure cooldown', async () => {

@@ -348,6 +348,10 @@ function loadResponsesRoute(createResult, options = {}) {
     },
     '../qwenAiSessionBridge': {
       createQwenAiSessionRequestFingerprint: () => 'qwen-responses-test-fingerprint',
+      createQwenAiTranscriptHash: () => 'transcript-hash',
+      createQwenAiDeltaHash: () => 'delta-hash',
+      createQwenAiChainKey: () => 'chain-key',
+      qwenAiStickyChainHeadFromEnv: () => 0,
       resolveQwenAiSessionBinding: state => state ? {
         providerId: state.providerId,
         accountId: state.accountId,
@@ -357,6 +361,21 @@ function loadResponsesRoute(createResult, options = {}) {
         parentId: state.getParentId(),
         requestFingerprint: state.requestFingerprint,
       } : undefined,
+      isQwenAiPoisonedChatErrorCode: () => false,
+    },
+    '../../store/types': {
+      isQwenAiStickySessionMode: () => false,
+    },
+    '../qwenAiStickyRegistry': {
+      qwenAiStickyRegistry: {
+        register: () => {},
+        release: () => {},
+        countForAccount: () => 0,
+        touch: () => false,
+        acquire: () => () => {},
+        update: () => {},
+        get: () => undefined,
+      },
     },
     '../qwenAiToolCallSessionStore': {
       getTrailingQwenAiToolResultBatch: () => undefined,

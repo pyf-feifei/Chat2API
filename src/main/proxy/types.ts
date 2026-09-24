@@ -321,6 +321,14 @@ export interface QwenAiEgressRecoveryState {
   useWebshareProxy: boolean
   /** One-shot direct-exit retry granted after a proxy transport failure. */
   directRetryAfterProxyFailureUsed?: boolean
+  /**
+   * A Webshare-routed attempt hit HTTP 402 bandwidth exhaustion (pool key
+   * drained) — not a content verdict. The exit never tested the verdict, so
+   * one extra proxy recovery may still switch to a healthy key.
+   */
+  webshareBandwidthExhausted?: boolean
+  /** A Webshare-routed attempt itself received the bxpunish/RGV587 verdict. */
+  webshareVerdictSeen?: boolean
 }
 
 export interface ProxyContext {

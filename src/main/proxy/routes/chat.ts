@@ -1254,7 +1254,9 @@ router.post('/completions', async (ctx: Context) => {
         // Built-in adapters already emit OpenAI-compatible SSE. Enforce the
         // reserved assistant-output boundary once more at the route edge so
         // every provider and visible text channel receives the same policy.
-        const guardedStream = createAssistantOutputBoundaryStream()
+        const guardedStream = createAssistantOutputBoundaryStream(undefined, {
+          stripOnly: requestIntent.intent === 'context_compaction',
+        })
         sourceStream.once('error', (error: Error) => guardedStream.destroy(error))
         guardedStream.once('error', (error: Error) => {
           if (!sourceStream.destroyed) sourceStream.destroy()
@@ -1293,7 +1295,9 @@ router.post('/completions', async (ctx: Context) => {
             storeManager.addLog('debug', `Stream response completed`, { requestId })
           }
         )
-        const guardedStream = createAssistantOutputBoundaryStream()
+        const guardedStream = createAssistantOutputBoundaryStream(undefined, {
+          stripOnly: requestIntent.intent === 'context_compaction',
+        })
         sourceStream.once('error', (error: Error) => transformStream.destroy(error))
         transformStream.once('error', (error: Error) => guardedStream.destroy(error))
         guardedStream.once('error', (error: Error) => {
@@ -1336,7 +1340,9 @@ router.post('/completions', async (ctx: Context) => {
 
       if (result.body) {
         const body = result.body as ChatCompletionResponse
-        const sanitizedBody = guardAssistantOutputCompletion(body)
+        const sanitizedBody = guardAssistantOutputCompletion(body, null, {
+          stripOnly: requestIntent.intent === 'context_compaction',
+        })
         // Check if we need to transform to Anthropic format
         if (isAnthropicToolFormat(request.tool_format)) {
           ctx.body = transformResponseToAnthropic(sanitizedBody)

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Mimo Adapter
  * Implements Mimo (Xiaomi AI Studio) API protocol
  */
@@ -315,6 +315,14 @@ export function buildMimoQuery(messages: MimoMessage[]): string {
   return entries.map((entry) => `${entry.role}: ${entry.content}`).join('\n\n')
 }
 
+function stripSurroundingQuotes(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
 export class MimoAdapter {
   private provider: Provider
   private account: Account
@@ -327,9 +335,9 @@ export class MimoAdapter {
   private getCredentials(): { serviceToken: string; userId: string; phToken: string } {
     const credentials = this.account.credentials
     return {
-      serviceToken: credentials.service_token || '',
-      userId: credentials.user_id || '',
-      phToken: credentials.ph_token || '',
+      serviceToken: stripSurroundingQuotes(credentials.service_token || ''),
+      userId: stripSurroundingQuotes(credentials.user_id || ''),
+      phToken: stripSurroundingQuotes(credentials.ph_token || ''),
     }
   }
 
@@ -431,7 +439,16 @@ export class MimoAdapter {
     const conversationId = uuid(false)
     const msgId = uuid(false).slice(0, 32)
     const query = buildMimoQuery(request.messages)
-    await this.saveConversation(conversationId)
+    try {
+      await this.saveConversation(conversationId)
+    } catch (error) {
+      // Save is bookkeeping only: a 401/auth skew must not block chat when
+      // the subsequent chat completion call still works with the same cookies.
+      console.warn(
+        '[Mimo] Failed to save conversation (continuing chat):',
+        error instanceof Error ? error.message : error,
+      )
+    }
 
     const modelLower = request.model.toLowerCase()
     let enableThinking = false

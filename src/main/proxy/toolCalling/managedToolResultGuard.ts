@@ -141,6 +141,15 @@ export interface ManagedToolResultGuardOutput {
   suppressed: boolean
 }
 
+export interface ManagedToolResultGuardOptions {
+  /**
+   * Suppress wrapper markup without recording a leak verdict. Used on
+   * context-compaction turns where the model may echo tool-result envelopes
+   * while summarizing history; failing the whole request is never correct.
+   */
+  stripOnly?: boolean
+}
+
 export interface ManagedToolResultStripResult extends ManagedToolResultGuardOutput {
   wrapperLeakDetected: boolean
 }
@@ -184,8 +193,12 @@ export class ManagedToolResultGuard {
   private readonly rejectUnprotectedToolCalls: boolean
   private readonly rejectMalformedProtectedToolCalls: boolean
   private readonly bufferUntilFlush: boolean
+  private readonly stripOnly: boolean
 
-  constructor(protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml') {
+  constructor(
+    protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml',
+    options: ManagedToolResultGuardOptions = {},
+  ) {
     const markers = protectedToolCallProtocol
       ? PROTECTED_TOOL_CALL_MARKERS[protectedToolCallProtocol]
       : undefined
@@ -197,6 +210,11 @@ export class ManagedToolResultGuard {
     // Hold the candidate until it can be parsed structurally so a literal
     // wrapper inside `arguments` is not mistaken for top-level assistant text.
     this.bufferUntilFlush = protectedToolCallProtocol === 'codex_responses'
+    this.stripOnly = options.stripOnly === true
+  }
+
+  private markWrapperLeak(): void {
+    if (!this.stripOnly) this.wrapperLeakDetected = true
   }
 
   push(content: string): ManagedToolResultGuardOutput {
@@ -234,15 +252,36 @@ export class ManagedToolResultGuard {
     if (this.rejectUnprotectedToolCalls) {
       const resultCandidate = findToolResultStart(this.buffer, final)
       if (resultCandidate) {
-        this.wrapperLeakDetected = true
-        this.buffer = ''
-        return { content, suppressed: true }
-      }
-      const candidate = findEarliestUnprotectedMarkup(this.buffer)
-      if (candidate) {
-        this.wrapperLeakDetected = true
-        this.buffer = ''
-        return { content, suppressed: true }
+        if (this.stripOnly) {
+          content += this.buffer.slice(0, resultCandidate.index)
+          this.buffer = this.buffer.slice(resultCandidate.index + resultCandidate.marker.length)
+          this.activeToolResultEnd = resultCandidate.end
+          this.resumeStateAfterToolResult = 'text'
+          this.state = 'tool_result'
+          suppressed = true
+        } else {
+          this.markWrapperLeak()
+          this.buffer = ''
+          return { content, suppressed: true }
+        }
+      } else {
+        // Strip every unprotected opener/closer before the normal drain so a
+        // second marker in the same buffer is not released as visible text.
+        while (this.stripOnly) {
+          const candidate = findEarliestUnprotectedMarkup(this.buffer)
+          if (!candidate) break
+          content += this.buffer.slice(0, candidate.index)
+          this.buffer = this.buffer.slice(candidate.index + candidate.marker.length)
+          suppressed = true
+        }
+        if (!this.stripOnly) {
+          const candidate = findEarliestUnprotectedMarkup(this.buffer)
+          if (candidate) {
+            this.markWrapperLeak()
+            this.buffer = ''
+            return { content, suppressed: true }
+          }
+        }
       }
     }
 
@@ -251,7 +290,13 @@ export class ManagedToolResultGuard {
         const malformed = findEarliestMalformedQwenMarkup(this.buffer, final)
         const protectedStart = findEarliestMarker(this.buffer, this.toolCallStarts)
         if (malformed && (!protectedStart || malformed.index < protectedStart.index)) {
-          this.wrapperLeakDetected = true
+          if (this.stripOnly) {
+            content += this.buffer.slice(0, malformed.index)
+            this.buffer = this.buffer.slice(malformed.index + malformed.marker.length)
+            suppressed = true
+            continue
+          }
+          this.markWrapperLeak()
           this.buffer = ''
           return { content, suppressed: true }
         }
@@ -295,7 +340,7 @@ export class ManagedToolResultGuard {
           this.activeToolResultEnd = toolResultIndex.end
           this.resumeStateAfterToolResult = 'fenced'
           this.state = 'tool_result'
-          this.wrapperLeakDetected = true
+          this.markWrapperLeak()
           suppressed = true
           continue
         }
@@ -311,7 +356,7 @@ export class ManagedToolResultGuard {
           const partialResultIndex = findDistinctivePartialResultSuffix(this.buffer)
           if (partialResultIndex !== -1) {
             content += this.buffer.slice(0, partialResultIndex)
-            this.wrapperLeakDetected = true
+            this.markWrapperLeak()
             suppressed = true
           } else {
             content += this.buffer
@@ -368,7 +413,7 @@ export class ManagedToolResultGuard {
           this.activeToolResultEnd = start.end ?? TOOL_RESULT_END
           this.resumeStateAfterToolResult = 'text'
           this.state = 'tool_result'
-          this.wrapperLeakDetected = true
+          this.markWrapperLeak()
           suppressed = true
         } else if (start.kind === 'fence') {
           this.state = 'fenced'
@@ -384,7 +429,7 @@ export class ManagedToolResultGuard {
         const partialResultIndex = findDistinctivePartialResultSuffix(this.buffer)
         if (partialResultIndex !== -1) {
           content += this.buffer.slice(0, partialResultIndex)
-          this.wrapperLeakDetected = true
+          this.markWrapperLeak()
           suppressed = true
         } else {
           content += this.buffer
@@ -421,8 +466,9 @@ export class ManagedToolResultGuard {
 export function stripManagedToolResultWrappers(
   content: string,
   protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml',
+  options: ManagedToolResultGuardOptions = {},
 ): ManagedToolResultStripResult {
-  const guard = new ManagedToolResultGuard(protectedToolCallProtocol)
+  const guard = new ManagedToolResultGuard(protectedToolCallProtocol, options)
   const streamed = guard.push(content)
   const flushed = guard.flush()
   return {

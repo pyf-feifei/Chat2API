@@ -32,9 +32,9 @@ const { applyQwenAiRetryNonce } = loadFilesModule()
 
 const SAMPLE = 'chat transcript body\nline two'
 
-test('retry nonce appends an inert marker only on attempts >= 2', () => {
-  assert.equal(applyQwenAiRetryNonce(SAMPLE, undefined), SAMPLE, 'first attempt must stay pristine')
-  assert.equal(applyQwenAiRetryNonce(SAMPLE, 1), SAMPLE, 'attempt 1 must stay pristine')
+test('retry nonce with default always scope perturbs attempt >= 1', () => {
+  assert.equal(applyQwenAiRetryNonce(SAMPLE, undefined), SAMPLE, 'missing nonce stays pristine')
+  assert.match(applyQwenAiRetryNonce(SAMPLE, 1), /\[chat2api transport note: conversation resync 1-/, 'default always scope perturbs attempt 1')
 
   const second = applyQwenAiRetryNonce(SAMPLE, 2)
   assert.ok(second.startsWith(SAMPLE), 'marker appends after the original content')
@@ -45,6 +45,18 @@ test('retry nonce appends an inert marker only on attempts >= 2', () => {
     applyQwenAiRetryNonce(SAMPLE, 2),
     'same attempt number still differs across invocations (timestamp component)',
   )
+})
+
+test('retry nonce scope=retry keeps attempt 1 pristine', () => {
+  const previous = process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
+  process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE = 'retry'
+  try {
+    assert.equal(applyQwenAiRetryNonce(SAMPLE, 1), SAMPLE, 'retry scope keeps attempt-1 upload-cache path')
+    assert.match(applyQwenAiRetryNonce(SAMPLE, 2), /conversation resync 2-/)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
+    else process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE = previous
+  }
 })
 
 test('retry nonce honors the disable flag', () => {

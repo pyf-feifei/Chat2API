@@ -84,6 +84,8 @@ function loadRequestForwarder(overrides = {}) {
       loadBalancer: {
         selectAccount: () => null,
         markAccountFailed: () => {},
+        markQwenAiRiskControl: () => {},
+        ...overrides.loadBalancer,
       },
     },
     './adapters/deepseek': { DeepSeekAdapter: adapterWithMatcher('isDeepSeekProvider') },
@@ -259,9 +261,13 @@ function loadRequestForwarder(overrides = {}) {
           disengageWebshareStickyMode: overrides.disengageSticky || (() => {}),
           reportWebshareProxyFailure: overrides.reportWebshareFailure || (() => {}),
           reportWebshareProxySuccess: overrides.reportWebshareSuccess || (() => {}),
+          reportWebshareKeyBandwidthExhausted: overrides.reportWebshareKeyBandwidth || overrides.reportWebshareFailure || (() => {}),
           getWebshareProxyAgent: () => undefined,
           webshareProxyUrlForLog: () => undefined,
         }
+      }
+      if (specifier === './adapters/qwen-risk-refresh' || specifier === './adapters/qwen-risk-refresh.ts') {
+        return { noteQwenAiRiskChallenge: () => {} }
       }
       if (specifier === './adapters/qwenAiProgressIntent' || specifier === './adapters/qwenAiProgressIntent.ts') {
         return { findManagedToolDenialClaim: () => undefined }
@@ -3326,29 +3332,87 @@ test('a webshare bandwidth-402 surfaces honestly once the direct retry is spent'
   assert.equal(result.status, 402)
   assert.equal(result.accountFault, false, 'a drained proxy pool must not fault the account')
   assert.equal(result.retryScope, undefined, 'a drained proxy pool must not rotate accounts')
-  assert.match(result.error, /Bandwidth limit reached/)
+  assert.match(result.error, /bandwidth limit \(HTTP 402\)|Bandwidth limit reached/i)
   assert.equal(attempts.length, 2, 'exactly one direct retry after the bandwidth-402, then stop')
 })
 
-test('size-offloaded document parse failure rotates the account instead of replaying inline', async () => {
-  const RequestForwarder = loadRequestForwarder()
+test('a second drained key after the extra escalation re-arms the direct fallback', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    reportWebshareKeyBandwidth: () => {},
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      const options = args.at(-1)
+      attempts.push(options)
+      // 1 direct verdict → 2 proxy 402 (key A) → 3 direct verdict →
+      // 4 proxy 402 (key B, bandwidthSpentOneExtra) → 5 direct must still run.
+      if (attempts.length === 1 || attempts.length === 3) {
+        return {
+          success: false,
+          status: 503,
+          headers: { bxpunish: '1' },
+          error: 'Qwen AI upstream is busy',
+          errorCode: 'qwen_ai_upstream_busy',
+          retryable: true,
+          accountFault: false,
+        }
+      }
+      if (attempts.length === 2 || attempts.length === 4) {
+        return {
+          success: false,
+          status: 402,
+          error: 'Bandwidth limit reached.',
+          errorCode: 'qwen_ai_webshare_bandwidth_exhausted',
+          retryable: false,
+          accountFault: false,
+        }
+      }
+      return { success: true, status: 200, body: { choices: [] } }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true, 'the re-armed direct fallback must run after the second 402')
+    assert.equal(attempts.length, 5, 'direct, proxy-402, direct, proxy-402, direct')
+    assert.deepEqual(
+      attempts.map(item => item.qwenAiWebshareProxy),
+      [false, true, false, true, false],
+      'the second drained key must re-arm one more direct attempt, not surface a raw 402',
+    )
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('a spent direct fallback after bandwidth-402 rewrites the raw 402 into an actionable message', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+  })
   const forwarder = new RequestForwarder()
   const attempts = []
   forwarder.delay = async () => true
   forwarder.doForward = async (...args) => {
-    const options = args.at(-1)
-    attempts.push(options)
-    // Simulate the adapter's probe write-back: the forwarder requested
-    // inline, but the payload blew past the offload target and the adapter
-    // sent the transcript as a document (the 2026-09-10 codex session 504).
-    options.qwenAiTransportProbe.requestedTransport = 'inline'
-    options.qwenAiTransportProbe.actualTransport = 'document'
-    options.qwenAiTransportProbe.offloadedBySize = true
+    attempts.push(args.at(-1))
     return {
       success: false,
-      status: 504,
-      error: 'Qwen AI file parse request failed: HTTP 504',
-      errorCode: 'qwen_ai_file_parse_http_error',
+      status: 402,
+      error: 'HTTP 402: Bandwidth limit reached.',
+      errorCode: 'qwen_ai_webshare_bandwidth_exhausted',
       retryable: false,
       accountFault: false,
     }
@@ -3363,15 +3427,390 @@ test('size-offloaded document parse failure rotates the account instead of repla
   )
 
   assert.equal(result.success, false)
-  assert.equal(result.retryScope, 'next-account', 'the escape must hand off to the route failover for a fresh account')
+  assert.equal(result.status, 402)
+  assert.equal(result.errorCode, 'qwen_ai_webshare_bandwidth_exhausted')
   assert.equal(result.accountFault, false)
-  assert.equal(result.errorCode, 'qwen_ai_file_parse_http_error')
-  assert.equal(
-    attempts.length,
-    1,
-    'an oversized transcript cannot ride the inline channel: rotate, do not replay inline on the same account',
+  assert.equal(result.retryScope, undefined)
+  assert.equal(result.retryable, false)
+  assert.match(result.error, /direct-exit fallback is spent/)
+  assert.match(result.error, /bandwidth limit \(HTTP 402\)|bandwidth limit/i)
+  assert.equal(attempts.length, 2, 'proxy 402 then the one direct fallback')
+})
+
+// ---------------------------------------------------------------------------
+// Content verdict (bxpunish/RGV587) must prefer Webshare before fail-fast
+// ---------------------------------------------------------------------------
+
+test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast)', async () => {
+  const engagements = []
+  const reports = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    engageSticky: reason => engagements.push(reason),
+    reportWebshareSuccess: () => reports.push('success'),
+    reportWebshareFailure: () => reports.push('failure'),
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      attempts.push(args.at(-1))
+      if (attempts.length === 1) {
+        // Header-only verdict: never present in the error body.
+        return {
+          success: false,
+          status: 503,
+          headers: { bxpunish: '1' },
+          error: 'Qwen AI upstream is busy',
+          errorCode: 'qwen_ai_upstream_busy',
+          retryable: true,
+          accountFault: false,
+        }
+      }
+      return { success: true, status: 200, body: { choices: [] } }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true, 'the Webshare escalation must recover the request instead of failing fast')
+    assert.equal(result.errorCode, undefined)
+    assert.equal(attempts.length, 2, 'direct verdict then one proxy recovery attempt')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
+    assert.equal(engagements.length, 1, 'proxy recovery success must engage sticky mode')
+    assert.deepEqual(reports, ['success'])
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('a proxy-routed bxpunish verdict fail-fasts as content_verdict (one proxy attempt)', async () => {
+  const reports = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    reportWebshareSuccess: () => reports.push('success'),
+    reportWebshareFailure: () => reports.push('failure'),
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      attempts.push(args.at(-1))
+      // Both exits draw the same verdict: escalate once, then give up.
+      return {
+        success: false,
+        status: 503,
+        headers: { bxpunish: '1' },
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, false)
+    assert.equal(result.status, 503)
+    assert.equal(result.errorCode, 'qwen_ai_content_verdict', 'give-up must surface the content-verdict code')
+    assert.equal(result.retryable, false, 'a content verdict must not invite further client retries')
+    assert.equal(result.retryScope, undefined, 'a content verdict must not rotate accounts')
+    assert.match(result.error, /risk-control verdict/i)
+    assert.match(result.error, /Webshare proxy recovery also received the verdict/i)
+    assert.equal(attempts.length, 2, 'exactly one direct miss then one proxy miss, then stop')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
+    assert.deepEqual(reports, ['failure'], 'the proxy miss must cool the pool entry')
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('a direct bxpunish verdict with Webshare disabled fails fast as content_verdict', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: false,
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      attempts.push(args.at(-1))
+      return {
+        success: false,
+        status: 503,
+        headers: { bxpunish: '1' },
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, false)
+    assert.equal(result.errorCode, 'qwen_ai_content_verdict')
+    assert.equal(result.retryable, false)
+    assert.equal(attempts.length, 1, 'without Webshare the direct verdict must not burn same-exit retries')
+    assert.match(result.error, /Webshare proxy recovery is not configured/i)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('proxy bandwidth-402 then a direct verdict spends one extra Webshare escalation', async () => {
+  const reports = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    reportWebshareSuccess: () => reports.push('success'),
+    reportWebshareFailure: () => reports.push('failure'),
+    reportWebshareKeyBandwidth: () => reports.push('bandwidth'),
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      const options = args.at(-1)
+      attempts.push(options)
+      // 1 direct verdict → 2 proxy 402 (never tested the verdict) →
+      // 3 direct verdict again → must re-escalate once onto a healthy key.
+      if (attempts.length === 1 || attempts.length === 3) {
+        return {
+          success: false,
+          status: 503,
+          headers: { bxpunish: '1' },
+          error: 'Qwen AI upstream is busy',
+          errorCode: 'qwen_ai_upstream_busy',
+          retryable: true,
+          accountFault: false,
+        }
+      }
+      if (attempts.length === 2) {
+        return {
+          success: false,
+          status: 402,
+          error: 'Qwen AI upstream chat creation returned HTTP 402: Bandwidth limit reached.',
+          errorCode: 'qwen_ai_webshare_bandwidth_exhausted',
+          retryable: false,
+          accountFault: false,
+        }
+      }
+      return { success: true, status: 200, body: { choices: [] } }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, true, 'the extra proxy escalation must recover after a bandwidth-402')
+    assert.equal(attempts.length, 4, 'direct verdict, proxy 402, direct verdict, healthy proxy')
+    assert.deepEqual(
+      attempts.map(item => item.qwenAiWebshareProxy),
+      [false, true, false, true],
+      'the second verdict must re-engage Webshare after the 402, not fail fast',
+    )
+    assert.ok(reports.includes('bandwidth'), 'the drained key must be cooled as a whole')
+    assert.ok(reports.includes('success'), 'the healthy proxy exit must clear the request')
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwidth note', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+  })
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
+  try {
+    const forwarder = new RequestForwarder()
+    const attempts = []
+    forwarder.delay = async () => true
+    forwarder.doForward = async (...args) => {
+      const options = args.at(-1)
+      attempts.push(options)
+      // Direct verdict → proxy 402 → direct verdict → second proxy also
+      // draws the verdict (webshareVerdictSeen). Give up with an honest note.
+      if (attempts.length === 2) {
+        return {
+          success: false,
+          status: 402,
+          error: 'Bandwidth limit reached.',
+          errorCode: 'qwen_ai_webshare_bandwidth_exhausted',
+          retryable: false,
+          accountFault: false,
+        }
+      }
+      return {
+        success: false,
+        status: 503,
+        headers: { bxpunish: '1' },
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, false)
+    assert.equal(result.errorCode, 'qwen_ai_content_verdict')
+    assert.equal(result.retryable, false)
+    assert.equal(result.retryScope, undefined)
+    assert.equal(attempts.length, 4, 'direct, proxy-402, direct, proxy-verdict then stop')
+    assert.deepEqual(
+      attempts.map(item => item.qwenAiWebshareProxy),
+      [false, true, false, true],
+    )
+    assert.match(result.error, /also received the verdict/i, 'the second proxy draw is a real verdict')
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('size-offloaded document parse failure retries locked inline before rotating', async () => {
+  const RequestForwarder = loadRequestForwarder()
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    const options = args.at(-1)
+    attempts.push(options)
+    // Simulate the adapter's probe write-back: the forwarder requested
+    // inline, but the payload blew past the offload target and the adapter
+    // sent the transcript as a document (the 2026-09-10 codex session 504).
+    options.qwenAiTransportProbe.requestedTransport = 'inline'
+    options.qwenAiTransportProbe.actualTransport = 'document'
+    options.qwenAiTransportProbe.offloadedBySize = true
+    if (attempts.length === 1) {
+      return {
+        success: false,
+        status: 504,
+        error: 'Qwen AI file parse request failed: HTTP 504',
+        errorCode: 'qwen_ai_file_parse_http_error',
+        retryable: false,
+        accountFault: false,
+      }
+    }
+    // Phase-1 escape: same-account locked inline must succeed without a
+    // second document upload or an account rotation.
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
   )
+
+  assert.equal(result.success, true)
+  assert.equal(attempts.length, 2, 'one same-account locked-inline retry after the size-offloaded parse failure')
+  assert.equal(
+    attempts[1].qwenAiMessageTransport,
+    'inline',
+    'the first escape must downgrade to inline even when the adapter size-offloaded',
+  )
+  assert.equal(attempts[1].qwenAiMessageTransportLocked, true, 'the inline escape must stay locked off the document pipeline')
   assert.notEqual(attempts[0].qwenAiTransportProbe, undefined, 'every attempt must carry a fresh transport probe')
+})
+
+test('locked-inline escape rejected as oversize rotates the account for document transport', async () => {
+  const RequestForwarder = loadRequestForwarder()
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    const options = args.at(-1)
+    attempts.push(options)
+    options.qwenAiTransportProbe.requestedTransport = 'inline'
+    options.qwenAiTransportProbe.actualTransport = attempts.length === 1 ? 'document' : 'inline'
+    options.qwenAiTransportProbe.offloadedBySize = attempts.length === 1
+    if (attempts.length === 1) {
+      return {
+        success: false,
+        status: 504,
+        error: 'Qwen AI file parse request failed: HTTP 504',
+        errorCode: 'qwen_ai_file_parse_http_error',
+        retryable: false,
+        accountFault: false,
+      }
+    }
+    // Phase-2: upstream refuses the locked-inline body as oversize.
+    return {
+      success: false,
+      status: 413,
+      error: 'Payload Too Large: message body exceeds the inline size limit',
+      errorCode: 'qwen_ai_message_too_large',
+      retryable: false,
+      accountFault: false,
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.retryScope, 'next-account', 'only an oversize inline rejection may rotate the account')
+  assert.equal(result.accountFault, false)
+  assert.equal(attempts.length, 2, 'parse failure → one locked inline attempt → size rejection → rotate')
+  assert.equal(attempts[1].qwenAiMessageTransport, 'inline')
+  assert.equal(attempts[1].qwenAiMessageTransportLocked, true)
 })
 
 test('document pipeline escape keeps the inline downgrade when the payload fits inline', async () => {

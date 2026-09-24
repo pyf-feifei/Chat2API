@@ -4,6 +4,7 @@ import { createParser, type EventSourceMessage } from 'eventsource-parser'
 import {
   createManagedToolResultWrapperLeakError,
   ManagedToolResultGuard,
+  type ManagedToolResultGuardOptions,
 } from './managedToolResultGuard.ts'
 import type { ToolProtocolId } from './types.ts'
 
@@ -37,6 +38,8 @@ interface GuardEntry {
   }
 }
 
+export interface AssistantOutputBoundaryOptions extends ManagedToolResultGuardOptions {}
+
 /**
  * Validates assistant-visible text in a completed Chat Completions body.
  * Structured tool-call arguments are deliberately not traversed: marker-like
@@ -45,6 +48,7 @@ interface GuardEntry {
 export function guardAssistantOutputCompletion<T extends Record<string, any>>(
   completion: T,
   protectedToolCallProtocol: ToolProtocolId | null = null,
+  options: AssistantOutputBoundaryOptions = {},
 ): T {
   const choices = Array.isArray(completion.choices) ? completion.choices : []
   const guardedChoices = choices.map((choice: any, choiceIndex: number) => {
@@ -60,12 +64,14 @@ export function guardAssistantOutputCompletion<T extends Record<string, any>>(
             container[field],
             `choices[${choiceIndex}].${containerName}.${field}`,
             protectedToolCallProtocol,
+            options,
           )
         } else if (field === 'content' && Array.isArray(container[field])) {
           container[field] = guardAssistantContentParts(
             container[field],
             `choices[${choiceIndex}].${containerName}.content`,
             protectedToolCallProtocol,
+            options,
           )
         }
       }
@@ -80,10 +86,11 @@ function guardAssistantContentParts(
   parts: unknown[],
   fieldPrefix: string,
   protectedToolCallProtocol: ToolProtocolId | null,
+  options: AssistantOutputBoundaryOptions = {},
 ): unknown[] {
   return parts.map((part, index) => {
     if (typeof part === 'string') {
-      return guardAssistantText(part, `${fieldPrefix}[${index}]`, protectedToolCallProtocol)
+      return guardAssistantText(part, `${fieldPrefix}[${index}]`, protectedToolCallProtocol, options)
     }
     if (!part || typeof part !== 'object' || Array.isArray(part)) return part
     const record = part as Record<string, unknown>
@@ -96,6 +103,7 @@ function guardAssistantContentParts(
           guarded[key],
           `${fieldPrefix}[${index}].${key}`,
           protectedToolCallProtocol,
+          options,
         )
       }
     }
@@ -107,8 +115,9 @@ function guardAssistantText(
   value: string,
   field: string,
   protectedToolCallProtocol: ToolProtocolId | null,
+  options: AssistantOutputBoundaryOptions = {},
 ): string {
-  const guard = new ManagedToolResultGuard(protectedToolCallProtocol)
+  const guard = new ManagedToolResultGuard(protectedToolCallProtocol, options)
   const streamed = guard.push(value)
   const flushed = guard.flush()
   if (guard.hasDetectedWrapperLeak()) {
@@ -124,6 +133,7 @@ function guardAssistantText(
  */
 export function createAssistantOutputBoundaryStream(
   protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml',
+  options: AssistantOutputBoundaryOptions = {},
 ): Transform {
   const decoder = new StringDecoder('utf8')
   const guards = new Map<string, GuardEntry>()
@@ -215,7 +225,7 @@ export function createAssistantOutputBoundaryStream(
           let entry = guards.get(key)
           if (!entry) {
             entry = {
-              guard: new ManagedToolResultGuard(protectedToolCallProtocol),
+              guard: new ManagedToolResultGuard(protectedToolCallProtocol, options),
               template: {
                 event: { ...event },
                 envelope: { ...envelope },

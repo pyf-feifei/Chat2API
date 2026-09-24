@@ -6,6 +6,7 @@ import type { Provider, ProviderCheckResult, Account, ProviderModelCapability } 
 import type { BuiltinProviderConfig } from '../store/types'
 
 const CHECK_TIMEOUT = 15000
+const MIMO_USER_CHECK_URL = 'https://aistudio.xiaomimimo.com/open-apis/user/mi/get'
 
 export interface TokenCheckResult {
   valid: boolean
@@ -167,20 +168,48 @@ export class ProviderChecker {
     }
   }
 
-  private static checkMimoToken(
+    private static async checkMimoToken(
     serviceToken: string,
     userId: string,
     phToken: string
-  ): TokenCheckResult {
+  ): Promise<TokenCheckResult> {
     if (!serviceToken || !userId || !phToken) {
       return { valid: false, error: 'Missing required credentials: service_token, user_id, ph_token' }
     }
 
-    return {
-      valid: true,
-      userInfo: {
-        name: 'Mimo User',
-      },
+    try {
+      const response = await axios.get(MIMO_USER_CHECK_URL, {
+        headers: {
+          Cookie: `serviceToken=${serviceToken}; userId=${userId}; xiaomichatbot_ph=${phToken}`,
+          Referer: 'https://aistudio.xiaomimimo.com/',
+          Origin: 'https://aistudio.xiaomimimo.com',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+        },
+        timeout: CHECK_TIMEOUT,
+        validateStatus: () => true,
+      })
+      const payload = response.data as { code?: number; data?: { nickName?: string; name?: string } } | undefined
+      if (response.status === 200 && payload?.code === 0) {
+        return {
+          valid: true,
+          userInfo: {
+            name: payload.data?.nickName || payload.data?.name || 'Mimo User',
+          },
+        }
+      }
+      if (response.status === 401 || payload?.code === 401) {
+        return { valid: false, error: 'Mimo credentials are invalid or expired' }
+      }
+      return {
+        valid: false,
+        error: `Mimo credential check failed: HTTP ${response.status}`,
+      }
+    } catch (error) {
+      return {
+        valid: false,
+        error: `Mimo credential check failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      }
     }
   }
 

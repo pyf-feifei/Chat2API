@@ -25,6 +25,29 @@ if not CHROME_PATH:
         CHROME_PATH = "chromium"
 ARTIFACT_DIR = Path(os.environ.get("ZAI_CAPTCHA_ARTIFACT_DIR", r"C:\my\Chat2API\scripts\zai-captcha"))
 
+
+def launch_stealth(pw, headless: bool):
+    """Launch the real Chrome channel via patchright with a consistent fingerprint.
+
+    The aliyun captcha reads the UA, Client Hints (Sec-CH-UA-Platform), navigator
+    .platform and the WebGL renderer. Spoofing a macOS Chrome UA on top of Windows
+    chromium - and blanking the GPU - makes those signals contradict each other,
+    which the risk engine treats as a bot. Driving the installed Chrome channel and
+    letting it present its own UA/renderer keeps every signal aligned; patchright
+    already hides the automation flags, so we add no anti-detection args of our own.
+    """
+    chrome_channel = os.path.isfile(r"C:\Program Files\Google\Chrome\Application\chrome.exe") or \
+        os.path.isfile(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") or \
+        (bool(CHROME_PATH) and "chrome" in os.path.basename(CHROME_PATH).lower() and "chromium" not in os.path.basename(CHROME_PATH).lower())
+    launch_args = {"headless": headless, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+    if chrome_channel:
+        launch_args["channel"] = "chrome"
+    elif CHROME_PATH and os.path.isfile(CHROME_PATH):
+        launch_args["executable_path"] = CHROME_PATH
+    browser = pw.chromium.launch(**launch_args)
+    context = browser.new_context(no_viewport=True)
+    return browser, context
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--token", default="", help="Z.ai JWT token (only needed for --mode captcha)")
@@ -165,6 +188,7 @@ def captcha_target_geometry(page) -> dict:
         raise RuntimeError("Puzzle alpha mask empty")
     alpha_y, alpha_x = np.where(mask)
     piece_left = int(alpha_x.min())
+    piece_px_width = int(alpha_x.max() - alpha_x.min() + 1)
     gray = 0.299 * bg[:,:,0] + 0.587 * bg[:,:,1] + 0.114 * bg[:,:,2]
     gx = np.zeros_like(gray)
     gy = np.zeros_like(gray)
@@ -247,6 +271,21 @@ def captcha_target_geometry(page) -> dict:
         # Near 0 the winner is much flatter than everything around it; near 1 the
         # picture is uniformly smooth and the answer is a guess.
         confidence = float(np.clip(1.0 - ratio, 0.0, 1.0))
+    if os.environ.get("ZAI_CAPTCHA_DEBUG"):
+        try:
+            dbg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+            d = ImageDraw.Draw(dbg)
+            # Red line = where we think the hole's left edge is (target_x in bg px).
+            d.line([(target_x, 0), (target_x, dbg.height)], fill=(255, 0, 0), width=2)
+            # Green line = the piece's own left edge for reference.
+            d.line([(piece_left, 0), (piece_left, dbg.height)], fill=(0, 255, 0), width=1)
+            stamp = int(time.time() * 1000) % 100000
+            dbg.save(str(ARTIFACT_DIR / f"debug-bg-target-{stamp}.png"))
+            Image.open(io.BytesIO(pz_bytes)).save(str(ARTIFACT_DIR / f"debug-piece-{stamp}.png"))
+            print(f"  [debug] bg={dbg.width}x{dbg.height} piece_px_width={piece_px_width} "
+                  f"target_x={target_x} saved stamp={stamp}")
+        except Exception as e:
+            print(f"  [debug] dump failed: {str(e)[:100]}")
     image_box = page.locator("#aliyunCaptcha-img-box").bounding_box() or page.locator("#aliyunCaptcha-img").bounding_box()
     puzzle_box = page.locator("#aliyunCaptcha-puzzle").bounding_box()
     track_box = page.locator("#aliyunCaptcha-sliding-body").bounding_box()
@@ -258,10 +297,19 @@ def captcha_target_geometry(page) -> dict:
     target_display_x = target_left_natural * scale_x
     target_puzzle_left = image_box["x"] + target_display_x
     max_travel = max(20, track_box["width"] - slider_box["width"] - 2)
+    # The slider rail and the picture are NOT 1:1. The piece sweeps only
+    # (image_width - piece_width) while the handle sweeps the full rail, so the
+    # piece trails the cursor by this gain. Commanding the handle in piece pixels
+    # (the old 1:1 assumption) undershoots by ~30%, which forced a long staircase
+    # of micro-corrections that reads as a bot. Convert piece distance -> handle
+    # distance with this gain so the first pull lands on the gap.
+    piece_display_width = piece_px_width * scale_x
+    piece_span = max(1.0, image_box["width"] - piece_display_width)
+    gain = float(np.clip(piece_span / max_travel, 0.4, 1.2))
     print(f"  target_x={target_x} piece_left={piece_left} display_x={target_display_x:.1f} "
-          f"max_travel={max_travel:.1f} score={score:.2f} confidence={confidence:.2f}")
+          f"max_travel={max_travel:.1f} gain={gain:.2f} score={score:.2f} confidence={confidence:.2f}")
     return {"target_display_x": float(target_display_x), "target_puzzle_left": float(target_puzzle_left),
-            "max_travel": float(max_travel), "confidence": confidence}
+            "max_travel": float(max_travel), "gain": gain, "confidence": confidence}
 
 def drag_slider(page, slider, target_puzzle_left, max_travel, bias=0):
     slider_box = slider.bounding_box()
@@ -384,14 +432,7 @@ def solve_captcha(
     required for /auths/signin, whose captcha param is session-bound."""
     captcha_result = {"value": None}
     pw = sync_playwright().start()
-    launch_args = {"headless": headless, "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]}
-    if CHROME_PATH and os.path.isfile(CHROME_PATH):
-        launch_args["executable_path"] = CHROME_PATH
-    browser = pw.chromium.launch(**launch_args)
-    context = browser.new_context(
-        viewport={"width": 1366, "height": 900},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    )
+    browser, context = launch_stealth(pw, headless)
     page = context.new_page()
 
     def handle_request(route, request):
@@ -660,7 +701,7 @@ def resolve_target(page):
     """
     geo = captcha_target_geometry(page)
     if geo.get("confidence", 0.0) >= 0.55:
-        return geo["target_puzzle_left"], geo["max_travel"]
+        return geo["target_puzzle_left"], geo["max_travel"], geo["gain"]
     print(f"  local matcher unsure (confidence={geo.get('confidence', 0):.2f}), asking vision")
     try:
         bg_bytes = image_bytes_from_locator(page, page.locator("#aliyunCaptcha-img").first)
@@ -670,10 +711,10 @@ def resolve_target(page):
             box = (page.locator("#aliyunCaptcha-img-box").bounding_box()
                    or page.locator("#aliyunCaptcha-img").bounding_box())
             scale_x = box["width"] / max(1, bg.size[0])
-            return box["x"] + vx * scale_x, geo["max_travel"]
+            return box["x"] + vx * scale_x, geo["max_travel"], geo["gain"]
     except Exception as e:
         print(f"  vision path failed, using local matcher: {str(e)[:120]}")
-    return geo["target_puzzle_left"], geo["max_travel"]
+    return geo["target_puzzle_left"], geo["max_travel"], geo["gain"]
 
 
 def expand_captcha(page) -> bool:
@@ -693,16 +734,19 @@ def expand_captcha(page) -> bool:
     return slider_visible(page)
 
 
-def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float) -> float:
+def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float, gain: float = 1.0) -> float:
     """Drag with continuous closed-loop control.
 
     One behaviour matters here: holding the button still for more than ~1s
     makes the widget spring the piece back to the origin, so the cursor must
     never idle mid-drag.
 
-    The track is 1:1 with the image, so required travel is just how far the
-    piece has to go - see the note below before "correcting" it with a gain.
+    The slider rail and the picture are not 1:1 - the piece trails the handle by
+    `gain` (piece pixels per handle pixel). Every handle command below divides
+    the desired piece travel by `gain`, so the first pull lands on the gap and we
+    avoid the long correction staircase that used to give us away.
     """
+    gain = max(0.2, min(1.5, gain))
     slider = page.locator("#aliyunCaptcha-sliding-slider")
     box = slider.bounding_box()
     if not box:
@@ -724,9 +768,11 @@ def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float) 
         page.mouse.up()
         raise RuntimeError("No puzzle box")
 
-    needed = target_puzzle_left - base
-    needed = max(0.0, min(max_travel, needed))
-    print(f"  drag: piece {base:.1f} -> {target_puzzle_left:.1f} (travel {needed:.1f})")
+    needed_piece = max(0.0, target_puzzle_left - base)
+    # Handle distance to move the piece `needed_piece`, capped by the rail.
+    needed = max(0.0, min(max_travel, needed_piece / gain))
+    print(f"  drag: piece {base:.1f} -> {target_puzzle_left:.1f} (piece travel {needed_piece:.1f}, "
+          f"handle travel {needed:.1f}, gain {gain:.2f})")
 
     # The widget scores the trajectory, not just where the piece lands. A clean
     # easing curve with uniform steps reads as a bot even when it lands dead on.
@@ -781,28 +827,30 @@ def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float) 
     page.wait_for_timeout(random.randint(300, 650))  # let the animation catch up
 
     # Small corrections, each followed by a real settle wait. The piece lags the
-    # cursor, so this closes whatever gap the first pass left.
+    # cursor, so this closes whatever gap the first pass left. With the gain
+    # applied above this should converge in 1-2 nudges, not the old dozen.
     best_err = None
-    for i in range(12):
+    for i in range(6):
         cur = read_puzzle_left(page)
         if cur is None:
             break
-        err = target_puzzle_left - cur
+        err = target_puzzle_left - cur  # piece-space error
         if best_err is None or abs(err) < abs(best_err):
             best_err = err
         if abs(err) <= 1.5:
             break
         remain = max_travel - mouse
-        if abs(err) > remain:
+        # Convert the piece-space error into a handle nudge via the gain.
+        step = err / gain
+        step = max(-12, min(12, step))
+        if step > remain:
             print(f"  drag: cannot close err={err:.1f} (remain={remain:.1f})")
             break
-        step = max(-8, min(8, err))
         mouse += step
         # Nudge with a small jittered move, then a human-scale pause to recheck.
         page.mouse.move(start_x + mouse, start_y + random.uniform(-0.9, 0.9), steps=random.randint(1, 3))
         page.wait_for_timeout(random.randint(160, 320))
-        if i % 4 == 0:
-            print(f"  drag fix i={i} mouse={mouse:6.1f} pos={cur:7.1f} err={err:6.1f}")
+        print(f"  drag fix i={i} mouse={mouse:6.1f} pos={cur:7.1f} err={err:6.1f}")
 
     page.wait_for_timeout(random.randint(120, 260))
     page.mouse.up()
@@ -844,8 +892,8 @@ def solve_slider_login(page, max_attempts: int = 3) -> bool:
         print(f"  Login captcha attempt {attempt+1}/{max_attempts}...")
         before = captcha_image_signature(page)
         try:
-            target_left, max_travel = resolve_target(page)
-            err = drag_slider_closed_loop(page, target_left, max_travel)
+            target_left, max_travel, gain = resolve_target(page)
+            err = drag_slider_closed_loop(page, target_left, max_travel, gain)
             print(f"  residual error={err:.2f}px")
             page.screenshot(path=str(ARTIFACT_DIR / f"login-captcha-attempt{attempt+1}.png"))
             if not slider_visible(page):
@@ -860,6 +908,15 @@ def solve_slider_login(page, max_attempts: int = 3) -> bool:
                 pass
         if not wait_for_new_captcha(page, before, 12.0):
             time.sleep(1.5)
+    return False
+
+
+def wait_for_login_captcha(page, timeout: int) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not slider_visible(page):
+            return True
+        time.sleep(0.5)
     return False
 
 
@@ -943,14 +1000,7 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
     automated solve leaves the window open so someone can drag the slider.
     """
     pw = sync_playwright().start()
-    launch_args = {"headless": headless, "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]}
-    if CHROME_PATH and os.path.isfile(CHROME_PATH):
-        launch_args["executable_path"] = CHROME_PATH
-    browser = pw.chromium.launch(**launch_args)
-    context = browser.new_context(
-        viewport={"width": 1366, "height": 900},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    )
+    browser, context = launch_stealth(pw, headless)
     page = context.new_page()
     detail = ""
     try:
@@ -981,12 +1031,13 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
         while time.time() < deadline:
             if expand_captcha(page):
                 if solve_slider_login(page, max_attempts=max_captcha_attempts):
+                    page.screenshot(path=str(ARTIFACT_DIR / "login-captcha-passed.png"))
+                    page.click("button:has-text('登录')", timeout=10000)
+                    page.screenshot(path=str(ARTIFACT_DIR / "login-after-submit.png"))
                     token = read_session_token(page, context, email=email)
                     if token:
                         break
-                    # Slider passed but no account JWT appeared - the signin was
-                    # rejected (wrong credentials) even though the captcha passed.
-                    detail = "captcha passed but no session token (check credentials)"
+                    detail = "captcha passed but no session token after login submission"
                     break
                 detail = "captcha verification failed"
                 if allow_human and not headless:
@@ -1003,9 +1054,12 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
                     print(f"  Waiting up to {human_timeout}s; Ctrl-C to give up.")
                     print("=" * 62)
                     refresh_captcha_for_human(page)
-                    token = read_session_token(page, context, human_timeout, email=email)
-                    if token:
-                        detail = ""
+                    if wait_for_login_captcha(page, human_timeout):
+                        page.screenshot(path=str(ARTIFACT_DIR / "login-captcha-passed.png"))
+                        page.click("button:has-text('登录')", timeout=10000)
+                        page.screenshot(path=str(ARTIFACT_DIR / "login-after-submit.png"))
+                        token = read_session_token(page, context, email=email)
+                        detail = "" if token else "captcha passed but no session token after login submission"
                     else:
                         detail = f"captcha not completed by human within {human_timeout}s"
                 break

@@ -537,7 +537,22 @@ function qwenAiFileParsePollIntervalMsFromEnv(): number {
 }
 
 function qwenAiFileParseTimeoutMsFromEnv(): number {
-  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_TIMEOUT_MS', 120000)
+  // Successful parses observed 5–25s with a long tail near 110s; 120s killed
+  // that tail. 180s matches the stream-idle budget and still bounds a stuck
+  // `running` status before the document escape engages.
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_TIMEOUT_MS', 180000)
+}
+
+function qwenAiFileParseKickIntervalMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_KICK_INTERVAL_MS', 45000)
+}
+
+function qwenAiFileParseKickMaxFromEnv(): number {
+  const raw = process.env.QWEN_AI_FILE_PARSE_KICK_MAX
+  if (!raw) return 3
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return 3
+  return Math.min(5, Math.floor(parsed))
 }
 
 function qwenAiFileOperationRequestTimeoutMsFromEnv(): number {
@@ -656,6 +671,12 @@ function throwIfQwenAiFileOperationStopped(options: QwenAiFileOperationOptions):
   if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
     throw createQwenAiFileDeadlineError()
   }
+}
+
+function isQwenAiFileOperationAbort(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code
+  if (code === 'ERR_CANCELED') return true
+  return (error as { name?: unknown } | undefined)?.name === 'AbortError'
 }
 
 function normalizeQwenAiFileOperationError(
@@ -2957,6 +2978,22 @@ export class QwenAiFileUploader {
     throwIfQwenAiFileOperationStopped(options)
   }
 
+  private postParseRequest(
+    fileId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<AxiosResponse> {
+    return this.postJson(
+      `${QWEN_AI_BASE}/api/v2/files/parse`,
+      { file_id: fileId },
+      () => ({
+        headers: this.getHeaders(),
+        timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
+        validateStatus: () => true,
+      }),
+      options,
+    )
+  }
+
   private async parseDocument(
     fileId: string,
     options: QwenAiFileOperationOptions = {},
@@ -2973,16 +3010,7 @@ export class QwenAiFileUploader {
     for (let parseAttempt = 1; ; parseAttempt += 1) {
       let parseResponse: AxiosResponse
       try {
-        parseResponse = await this.postJson(
-          `${QWEN_AI_BASE}/api/v2/files/parse`,
-          { file_id: fileId },
-          () => ({
-            headers: this.getHeaders(),
-            timeout: qwenAiFileOperationRequestTimeoutMsFromEnv(),
-            validateStatus: () => true,
-          }),
-          options,
-        )
+        parseResponse = await this.postParseRequest(fileId, options)
       } catch (error) {
         if (
           parseAttempt <= retryMax
@@ -3024,12 +3052,16 @@ export class QwenAiFileUploader {
     throwIfQwenAiFileOperationStopped(options)
     const parsePollIntervalMs = qwenAiFileParsePollIntervalMsFromEnv()
     const parseTimeoutMs = qwenAiFileParseTimeoutMsFromEnv()
+    const parseKickIntervalMs = qwenAiFileParseKickIntervalMsFromEnv()
+    const parseKickMax = qwenAiFileParseKickMaxFromEnv()
     const parseDeadlineAt = Date.now() + parseTimeoutMs
     const requestDeadlineAt = operationDeadlineAt(options)
     const pollingDeadlineAt = requestDeadlineAt === undefined
       ? parseDeadlineAt
       : Math.min(parseDeadlineAt, requestDeadlineAt)
     let lastStatus = ''
+    let kicks = 0
+    let lastKickAt = Date.now()
 
     while (Date.now() < pollingDeadlineAt) {
       const waitMs = Math.min(parsePollIntervalMs, pollingDeadlineAt - Date.now())
@@ -3087,6 +3119,27 @@ export class QwenAiFileUploader {
         parseFailedError.accountFault = false
         parseFailedError.retryScope = 'next-account'
         throw parseFailedError
+      }
+
+      // A long-lived `running` status can mean the parse job never started
+      // consuming the OSS object (observed 2026-09-22: 120s of `running` with
+      // upload already complete). Re-POST /files/parse to kick the job while
+      // the poll continues; a soft kick failure must not abort a healthy poll.
+      if (
+        parseKickIntervalMs > 0
+        && kicks < parseKickMax
+        && Date.now() - lastKickAt >= parseKickIntervalMs
+      ) {
+        kicks += 1
+        lastKickAt = Date.now()
+        console.warn(`[QwenAI][File] parse still ${normalizedStatus}, kicking parse fileId=${fileId} kick=${kicks}/${parseKickMax}`)
+        try {
+          await this.postParseRequest(fileId, options)
+        } catch (error) {
+          if (isQwenAiFileOperationAbort(error)) throw error
+          console.warn(`[QwenAI][File] parse kick failed fileId=${fileId} kick=${kicks}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        throwIfQwenAiFileOperationStopped(options)
       }
     }
 

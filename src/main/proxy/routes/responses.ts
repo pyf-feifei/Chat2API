@@ -1638,7 +1638,11 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       // route before converting Chat Completions SSE into Responses events.
       // This is deliberately route/protocol agnostic: structured tool call
       // arguments remain untouched by the boundary implementation.
-      const assistantStream = createAssistantOutputBoundaryStream(null)
+      // Context compaction only needs the envelopes gone — failing the
+      // summary because the model echoed history wrappers is never useful.
+      const assistantStream = createAssistantOutputBoundaryStream(null, {
+        stripOnly: requestIntent.intent === 'context_compaction',
+      })
       const responsesStream = createResponsesStreamTransform({
         request,
         responseId,
@@ -1797,6 +1801,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     const guardedBody = guardAssistantOutputCompletion(
       result.body ?? fallbackCompletion,
       null,
+      { stripOnly: requestIntent.intent === 'context_compaction' },
     )
     const response = await chatCompletionToResponse(guardedBody, request, {
       id: responseId,

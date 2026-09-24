@@ -149,7 +149,7 @@ ENV QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 # Bound each account's document parse stage independently so a stalled parse
 # can move to another account while the cumulative request deadline remains.
 ENV QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS=2000
-ENV QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
+ENV QWEN_AI_FILE_PARSE_TIMEOUT_MS=180000
 ENV QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 # Install Chromium and Python deps for Z.ai captcha solver
 RUN apt-get update && apt-get install -y --no-install-recommends \

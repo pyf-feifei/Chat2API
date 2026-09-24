@@ -1,4 +1,4 @@
-import type { ProviderModelCapability } from '../../shared/types'
+﻿import type { ProviderModelCapability } from '../../shared/types'
 
 export interface ParsedProviderModels {
   supportedModels: string[]
@@ -62,6 +62,15 @@ function extractModelsPayload(responseData: unknown): unknown[] {
   }
 
   if (data && typeof data === 'object') {
+    // MiMo format: data.modelConfigList or data.modelConfigListNg
+    const mimoRecord = data as { modelConfigList?: unknown; modelConfigListNg?: unknown }
+    if (Array.isArray(mimoRecord.modelConfigList)) {
+      return mimoRecord.modelConfigList
+    }
+    if (Array.isArray(mimoRecord.modelConfigListNg)) {
+      return mimoRecord.modelConfigListNg
+    }
+
     const nestedData = (data as { data?: unknown }).data
     if (Array.isArray(nestedData)) {
       return nestedData
@@ -76,11 +85,15 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
   const supportedModels: string[] = []
   const modelMappings: Record<string, string> = {}
   const modelCapabilities: Record<string, ProviderModelCapability> = {}
+  const seenModels = new Set<string>()
 
   for (const model of models) {
     if (typeof model === 'string') {
-      supportedModels.push(model)
-      modelMappings[model] = model
+      if (!seenModels.has(model)) {
+        seenModels.add(model)
+        supportedModels.push(model)
+        modelMappings[model] = model
+      }
       continue
     }
 
@@ -92,16 +105,21 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
       [key: string]: unknown
       id?: unknown
       model_id?: unknown
+      model?: unknown
       name?: unknown
       display_name?: unknown
       info?: unknown
       meta?: unknown
       think_skip?: unknown
+      nToken?: unknown
     }
-    const modelId = String(candidate.id || candidate.model_id || candidate.name || '')
+
+    // MiMo uses 'model' field for the actual model ID and 'name' for display name
+    const modelId = String(candidate.model || candidate.id || candidate.model_id || candidate.name || '')
     const modelName = String(candidate.name || candidate.display_name || modelId)
 
-    if (modelId) {
+    if (modelId && !seenModels.has(modelName)) {
+      seenModels.add(modelName)
       supportedModels.push(modelName)
       modelMappings[modelName] = modelId
 
@@ -111,6 +129,7 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
         'maxContextLength',
         'context_length',
         'contextLength',
+        'nToken',
       ])
       const maxSummaryGenerationLength = readPositiveInteger(candidate, [
         'max_summary_generation_length',
@@ -155,7 +174,22 @@ function readPositiveInteger(
     }
   }
   for (const value of values) {
-    const numeric = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN
+    // Handle MiMo's nToken format like "1M", "256K"
+    if (typeof value === 'string') {
+      const trimmed = value.trim().toUpperCase()
+      const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([KMGT])?$/)
+      if (match) {
+        const num = parseFloat(match[1])
+        const suffix = match[2]
+        const multiplier = suffix === 'K' ? 1024 : suffix === 'M' ? 1024 * 1024 : suffix === 'G' ? 1024 * 1024 * 1024 : suffix === 'T' ? 1024 * 1024 * 1024 * 1024 : 1
+        const result = Math.round(num * multiplier)
+        if (Number.isSafeInteger(result) && result > 0) return result
+      }
+      const numeric = Number(trimmed)
+      if (Number.isSafeInteger(numeric) && numeric > 0) return numeric
+      continue
+    }
+    const numeric = typeof value === 'number' ? value : NaN
     if (Number.isSafeInteger(numeric) && numeric > 0) return numeric
   }
   return undefined
@@ -165,14 +199,20 @@ function readThinkingSkippable(model: {
   info?: unknown
   meta?: unknown
   think_skip?: unknown
+  thinkingDefaultOn?: unknown
 }): boolean | undefined {
   const candidates = [
     getNestedValue(model.info, ['meta', 'think_skip', 'enable']),
     getNestedValue(model.meta, ['think_skip', 'enable']),
     getNestedValue(model.think_skip, ['enable']),
   ]
-
-  return candidates.find((value): value is boolean => typeof value === 'boolean')
+  const found = candidates.find((value): value is boolean => typeof value === 'boolean')
+  if (found !== undefined) return found
+  // MiMo uses thinkingDefaultOn
+  if (typeof model.thinkingDefaultOn === 'boolean') {
+    return !model.thinkingDefaultOn
+  }
+  return undefined
 }
 
 function getNestedValue(value: unknown, path: string[]): unknown {
