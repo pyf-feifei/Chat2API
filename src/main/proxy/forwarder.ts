@@ -251,6 +251,10 @@ export { isQwenAiUpstreamBusyResult }
 function isQwenAiDocumentPipelineFailure(result: ForwardResult): boolean {
   return !result.success
     && result.accountFault === false
+    // Webshare bandwidth exhaustion is proxy-pool quota, not a dead document
+    // channel. Escaping to locked inline would only re-arm the drained proxy
+    // (or pin a direct retry that the bandwidth arm already owns).
+    && result.errorCode !== 'qwen_ai_webshare_bandwidth_exhausted'
     && (
       result.errorCode === 'qwen_ai_file_parse_timeout'
       || /file parse|file upload|upload sts|parse request failed|parse failed/i.test(result.error ?? '')

@@ -2882,7 +2882,54 @@ export class QwenAiFileUploader {
           throwIfQwenAiFileOperationStopped(options)
           continue
         }
-        throw new Error(`Qwen AI upload STS request failed: HTTP ${response.status}`)
+        const bodyText = typeof response.data === 'string'
+          ? response.data
+          : response.data == null
+            ? ''
+            : (() => {
+              try {
+                return JSON.stringify(response.data)
+              } catch {
+                return ''
+              }
+            })()
+        // A 402 whose body is the proxy pool's own quota notice never
+        // originates from chat.qwen.ai: it is Webshare bandwidth exhaustion
+        // on the STS fetch path (same signature as the chat POST classifier).
+        // Classify it so the forwarder cools the drained key and spends the
+        // one-shot direct-exit retry instead of surfacing a bare Payment
+        // Required or mis-rotating Qwen accounts.
+        const isWebshareBandwidth = response.status === 402
+          && /bandwidth limit reached/i.test(bodyText)
+        const error = new Error(
+          `Qwen AI upload STS request failed: HTTP ${response.status}`,
+        ) as QwenAiFileOperationError
+        error.status = response.status
+        if (isWebshareBandwidth) {
+          error.code = 'qwen_ai_webshare_bandwidth_exhausted'
+          error.retryable = false
+          error.accountFault = false
+          console.warn(
+            `[QwenAI][File] sts webshare bandwidth exhausted filename="${file.filename}" status=402`,
+          )
+        } else if (response.status === 401 || response.status === 403) {
+          // Credential rejections stay account-bound so the pool rotates off
+          // the dead token; leave accountFault unset for policy inference.
+          console.warn(
+            `[QwenAI][File] sts auth rejected filename="${file.filename}" status=${response.status}`,
+          )
+        } else {
+          // STS is part of the document pipeline, not the account: a 4xx/5xx
+          // here (after bounded retries) must set accountFault=false so the
+          // forwarder's document-pipeline escape can lock the retry inline
+          // instead of stalling the client on a re-upload into the same dead
+          // path. Message keeps the historical `/upload sts/` match.
+          error.accountFault = false
+          console.warn(
+            `[QwenAI][File] sts request failed filename="${file.filename}" status=${response.status} body=${bodyText.slice(0, 200)}`,
+          )
+        }
+        throw error
       }
 
       if (!isQwenAiStsRateLimited(response.data) || rateLimitRetries >= STS_RATE_LIMIT_MAX_RETRIES) {

@@ -173,3 +173,52 @@ test('STS transient retry stays abortable by the client', async () => {
   assert.equal(error.status, 499)
   assert.equal(stsCalls(calls).length, 1, 'abort must cut the retry loop before the next STS call')
 })
+
+test('STS webshare bandwidth 402 is classified for the direct-exit retry arm', async () => {
+  const { uploader, calls } = createUploader(async () => ({
+    status: 402,
+    data: 'Bandwidth limit reached. Please upgrade to continue using the proxy.',
+  }))
+
+  const error = await uploader.startDirectUpload(DIRECT_INPUT, {}).then(
+    () => null,
+    err => err,
+  )
+
+  assert.ok(error, 'expected the STS bandwidth 402 to fail')
+  assert.equal(stsCalls(calls).length, 1, 'bandwidth 402 must not transient-retry')
+  assert.match(error.message, /upload STS request failed: HTTP 402/)
+  assert.equal(error.status, 402)
+  assert.equal(error.code, 'qwen_ai_webshare_bandwidth_exhausted')
+  assert.equal(error.accountFault, false)
+  assert.equal(error.retryable, false)
+})
+
+test('STS non-bandwidth HTTP failure is account-neutral for document escape', async () => {
+  const { uploader, calls } = createUploader(async () => ({ status: 400, data: { error: 'bad' } }))
+
+  const error = await uploader.startDirectUpload(DIRECT_INPUT, {}).then(
+    () => null,
+    err => err,
+  )
+
+  assert.ok(error, 'expected the STS request to fail')
+  assert.equal(stsCalls(calls).length, 1, '4xx STS rejections must fail without transient retries')
+  assert.match(error.message, /upload STS request failed: HTTP 400/)
+  assert.equal(error.status, 400)
+  assert.equal(error.accountFault, false)
+  assert.notEqual(error.code, 'qwen_ai_webshare_bandwidth_exhausted')
+})
+
+test('STS auth rejection leaves accountFault unset for policy rotation', async () => {
+  const { uploader } = createUploader(async () => ({ status: 401, data: {} }))
+
+  const error = await uploader.startDirectUpload(DIRECT_INPUT, {}).then(
+    () => null,
+    err => err,
+  )
+
+  assert.ok(error)
+  assert.equal(error.status, 401)
+  assert.notEqual(error.accountFault, false, '401 must not be forced account-neutral')
+})
