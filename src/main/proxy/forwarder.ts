@@ -1519,12 +1519,16 @@ export class RequestForwarder {
       const riskChallengeEvidence = /FAIL_SYS_USER_VALIDATE|RGV587/i.test(result.error ?? '')
         || (bxpunishHeaderEarly !== undefined && bxpunishHeaderEarly !== '' && bxpunishHeaderEarly !== '0')
       if (riskChallengeEvidence) {
-        // The account is behind a challenge the harvester cannot always clear
-        // (solvedSlider:false on FAIL_SYS_USER_VALIDATE). Without a cooldown
-        // the pool keeps selecting it — and a sticky-chain session pinned to it
-        // retries the dead account for the whole busy budget. Cool it down so
-        // the balancer rotates to a healthy account immediately.
-        loadBalancer.markQwenAiRiskControl(account.id)
+        // Account-bound challenges (FAIL_SYS_USER_VALIDATE on a sticky session)
+        // still need an immediate balancer bench so the pool rotates off the
+        // wedged credential. An account-neutral busy+verdict (accountFault:false)
+        // is content/egress-determined: the SAME payload fails on every account
+        // and every Webshare exit, so a 600s hard cool only drains the pool
+        // (observed 2026-09-24: 10 accounts cooled during multi-exit verdict
+        // tests). Leave those to the governor's short account-neutral bench.
+        if (result.accountFault !== false) {
+          loadBalancer.markQwenAiRiskControl(account.id)
+        }
         void import('./adapters/qwen-risk-refresh')
           .then(module => module.noteQwenAiRiskChallenge(
             account,
@@ -2050,9 +2054,16 @@ export class RequestForwarder {
         // The trigger must consult the transport the attempt ACTUALLY used:
         // the adapter's size offload upgrades inline → document on its own,
         // so the forwarder-level variable alone misses exactly the oversized
-        // sessions where the pipeline failure hurts most.
+        // sessions where the pipeline failure hurts most. Parse-stage error
+        // codes also prove document transport even when the adapter threw
+        // out of prepare before the probe write-back could run (observed
+        // 2026-09-24: empty probe + qwen_ai_file_parse_timeout skipped the
+        // escape and the 504 reached the client after two 180s burns).
         const attemptUsedDocumentTransport = qwenAiMessageTransport === 'document'
           || qwenAiTransportProbe?.actualTransport === 'document'
+          || result.errorCode === 'qwen_ai_file_parse_timeout'
+          || result.errorCode === 'qwen_ai_file_parse_http_error'
+          || /file parse/i.test(result.error ?? '')
         const documentEscapeWindow = !context.signal?.aborted
           && qwenAiRequestDeadline !== undefined
           && Date.now() < qwenAiRequestDeadline
@@ -2325,6 +2336,10 @@ export class RequestForwarder {
         + 'transcript, or try again later.'
       lastRetryable = false
       lastRetryScope = undefined
+      // Content/egress verdict: never a credential fault. Explicit false
+      // keeps route-level risk benches and the governor on the short
+      // account-neutral path instead of the escalating risk ladder.
+      lastAccountFault = false
     } else if (
       isQwenAiProvider
       && lastErrorCode === 'qwen_ai_webshare_bandwidth_exhausted'

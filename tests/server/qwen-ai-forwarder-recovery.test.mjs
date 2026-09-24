@@ -726,15 +726,23 @@ test('outer Qwen explicit account-fault scopes bypass the semantic replay slot',
   }
 })
 
-test('outer Qwen forwarding preserves parse-stage next-account classification', async () => {
-  const parseTimeout = Object.assign(new Error('Qwen AI file parse timed out'), {
+test('outer Qwen forwarding escapes file_parse_timeout to locked inline when the probe never reported', async () => {
+  // Production shape: prepare throws out of chatCompletion, forwardQwenAi's
+  // catch converts it to this ForwardResult, and the escape runs on the
+  // result path with an empty probe (adapter never reached write-back).
+  const parseTimeoutResult = {
+    success: false,
     status: 504,
-    code: 'qwen_ai_file_parse_timeout',
+    error: 'Qwen AI file parse timed out after 180000ms',
+    errorCode: 'qwen_ai_file_parse_timeout',
     retryable: false,
     accountFault: false,
     retryScope: 'next-account',
-  })
-  const { attempts, execute } = createHarness([parseTimeout])
+  }
+  const { attempts, execute } = createHarness([
+    parseTimeoutResult,
+    { success: true, status: 200, body: { choices: [] } },
+  ])
 
   const result = await execute({
     model: 'model-1',
@@ -742,13 +750,15 @@ test('outer Qwen forwarding preserves parse-stage next-account classification', 
     stream: true,
   })
 
-  assert.equal(result.success, false)
-  assert.equal(result.status, 504)
-  assert.equal(result.errorCode, 'qwen_ai_file_parse_timeout')
-  assert.equal(result.retryable, false)
-  assert.equal(result.accountFault, false)
-  assert.equal(result.retryScope, 'next-account')
-  assert.equal(attempts.length, 1, 'the same account must not replay the upload')
+  assert.equal(result.success, true, 'the locked-inline escape must succeed without rotating')
+  assert.equal(attempts.length, 2, 'parse timeout must same-account escape, not stop at one attempt')
+  assert.equal(attempts[1].qwenAiMessageTransport, 'inline')
+  assert.equal(attempts[1].qwenAiMessageTransportLocked, true)
+  assert.equal(
+    attempts[0].qwenAiTransportProbe?.actualTransport,
+    undefined,
+    'the probe stays empty when prepare throws before write-back',
+  )
 })
 
 test('outer Qwen forwarding clears account classification when the client aborts', async () => {
@@ -3444,12 +3454,16 @@ test('a spent direct fallback after bandwidth-402 rewrites the raw 402 into an a
 test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast)', async () => {
   const engagements = []
   const reports = []
+  const riskBenches = []
   const RequestForwarder = loadRequestForwarder({
     qwenAiRequestTimeoutMs: 600_000,
     webshareEnabled: true,
     engageSticky: reason => engagements.push(reason),
     reportWebshareSuccess: () => reports.push('success'),
     reportWebshareFailure: () => reports.push('failure'),
+    loadBalancer: {
+      markQwenAiRiskControl: accountId => riskBenches.push(accountId),
+    },
   })
   const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
   process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '0'
@@ -3488,6 +3502,7 @@ test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast
     assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
     assert.equal(engagements.length, 1, 'proxy recovery success must engage sticky mode')
     assert.deepEqual(reports, ['success'])
+    assert.deepEqual(riskBenches, [], 'an account-neutral verdict must not hard-cool the account on the balancer')
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
@@ -3496,11 +3511,15 @@ test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast
 
 test('a proxy-routed bxpunish verdict rotates exits then fail-fasts as content_verdict', async () => {
   const reports = []
+  const riskBenches = []
   const RequestForwarder = loadRequestForwarder({
     qwenAiRequestTimeoutMs: 600_000,
     webshareEnabled: true,
     reportWebshareSuccess: () => reports.push('success'),
     reportWebshareFailure: () => reports.push('failure'),
+    loadBalancer: {
+      markQwenAiRiskControl: accountId => riskBenches.push(accountId),
+    },
   })
   const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
   const previousExitMax = process.env.CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX
@@ -3537,12 +3556,14 @@ test('a proxy-routed bxpunish verdict rotates exits then fail-fasts as content_v
     assert.equal(result.errorCode, 'qwen_ai_content_verdict', 'give-up must surface the content-verdict code')
     assert.equal(result.retryable, false, 'a content verdict must not invite further client retries')
     assert.equal(result.retryScope, undefined, 'a content verdict must not rotate accounts')
+    assert.equal(result.accountFault, false, 'a content verdict must stay account-neutral for cooldown policy')
     assert.match(result.error, /risk-control verdict/i)
     assert.match(result.error, /also received the verdict/i)
     assert.match(result.error, /on 3 exit/i, 'the give-up note reports how many proxy exits drew the verdict')
     assert.equal(attempts.length, 4, 'direct miss then three proxy exits before give-up')
     assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true, true, true])
     assert.deepEqual(reports, ['failure', 'failure', 'failure'], 'each proxy miss must cool its pool entry')
+    assert.deepEqual(riskBenches, [], 'multi-exit content verdicts must not drain the account pool via balancer cooldown')
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
@@ -3950,4 +3971,78 @@ test('the HTTP parse error is content-determined for the rotation stop rule', as
     true,
     'the stop rule must cap the document-escape rotation at one extra account',
   )
+})
+
+test('the transport classifier treats a proxy exit ETIMEDOUT as a socket-level fault', () => {
+  // Observed 2026-09-24: a dead Webshare exit raised
+  // `connect ETIMEDOUT 198.105.121.200:6462` during chat creation. The
+  // mapped status is 502, so classification must key on the socket code in
+  // the message (without a status field) — otherwise sticky mode never
+  // disengages and the one-shot direct retry is never granted.
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const match = source.match(/return \/(EAI_AGAIN\|[^/]+)\/i\.test\(/)
+  assert.ok(match, 'isQwenAiTransientTransportError regex must be present')
+  const evidence = [
+    'ETIMEDOUT',
+    'connect ETIMEDOUT 198.105.121.200:6462',
+    'code=ETIMEDOUT connect ETIMEDOUT 198.105.121.200:6462',
+  ]
+  const classifier = new RegExp(match[1], 'i')
+  for (const value of evidence) {
+    assert.match(value, classifier, `evidence must classify as transient: ${value}`)
+  }
+  // Upstream HTTP decisions must stay non-transient even when the body
+  // mentions a timeout word.
+  assert.doesNotMatch('status=502 bad gateway', classifier)
+})
+
+test('a thrown proxy ETIMEDOUT disengages sticky mode and retries once direct', async () => {
+  const disengagements = []
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: true,
+    webshareStickyActive: true,
+    disengageSticky: reason => disengagements.push(reason),
+    // Mirror the production classifier after toolfix41: socket-level
+    // evidence (including ETIMEDOUT) without an HTTP status.
+    isQwenAiTransientTransportError: value => {
+      const record = value ?? {}
+      const status = record.status ?? record.statusCode
+      if (typeof status === 'number' && status >= 400) return false
+      return /ECONNREFUSED|ECONNRESET|ECONNABORTED|ETIMEDOUT|socket hang up/i.test(
+        String(record.errorCode ?? record.code ?? record.error ?? record.message ?? ''),
+      )
+    },
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  // Dead proxy exit surfaces as a THROWN adapter error from chat creation
+  // (container observation 2026-09-24, requestId resp_muffdi15f65…).
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    if (attempts.length === 1) {
+      throw Object.assign(
+        new Error('connect ETIMEDOUT 198.105.121.200:6462'),
+        { code: 'ETIMEDOUT' },
+      )
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true, 'the one-shot direct retry must recover the request')
+  assert.deepEqual(
+    attempts.map(item => item.qwenAiWebshareProxy),
+    [true, false],
+    'the retry must leave the timed-out proxy for the direct exit',
+  )
+  assert.equal(disengagements.length, 1, 'the thrown ETIMEDOUT must disengage sticky mode')
 })

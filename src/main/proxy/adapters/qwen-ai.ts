@@ -825,7 +825,7 @@ export function isQwenAiTransientTransportError(error: unknown): boolean {
     }
   }
 
-  return /EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ECONNRESET|ECONNABORTED|ERR_STREAM_PREMATURE_CLOSE|ERR_NETWORK|ERR_SOCKET|socket hang up|premature close|network error/i.test(
+  return /EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ECONNRESET|ECONNABORTED|ETIMEDOUT|ERR_STREAM_PREMATURE_CLOSE|ERR_NETWORK|ERR_SOCKET|socket hang up|premature close|network error/i.test(
     evidence.join(' '),
   )
 }
@@ -4369,11 +4369,22 @@ export class QwenAiAdapter {
     // 2026-09-11 evening: ~6 accounts burned with no effect).
     const isWebshareBandwidthExhausted = response.status === 402
       && /bandwidth limit reached/i.test(body)
+    // nginx/alibaba edge 502/503/504 pages are gateway stalls, not provider
+    // JSON verdicts. Observed live 2026-09-24: chat creation answered with
+    // alibaba-ga HTML 502 while the credential was healthy — without a
+    // retryable next-account classification the forwarder treats the bare
+    // envelope as terminal and surfaces "Stream disconnected" to Codex.
+    const isHtmlGatewayRejection = response.status >= 500 && response.status <= 504 && (
+      /(?:text\/html|application\/xhtml\+xml)/i.test(contentType)
+      || /^\s*(?:<!doctype\s*html|<html[\s>])/i.test(body)
+      || /bad gateway|gateway time-?out|service unavailable|alibaba-/i.test(body)
+    )
     const isCapacityLimit = !isUpstreamBusy
       && !isRiskControl
       && !chatInProgress
       && !isResponseEnded
       && !isWebshareBandwidthExhausted
+      && !isHtmlGatewayRejection
       && (response.status === 429 || envelopeError?.status === 429)
     const upstreamStatus = response.status >= 400 && response.status <= 599
       ? response.status
@@ -4459,6 +4470,13 @@ export class QwenAiAdapter {
       // healthy account instead of surfacing an API error to the client.
       error.retryable = true
       markQwenAiNextAccountFailure(error)
+    } else if (isHtmlGatewayRejection) {
+      // Account-neutral edge/gateway stall: retry the attempt loop and allow
+      // one still-private next-account replay once local recovery is spent.
+      error.code = 'qwen_ai_upstream_gateway'
+      error.retryable = true
+      error.accountFault = false
+      markQwenAiNextAccountReplay(error)
     } else if (isWebshareBandwidthExhausted) {
       error.code = 'qwen_ai_webshare_bandwidth_exhausted'
       error.retryable = false
@@ -4476,6 +4494,9 @@ export class QwenAiAdapter {
     } else if (chatInProgress) {
       error.accountFault = false
       delete error.retryScope
+    } else if (isHtmlGatewayRejection) {
+      error.accountFault = false
+      markQwenAiNextAccountReplay(error)
     } else if (error.status === 401 || error.status === 403 || isRiskControl || isCapacityLimit) {
       markQwenAiNextAccountFailure(error)
     } else if (error.status >= 500) {
@@ -4800,6 +4821,7 @@ export class QwenAiAdapter {
         prepareQwenAiMultimodalMessage(messages, uploader, {
           transport,
           messageTransportLocked: request.messageTransportLocked,
+          transportProbe: request.transportProbe,
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
           managedDocumentMode,
@@ -5158,6 +5180,7 @@ export class QwenAiAdapter {
           requestIntent: request.requestIntent,
           transport: request.messageTransport,
           messageTransportLocked: request.messageTransportLocked,
+          transportProbe: request.transportProbe,
           transcriptTransportPolicy: request.transcriptTransportPolicy
             ?? qwenAiTranscriptTransportPolicyFromEnv(),
           managedToolCalling: request.managedToolCalling,

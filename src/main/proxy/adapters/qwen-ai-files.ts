@@ -274,6 +274,12 @@ export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperati
    */
   messageTransportLocked?: boolean
   /**
+   * Written as soon as transport settles to 'document' and BEFORE the upload
+   * /parse loop: a parse timeout throws out of prepare, and the forwarder's
+   * document→inline escape must still see that this attempt used document.
+   */
+  transportProbe?: QwenAiTransportProbe
+  /**
    * 'plain' renders tool calls/results as prose without protocol envelopes —
    * used by context compaction so the summary has no wrapper format to imitate.
    */
@@ -3557,6 +3563,17 @@ export async function prepareQwenAiMultimodalMessage(
   }
 
   const transport: QwenAiMessageTransport = generatedDocuments.length > 0 ? 'document' : 'inline'
+  // Report the settled transport before any upload/parse can throw. The
+  // post-prepare write-back in qwen-ai.ts never runs when parse times out,
+  // and an empty probe made the forwarder treat a document failure as inline
+  // (observed 2026-09-24: qwen_ai_file_parse_timeout burned two accounts and
+  // reached the client because the escape condition stayed false).
+  if (options.transportProbe) {
+    options.transportProbe.requestedTransport = options.transport ?? 'inline'
+    options.transportProbe.actualTransport = transport
+    options.transportProbe.offloadedBySize = transport === 'document'
+      && (options.transport ?? 'inline') !== 'document'
+  }
   const uploadedParts = [...uniqueFileParts, ...generatedDocuments]
 
   const files: any[] = []

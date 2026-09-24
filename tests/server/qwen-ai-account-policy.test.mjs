@@ -139,7 +139,7 @@ test('request-wide account-neutral replay slot is consumed at most once', () => 
 })
 
 test('account-neutral recovery failures retain or derive a bounded pool replay scope', () => {
-  for (const errorCode of ['qwen_ai_upstream_busy', 'qwen_ai_semantic_incomplete']) {
+  for (const errorCode of ['qwen_ai_upstream_busy', 'qwen_ai_semantic_incomplete', 'qwen_ai_upstream_gateway']) {
     const failure = { errorCode, accountFault: false }
     assert.equal(qwenAiAccountNeutralReplayScopeAfterRecovery(failure), 'next-account')
     assert.equal(qwenAiSafeExplicitRetryScope({

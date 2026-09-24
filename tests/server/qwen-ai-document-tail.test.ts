@@ -306,3 +306,58 @@ test('document transport attests declared tool names inline', async () => {
     assert.doesNotMatch(prepared.content, /declared these managed tools/)
   })
 })
+
+test('transportProbe reports document before the upload loop and survives a parse throw', async () => {
+  const probe: { requestedTransport?: string; actualTransport?: string; offloadedBySize?: boolean } = {}
+  const parseTimeout = Object.assign(new Error('Qwen AI file parse timed out after 180000ms'), {
+    status: 504,
+    code: 'qwen_ai_file_parse_timeout',
+    retryable: false,
+    accountFault: false,
+  })
+  const failingUploader = {
+    uploadPart: async () => {
+      assert.equal(
+        probe.actualTransport,
+        'document',
+        'the probe must already report document when upload/parse runs',
+      )
+      throw parseTimeout
+    },
+  }
+
+  await assert.rejects(
+    () => prepareQwenAiMultimodalMessage(
+      [{ role: 'user', content: buildSingleMessageCorpus() }],
+      failingUploader as never,
+      {
+        transport: 'document',
+        managedToolCalling: true,
+        requestMaxBytes: 90 * 1024,
+        transportProbe: probe as never,
+      },
+    ),
+    (error: Error & { code?: string }) => error.code === 'qwen_ai_file_parse_timeout',
+  )
+
+  assert.equal(probe.actualTransport, 'document', 'a parse throw must leave document on the probe')
+  assert.equal(probe.requestedTransport, 'document')
+  assert.equal(probe.offloadedBySize, false)
+
+  // Size-driven offload (requested inline, settled document) marks offloadedBySize.
+  const sizeProbe: { requestedTransport?: string; actualTransport?: string; offloadedBySize?: boolean } = {}
+  const sizePrepared = await prepareQwenAiMultimodalMessage(
+    [{ role: 'user', content: buildSingleMessageCorpus() }],
+    createStubUploader() as never,
+    {
+      transport: 'inline',
+      requestMaxBytes: 90 * 1024,
+      transcriptTransportPolicy: { uploadEnabled: true, extension: 'txt' },
+      transportProbe: sizeProbe as never,
+    },
+  )
+  assert.equal(sizePrepared.transport, 'document')
+  assert.equal(sizeProbe.actualTransport, 'document')
+  assert.equal(sizeProbe.requestedTransport, 'inline')
+  assert.equal(sizeProbe.offloadedBySize, true)
+})

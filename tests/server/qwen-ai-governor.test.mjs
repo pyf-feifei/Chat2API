@@ -762,6 +762,60 @@ test('Qwen AI deferred stream risk failures are reported back to the governor', 
   assert.equal(status.accounts[0].governorCooldownReason, 'qwen_ai_risk_control')
 })
 
+test('account-neutral content verdicts get a short bench, not the escalating risk ladder', () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    accountMinIntervalMs: 0,
+    failureCooldownMs: 60_000,
+    riskCooldownMs: 600_000,
+    maxRiskCooldownMs: 1_800_000,
+    globalRiskThreshold: 1,
+    riskWindowMs: 60_000,
+    globalRiskCooldownMs: 1_800_000,
+    maxGlobalRiskCooldownMs: 1_800_000,
+  })
+  const governor = new Governor()
+  const accounts = ['account-neutral-1', 'account-neutral-2'].map(id => ({
+    id,
+    name: id,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+
+  for (const account of accounts) {
+    governor.reportDeferredFailure(account.id, {
+      success: false,
+      status: 503,
+      headers: { bxpunish: '1' },
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+    })
+    // A second hit must not escalate 600s → 1200s for a payload verdict.
+    governor.reportDeferredFailure(account.id, {
+      success: false,
+      status: 503,
+      headers: { bxpunish: '1' },
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+    })
+  }
+
+  const status = governor.getStatus(accounts, providers)
+  for (const account of status.accounts) {
+    assert.ok(
+      account.governorCooldownInMs > 0 && account.governorCooldownInMs <= 120_000,
+      `account-neutral verdict bench must stay short, got ${account.governorCooldownInMs}ms`,
+    )
+    assert.equal(account.governorCooldownReason, 'qwen_ai_content_verdict')
+  }
+  assert.equal(status.globalCooldownInMs, 0, 'content verdicts must not open the global risk circuit')
+  assert.equal(status.recentRiskAccounts, 0, 'content verdicts must not feed the global risk window')
+})
+
 test('a busy storm cools every reported account with a retry-after hint', () => {
   const savedThreshold = process.env.CHAT2API_QWEN_AI_BUSY_STORM_ACCOUNT_THRESHOLD
   const savedCooldown = process.env.CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS

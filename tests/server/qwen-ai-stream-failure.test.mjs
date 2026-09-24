@@ -5520,6 +5520,50 @@ test('Qwen AI preserves an HTTP 429 Chinese congestion response as capacity', as
   assert.equal(error.retryScope, 'next-account')
 })
 
+test('Qwen AI HTML gateway 502 is retryable next-account, not terminal', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const { isQwenAiAccountFault, qwenAiAccountNeutralReplayScopeAfterRecovery } = loadRealModule('src/main/proxy/qwenAiAccountPolicy.ts')
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: {} },
+  )
+
+  // Observed live 2026-09-24: chat creation answered alibaba-ga HTML 502 while
+  // the credential was healthy. Without a retryable next-account classification
+  // the forwarder treats the bare envelope as terminal and Codex sees
+  // "Stream disconnected before completion".
+  const htmlBody = '<html><head><title>502 Bad Gateway</title></head><body bgcolor="white"><center><h1>502 Bad Gateway</h1></center><hr><center>alibaba-ga</center></body></html>'
+  for (const [status, contentType] of [
+    [502, 'text/html'],
+    [503, 'text/html; charset=utf-8'],
+    [504, 'text/html'],
+  ]) {
+    const error = await adapter.createInvalidStreamError({
+      status,
+      headers: { 'content-type': contentType },
+      data: htmlBody,
+    }, status === 502 ? 'chat creation returned HTTP 502' : `returned HTTP ${status}`)
+
+    assert.equal(error.status, status)
+    assert.equal(error.code, 'qwen_ai_upstream_gateway')
+    assert.equal(error.retryable, true)
+    assert.equal(error.accountFault, false)
+    assert.equal(error.retryScope, 'next-account')
+    assert.equal(isQwenAiAccountFault(error), false)
+    assert.equal(qwenAiAccountNeutralReplayScopeAfterRecovery(error), 'next-account')
+  }
+
+  // Bad-gateway wording without an HTML content-type still classifies.
+  const textGateway = await adapter.createInvalidStreamError({
+    status: 502,
+    headers: { 'content-type': 'text/plain' },
+    data: '502 Bad Gateway',
+  }, 'upstream returned HTTP 502')
+  assert.equal(textGateway.code, 'qwen_ai_upstream_gateway')
+  assert.equal(textGateway.retryable, true)
+  assert.equal(textGateway.retryScope, 'next-account')
+})
+
 test('Qwen AI tags a webshare bandwidth-402 as proxy quota exhaustion, not an account fault', async () => {
   const { QwenAiAdapter } = loadQwenAiStreamHandler()
   const { isQwenAiAccountFault, qwenAiAccountRetryScope } = loadRealModule('src/main/proxy/qwenAiAccountPolicy.ts')

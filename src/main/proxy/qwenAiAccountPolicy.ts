@@ -252,6 +252,9 @@ const QWEN_AI_ACCOUNT_NEUTRAL_REPLAY_CODES = new Set([
   'qwen_ai_queue_timeout',
   'chat_in_progress',
   'qwen_ai_upstream_busy',
+  // HTML edge/gateway 502/503/504 (alibaba-ga Bad Gateway) is infrastructure,
+  // not the credential: another account/exit may reach the healthy backend.
+  'qwen_ai_upstream_gateway',
   'qwen_ai_semantic_empty',
   'qwen_ai_semantic_incomplete',
   'qwen_ai_wrapper_leak',

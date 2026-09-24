@@ -932,23 +932,39 @@ export class QwenAiRequestGovernor {
       // for an IP problem. Bench the account only briefly and leave its failure
       // counter untouched — observed 2026-09-22: 28 accounts frozen overnight
       // by refresh hits alone while the chat path was fine.
+      //
+      // The same short-bench rule applies when the caller already classified
+      // the result as account-neutral (accountFault:false). A busy+bxpunish
+      // content/egress verdict reproduces on every account and every Webshare
+      // exit; the escalating ladder plus global risk circuit then empties the
+      // rotation (observed 2026-09-24: 10 accounts × 600–1200s during one
+      // multi-exit content-verdict storm while healthy traffic still passed).
       const isRefreshRisk = result.errorCode === 'qwen_ai_token_refresh_failed'
         || result.errorCode === 'qwen_ai_token_refresh_gated'
-      const cooldownMs = isRefreshRisk
+      const isAccountNeutralRisk = result.accountFault === false
+      const isEgressOrNeutralRisk = isRefreshRisk || isAccountNeutralRisk
+      const cooldownMs = isEgressOrNeutralRisk
         ? Math.max(30_000, Math.min(config.failureCooldownMs, 120_000))
         : Math.min(config.riskCooldownMs * (2 ** (failures - 1)), config.maxRiskCooldownMs)
       this.openCooldown(
         accountId,
         cooldownMs,
-        isRefreshRisk ? 'qwen_ai_refresh_risk_control' : 'qwen_ai_risk_control',
-        isRefreshRisk ? current?.failures ?? 1 : failures,
+        isRefreshRisk
+          ? 'qwen_ai_refresh_risk_control'
+          : isAccountNeutralRisk
+            ? 'qwen_ai_content_verdict'
+            : 'qwen_ai_risk_control',
+        isEgressOrNeutralRisk ? current?.failures ?? 1 : failures,
       )
       // One context compaction can fan out into correlated map/reduce calls.
       // Keep each affected account out of rotation, but do not mistake those
       // internal calls for independent evidence that ordinary traffic must be
       // stopped globally. A gated refresh never reached the network, so it
-      // carries no new evidence about the egress either.
-      if (requestClass === 'normal' && !isRefreshRisk) {
+      // carries no new evidence about the egress either. Account-neutral
+      // content verdicts are payload-determined — they must not trip the
+      // global risk circuit either (that circuit is for credential/egress
+      // failures that every future request will also draw).
+      if (requestClass === 'normal' && !isEgressOrNeutralRisk) {
         this.recordGlobalRiskControl(accountId, config, this.getQwenAiAccountScope())
       }
       return result
