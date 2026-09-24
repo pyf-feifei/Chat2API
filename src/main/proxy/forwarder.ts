@@ -5807,7 +5807,7 @@ export class RequestForwarder {
       if (response.status >= 400) {
         const isAuth = response.status === 401 || response.status === 403
         const errorMessage = isAuth
-          ? `Mimo credentials expired (HTTP ${response.status}). serviceToken lasts ~24h and cannot auto-refresh — log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`
+          ? `Mimo credentials expired (HTTP ${response.status}). Store Xiaomi email+password for auto-relogin, or log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`
           : `HTTP ${response.status}`
         return {
           success: false,
@@ -5904,9 +5904,9 @@ export class RequestForwarder {
           success: false,
           status: status ?? 401,
           error:
-            /log out\/in/i.test(message)
+            /log out\/in|email\+password|auto-relogin/i.test(message)
               ? message
-              : `Mimo credentials expired (HTTP ${status ?? 401}). serviceToken lasts ~24h and cannot auto-refresh — log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`,
+              : `Mimo credentials expired (HTTP ${status ?? 401}). Store Xiaomi email+password for auto-relogin, or log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`,
           errorCode: 'mimo_credentials_expired',
           accountFault: true,
           retryable: false,

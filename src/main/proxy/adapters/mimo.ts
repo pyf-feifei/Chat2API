@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Mimo Adapter
  * Implements Mimo (Xiaomi AI Studio) API protocol
  */
@@ -7,6 +7,8 @@ import axios from 'axios'
 import type { AxiosResponse } from 'axios'
 import { PassThrough } from 'stream'
 import type { Account, Provider } from '../../store/types'
+// Explicit .ts extension keeps this module loadable by `node --test`.
+import { storeManager } from '../../store/store.ts'
 import type { ChatMessage } from '../types.ts'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser.ts'
 import type { ToolCallingPlan } from '../toolCalling/types.ts'
@@ -373,7 +375,7 @@ export class MimoAdapter {
   private async saveConversation(conversationId: string): Promise<void> {
     const { serviceToken, userId, phToken } = this.getCredentials()
     const response = await axios.post(
-      this.buildUrl('/open-apis/chat/conversation/save', phToken),
+      this.buildUrl('/fastchat/open-apis/chat/conversation/save', phToken),
       {
         conversationId,
         title: '新对话',
@@ -401,7 +403,7 @@ export class MimoAdapter {
     try {
       const { serviceToken, userId, phToken } = this.getCredentials()
       const response = await axios.post(
-        this.buildUrl('/open-apis/chat/conversation/genTitle', phToken),
+        this.buildUrl('/fastchat/open-apis/chat/conversation/genTitle', phToken),
         {
           conversationId,
           content,
@@ -430,24 +432,99 @@ export class MimoAdapter {
     conversationId: string
     query: string
   }> {
+    const conversationId = uuid(false)
+    const msgId = uuid(false).slice(0, 32)
+    const query = buildMimoQuery(request.messages)
+
+    let response = await this.sendChatRequest(request, conversationId, msgId, query, false)
+
+    if (response.status === 401 || response.status === 403) {
+      console.log(`[Mimo] chat auth error (${response.status}), attempting credential refresh...`)
+      const refreshed = await this.attemptCredentialsRefresh()
+      if (refreshed) {
+        response = await this.sendChatRequest(request, conversationId, msgId, query, true)
+      }
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      const err = new Error(
+        `Mimo credentials expired (HTTP ${response.status}). serviceToken lasts ~24h. `
+        + 'Store Xiaomi email+password on the account to auto-relogin, or log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.',
+      ) as Error & { status?: number; retryable?: boolean; accountFault?: boolean }
+      err.status = response.status
+      err.retryable = false
+      err.accountFault = true
+      throw err
+    }
+
+    if (response.status >= 400) {
+      const err = new Error(`Mimo chat request failed: HTTP ${response.status}`) as Error & {
+        status?: number
+        retryable?: boolean
+      }
+      err.status = response.status
+      err.retryable = response.status >= 500 || response.status === 429
+      throw err
+    }
+
+    return { response, conversationId, query }
+  }
+
+  /**
+   * Re-login with stored Xiaomi email+password when serviceToken is rejected.
+   * Returns true when store credentials were rotated and the retry can use them.
+   */
+  private async attemptCredentialsRefresh(): Promise<boolean> {
+    try {
+      // Re-read from the store: credentials may have gained email/password or
+      // newer cookies since this adapter instance was constructed.
+      const account = storeManager.getAccountById(this.account.id, true) || this.account
+      const { mimoTokenRefresher } = await import('./mimo-token-refresh')
+      if (!mimoTokenRefresher.canRefresh(account)) {
+        console.log('[Mimo] No stored Xiaomi email/password, credential re-login unavailable')
+        return false
+      }
+      const refreshed = await mimoTokenRefresher.refreshAfterUnauthorized(account)
+      if (refreshed) {
+        const latest = storeManager.getAccountById(this.account.id, true) || account
+        this.account = latest
+        console.log('[Mimo] Credentials refreshed successfully via Xiaomi passport re-login')
+        return true
+      }
+      return false
+    } catch (error) {
+      console.log(
+        '[Mimo] Credential re-login failed:',
+        error instanceof Error ? error.message : error,
+      )
+      return false
+    }
+  }
+
+  private async sendChatRequest(
+    request: ChatCompletionRequest,
+    conversationId: string,
+    msgId: string,
+    query: string,
+    isRetry: boolean,
+  ): Promise<AxiosResponse> {
     const { serviceToken, userId, phToken } = this.getCredentials()
 
     if (!serviceToken || !userId || !phToken) {
       throw new Error('Mimo credentials not configured. Please add service_token, user_id, and ph_token in account settings.')
     }
 
-    const conversationId = uuid(false)
-    const msgId = uuid(false).slice(0, 32)
-    const query = buildMimoQuery(request.messages)
-    try {
-      await this.saveConversation(conversationId)
-    } catch (error) {
-      // Save is bookkeeping only: a 401/auth skew must not block chat when
-      // the subsequent chat completion call still works with the same cookies.
-      console.warn(
-        '[Mimo] Failed to save conversation (continuing chat):',
-        error instanceof Error ? error.message : error,
-      )
+    if (!isRetry) {
+      try {
+        await this.saveConversation(conversationId)
+      } catch (error) {
+        // Save is bookkeeping only: a 401/auth skew must not block chat when
+        // the subsequent chat completion call still works with the same cookies.
+        console.warn(
+          '[Mimo] Failed to save conversation (continuing chat):',
+          error instanceof Error ? error.message : error,
+        )
+      }
     }
 
     const modelLower = request.model.toLowerCase()
@@ -471,35 +548,14 @@ export class MimoAdapter {
       multiMedias: [],
     }
 
-    const response = await axios({
+    return axios({
       method: 'POST',
-      url: this.buildUrl('/open-apis/bot/chat', phToken),
+      url: this.buildUrl('/fastchat/open-apis/bot/chat', phToken),
       data: requestBody,
       responseType: 'stream',
       headers: this.buildHeaders(serviceToken, userId, phToken),
       validateStatus: () => true,
     })
-
-    if (response.status === 401 || response.status === 403) {
-      const err = new Error(
-        `Mimo credentials expired (HTTP ${response.status}). serviceToken lasts ~24h and cannot auto-refresh — log out/in at aistudio.xiaomimimo.com and update service_token/user_id/ph_token.`,
-      ) as Error & { status?: number; retryable?: boolean }
-      err.status = response.status
-      err.retryable = false
-      throw err
-    }
-
-    if (response.status >= 400) {
-      const err = new Error(`Mimo chat request failed: HTTP ${response.status}`) as Error & {
-        status?: number
-        retryable?: boolean
-      }
-      err.status = response.status
-      err.retryable = response.status >= 500 || response.status === 429
-      throw err
-    }
-
-    return { response, conversationId, query }
   }
 
   private async getConversationList(pageNum: number = 1, pageSize: number = 100): Promise<{
@@ -512,7 +568,7 @@ export class MimoAdapter {
       throw new Error('Mimo credentials not configured')
     }
 
-    const url = `${MIMO_API_BASE}/open-apis/chat/conversation/list?xiaomichatbot_ph=${encodeURIComponent(phToken)}`
+    const url = `${MIMO_API_BASE}/fastchat/open-apis/chat/conversation/list?xiaomichatbot_ph=${encodeURIComponent(phToken)}`
 
     const response = await axios.post(
       url,
@@ -561,7 +617,7 @@ export class MimoAdapter {
       throw new Error('Mimo credentials not configured')
     }
 
-    const url = `${MIMO_API_BASE}/open-apis/chat/conversation/delete?xiaomichatbot_ph=${encodeURIComponent(phToken)}`
+    const url = `${MIMO_API_BASE}/fastchat/open-apis/chat/conversation/delete?xiaomichatbot_ph=${encodeURIComponent(phToken)}`
 
     const response = await axios.post(
       url,

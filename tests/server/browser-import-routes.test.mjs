@@ -14,6 +14,8 @@ test('management API exposes browser-assisted import completion route', () => {
   assert.match(source, /baxiaUidToken/)
   assert.match(source, /x5secdata/)
   assert.match(source, /tongyi_sso_ticket/)
+  assert.match(source, /service_token/)
+  assert.match(source, /xiaomichatbot_ph/)
   assert.match(source, /setBrowserImportResult/)
 })
 

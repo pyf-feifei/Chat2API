@@ -8,9 +8,10 @@ import {
   SecuritySettings,
   ManagementApiSettings,
   CaptchaVisionSettings,
+  GmailSettings,
 } from '@/components/settings'
 import { useSettingsStore } from '@/stores/settingsStore'
-import { Sun, Settings as SettingsIcon, Database, Shield, Key, ScanEye } from 'lucide-react'
+import { Sun, Settings as SettingsIcon, Database, Shield, Key, ScanEye, Mail } from 'lucide-react'
 
 export function Settings() {
   const { t } = useTranslation()
@@ -36,7 +37,7 @@ export function Settings() {
       </div>
 
       <Tabs defaultValue="appearance" className="w-full">
-        <TabsList className="grid w-full grid-cols-6 h-auto">
+        <TabsList className="grid w-full grid-cols-7 h-auto">
           <TabsTrigger value="appearance" className="flex items-center gap-2 py-2">
             <Sun className="h-4 w-4" />
             <span className="hidden sm:inline">{t('settings.appearance')}</span>
@@ -60,6 +61,10 @@ export function Settings() {
           <TabsTrigger value="captchaVision" className="flex items-center gap-2 py-2">
             <ScanEye className="h-4 w-4" />
             <span className="hidden sm:inline">{t('settings.captchaVision.title')}</span>
+          </TabsTrigger>
+          <TabsTrigger value="gmail" className="flex items-center gap-2 py-2">
+            <Mail className="h-4 w-4" />
+            <span className="hidden sm:inline">{t('settings.gmail.title')}</span>
           </TabsTrigger>
         </TabsList>
 
@@ -85,6 +90,10 @@ export function Settings() {
 
         <TabsContent value="captchaVision" className="mt-6">
           <CaptchaVisionSettings />
+        </TabsContent>
+
+        <TabsContent value="gmail" className="mt-6">
+          <GmailSettings />
         </TabsContent>
       </Tabs>
     </div>

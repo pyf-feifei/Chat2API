@@ -17,7 +17,13 @@ const router = new Router({ prefix: '/v0/management/config' })
 
 router.use(managementAuthMiddleware)
 
-const SENSITIVE_KEYS = ['managementApiSecret', 'apiKeys', 'credentials']
+const SENSITIVE_KEYS = [
+  'managementApiSecret',
+  'apiKeys',
+  'credentials',
+  'matonApiKey',
+  'captchaVisionApiKey',
+]
 
 function maskSensitiveValue(value: unknown, key?: string): unknown {
   if (typeof value === 'string') {
@@ -47,8 +53,13 @@ function maskSensitiveObject(obj: Record<string, unknown>): Record<string, unkno
   const masked: Record<string, unknown> = {}
 
   for (const [key, value] of Object.entries(obj)) {
-    if (key === 'key' || key === 'managementApiSecret' || key === 'credentials') {
-      masked[key] = '***'
+    if (
+      key === 'key' ||
+      key === 'managementApiSecret' ||
+      key === 'credentials' ||
+      SENSITIVE_KEYS.some(k => key.toLowerCase().includes(k.toLowerCase()))
+    ) {
+      masked[key] = typeof value === 'string' && value ? '***' : value
     } else if (key === 'apiKeys' && Array.isArray(value)) {
       masked[key] = value.map(apiKey => ({
         ...apiKey,
@@ -73,6 +84,22 @@ function maskConfig(config: AppConfig): Record<string, unknown> {
     masked.managementApi = managementApi
   }
 
+  if (masked.gmailConfig) {
+    const gmailConfig = { ...(masked.gmailConfig as Record<string, unknown>) }
+    if (typeof gmailConfig.matonApiKey === 'string' && gmailConfig.matonApiKey) {
+      gmailConfig.matonApiKey = '***'
+    }
+    masked.gmailConfig = gmailConfig
+  }
+
+  if (masked.captchaVision) {
+    const captchaVision = { ...(masked.captchaVision as Record<string, unknown>) }
+    if (typeof captchaVision.apiKey === 'string' && captchaVision.apiKey) {
+      captchaVision.apiKey = '***'
+    }
+    masked.captchaVision = captchaVision
+  }
+
   if (Array.isArray(masked.apiKeys)) {
     masked.apiKeys = masked.apiKeys.map(apiKey => ({
       ...(apiKey as Record<string, unknown>),
@@ -89,7 +116,7 @@ router.get('/', async (ctx: Context) => {
 
     ctx.body = {
       success: true,
-      data: config,
+      data: maskConfig(config),
     } as ManagementApiResponse<AppConfig>
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
@@ -139,7 +166,7 @@ router.put('/', async (ctx: Context) => {
 
     ctx.body = {
       success: true,
-      data: updatedConfig,
+      data: maskConfig(updatedConfig),
     } as ManagementApiResponse<AppConfig>
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'

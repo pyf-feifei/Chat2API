@@ -315,7 +315,7 @@ export function Providers() {
       const account = await window.electronAPI.accounts.add({
         providerId: targetProvider.id,
         name: `${provider.name} ${t('providers.accounts')}`,
-        email: provider.id === 'qwen-ai' ? credentials.email?.trim() || undefined : undefined,
+        email: ['qwen-ai', 'zai', 'mimo'].includes(provider.id) ? credentials.email?.trim() || undefined : undefined,
         credentials: credentials,
       })
       store.addAccount(account)

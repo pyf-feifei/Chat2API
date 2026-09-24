@@ -994,6 +994,14 @@ const config = {
   update: updateConfig,
   onConfigChanged: (callback: (config: AppConfig) => void) =>
     on('config:changed', callback as Listener),
+  testCaptchaVision: (): Promise<never> => {
+    throw new Error('Captcha vision test requires the desktop app.')
+  },
+  testGmail: async (updates: unknown): Promise<unknown> =>
+    managementFetch('/gmail/test', {
+      method: 'POST',
+      body: JSON.stringify(updates || {}),
+    }),
 }
 
 const prompts = {
@@ -1261,6 +1269,10 @@ async function invoke(channel: string, ...args: unknown[]): Promise<unknown> {
       return contextManagement.getConfig()
     case 'contextManagement:updateConfig':
       return contextManagement.updateConfig(args[0])
+    case 'captchaVision:test':
+      return config.testCaptchaVision()
+    case 'gmail:test':
+      return config.testGmail(args[0])
     default:
       throw new Error(`Unsupported web admin IPC channel: ${channel}`)
   }

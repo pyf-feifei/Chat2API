@@ -280,6 +280,8 @@ export interface AppConfig {
   language: 'zh-CN' | 'en-US'
   /** Vision model for solving the Z.ai slider captcha (optional; env fallback) */
   captchaVision?: CaptchaVisionConfig
+  /** Maton Gmail helper for MiMo email OTP (optional; env fallback) */
+  gmailConfig?: GmailConfig
 }
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -417,6 +419,36 @@ export interface CaptchaVisionTestResult {
   /** Endpoint actually called (never includes the secret). */
   endpoint?: string
   /** Raw model reply, trimmed and truncated, for troubleshooting. */
+  reply?: string
+}
+
+/**
+ * Maton Gmail helper settings used to fetch Xiaomi email OTP codes
+ * during MiMo account login/import.
+ */
+export interface GmailConfig {
+  enabled: boolean
+  /** Maton API key (Bearer). */
+  matonApiKey: string
+  /** Active google-mail connection id (Maton-Connection header). */
+  matonConnectionId: string
+  /** Optional override for the gateway base URL. */
+  gatewayBaseUrl: string
+  /** Optional override for the control-plane base URL. */
+  controlBaseUrl: string
+}
+
+/** Result of a round-trip connectivity probe against the Maton Gmail helper. */
+export interface GmailTestResult {
+  ok: boolean
+  message:
+    | 'ok'
+    | 'missingApiKey'
+    | 'httpError'
+    | 'badJson'
+    | 'timeout'
+    | 'networkError'
+  endpoint?: string
   reply?: string
 }
 

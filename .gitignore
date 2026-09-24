@@ -147,3 +147,7 @@ scripts/zai-captcha/*.png
 scripts/zai-captcha/diag_*.py
 scripts/zai-captcha/zai-bundle.js
 scripts/zai-captcha/__pycache__/
+
+# Mimo browser-login local debug artifacts (screenshots / geetest captures)
+scripts/mimo-login/artifacts/
+scripts/mimo-login/__pycache__/

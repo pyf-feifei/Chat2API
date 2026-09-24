@@ -383,7 +383,13 @@
     "phToken": "PH Token",
     "phTokenPlaceholder": "Enter xiaomichatbot_ph",
     "phTokenHelp": "DevTools -> Application -> Cookies -> xiaomichatbot_ph. Re-import all three cookies together when auth fails.",
-    "tokenExpiryNote": "serviceToken lasts about 24 hours and cannot be auto-refreshed. On 401, log out and back in, then update all three cookies."
+    "email": "Login Email (Optional)",
+    "emailPlaceholder": "Xiaomi account email for automatic serviceToken refresh",
+    "emailHelp": "When email and password are provided, Chat2API re-logins via Xiaomi passport after serviceToken expires. This email is shown in the account list.",
+    "password": "Login Password (Optional)",
+    "passwordPlaceholder": "Xiaomi account password for automatic serviceToken refresh",
+    "passwordHelp": "Stored in encrypted credentials when available. Automatic refresh can fail if Xiaomi requires captcha, 2FA, or identity verification.",
+    "tokenExpiryNote": "serviceToken lasts about 24 hours. With email+password it re-logins automatically; otherwise log out/in at aistudio.xiaomimimo.com and update all three cookies."
   },
   "perplexity": {
     "name": "Perplexity",
@@ -995,6 +1001,35 @@
         "emptyContent": "Model returned empty content. It is probably a reasoning model that used the whole token budget - try a non-reasoning model.",
         "mismatch": "Model replied, but could not read the probe image. Check that the model is vision-capable.",
         "timeout": "Request timed out after 60s.",
+        "networkError": "Network request failed."
+      }
+    },
+    "gmail": {
+      "title": "Gmail OTP",
+      "description": "Maton Gmail helper used to fetch Xiaomi verification codes during MiMo account login and import.",
+      "enableToggle": "Enable Gmail auto code fetch",
+      "enableDescription": "When enabled, scripts and import flows prefer the Maton Gmail API over a local helper script.",
+      "matonApiKey": "Maton API Key",
+      "matonApiKeyHelp": "Bearer token for gateway.maton.ai / ctrl.maton.ai. Stored in app config; never commit it to git.",
+      "showKey": "Show API key",
+      "hideKey": "Hide API key",
+      "connectionId": "Connection ID",
+      "connectionIdHelp": "Active google-mail connection id (Maton-Connection header). Leave empty to only list connections when testing.",
+      "gatewayBaseUrl": "Gateway Base URL",
+      "controlBaseUrl": "Control Base URL",
+      "test": "Test connection",
+      "testDisabledHint": "Fill in Maton API Key first",
+      "unsaved": "Unsaved changes",
+      "saveSuccess": "Gmail settings saved",
+      "saveError": "Failed to save Gmail settings",
+      "reply": "Reply",
+      "warning": "Used by scripts/mimo-login/login.py and the MiMo import skill. Configure here so keys do not live in local env files.",
+      "result": {
+        "ok": "Maton Gmail connection is working.",
+        "missingApiKey": "Maton API Key is empty.",
+        "httpError": "Maton returned an HTTP error.",
+        "badJson": "Maton returned a non-JSON response.",
+        "timeout": "Request timed out after 30s.",
         "networkError": "Network request failed."
       }
     }

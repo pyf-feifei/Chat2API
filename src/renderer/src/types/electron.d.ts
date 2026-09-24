@@ -29,6 +29,8 @@ import type {
   WebshareProxyListItem,
   CaptchaVisionConfig,
   CaptchaVisionTestResult,
+  GmailConfig,
+  GmailTestResult,
 } from '../../../shared/types'
 
 export type {
@@ -63,6 +65,8 @@ export type {
   WebshareProxyListItem,
   CaptchaVisionConfig,
   CaptchaVisionTestResult,
+  GmailConfig,
+  GmailTestResult,
 }
 
 export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
@@ -341,6 +345,8 @@ interface ConfigAPI {
   onConfigChanged: (callback: (config: AppConfig) => void) => () => void
   /** Round-trip probe for the Z.ai captcha vision model (tests unsaved form values). */
   testCaptchaVision: (config: Partial<CaptchaVisionConfig>) => Promise<CaptchaVisionTestResult>
+  /** Round-trip probe for the Maton Gmail helper (tests unsaved form values). */
+  testGmail: (config: Partial<GmailConfig>) => Promise<GmailTestResult>
 }
 
 interface PromptsAPI {

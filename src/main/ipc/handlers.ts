@@ -17,7 +17,8 @@ import { TrayManager } from '../tray/TrayManager'
 import { ConfigManager } from '../store/config'
 import { generateManagementSecret } from '../proxy/middleware/managementAuth'
 import { testCaptchaVisionConnection } from '../lib/captchaVision'
-import type { CaptchaVisionConfig } from '../store/types'
+import { testGmailConnection } from '../lib/matonGmail'
+import type { CaptchaVisionConfig, GmailConfig } from '../store/types'
 import { UpdaterManager } from '../updater'
 import { DeepSeekAdapter } from '../proxy/adapters/deepseek'
 import { GLMAdapter } from '../proxy/adapters/glm'
@@ -1025,6 +1026,11 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
       model: config?.model ?? current?.model ?? '',
     }
     return testCaptchaVisionConnection(merged)
+  })
+
+  ipcMain.handle(IpcChannels.GMAIL_TEST, async (_, updates: Partial<GmailConfig>) => {
+    const current = ConfigManager.get().gmailConfig
+    return testGmailConnection({ ...current, ...updates })
   })
   
   oauthManager.on('progress', (event) => {

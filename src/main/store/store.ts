@@ -37,6 +37,7 @@ import {
   normalizeQwenAiSessionMode,
   normalizeWebshareProxyConfig,
   normalizeCaptchaVisionConfig,
+  normalizeGmailConfig,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -262,6 +263,7 @@ class StoreManager {
         ? undefined
         : normalizeWebshareProxyConfig(rawConfig.webshareProxyConfig),
       captchaVision: normalizeCaptchaVisionConfig(rawConfig.captchaVision),
+      gmailConfig: normalizeGmailConfig(rawConfig.gmailConfig),
     }
   }
 
@@ -997,6 +999,10 @@ class StoreManager {
 
     if ('captchaVision' in updates) {
       newConfig.captchaVision = normalizeCaptchaVisionConfig(updates.captchaVision)
+    }
+
+    if ('gmailConfig' in updates) {
+      newConfig.gmailConfig = normalizeGmailConfig(updates.gmailConfig)
     }
 
     const normalized = this.normalizeConfig(newConfig)

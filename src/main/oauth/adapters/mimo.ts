@@ -107,8 +107,9 @@ export class MimoAdapter extends BaseOAuthAdapter {
 
   /**
    * Mimo's serviceToken expires in ~24h and has no official refresh endpoint.
-   * This pass-through returns the existing cookies unchanged; callers must
-   * re-import credentials (web logout + login) when auth fails.
+   * When Xiaomi email+password are stored, callers should use
+   * `mimoTokenRefresher` (proxy layer) for a full passport re-login; this
+   * OAuth pass-through only echoes the existing cookies for management APIs.
    */
   async refreshToken(credentials: Record<string, string>): Promise<CredentialInfo | null> {
     const serviceToken = credentials['service_token'] || credentials['serviceToken']
@@ -126,6 +127,8 @@ export class MimoAdapter extends BaseOAuthAdapter {
         service_token: serviceToken,
         user_id: userId,
         ph_token: phToken,
+        ...(credentials.email ? { email: credentials.email } : {}),
+        ...(credentials.password ? { password: credentials.password } : {}),
       },
     }
   }

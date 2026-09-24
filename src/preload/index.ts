@@ -21,6 +21,8 @@ import type {
   WebshareProxyConfig,
   CaptchaVisionConfig,
   CaptchaVisionTestResult,
+  GmailConfig,
+  GmailTestResult,
 } from '../shared/types'
 
 export interface WebshareProxyConfigPayload extends WebshareProxyConfig {
@@ -537,6 +539,9 @@ const configAPI = {
    */
   testCaptchaVision: (config: Partial<CaptchaVisionConfig>): Promise<CaptchaVisionTestResult> =>
     ipcRenderer.invoke(IpcChannels.CAPTCHA_VISION_TEST, config),
+
+  testGmail: (updates: Partial<GmailConfig>): Promise<GmailTestResult> =>
+    ipcRenderer.invoke(IpcChannels.GMAIL_TEST, updates),
 }
 
 const promptsAPI = {

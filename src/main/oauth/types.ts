@@ -22,7 +22,15 @@ export type OAuthStatus = 'idle' | 'pending' | 'success' | 'error' | 'cancelled'
 /**
  * Token type
  */
-export type TokenType = 'jwt' | 'refresh' | 'access' | 'cookie'
+export type TokenType =
+  | 'jwt'
+  | 'refresh'
+  | 'access'
+  | 'cookie'
+  | 'token'
+  | 'service_token'
+  | 'user_id'
+  | 'ph_token'
 
 /**
  * OAuth login result
@@ -218,6 +226,42 @@ export const MANUAL_TOKEN_CONFIGS: Record<ProviderType, ManualTokenConfig[]> = {
       placeholder: 'Enter Microsoft 365 access token',
       description: 'Obtain via OAuth PKCE flow or device-code flow for M365 Copilot',
       helpUrl: 'https://m365.cloud.microsoft',
+    },
+  ],
+  zai: [
+    {
+      providerType: 'zai',
+      tokenType: 'token',
+      label: 'Token',
+      placeholder: 'Enter Z.ai token',
+      description: 'Get token from z.ai developer settings or browser cookies',
+      helpUrl: 'https://z.ai',
+    },
+  ],
+  mimo: [
+    {
+      providerType: 'mimo',
+      tokenType: 'service_token',
+      label: 'serviceToken',
+      placeholder: 'Enter serviceToken cookie value',
+      description: 'From aistudio.xiaomimimo.com browser DevTools Cookies (serviceToken)',
+      helpUrl: 'https://aistudio.xiaomimimo.com',
+    },
+    {
+      providerType: 'mimo',
+      tokenType: 'user_id',
+      label: 'userId',
+      placeholder: 'Enter userId cookie value',
+      description: 'From aistudio.xiaomimimo.com browser DevTools Cookies (userId)',
+      helpUrl: 'https://aistudio.xiaomimimo.com',
+    },
+    {
+      providerType: 'mimo',
+      tokenType: 'ph_token',
+      label: 'xiaomichatbot_ph',
+      placeholder: 'Enter xiaomichatbot_ph cookie value',
+      description: 'From aistudio.xiaomimimo.com browser DevTools Cookies (xiaomichatbot_ph)',
+      helpUrl: 'https://aistudio.xiaomimimo.com',
     },
   ],
 }

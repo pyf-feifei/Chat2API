@@ -15,6 +15,7 @@ import toolCallingRouter from './toolCalling'
 import qwenAiGovernorRouter from './qwenAiGovernor'
 import webshareProxyRouter from './webshareProxy'
 import m365OAuthRouter from './m365OAuth'
+import gmailRouter from './gmail'
 
 export {
   configRouter,
@@ -29,6 +30,7 @@ export {
   qwenAiGovernorRouter,
   webshareProxyRouter,
   m365OAuthRouter,
+  gmailRouter,
 }
 
 export default [
@@ -44,4 +46,5 @@ export default [
   qwenAiGovernorRouter,
   webshareProxyRouter,
   m365OAuthRouter,
+  gmailRouter,
 ]

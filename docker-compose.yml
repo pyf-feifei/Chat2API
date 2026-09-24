@@ -42,6 +42,11 @@ services:
       # the active Qwen pool. Ordinary 5xx and chat/session errors stay on the
       # current account. A positive value can impose a deployment-specific cap.
       CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:-5}
+      # Mimo serviceToken has no refresh grant: renewal re-runs the Xiaomi
+      # password login. auto = try HTTP passport first, then fall back to the
+      # patchright driver in scripts/mimo-login (Geetest slide + email OTP).
+      MIMO_REFRESH_MODE: ${MIMO_REFRESH_MODE:-auto}
+      MIMO_REFRESH_BROWSER_TIMEOUT_MS: ${MIMO_REFRESH_BROWSER_TIMEOUT_MS:-300000}
       # Active accounts need the Qwen Web token cookie before they can enter
       # the request pool. Repair incomplete sessions serially to limit sign-in load.
       CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED: ${CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED:-true}

@@ -156,6 +156,40 @@ export function normalizeCaptchaVisionConfig(value: unknown): CaptchaVisionConfi
   }
 }
 
+export interface GmailConfig {
+  enabled: boolean
+  matonApiKey: string
+  matonConnectionId: string
+  gatewayBaseUrl: string
+  controlBaseUrl: string
+}
+
+export const DEFAULT_GMAIL_CONFIG: GmailConfig = {
+  enabled: false,
+  matonApiKey: '',
+  matonConnectionId: '',
+  gatewayBaseUrl: 'https://gateway.maton.ai/google-mail',
+  controlBaseUrl: 'https://ctrl.maton.ai',
+}
+
+export function normalizeGmailConfig(value: unknown): GmailConfig {
+  if (!value || typeof value !== 'object') return { ...DEFAULT_GMAIL_CONFIG }
+  const r = value as Record<string, unknown>
+  return {
+    enabled: r.enabled === true,
+    matonApiKey: typeof r.matonApiKey === 'string' ? r.matonApiKey.trim() : '',
+    matonConnectionId: typeof r.matonConnectionId === 'string' ? r.matonConnectionId.trim() : '',
+    gatewayBaseUrl:
+      typeof r.gatewayBaseUrl === 'string' && r.gatewayBaseUrl.trim()
+        ? r.gatewayBaseUrl.trim().replace(/\/+$/, '')
+        : DEFAULT_GMAIL_CONFIG.gatewayBaseUrl,
+    controlBaseUrl:
+      typeof r.controlBaseUrl === 'string' && r.controlBaseUrl.trim()
+        ? r.controlBaseUrl.trim().replace(/\/+$/, '')
+        : DEFAULT_GMAIL_CONFIG.controlBaseUrl,
+  }
+}
+
 export const DEFAULT_WEBSHARE_PROXY_CONFIG: WebshareProxyConfig = {
   enabled: false,
   proxyUrl: '',
@@ -424,6 +458,8 @@ export interface AppConfig {
   contextManagement: ContextManagementConfig
   /** Vision model for solving the Z.ai slider captcha (optional; env fallback) */
   captchaVision?: CaptchaVisionConfig
+  /** Maton Gmail helper for MiMo email OTP (optional; env fallback) */
+  gmailConfig?: GmailConfig
 }
 
 /**
@@ -1143,6 +1179,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   managementApi: DEFAULT_MANAGEMENT_API_CONFIG,
   contextManagement: DEFAULT_CONTEXT_MANAGEMENT_CONFIG,
   captchaVision: DEFAULT_CAPTCHA_VISION_CONFIG,
+  gmailConfig: DEFAULT_GMAIL_CONFIG,
 }
 
 /**

@@ -181,6 +181,14 @@ ENV CHAT2API_QWEN_AI_RETRY_NONCE=true
 # account: rotating accounts does not change the payload hash. 'always' costs
 # the transcript upload-cache hit and buys fingerprint immunity.
 ENV CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=always
+# Mimo has no refresh endpoint: serviceToken renewal re-runs the Xiaomi password
+# login. HTTP passport is risk-controlled from datacenter IPs, so auto mode
+# falls back to this patchright driver (Geetest slide + email OTP), which reuses
+# the Chromium/patchright runtime installed for the Z.ai/Qwen solvers above.
+ENV MIMO_REFRESH_MODE=auto
+ENV MIMO_LOGIN_SCRIPT_PATH=/app/scripts/mimo-login/login.py
+ENV MIMO_LOGIN_ARTIFACT_DIR=/tmp/mimo-login
+ENV MIMO_REFRESH_BROWSER_TIMEOUT_MS=300000
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/out-server ./out-server
@@ -188,7 +196,8 @@ COPY --from=build /app/out-admin ./out-admin
 COPY --from=build /app/sha3_wasm_bg.7b9ca65ddd.wasm ./sha3_wasm_bg.7b9ca65ddd.wasm
 COPY scripts/zai-captcha /app/scripts/zai-captcha
 COPY scripts/qwen-captcha /app/scripts/qwen-captcha
-RUN mkdir -p /data /tmp/zai-captcha /tmp/qwen-captcha
+COPY scripts/mimo-login /app/scripts/mimo-login
+RUN mkdir -p /data /tmp/zai-captcha /tmp/qwen-captcha /tmp/mimo-login
 VOLUME ["/data"]
 EXPOSE 8080
 CMD ["node", "out-server/server/index.js"]

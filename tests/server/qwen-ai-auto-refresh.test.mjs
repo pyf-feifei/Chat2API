@@ -80,9 +80,9 @@ test('Qwen AI credentials include optional email and password for automatic toke
   assert.match(providerSource, /required:\s*false/)
   assert.match(storeTypesSource, /export \{ builtinProviders as BUILTIN_PROVIDERS \} from '\.\.\/providers\/builtin\/index\.ts'/)
 
-  assert.match(addAccountSource, /const accountEmail = provider && \['qwen-ai', 'zai'\]\.includes\(provider\.id\)/)
+  assert.match(addAccountSource, /const accountEmail = provider && \['qwen-ai', 'zai', 'mimo'\]\.includes\(provider\.id\)/)
   assert.match(addAccountSource, /email:\s*accountEmail/)
-  assert.match(providersPageSource, /email:\s*provider\.id === 'qwen-ai' \? credentials\.email\?\.trim\(\) \|\| undefined : undefined/)
+  assert.match(providersPageSource, /email:\s*\['qwen-ai', 'zai', 'mimo'\]\.includes\(provider\.id\) \? credentials\.email\?\.trim\(\) \|\| undefined : undefined/)
 })
 
 test('Qwen AI OAuth import form keeps optional refresh login fields', () => {

@@ -314,8 +314,8 @@ export function AddProviderDialog({
 
   const supportsOAuth = selectedProviderData && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(selectedProviderData.id)
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
-  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai', 'kimi', 'zai'].includes(selectedProviderData.id)
-  const oauthRefreshCredentialFields = selectedProviderData?.id === 'qwen-ai'
+  const supportsBrowserImport = isDockerWebAdmin && selectedProviderData && ['qwen', 'qwen-ai', 'kimi', 'zai', 'mimo'].includes(selectedProviderData.id)
+  const oauthRefreshCredentialFields = selectedProviderData && ['qwen-ai', 'zai', 'mimo'].includes(selectedProviderData.id)
     ? selectedProviderData.credentialFields.filter(field => ['email', 'password'].includes(field.name))
     : []
 
@@ -597,6 +597,7 @@ export function AddProviderDialog({
       qwen: 'https://www.qianwen.com',
       kimi: 'https://www.kimi.com',
       zai: 'https://chat.z.ai',
+      mimo: 'https://aistudio.xiaomimimo.com',
     }
     await window.electronAPI?.app.openExternal(loginUrls[selectedProviderData.id] || selectedProviderData.apiEndpoint)
   }
@@ -745,6 +746,16 @@ export function AddProviderDialog({
                   label: t('mimo.phToken'),
                   placeholder: t('mimo.phTokenPlaceholder'),
                   helpText: t('mimo.phTokenHelp'),
+                },
+                email: {
+                  label: t('mimo.email'),
+                  placeholder: t('mimo.emailPlaceholder'),
+                  helpText: t('mimo.emailHelp'),
+                },
+                password: {
+                  label: t('mimo.password'),
+                  placeholder: t('mimo.passwordPlaceholder'),
+                  helpText: t('mimo.passwordHelp'),
                 },
               },
               perplexity: {

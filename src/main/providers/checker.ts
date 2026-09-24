@@ -202,7 +202,7 @@ export class ProviderChecker {
         return {
           valid: false,
           error:
-            'Mimo credentials expired. Log out and back in at aistudio.xiaomimimo.com, then update service_token/user_id/ph_token (serviceToken lasts ~24h).',
+            'Mimo credentials expired. Store Xiaomi email+password for auto-relogin, or log out and back in at aistudio.xiaomimimo.com, then update service_token/user_id/ph_token (serviceToken lasts ~24h).',
         }
       }
       if (payload?.code !== 0 && payload?.code !== undefined) {

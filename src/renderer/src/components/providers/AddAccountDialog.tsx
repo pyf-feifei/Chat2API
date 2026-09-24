@@ -268,11 +268,11 @@ export function AddAccountDialog({
   const credentialFields: CredentialField[] = builtinProvider?.credentialFields || getDefaultCredentialFields(provider?.authType, t)
   // Providers whose credential re-login needs email/password get the fields in
   // the OAuth tab too, so a browser-login account can still enable auto-refresh.
-  const oauthRefreshCredentialFields = provider && ['qwen-ai', 'zai'].includes(provider.id)
+  const oauthRefreshCredentialFields = provider && ['qwen-ai', 'zai', 'mimo'].includes(provider.id)
     ? credentialFields.filter(field => ['email', 'password'].includes(field.name))
     : []
   const isDockerWebAdmin = !!window.__CHAT2API_WEB_ADMIN__
-  const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi', 'zai'].includes(provider.id)
+  const supportsBrowserImport = isDockerWebAdmin && provider && ['qwen', 'qwen-ai', 'kimi', 'zai', 'mimo'].includes(provider.id)
   // Docker web admin has no in-app login window; only keep the OAuth tab when a
   // browser-import flow can actually complete the login there.
   const supportsOAuth = provider && ['deepseek', 'glm', 'kimi', 'mimo', 'minimax', 'qwen', 'qwen-ai', 'zai', 'perplexity'].includes(provider.id) && (!isDockerWebAdmin || !!supportsBrowserImport)
@@ -494,7 +494,7 @@ export function AddAccountDialog({
         console.log('[AddAccountDialog] MiniMax realUserID provided:', credentials.realUserID)
       }
 
-      const accountEmail = provider && ['qwen-ai', 'zai'].includes(provider.id)
+      const accountEmail = provider && ['qwen-ai', 'zai', 'mimo'].includes(provider.id)
         ? finalCredentials.email?.trim() || undefined
         : undefined
 
@@ -666,6 +666,7 @@ export function AddAccountDialog({
       qwen: 'https://www.qianwen.com',
       kimi: 'https://www.kimi.com',
       zai: 'https://chat.z.ai',
+      mimo: 'https://aistudio.xiaomimimo.com',
     }
     await window.electronAPI?.app.openExternal(loginUrls[provider.id] || provider.apiEndpoint)
   }
@@ -1188,6 +1189,16 @@ function CredentialFieldsForm({ fields, credentials, onChange, t, providerId }: 
           label: t('mimo.phToken'),
           placeholder: t('mimo.phTokenPlaceholder'),
           helpText: t('mimo.phTokenHelp'),
+        },
+        email: {
+          label: t('mimo.email'),
+          placeholder: t('mimo.emailPlaceholder'),
+          helpText: t('mimo.emailHelp'),
+        },
+        password: {
+          label: t('mimo.password'),
+          placeholder: t('mimo.passwordPlaceholder'),
+          helpText: t('mimo.passwordHelp'),
         },
       },
       perplexity: {

@@ -1,4 +1,4 @@
-﻿import type { BuiltinProviderConfig } from '../../store/types'
+import type { BuiltinProviderConfig } from '../../store/types'
 
 export const mimoConfig: BuiltinProviderConfig = {
   id: 'mimo',
@@ -6,7 +6,7 @@ export const mimoConfig: BuiltinProviderConfig = {
   type: 'builtin',
   authType: 'cookie',
   apiEndpoint: 'https://aistudio.xiaomimimo.com',
-  chatPath: '/open-apis/bot/chat',
+  chatPath: '/fastchat/open-apis/bot/chat',
   headers: {
     'Content-Type': 'application/json',
     'Accept': '*/*',
@@ -26,7 +26,7 @@ export const mimoConfig: BuiltinProviderConfig = {
   },
   enabled: true,
   description: 'XiaomiMIMO - Xiaomi General Intelligence Foundation Model',
-  modelsApiEndpoint: 'https://aistudio.xiaomimimo.com/open-apis/bot/config',
+  modelsApiEndpoint: 'https://aistudio.xiaomimimo.com/fastchat/open-apis/bot/config',
   modelsApiHeaders: {
     'Accept': 'application/json, text/plain, */*',
     'Referer': 'https://aistudio.xiaomimimo.com/',
@@ -35,6 +35,7 @@ export const mimoConfig: BuiltinProviderConfig = {
   supportedModels: [
     'MiMo-V2.6-Pro',
     'MiMo-V2.6-Flash',
+    'MiMo-V2.6-Pro-Ultraspeed',
     'MiMo-V2.5-Pro',
     'MiMo-V2.5',
     'MiMo-V2-Flash',
@@ -42,6 +43,7 @@ export const mimoConfig: BuiltinProviderConfig = {
   modelMappings: {
     'MiMo-V2.6-Pro': 'mimo-v2.6-pro',
     'MiMo-V2.6-Flash': 'mimo-v2.6-flash',
+    'MiMo-V2.6-Pro-Ultraspeed': 'mimo-v2.6-pro-ultraspeed-studio',
     'MiMo-V2.5-Pro': 'mimo-v2.5-pro',
     'MiMo-V2.5': 'mimo-v2.5',
     'MiMo-V2-Flash': 'mimo-v2-flash',
@@ -72,6 +74,24 @@ export const mimoConfig: BuiltinProviderConfig = {
       placeholder: 'Enter xiaomichatbot_ph from Cookie',
       helpText:
         'DevTools -> Application -> Cookies -> xiaomichatbot_ph. Re-import with serviceToken when the account is rejected.',
+    },
+    {
+      name: 'email',
+      label: 'Login Email (Optional)',
+      type: 'text',
+      required: false,
+      placeholder: 'Optional Xiaomi account email for automatic serviceToken refresh',
+      helpText:
+        'Used with password to re-login via Xiaomi passport and mint a fresh serviceToken when auth fails',
+    },
+    {
+      name: 'password',
+      label: 'Login Password (Optional)',
+      type: 'password',
+      required: false,
+      placeholder: 'Optional Xiaomi account password for automatic serviceToken refresh',
+      helpText:
+        'Stored in encrypted credentials when encryption is available; automatic refresh can fail if Xiaomi requires captcha, 2FA, or identity verification',
     },
   ],
 }

@@ -30,7 +30,7 @@ const BROWSER_IMPORT_RESULT_LIMIT = 128
 const BROWSER_IMPORT_RATE_WINDOW_MS = 60 * 1000
 const BROWSER_IMPORT_RATE_LIMIT = 32
 
-type BrowserImportProviderId = 'qwen' | 'qwen-ai' | 'kimi'
+type BrowserImportProviderId = 'qwen' | 'qwen-ai' | 'kimi' | 'zai' | 'mimo'
 
 type BrowserImportResult = {
   importId: string
@@ -165,6 +165,30 @@ function normalizeBrowserImportCredentials(
     }
   }
 
+  if (providerId === 'zai') {
+    const token = String(credentials.token || '')
+    const cookies = String(credentials.cookies || '')
+    return {
+      token,
+      ...(cookies ? { cookies } : {}),
+    }
+  }
+
+  if (providerId === 'mimo') {
+    const serviceToken = String(
+      credentials.service_token
+      || credentials.serviceToken
+      || '',
+    )
+    const userId = String(credentials.user_id || credentials.userId || '')
+    const phToken = String(credentials.ph_token || credentials.xiaomichatbot_ph || '')
+    return {
+      service_token: serviceToken,
+      user_id: userId,
+      ph_token: phToken,
+    }
+  }
+
   const ticket = String(credentials.ticket || credentials.tongyi_sso_ticket || '')
   return {
     ticket,
@@ -184,7 +208,13 @@ function setBrowserImportResult(input: {
     throw new Error('importId must be between 16 and 128 characters')
   }
 
-  if (input.providerId !== 'qwen' && input.providerId !== 'qwen-ai' && input.providerId !== 'kimi') {
+  if (
+    input.providerId !== 'qwen'
+    && input.providerId !== 'qwen-ai'
+    && input.providerId !== 'kimi'
+    && input.providerId !== 'zai'
+    && input.providerId !== 'mimo'
+  ) {
     throw new Error('Unsupported browser import provider')
   }
 
