@@ -8083,7 +8083,9 @@ export class QwenAiStreamHandler {
             accountId: this.account?.id,
             notice: answerText.trim().slice(0, 80),
           }))
-          failStream(createQwenAiDailyQuotaError())
+          // Non-streaming path: rejectOnce is the local settlement hook here.
+          // failStream only exists in the streaming closure.
+          rejectOnce(createQwenAiDailyQuotaError())
           return
         }
 
