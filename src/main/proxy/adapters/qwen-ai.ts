@@ -2616,12 +2616,28 @@ const QWEN_AI_DAILY_QUOTA_NOTICES: readonly RegExp[] = [
   // match: the notice is a standalone sentence, not the start of a clause.
   /^\s*(?:请|你)?(?:可|能)?(?:在)?明日再(?:来|聊|使用)[。，,！!？?…\s]*$/,
   /(?:今日|今天)已(?:用完|达到上限)/,
+  // English notices, observed 2026-09-26:
+  //   "You've reached today's chat limit. Please try again tomorrow."
+  // The English form carries no keyword the generic rate-limit regex catches,
+  // so it has to be anchored here or it reads as a normal answer.
+  /(?:you'?ve|you have|you)\s+(?:reached|hit|exceeded)\s+(?:today'?s|the)\s+.*(?:limit|quota)/i,
+  /(?:reached|hit|exceeded|using up)\s+(?:today'?s|the)\s+.*(?:limit|quota)/i,
+  /(?:daily|per[- ]day)\s+(?:chat|message|conversation|request)\s+limit/i,
   /daily[^.\n]{0,24}(?:limit|quota)[^\n]{0,16}(?:reached|exceeded)/i,
   /(?:limit|quota)[^\n]{0,16}(?:reached|exceeded)[^\n]{0,16}daily/i,
-  // "You've reached your daily limit" has the subject first and no "daily" in
-  // front of "limit", so cover the possessive form explicitly.
   /(?:you'?ve|you have)\s+(?:reached|hit|exceeded)\s+(?:your\s+)?daily/i,
   /(?:reached|hit|exceeded)\s+(?:your\s+)?daily\s+(?:limit|quota)/i,
+]
+
+/**
+ * A short standalone "come back later" line is a refusal only when it is the
+ * whole message. Embedded in a longer answer it is ordinary prose: "Yes,
+ * please try again tomorrow if the limit still applies" must not park the
+ * account, while a bare "Please try again tomorrow" must.
+ */
+const QWEN_AI_DAILY_QUOTA_FALLBACKS: readonly RegExp[] = [
+  /^\s*(?:please\s+)?(?:try|come back|check back)\s+(?:again\s+)?(?:tomorrow|later)\b[.!。！\s]*$/i,
+  /^\s*(?:明日|明天|稍后)(?:再来|再试)?\s*[.!。！\s]*$/,
 ]
 
 export function isQwenAiDailyQuotaNotice(text: string, reasoning = ''): boolean {
@@ -2632,7 +2648,8 @@ export function isQwenAiDailyQuotaNotice(text: string, reasoning = ''): boolean 
   if (String(reasoning || '').trim().length > 0) return false
   // Notices are short one-liners. A long passage quoting the phrase is prose.
   if (body.length > 120) return false
-  return QWEN_AI_DAILY_QUOTA_NOTICES.some((re) => re.test(body))
+  if (QWEN_AI_DAILY_QUOTA_NOTICES.some((re) => re.test(body))) return true
+  return QWEN_AI_DAILY_QUOTA_FALLBACKS.some((re) => re.test(body))
 }
 
 function createQwenAiDailyQuotaError(): QwenAiUpstreamError {
@@ -7336,7 +7353,7 @@ export class QwenAiStreamHandler {
       // rotates instead of re-selecting it.
       if (isQwenAiDailyQuotaNotice(this.content, this.reasoning)) {
         console.warn('[QwenAI] stream returned a daily-quota refusal; parking the account', JSON.stringify({
-          requestId: context.requestId,
+          requestId: this.toolCallingPlan?.diagnostics?.requestId,
           accountId: this.account?.id,
           notice: String(this.content).trim().slice(0, 80),
         }))
@@ -8062,7 +8079,7 @@ export class QwenAiStreamHandler {
         // model's answer and the account would keep being selected all day.
         if (isQwenAiDailyQuotaNotice(answerText, finalReasoning)) {
           console.warn('[QwenAI] upstream returned a daily-quota refusal; parking the account', JSON.stringify({
-            requestId: context.requestId,
+            requestId: this.toolCallingPlan?.diagnostics?.requestId,
             accountId: this.account?.id,
             notice: answerText.trim().slice(0, 80),
           }))

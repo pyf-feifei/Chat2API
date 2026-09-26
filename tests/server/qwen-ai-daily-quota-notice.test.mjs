@@ -83,6 +83,21 @@ describe('qwen ai daily quota notice', () => {
     }
   })
 
+  it('detects the English notice observed on 2026-09-26', async () => {
+    const { isQwenAiDailyQuotaNotice } = await loadQuotaHelpers()
+    // Verbatim from a real refusal on the local instance.
+    const notices = [
+      "You've reached today's chat limit. Please try again tomorrow.",
+      "You've reached your daily limit",
+      'You have exceeded your daily quota',
+      'Daily chat limit reached',
+      'Please try again tomorrow',
+    ]
+    for (const n of notices) {
+      assert.equal(isQwenAiDailyQuotaNotice(n, ''), true, `missed: ${n}`)
+    }
+  })
+
   it('does not misfire on ordinary answers', async () => {
     const { isQwenAiDailyQuotaNotice } = await loadQuotaHelpers()
     const answers = [
@@ -92,6 +107,11 @@ describe('qwen ai daily quota notice', () => {
       'The answer is 42.',
       'Quota handling is implemented by rotating accounts.',
       '请明日再来之前，先把这个任务做完。', // contains the phrase but is a real instruction
+      // A real answer about limits must not be parked. Both are longer than
+      // the notice cap, and the second would match a loose "daily ... limit"
+      // pattern if the length guard were removed.
+      'The daily chat limit applies per account, and the implementation rotates accounts when the quota is exhausted so the pool keeps serving requests.',
+      'Yes, please try again tomorrow if the rate limit is still in effect.',
     ]
     for (const a of answers) {
       assert.equal(isQwenAiDailyQuotaNotice(a, ''), false, `false positive: ${a}`)
