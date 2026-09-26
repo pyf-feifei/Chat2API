@@ -26,7 +26,12 @@ import { M365Adapter, m365DebugStreamEnabled, m365WorkflowContinuationAttemptsFr
 import { isM365AuthIssue, isM365QuotaWall, m365FailureClassification } from './m365FailoverClassification'
 import { appendManagedReplayTurns } from './toolCalling/m365Transcript.ts'
 import { findManagedToolDenialClaim } from './adapters/qwenAiProgressIntent'
-import { MimoAdapter, MimoStreamHandler } from './adapters/mimo'
+import {
+  MimoAdapter,
+  MimoStreamHandler,
+  mimoManagedContinuationAttempts,
+  mimoManagedContinuationTimeoutMs,
+} from './adapters/mimo'
 import { QwenAdapter, QwenStreamHandler } from './adapters/qwen'
 import {
   describeErrorForLog,
@@ -75,6 +80,8 @@ import { markAccountErrorIfPermanent } from './accountStatus.ts'
 import { sessionManager } from './sessionManager'
 import {
   createContextManagementService,
+  getUpstreamTokenOptimizerSettings,
+  optimizeUpstreamRequest,
   SummaryGenerator,
   type ChatMessage as ContextChatMessage,
 } from './services/contextManagementService'
@@ -88,6 +95,17 @@ import {
   planQwenAiCompactionChunks,
   type QwenAiCompactionChunk,
 } from './qwenAiCompactionBoundary'
+import { stripRetrievalTool, extractArchiveHashes, buildRetrieveTool } from './services/retrievalTool.ts'
+import { getCompressionSettings, resolveCompressionBackend } from './services/compressionSettings.ts'
+import { runWithRetrievalLoop } from './services/retrievalLoop.ts'
+import { createRetrievalAwareStream } from './services/retrievalStream.ts'
+import type { LocalToolContext } from './toolCalling/localToolCalls.ts'
+import { buildRetrievalContinuation, runWithLocalToolContext } from './toolCalling/localToolCalls.ts'
+import type { NormalizedToolDefinition } from './toolCalling/types.ts'
+import { CompressionArchive, buildScope } from './services/compressionArchive.ts'
+import type { CompressionContext } from './services/upstreamTokenOptimizer.ts'
+import { join } from 'node:path'
+import { getRuntime } from '../runtime/index.ts'
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
   consumeQwenAiAccountNeutralReplaySlot,
@@ -96,6 +114,16 @@ import {
   qwenAiSafeExplicitRetryScope,
   qwenAiAccountRetryScope,
 } from './qwenAiAccountPolicy'
+import {
+  clearQwenAiEgressCircuit,
+  clearQwenAiRiskCircuit,
+  createQwenAiRiskFingerprint,
+  getQwenAiEgressCircuitEntry,
+  getQwenAiRiskCircuitEntry,
+  openQwenAiRiskCircuit,
+  qwenAiRiskCircuitThreshold,
+  recordQwenAiEgressRiskVerdict,
+} from './qwenAiRiskCircuit'
 import {
   isWebshareProxyEnabled,
   isWebshareStickyActive,
@@ -777,6 +805,66 @@ function qwenAiVerdictProxyExitMaxFromEnv(): number {
   return value
 }
 
+/**
+ * How long a daily-quota refusal keeps an account out of rotation.
+ *
+ * The upstream resets on its own day boundary, which is not midnight local
+ * time. A fixed 20h window is chosen because it always outlives a same-day
+ * exhaustion (it cannot expire before the upstream's reset) while still
+ * letting the account return automatically the following day without needing
+ * a reset job. `resetDailyUsage()` has no caller, so no scheduled clear can be
+ * relied on.
+ */
+const DAILY_QUOTA_PARK_MS = 20 * 60 * 60 * 1000
+
+/**
+ * Take an account out of rotation until its daily quota resets.
+ *
+ * Advisory: the pool keeps working, this only stops the wasted selections.
+ */
+function markAccountDailyQuotaExhausted(accountId: string | undefined): void {
+  if (!accountId) return
+  const until = Date.now() + DAILY_QUOTA_PARK_MS
+  try {
+    storeManager.updateAccount(accountId, { dailyQuotaExhaustedUntil: until })
+    console.warn('[QwenAI] account parked until the daily quota resets', JSON.stringify({
+      accountId,
+      until: new Date(until).toISOString(),
+    }))
+  } catch (error) {
+    console.warn('[QwenAI] failed to park a quota-exhausted account:', error)
+  }
+}
+
+function createQwenAiRiskCircuitResult(
+  entry: { until: number },
+  startTime: number,
+): ForwardResult {
+  const retryAfterSeconds = Math.max(1, Math.ceil((entry.until - Date.now()) / 1000))
+  return {
+    success: false,
+    status: 503,
+    errorCode: 'qwen_ai_risk_circuit_open',
+    error: `Qwen AI risk-control circuit is open for this request; retry after ${retryAfterSeconds}s.`,
+    retryable: false,
+    accountFault: false,
+    headers: { 'Retry-After': String(retryAfterSeconds) },
+    latency: Math.max(0, Date.now() - startTime),
+  }
+}
+
+function createQwenAiSharedRiskVerdictResult(startTime: number): ForwardResult {
+  return {
+    success: false,
+    status: 503,
+    errorCode: 'qwen_ai_content_verdict',
+    error: 'Qwen AI risk-control verdict was already terminal for this request.',
+    retryable: false,
+    accountFault: false,
+    latency: Math.max(0, Date.now() - startTime),
+  }
+}
+
 function qwenAiValidatedStreamMaxBytesFromEnv(): number {
   const fallback = 16 * 1024 * 1024
   const raw = process.env.CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES
@@ -1129,6 +1217,16 @@ export class RequestForwarder {
     maxContentLength: Infinity,
   })
 
+  /**
+   * Compression archives, keyed by file path plus TTL and size bounds.
+   *
+   * Held per process rather than per request: `CompressionArchive` is
+   * file-backed, so a fresh instance reads and parses the whole JSON file. One
+   * instance per configuration keeps that off the hot path and lets concurrent
+   * turns observe each other's writes.
+   */
+  private readonly compressionArchives = new Map<string, CompressionArchive>()
+
   private readonly providerForwarders: ProviderForwarder[] = [
     {
       profileKey: 'deepseek',
@@ -1230,7 +1328,32 @@ export class RequestForwarder {
       },
       providerProfileKey,
       actualModel: request.model,
+      localTools: this.localToolsForRequest(request),
     })
+  }
+
+  /**
+   * The proxy-internal tools to teach the model for this request.
+   *
+   * Returns undefined — the byte-identical plan — unless both hold: retrieval
+   * is enabled, and the request actually advertised at least one archive
+   * marker. Without the second check the model would be taught a tool with
+   * nothing to retrieve, which is pure prompt overhead on every ordinary turn.
+   *
+   * Streaming is NOT excluded. Phase C added a streaming loop that buffers the
+   * first turn and continues when, and only when, that turn asks for something
+   * local; an armed stream that never asks emits its first turn byte-identical
+   * to an unarmed one.
+   *
+   * This is the single predicate that arms both the prompt and the loop.
+   */
+  private localToolsForRequest(
+    request: ChatCompletionRequest,
+  ): NormalizedToolDefinition[] | undefined {
+    if (!getCompressionSettings().retrieval.enabled) return undefined
+    const advertised = extractArchiveHashes(request.messages ?? [])
+    if (advertised.length === 0) return undefined
+    return [buildRetrieveTool()]
   }
 
   private matchProviderForwarder(provider: Provider): ProviderForwarder | undefined {
@@ -1240,6 +1363,95 @@ export class RequestForwarder {
   private applyToolCallsToResponse(result: any, transformed: ToolCallingTransformResult): void {
     const engine = new ToolCallingEngine(storeManager.getConfig().toolCallingConfig)
     engine.applyNonStreamResponse(result, transformed.plan)
+  }
+
+  /**
+   * Build the retrieval context for one request.
+   *
+   * Everything here is derived from the request the client actually sent, so a
+   * span the model was never offered cannot be retrieved and a span from
+   * another account cannot be resolved. The archive itself is shared and
+   * process-wide; the scope is what isolates it.
+   *
+   * The archive is cached per configuration because it is file-backed:
+   * constructing one reads and parses the whole JSON file, and doing that on
+   * every request would put disk I/O on the hot path of every retrieval-enabled
+   * turn. `CompressionArchive` mutates in place, so sharing one instance is also
+   * what makes concurrent turns see each other's writes.
+   */
+  private createRetrievalToolContext(
+    request: ChatCompletionRequest,
+    account: Account,
+    provider: Provider,
+    /**
+     * The proxy context's request id, for the scope's conversation key fallback.
+     *
+     * Passed in rather than closed over: this method does not receive the proxy
+     * context, and an earlier revision referenced `context` from here, which threw
+     * `context is not defined` on every retrieval-armed request.
+     */
+    requestId?: string,
+  ): LocalToolContext {
+    const settings = getCompressionSettings()
+
+    return {
+      scope: buildScope(
+        provider.id,
+        account.id,
+        this.currentConversationKey(request),
+        String(requestId ?? 'request'),
+      ),
+      archive: this.compressionArchive(),
+      advertised: extractArchiveHashes(request.messages ?? []),
+      settings: settings.retrieval,
+      used: 0,
+      pending: [],
+    }
+  }
+
+  /**
+   * The process-wide CCR archive, at the default path.
+   *
+   * Used on every request so that balanced mode always records what it dropped.
+   * The retrieval loop additionally narrows the scope per conversation, but the
+   * archive itself is shared and the store is created once per configuration.
+   */
+  private compressionArchive(): CompressionArchive {
+    return this.compressionArchiveFor(
+      this.compressionArchivePath(),
+      getCompressionSettings().archiveTtlMs,
+      getCompressionSettings().archiveMaxChars,
+    )
+  }
+
+  private compressionArchivePath(): string {
+    const configured = process.env.CHAT2API_COMPRESS_ARCHIVE_PATH?.trim()
+    return configured
+      ? configured
+      : join(getRuntime().getDataDir(), 'compression-archive.json')
+  }
+
+  private compressionArchiveFor(filePath: string, ttlMs: number, maxChars: number): CompressionArchive {
+    const key = `${filePath}|${ttlMs}|${maxChars}`
+    const cached = this.compressionArchives.get(key)
+    if (cached) return cached
+    const created = new CompressionArchive({ filePath, ttlMs, maxChars })
+    this.compressionArchives.set(key, created)
+    return created
+  }
+
+  /**
+   * The conversation key for a request, when the client supplies one.
+   *
+   * Without a key the archive scope falls back to the request id, which is
+   * correct but yields no cross-turn reuse. Reusing the existing session notion
+   * would be better; this deliberately does not invent a second one.
+   */
+  private currentConversationKey(request: ChatCompletionRequest): string | undefined {
+    const explicit = (request as ChatCompletionRequest & { conversationKey?: unknown }).conversationKey
+    if (typeof explicit === 'string' && explicit) return explicit
+    const user = (request as ChatCompletionRequest & { user?: unknown }).user
+    return typeof user === 'string' && user ? user : undefined
   }
 
   /**
@@ -1377,6 +1589,116 @@ export class RequestForwarder {
     const recoverManagedToolStream = QwenAiAdapter.isQwenAiProvider(provider)
       && bufferManagedToolStreams
     const isQwenAiProvider = QwenAiAdapter.isQwenAiProvider(provider)
+    const tokenOptimizerSettings = typeof getUpstreamTokenOptimizerSettings === 'function'
+      ? getUpstreamTokenOptimizerSettings()
+      : {
+        mode: 'off' as const,
+        minEstimatedTokens: Number.POSITIVE_INFINITY,
+        recentMessages: 0,
+        minEstimatedSavings: Number.POSITIVE_INFINITY,
+        maxToolTextChars: 0,
+      }
+    const hasOpaqueContinuation = Boolean(context.qwenAiSessionBridge?.continuation)
+      || Boolean((request as ChatCompletionRequest & { previous_response_id?: unknown }).previous_response_id)
+    let tokenOptimizationApplied = false
+    if (
+      typeof optimizeUpstreamRequest === 'function'
+      && tokenOptimizerSettings.mode !== 'off'
+      && requestIntent === 'normal'
+      && !hasOpaqueContinuation
+      && Array.isArray(request.messages)
+    ) {
+      try {
+        // CCR: the archive context must be supplied here, not only when the
+        // retrieval loop is armed. Balanced mode's whole premise is that the
+        // omitted text is recoverable, and a real run showed `archivedCount: 0`
+        // because this call passed no context, so `archiveOmission` declined
+        // every span and the marker stayed unaddressable.
+        //
+        // `request`, not `modifiedRequest`: the context-management stage that
+        // produces `modifiedRequest` runs further down, so referencing it here is
+        // a temporal-dead-zone read. The scope only needs the conversation key,
+        // which the request already carries.
+        const ccrContext: CompressionContext = {
+          archive: this.compressionArchive(),
+          scope: buildScope(
+            provider.id,
+            account.id,
+            this.currentConversationKey(request),
+            String(context.requestId ?? 'request'),
+          ),
+        }
+        const optimization = await optimizeUpstreamRequest(request, tokenOptimizerSettings, ccrContext)
+        console.info('[Forwarder] upstream-token-optimizer', JSON.stringify({
+          requestId: context.requestId,
+          providerId: provider.id,
+          mode: optimization.mode,
+          applied: optimization.applied,
+          before: optimization.estimatedInputTokensBefore,
+          candidate: optimization.estimatedInputTokensCandidate,
+          after: optimization.estimatedInputTokensAfter,
+          estimatedSaved: optimization.estimatedTokensSaved,
+          candidateSaved: optimization.candidateTokensSaved,
+          changedMessageCount: optimization.changedMessageCount,
+          compactedJsonMessageCount: optimization.compactedJsonMessageCount,
+          compressedRunCount: optimization.compressedRunCount,
+          balancedMessageCount: optimization.balancedMessageCount,
+          balancedOmittedChars: optimization.balancedOmittedChars,
+          // Which rule produced the live-zone floor, so an operator can tell a
+          // client-declared cache boundary from a count-based one.
+          liveZoneSource: optimization.liveZoneSource,
+          liveZoneFloor: optimization.liveZoneFloor,
+          liveZoneCeiling: optimization.liveZoneCeiling,
+          backend: optimization.backend,
+          // Archive counters, not hashes. A hash identifies tool output that may
+          // contain credentials or file contents, and this line goes to the log.
+          archivedCount: optimization.archivedCount,
+          archivedChars: optimization.archivedChars,
+          skipReason: optimization.skipReason,
+        }))
+        if (optimization.applied) {
+          request = optimization.request
+          tokenOptimizationApplied = true
+        }
+      } catch (error) {
+        // Compression is an optimization, never a request dependency. Any
+        // unexpected input/runtime failure falls through to the original
+        // request and the normal upstream path.
+        console.warn('[Forwarder] upstream-token-optimizer failed open', error instanceof Error ? error.message : String(error))
+      }
+    }
+    // Fingerprint the exact payload that will be sent upstream. If safe
+    // optimization changed old tool text, keeping the pre-optimization
+    // fingerprint would make risk-circuit decisions describe a different
+    // payload.
+    const qwenAiRiskFingerprint = QwenAiAdapter.isQwenAiProvider(provider)
+      ? createQwenAiRiskFingerprint(request, actualModel, context.qwenAiRiskKey)
+      : undefined
+    if (qwenAiRiskFingerprint) {
+      const circuitEntry = getQwenAiRiskCircuitEntry(qwenAiRiskFingerprint)
+      if (circuitEntry) {
+        console.warn('[QwenAI] identical request blocked by risk circuit', JSON.stringify({
+          requestId: context.requestId,
+          fingerprint: qwenAiRiskFingerprint.slice(0, 12),
+          retryAfter: Math.max(1, Math.ceil((circuitEntry.until - Date.now()) / 1000)),
+        }))
+        return createQwenAiRiskCircuitResult(circuitEntry, startTime)
+      }
+    }
+    if (QwenAiAdapter.isQwenAiProvider(provider)) {
+      // A bxpunish/RGV587 verdict is decided by the egress path, not by one
+      // payload, so the per-fingerprint circuit above cannot protect the rest
+      // of the pool. Park the whole egress before another account is spent.
+      const egressEntry = getQwenAiEgressCircuitEntry()
+      if (egressEntry) {
+        console.warn('[QwenAI] egress risk circuit open; request refused before pool dispatch', JSON.stringify({
+          requestId: context.requestId,
+          retryAfter: Math.max(1, Math.ceil((egressEntry.until - Date.now()) / 1000)),
+          distinctFingerprints: egressEntry.distinctFingerprints,
+        }))
+        return createQwenAiRiskCircuitResult(egressEntry, startTime)
+      }
+    }
     const defaultManagedToolRecoveryOnly = recoverManagedToolStream
     const maxRetries = QwenAiAdapter.isQwenAiProvider(provider)
       ? requestIntent === 'context_compaction'
@@ -1482,6 +1804,13 @@ export class RequestForwarder {
           useWebshareProxy: false,
         })
       : undefined
+    if (qwenAiEgressRecoveryState?.riskVerdictSeen) {
+      return createQwenAiSharedRiskVerdictResult(startTime)
+    }
+    if (qwenAiEgressRecoveryState?.useWebshareProxy && !isWebshareProxyEnabled()) {
+      disengageWebshareStickyMode('no healthy Webshare recovery exit')
+      qwenAiEgressRecoveryState.useWebshareProxy = false
+    }
     // Sticky mode (mode B): while the direct exit IP is RGV587-flagged, ALL
     // attempts on this request route through the Webshare proxy instead of
     // paying a failed direct attempt + recovery retry per request. The probe
@@ -1528,6 +1857,13 @@ export class RequestForwarder {
         // tests). Leave those to the governor's short account-neutral bench.
         if (result.accountFault !== false) {
           loadBalancer.markQwenAiRiskControl(account.id)
+          // A daily-quota refusal is account-bound and lasts until the
+          // upstream's day boundary, far longer than any risk cooldown. Park
+          // the account so the balancer stops selecting it: re-selecting it
+          // only spends another request to receive the same notice.
+          if (result.errorCode === 'qwen_ai_daily_quota_exhausted') {
+            markAccountDailyQuotaExhausted(account.id)
+          }
         }
         void import('./adapters/qwen-risk-refresh')
           .then(module => module.noteQwenAiRiskChallenge(
@@ -1580,6 +1916,9 @@ export class RequestForwarder {
       const directExitRiskControlled =
         /FAIL_SYS_USER_VALIDATE|RGV587/i.test(result.error ?? '')
         || (bxpunishHeader !== undefined && bxpunishHeader !== '' && bxpunishHeader !== '0')
+      if (directExitRiskControlled && qwenAiEgressRecoveryState) {
+        qwenAiEgressRecoveryState.riskVerdictObserved = true
+      }
       // Content-verdict / exit-IP risk control: the SAME direct exit always
       // reproduces the verdict, so a same-exit busy retry or account rotation
       // only burns the pool. Prefer a Webshare egress switch (same as
@@ -1613,6 +1952,7 @@ export class RequestForwarder {
           && observedAt + webshareDelayMs < qwenAiRequestDeadline
         if (!canEscalateVerdictToWebshare) {
           riskVerdictSeen = true
+          if (qwenAiEgressRecoveryState) qwenAiEgressRecoveryState.riskVerdictSeen = true
           console.warn('[QwenAI] content verdict (bxpunish/RGV587) — failing fast, no failover burn', JSON.stringify({
             requestId: context.requestId,
             accountId: account.id,
@@ -1671,9 +2011,11 @@ export class RequestForwarder {
         willRetry = true
         retryViaWebshare = true
       }
-      const nextMessageTransport: QwenAiMessageTransport = qwenAiMessageTransport === 'inline'
-        ? 'document'
-        : qwenAiMessageTransport
+      const nextMessageTransport: QwenAiMessageTransport = directExitRiskControlled
+        ? qwenAiMessageTransport
+        : qwenAiMessageTransport === 'inline'
+          ? 'document'
+          : qwenAiMessageTransport
       console.info('[QwenAI] upstream-busy response', JSON.stringify({
         requestId: context.requestId,
         accountId: account.id,
@@ -1799,12 +2141,17 @@ export class RequestForwarder {
       if (qwenAiRequestDeadline !== undefined && Date.now() >= qwenAiRequestDeadline) {
         return createQwenAiRequestTimeoutResult(startTime)
       }
+      if (getQwenAiWebshareProxy() && !isWebshareProxyEnabled()) {
+        disengageWebshareStickyMode('no healthy Webshare recovery exit')
+        setQwenAiWebshareProxy(false)
+      }
 
       modifiedRequest = request
 
       if (
         requestIntent !== 'context_compaction'
         && config.contextManagement?.enabled
+        && !tokenOptimizationApplied
         && modifiedRequest.messages
         && modifiedRequest.messages.length > 0
       ) {
@@ -1878,30 +2225,80 @@ export class RequestForwarder {
       const qwenAiTransportProbe: QwenAiTransportProbe = {}
 
       try {
-        const rawResult = await this.doForward(
-          modifiedRequest,
+        // Proxy-internal tool continuation (recoverable compression, phase A).
+        //
+        // Wrapping the single call site rather than editing all ten provider
+        // forwarders: the wrapper owns the loop, and the partition inside
+        // `applyNonStreamResponse` records what it resolved. With retrieval off,
+        // or on a streaming request, this reduces to the original single attempt.
+        // One predicate decides both whether the model is taught the retrieval
+        // tool and whether the loop is armed. If the two ever disagree the model
+        // is asked for a tool whose answer is thrown away, or the answer is
+        // computed for a tool the model was never told about.
+        const retrievalArmed = this.localToolsForRequest(modifiedRequest) !== undefined
+
+        const forwardAttempt = (loopRequest: ChatCompletionRequest) => this.doForward(
+          loopRequest,
           account,
           provider,
           actualModel,
           context,
           {
             qwenAiRecoveryBypassAccountInterval: useRecoveryBypass,
-            // A spent deadline must surface as a clean 504 instead of being
-            // clamped to a 1ms axios timeout that aborts the request the
-            // moment it is issued (observed 2026-09-08: reconnects inherited
-            // an exhausted deadline and every retry died as ECONNABORTED).
+            // A spent deadline must surface as a clean 504 instead of being clamped to a
+            // 1ms axios timeout that aborts the request the moment it is issued (observed
+            // 2026-09-08: reconnects inherited an exhausted deadline and every retry died
+            // as ECONNABORTED).
             qwenAiRequestTimeoutMs: qwenAiRequestDeadline === undefined
               ? undefined
               : qwenAiRequestDeadline - Date.now(),
             qwenAiRequestDeadlineAt: qwenAiRequestDeadline,
             qwenAiMessageTransport,
-            qwenAiMessageTransportLocked: qwenAiMessageTransportLocked,
+            qwenAiMessageTransportLocked,
             qwenAiTransportProbe,
             qwenAiTranscriptTransportPolicy,
             qwenAiWebshareProxy: getQwenAiWebshareProxy(),
             attempt: attempt + 1,
           },
         )
+
+        // Streaming retrieval (phase C). The non-streaming loop above cannot run
+        // on a stream: the first turn has already been committed to the client by
+        // the time a tool call is parsed. So a streaming armed request buffers
+        // its first turn, and only if that turn asked for something local does
+        // it continue and emit the second one instead.
+        //
+        // An unarmed request never reaches this: its stream object is returned by
+        // identity, so a deployment that does not use the feature is unaffected.
+        const retrievalContext = retrievalArmed
+          ? this.createRetrievalToolContext(modifiedRequest, account, provider, context.requestId)
+          : undefined
+        const runAttempt = (req: ChatCompletionRequest) => runWithLocalToolContext(
+          retrievalContext as LocalToolContext,
+          () => forwardAttempt(req),
+        )
+
+        const retrievalLoop = retrievalArmed
+          ? await runWithRetrievalLoop({
+            attempt: runAttempt,
+            request: modifiedRequest,
+            baseRequest: modifiedRequest,
+            context: retrievalContext as LocalToolContext,
+            signal: context.signal,
+          })
+          : undefined
+        const rawResult = retrievalLoop ? retrievalLoop.response : await forwardAttempt(modifiedRequest)
+        if (retrievalLoop) {
+          console.info('[Forwarder] retrieval loop', JSON.stringify({
+            requestId: context.requestId,
+            providerId: provider.id,
+            actualModel,
+            stream: modifiedRequest.stream === true,
+            turns: retrievalLoop.turns,
+            resolved: retrievalLoop.resolved.length,
+            stopReason: retrievalLoop.stopReason,
+          }))
+        }
         // Adapter/wrapper boundaries can drop the derived accountFault flag.
         // Recover only the narrow, status/code-defined account classes here;
         // congestion, transport failures, and conversation-state errors stay
@@ -1918,7 +2315,62 @@ export class RequestForwarder {
             })()
           : rawResult
 
+        // Phase C: wrap a streaming armed result so a local tool call can be
+        // answered without the client ever seeing the discarded first turn.
+        if (retrievalArmed && result.stream && retrievalContext) {
+          result.stream = createRetrievalAwareStream({
+            source: result.stream as PassThrough & Record<string, unknown>,
+            context: retrievalContext,
+            budget: retrievalContext.settings.maxRetrievalsPerRequest,
+            continue: async (local, assistantMessage) => {
+              const continuation = buildRetrievalContinuation({
+                messages: modifiedRequest.messages as ChatMessage[],
+                assistantMessage,
+                local,
+              })
+              if (!continuation) return undefined
+              const nextRequest: ChatCompletionRequest = {
+                ...modifiedRequest,
+                messages: continuation,
+              }
+              const nextResult = await runWithLocalToolContext(
+                retrievalContext,
+                () => forwardAttempt(nextRequest),
+              )
+              if (!nextResult?.success || !nextResult.stream) return undefined
+              return nextResult.stream as PassThrough & Record<string, unknown>
+            },
+            onLoop: (info) => {
+              console.info('[Forwarder] retrieval stream loop', JSON.stringify({
+                requestId: context.requestId,
+                providerId: provider.id,
+                actualModel,
+                ...info,
+              }))
+            },
+          }) as typeof result.stream
+        }
+        if (
+          qwenAiTransportProbe.actualTransport === 'inline'
+          || qwenAiTransportProbe.actualTransport === 'document'
+        ) {
+          qwenAiMessageTransport = qwenAiTransportProbe.actualTransport
+        }
+
         if (result.success) {
+          if (qwenAiRiskFingerprint) clearQwenAiRiskCircuit(qwenAiRiskFingerprint)
+          // Any accepted upstream response proves this egress works, so drop
+          // the egress verdict ledger instead of waiting out the cooldown.
+          clearQwenAiEgressCircuit()
+          // An account that answers is no longer quota-exhausted. Clear the
+          // park marker so a request that only slipped through before the
+          // marker was written (or one whose window already elapsed) returns
+          // to normal rotation immediately.
+          if (account.dailyQuotaExhaustedUntil && account.dailyQuotaExhaustedUntil <= Date.now()) {
+            try {
+              storeManager.updateAccount(account.id, { dailyQuotaExhaustedUntil: undefined })
+            } catch { /* advisory only */ }
+          }
           if (getQwenAiWebshareProxy()) {
             // A proxy-routed attempt that completed clears that pool entry's
             // failure history so future recovery traffic trusts it again.
@@ -1987,6 +2439,21 @@ export class RequestForwarder {
         lastAccountFault = result.accountFault
         lastRetryScope = result.retryScope
         previousRecoveryHint = result.recoveryHint
+
+        if (
+          isQwenAiProvider
+          && result.errorCode === 'qwen_ai_webshare_bandwidth_exhausted'
+          && qwenAiEgressRecoveryState?.riskVerdictObserved === true
+        ) {
+          riskVerdictSeen = true
+          qwenAiEgressRecoveryState.riskVerdictSeen = true
+          console.warn('[QwenAI] proxy bandwidth exhausted after a risk verdict; stopping recovery', JSON.stringify({
+            requestId: context.requestId,
+            accountId: account.id,
+            attempt: attempt + 1,
+          }))
+          break
+        }
 
         // A webshare bandwidth-402 is pool quota exhaustion, not an account
         // or Qwen fault: rotating accounts cannot add proxy bandwidth, and
@@ -2315,6 +2782,39 @@ export class RequestForwarder {
     if (riskVerdictSeen) {
       lastStatus = 503
       lastErrorCode = 'qwen_ai_content_verdict'
+      if (qwenAiEgressRecoveryState) qwenAiEgressRecoveryState.riskVerdictSeen = true
+      const egressCircuit = recordQwenAiEgressRiskVerdict({
+        fingerprint: qwenAiRiskFingerprint,
+        reason: 'qwen_ai_content_verdict',
+      })
+      if (egressCircuit) {
+        console.warn('[QwenAI] egress risk circuit opened; pausing Qwen traffic', JSON.stringify({
+          requestId: context.requestId,
+          distinctFingerprints: egressCircuit.distinctFingerprints,
+          verdicts: egressCircuit.verdicts,
+          retryAfter: Math.max(1, Math.ceil((egressCircuit.until - Date.now()) / 1000)),
+        }))
+      }
+      if (qwenAiRiskFingerprint) {
+        const circuitEntry = openQwenAiRiskCircuit(qwenAiRiskFingerprint, {
+          reason: 'qwen_ai_content_verdict',
+        })
+        const retryAfterSeconds = Math.max(1, Math.ceil((circuitEntry.until - Date.now()) / 1000))
+        const circuitBlocking = circuitEntry.failures >= qwenAiRiskCircuitThreshold()
+        console.warn('[QwenAI] risk circuit recorded for request fingerprint', JSON.stringify({
+          requestId: context.requestId,
+          fingerprint: qwenAiRiskFingerprint.slice(0, 12),
+          failures: circuitEntry.failures,
+          blocking: circuitBlocking,
+          retryAfter: circuitBlocking ? retryAfterSeconds : 1,
+        }))
+        if (circuitBlocking) {
+          lastHeaders = {
+            ...(lastHeaders || {}),
+            'Retry-After': String(retryAfterSeconds),
+          }
+        }
+      }
       const verdictProxyExitDraws = qwenAiEgressRecoveryState?.webshareVerdictExits ?? 0
       const proxySawVerdict = verdictProxyExitDraws > 0
         || qwenAiEgressRecoveryState?.webshareVerdictSeen === true
@@ -5778,6 +6278,93 @@ export class RequestForwarder {
    * Mimo Dedicated Forward
    * Uses Mimo adapter for Xiaomi AI Studio
    */
+  /**
+   * Managed-tool recovery for MiMo: a turn that narrated intent, emitted a
+   * managed tool-result wrapper, or otherwise produced no tool call is
+   * replayed once in a fresh conversation with the shared continuation nudge
+   * (same mechanism zai/glm/kimi use). Budget and deadline are env-configurable;
+   * exhaustion degrades to delivering the dangling text instead of failing.
+   */
+  private async replayMimoManagedTurn(options: {
+    request: ChatCompletionRequest
+    adapter: MimoAdapter
+    account: Account
+    actualModel: string
+    plan: ToolCallingTransformResult['plan']
+    activeUserRequest?: string
+    danglingContent: string
+    protocolError: Error | null
+    env: Record<string, string | undefined>
+  }): Promise<{
+    response: { status: number; data: unknown }
+    conversationId: string
+    query: string
+    handler: MimoStreamHandler
+  } | null> {
+    const attemptsLimit = mimoManagedContinuationAttempts(options.env)
+    if (attemptsLimit < 1 || !options.plan) return null
+    const deadlineAt = Date.now() + mimoManagedContinuationTimeoutMs(options.env)
+    if (Date.now() >= deadlineAt) return null
+
+    const nudge = createToolWorkflowContinuationMessage({
+      activeUserRequest: options.activeUserRequest,
+      completionProofMissing: false,
+      failedToolResultPending: options.plan.failedToolResultPending === true,
+      requireManagedToolCall: true,
+      plan: options.plan,
+    })
+    const nudgeContent = typeof nudge.content === 'string'
+      ? nudge.content
+      : JSON.stringify(nudge.content)
+
+    const replayMessages = [
+      ...(options.request.messages as any[]),
+      ...(options.danglingContent?.trim()
+        ? [{ role: 'assistant', content: options.danglingContent.trim() }]
+        : []),
+      { role: 'user', content: nudgeContent },
+    ]
+
+    console.warn('[Mimo] Managed tool continuation replay', JSON.stringify({
+      reason: options.protocolError ? 'protocol_error' : 'no_tool_call',
+      protocolError: options.protocolError?.message,
+      danglingLength: options.danglingContent?.length ?? 0,
+    }))
+
+    try {
+      const replay = await options.adapter.chatCompletion({
+        model: options.actualModel,
+        originalModel: options.request.originalModel,
+        messages: replayMessages,
+        stream: true,
+        temperature: options.request.temperature,
+        enableThinking: options.request.reasoning_effort
+          ? options.request.reasoning_effort !== 'none'
+          : undefined,
+        enableWebSearch: options.request.web_search === true,
+      } as any)
+      if (replay.response.status >= 400) {
+        try { (replay.response.data as { destroy?: () => void })?.destroy?.() } catch {}
+        return null
+      }
+      const handler = new MimoStreamHandler(options.actualModel, replay.conversationId, 'separate', options.plan, {
+        // Keep replay buffered so a pipe-delimited tool call can be converted
+        // into a structured function call before any raw text reaches Codex.
+        deferOutput: true,
+        tolerateProtocolError: true,
+      })
+      return {
+        response: replay.response as unknown as { status: number; data: unknown },
+        conversationId: replay.conversationId,
+        query: replay.query,
+        handler,
+      }
+    } catch (error) {
+      console.warn('[Mimo] Managed tool continuation replay failed:', error instanceof Error ? error.message : error)
+      return null
+    }
+  }
+
   private async forwardMimo(
     request: ChatCompletionRequest,
     account: Account,
@@ -5837,24 +6424,58 @@ export class RequestForwarder {
           }
         : undefined
 
-      const handler = new MimoStreamHandler(actualModel, conversationId, 'separate', transformed.plan)
+      const managedToolsActive = transformed.plan?.shouldParseResponse === true
+      const handler = new MimoStreamHandler(actualModel, conversationId, 'separate', transformed.plan, {
+        deferOutput: managedToolsActive,
+        tolerateProtocolError: managedToolsActive,
+      })
 
       if (request.stream) {
         const transformedStream = new PassThrough()
-        const openAIStream = handler.handleStream(response.data)
 
         ;(async () => {
           try {
-            for await (const chunk of openAIStream) {
+            let deliveredConversationId = conversationId
+            let deliveredQuery = query
+            let deliveredHandler = handler
+            const buffered: string[] = []
+            for await (const chunk of handler.handleStream(response.data)) {
+              buffered.push(chunk)
+            }
+
+            if (managedToolsActive && !handler.hasEmittedToolCall()) {
+              const replay = await this.replayMimoManagedTurn({
+                request,
+                adapter,
+                account,
+                actualModel,
+                plan: transformed.plan,
+                activeUserRequest: extractLatestActiveUserRequest(transformedRequest.messages as any),
+                danglingContent: handler.getAssistantContentForTitle(),
+                protocolError: handler.getProtocolError(),
+                env: process.env,
+              })
+              if (replay) {
+                deliveredConversationId = replay.conversationId
+                deliveredQuery = replay.query
+                deliveredHandler = replay.handler
+                buffered.length = 0
+                for await (const chunk of replay.handler.handleStream(replay.response.data)) {
+                  buffered.push(chunk)
+                }
+              }
+            }
+
+            for (const chunk of buffered) {
               transformedStream.write(chunk)
             }
             await adapter.generateConversationTitle(
-              conversationId,
-              query,
-              handler.getAssistantContentForTitle()
+              deliveredConversationId,
+              deliveredQuery,
+              deliveredHandler.getAssistantContentForTitle(),
             )
             if (deleteSessionCallback) {
-              await deleteSessionCallback(conversationId)
+              await deleteSessionCallback(deliveredConversationId)
             }
             transformedStream.end()
           } catch (error) {
@@ -6131,7 +6752,13 @@ export class RequestForwarder {
     }
 
     if (request.tools !== undefined) {
-      body.tools = request.tools
+      // The retrieval tool is a PROXY-INTERNAL tool. It exists so the model can
+      // ask this process for an omitted span, and its only implementation is
+      // here. A provider must never receive it: it cannot execute it, and a
+      // request carrying an unexecutable tool is a protocol error upstream.
+      // Teaching the model the tool happens in the managed prompt; the wire
+      // payload is built here, so this is the one place the two can diverge.
+      body.tools = stripRetrievalTool(request.tools)
     }
 
     if (request.tool_choice !== undefined) {

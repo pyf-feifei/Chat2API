@@ -387,6 +387,14 @@ export class LoadBalancer {
       return false
     }
 
+    // The upstream refused this account for the rest of its daily quota. Keep
+    // it out of rotation until that window ends instead of re-selecting it:
+    // the refusal is not transient, so a risk cooldown (minutes) would only
+    // delay the next wasted request rather than prevent it.
+    if (account.dailyQuotaExhaustedUntil && account.dailyQuotaExhaustedUntil > Date.now()) {
+      return false
+    }
+
     if (account.dailyLimit && account.todayUsed && account.todayUsed >= account.dailyLimit) {
       return false
     }

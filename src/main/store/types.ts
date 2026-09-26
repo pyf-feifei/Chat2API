@@ -340,6 +340,27 @@ export interface Account {
   dailyLimit?: number
   /** Today used count */
   todayUsed?: number
+  /**
+   * Consecutive upstream "this account does not exist" verdicts. A single
+   * verdict is never enough to freeze an account (see qwen-ai-token-refresh).
+   */
+  unregisteredStrikes?: number
+  /** Timestamp of the first verdict in the current strike window */
+  firstUnregisteredAt?: number
+  /** Timestamp of the most recent verdict in the current strike window */
+  lastUnregisteredAt?: number
+  /**
+   * End of the daily-quota exhaustion window (epoch ms), set when the upstream
+   * answers a request with a quota notice in the message body.
+   *
+   * Deliberately separate from `todayUsed`/`dailyLimit`: that counter is only
+   * ever incremented and `resetDailyUsage()` has no caller, so it can never be
+   * trusted as a per-day figure, and `dailyLimit` is unset on every account,
+   * which leaves the `todayUsed >= dailyLimit` guard in loadbalancer inert.
+   * A quota resets at the upstream's day boundary, so the isolation has to
+   * survive until then rather than for the minutes a risk cooldown lasts.
+   */
+  dailyQuotaExhaustedUntil?: number
 }
 
 /**
