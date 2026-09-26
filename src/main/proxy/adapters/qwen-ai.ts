@@ -81,6 +81,11 @@ import {
   resolveQwenAiModelMode,
 } from '../../providers/qwen-ai-model-mode'
 import type { QwenAiSessionState } from '../qwenAiSessionBridge'
+import {
+  placeQwenAiDepthDirective,
+  qwenAiDepthPromptChannelFromEnv,
+  resolveQwenAiDepthDirective,
+} from './qwen-ai-depth-prompt'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 // Cumulative wall-clock deadline for one logical client request including all
@@ -2552,6 +2557,7 @@ function createQwenAiStreamFailure(
     | 'qwen_ai_semantic_empty'
     | 'qwen_ai_semantic_incomplete'
     | 'qwen_ai_wrapper_leak'
+    | 'qwen_ai_daily_quota_exhausted'
     | 'qwen_ai_invalid_tool_arguments' = 'qwen_ai_stream_incomplete',
 ): QwenAiUpstreamError {
   const error = new Error(message) as QwenAiUpstreamError
@@ -2583,6 +2589,67 @@ function createQwenAiSemanticIncompleteError(): QwenAiUpstreamError {
   )
   error.status = 422
   error.accountFault = false
+  return error
+}
+
+/**
+ * Qwen's free tier caps conversations per account per day. When the cap is
+ * reached the upstream does NOT answer with a 4xx: it returns HTTP 200 and
+ * puts the notice in the assistant's own content, e.g.
+ *
+ *   content: "今日对话次数已达上限，请明日再来。"
+ *   reasoning_content: ""
+ *
+ * Left alone this surfaces to the client as if the model had said it, and the
+ * account is never retired, so the load balancer keeps selecting it for the
+ * rest of the day (observed 2026-09-26: an A/B sampler recorded these refusals
+ * as valid samples with reasoning_chars=0, which inverted its own conclusion).
+ *
+ * Matching is deliberately narrow and anchored, so a legitimate answer that
+ * merely discusses the word "quota" is not mistaken for a refusal. A real
+ * refusal is short, has no reasoning, and is a fixed notice.
+ */
+const QWEN_AI_DAILY_QUOTA_NOTICES: readonly RegExp[] = [
+  /今日(?:对话|聊天|使用)次数[^。\n]{0,8}已达(?:上限|限制)/,
+  /(?:对话|聊天|使用)次数[^。\n]{0,8}(?:已)?达上限/,
+  // Anchored so "请明日再来之前先做完这个任务" (a real instruction) does not
+  // match: the notice is a standalone sentence, not the start of a clause.
+  /^\s*(?:请|你)?(?:可|能)?(?:在)?明日再(?:来|聊|使用)[。，,！!？?…\s]*$/,
+  /(?:今日|今天)已(?:用完|达到上限)/,
+  /daily[^.\n]{0,24}(?:limit|quota)[^\n]{0,16}(?:reached|exceeded)/i,
+  /(?:limit|quota)[^\n]{0,16}(?:reached|exceeded)[^\n]{0,16}daily/i,
+  // "You've reached your daily limit" has the subject first and no "daily" in
+  // front of "limit", so cover the possessive form explicitly.
+  /(?:you'?ve|you have)\s+(?:reached|hit|exceeded)\s+(?:your\s+)?daily/i,
+  /(?:reached|hit|exceeded)\s+(?:your\s+)?daily\s+(?:limit|quota)/i,
+]
+
+export function isQwenAiDailyQuotaNotice(text: string, reasoning = ''): boolean {
+  const body = String(text || '').trim()
+  if (!body) return false
+  // A refusal is not a reasoned answer. If the model produced a real chain of
+  // thought it was solving the task, not relaying a notice.
+  if (String(reasoning || '').trim().length > 0) return false
+  // Notices are short one-liners. A long passage quoting the phrase is prose.
+  if (body.length > 120) return false
+  return QWEN_AI_DAILY_QUOTA_NOTICES.some((re) => re.test(body))
+}
+
+function createQwenAiDailyQuotaError(): QwenAiUpstreamError {
+  const error = createQwenAiStreamFailure(
+    'Qwen AI refused the request: this account has exhausted its daily conversation quota '
+    + '(upstream answered HTTP 200 with a quota notice). The account is parked until the '
+    + 'quota resets; retrying on the same account cannot succeed today.',
+    'qwen_ai_daily_quota_exhausted',
+  )
+  // 429: retryable in principle, but not on this account today.
+  error.status = 429
+  // A quota refusal is a property of the ACCOUNT's daily allowance, not a
+  // credential fault and not a content risk verdict. accountFault=false keeps
+  // the governor on the short neutral path so the pool rotates instead of
+  // draining.
+  error.accountFault = true
+  error.retryable = false
   return error
 }
 
@@ -3795,7 +3862,27 @@ export function resolveQwenAiFeatureMode(
   capability: ProviderModelCapability | undefined,
   reasoningEffort?: string | null,
   managedToolCalling?: boolean,
-): { thinkingEnabled: boolean; autoThinking: boolean; thinkingMode?: 'Fast' | 'Auto' | 'Thinking' } {
+): {
+  thinkingEnabled: boolean
+  autoThinking: boolean
+  thinkingMode?: 'Fast' | 'Auto' | 'Thinking'
+  /**
+   * Prompt-side depth directive. The upstream enum is an on/off switch whose
+   * "Thinking" member is not deeper than "Auto" (measured: high/Auto ~4.5k vs
+   * xhigh/Thinking ~3.5k reasoning chars), so depth is carried by the prompt
+   * instead. Undefined whenever the directive cannot apply - see
+   * qwen-ai-depth-prompt.ts for the measurements and the gates.
+   */
+  depthDirective?: string
+} {
+  const resolveDepth = (thinkingEnabled: boolean, modePinned: boolean): string | undefined =>
+    resolveQwenAiDepthDirective({
+      reasoningEffort,
+      thinkingEnabled,
+      modePinned,
+      managedToolCalling,
+    })
+
   const modelMode = resolveQwenAiModelMode(requestedModel)
   if (modelMode.thinkingEnabled !== undefined) {
     // Client effort wins: a managed tool-call branch only falls back to the
@@ -3813,10 +3900,12 @@ export function resolveQwenAiFeatureMode(
     // Floating aliases (_Auto / bare qwen3.8-max) let an explicit client
     // effort take over the mode; pinned suffixes (_Fast/_Thinking) win.
     const effective = applyQwenAiEffortToModelMode(modelMode, reasoningEffort)
+    const thinkingEnabled = effective.thinkingEnabled ?? true
     return {
-      thinkingEnabled: effective.thinkingEnabled ?? true,
-      autoThinking: effective.autoThinking ?? effective.thinkingEnabled ?? true,
+      thinkingEnabled,
+      autoThinking: effective.autoThinking ?? thinkingEnabled,
       thinkingMode: effective.thinkingMode,
+      depthDirective: resolveDepth(thinkingEnabled, effective.precedence === 'pinned'),
     }
   }
 
@@ -3832,6 +3921,7 @@ export function resolveQwenAiFeatureMode(
     // Keep prior behavior for other Qwen models while Qwen3.8-Max aliases
     // deliberately control this flag independently.
     autoThinking: thinkingEnabled,
+    depthDirective: resolveDepth(thinkingEnabled, false),
   }
 }
 
@@ -4870,46 +4960,77 @@ export class QwenAiAdapter {
         thinkingMode: featureMode.thinkingMode,
         thinkingBudget: request.thinking_budget,
       })
-
-      const createPayload = () => ({
-        stream: true,
-        version: '2.1',
-        incremental_output: true,
-        chat_id: chatId,
-        chat_mode: 'normal',
-        model: modelId,
-        ...(preparedUserMessage.nativeSystemPrompt
-          ? { system_message: preparedUserMessage.nativeSystemPrompt }
-          : {}),
-        parent_id: null,
-        messages: [
-          {
-            fid,
-            parentId: null,
-            childrenIds: [childId],
-            role: 'user',
-            content: preparedUserMessage.content,
-            user_action: 'chat',
-            files: preparedUserMessage.files,
-            timestamp: ts,
-            models: [modelId],
-            chat_type: chatType,
-            feature_config: featureConfig,
-            extra: {
-              meta: {
-                subChatType: chatType,
-                ...(imageGeneration
-                  ? { size: imageGeneration.size, model: imageGeneration.model }
-                  : {}),
-              },
-            },
-            sub_chat_type: chatType,
-            parent_id: null,
-          },
-        ],
-        timestamp: ts + 1,
-        ...(imageGeneration ? { size: imageGeneration.size } : {}),
+      // Depth goes on the user turn by default because the native
+      // system_message field is per-chat: a per-request effort written there
+      // would keep governing later turns after the client lowers its effort.
+      // A deployment with a stable effort can opt into 'native' so the model
+      // reads it as a system instruction rather than something the user said.
+      //
+      // Recomputed per payload build: the complete-document re-prepare below
+      // replaces preparedUserMessage, so a snapshot taken once would post the
+      // pre-offload inline content and defeat that retry.
+      const depthChannel = qwenAiDepthPromptChannelFromEnv()
+      // The placement the final payload actually used. createPayload can run
+      // more than once (the complete-document re-prepare below replaces
+      // preparedUserMessage), so the payload build - never a one-off snapshot -
+      // is the single source of truth for both the wire format and the log.
+      let lastDepthPlacement = placeQwenAiDepthDirective({
+        directive: featureMode.depthDirective,
+        channel: depthChannel,
+        userContent: preparedUserMessage.content,
+        systemPrompt: preparedUserMessage.nativeSystemPrompt,
+        systemPromptMaxBytes: nativeSystemPromptMaxBytes,
+        nativeSystemAvailable: systemPromptMode === 'native',
       })
+      const createPayload = () => {
+        lastDepthPlacement = placeQwenAiDepthDirective({
+          directive: featureMode.depthDirective,
+          channel: depthChannel,
+          userContent: preparedUserMessage.content,
+          systemPrompt: preparedUserMessage.nativeSystemPrompt,
+          systemPromptMaxBytes: nativeSystemPromptMaxBytes,
+          nativeSystemAvailable: systemPromptMode === 'native',
+        })
+        return {
+          stream: true,
+          version: '2.1',
+          incremental_output: true,
+          chat_id: chatId,
+          chat_mode: 'normal',
+          model: modelId,
+          ...(lastDepthPlacement.systemPrompt
+            ? { system_message: lastDepthPlacement.systemPrompt }
+            : {}),
+          parent_id: null,
+          messages: [
+            {
+              fid,
+              parentId: null,
+              childrenIds: [childId],
+              role: 'user',
+              content: lastDepthPlacement.userContent,
+              user_action: 'chat',
+              files: preparedUserMessage.files,
+              timestamp: ts,
+              models: [modelId],
+              chat_type: chatType,
+              feature_config: featureConfig,
+              extra: {
+                meta: {
+                  subChatType: chatType,
+                  ...(imageGeneration
+                    ? { size: imageGeneration.size, model: imageGeneration.model }
+                    : {}),
+                },
+              },
+              sub_chat_type: chatType,
+              parent_id: null,
+            },
+          ],
+          timestamp: ts + 1,
+          ...(imageGeneration ? { size: imageGeneration.size } : {}),
+        }
+      }
       let payload = createPayload()
       let serializedPayload = JSON.stringify(payload)
       let payloadBytes = Buffer.byteLength(serializedPayload, 'utf8')
@@ -4980,9 +5101,14 @@ export class QwenAiAdapter {
         inlineUtf8Bytes: preparedUserMessage.inlineUtf8Bytes,
         payloadUtf8Bytes: payloadBytes,
         requestTargetBytes: requestMaxBytes,
-        nativeSystemPromptChars: preparedUserMessage.nativeSystemPrompt
-          ? preparedUserMessage.nativeSystemPrompt.length
-          : 0,
+        // `systemPrompt` is whatever the caller passed, and
+        // `placeQwenAiDepthDirective` returns it unchanged when it declines to
+        // place a directive. `preparedUserMessage.nativeSystemPrompt` is
+        // undefined on the paths that do not build a native system prompt, so
+        // this read needs the guard: an unguarded `.length` here threw a
+        // TypeError out of the debug block and took the whole request with it.
+        nativeSystemPromptChars: lastDepthPlacement.systemPrompt?.length ?? 0,
+        depthPromptChannel: lastDepthPlacement.usedChannel ?? 'none',
         conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
         fileCount: preparedUserMessage.files.length,
         requestedMessageTransport: request.messageTransport ?? 'inline',
@@ -5215,6 +5341,21 @@ export class QwenAiAdapter {
     if (!nativeSystemPrompt && request.nativeSystemPrompt) {
       nativeSystemPrompt = request.nativeSystemPrompt
     }
+
+    // Same placement as the first turn, applied after the transport so the
+    // directive rides the final content. An earlier revision assigned to
+    // `content` before this `let` declaration, a temporal-dead-zone
+    // ReferenceError thrown on every continuation turn.
+    const depthPlacement = placeQwenAiDepthDirective({
+      directive: featureMode.depthDirective,
+      channel: qwenAiDepthPromptChannelFromEnv(),
+      userContent: content,
+      systemPrompt: nativeSystemPrompt,
+      systemPromptMaxBytes: qwenAiNativeSystemMaxBytesFromEnv(),
+      nativeSystemAvailable: qwenAiSystemPromptModeFromEnv() === 'native',
+    })
+    content = depthPlacement.userContent
+    nativeSystemPrompt = depthPlacement.systemPrompt
 
     const fid = uuid()
     const childId = uuid()
@@ -7189,6 +7330,20 @@ export class QwenAiStreamHandler {
         return
       }
 
+      // Streamed daily-quota refusal. The notice arrives in the content channel
+      // with an empty reasoning channel, so it is only checked once the notice
+      // itself is visible; failStream marks the account so the governor
+      // rotates instead of re-selecting it.
+      if (isQwenAiDailyQuotaNotice(this.content, this.reasoning)) {
+        console.warn('[QwenAI] stream returned a daily-quota refusal; parking the account', JSON.stringify({
+          requestId: context.requestId,
+          accountId: this.account?.id,
+          notice: String(this.content).trim().slice(0, 80),
+        }))
+        failStream(createQwenAiDailyQuotaError())
+        return
+      }
+
       const completionProof = parseManagedWorkflowCompletionProof(
         this.content,
         this.toolCallingPlan,
@@ -7899,6 +8054,19 @@ export class QwenAiStreamHandler {
 
         if (isDanglingManagedToolAnswer(answerText, this.toolCallingPlan)) {
           recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+          return
+        }
+
+        // An exhausted daily quota arrives as HTTP 200 with the notice in
+        // `content`. Returning that verbatim would present the notice as the
+        // model's answer and the account would keep being selected all day.
+        if (isQwenAiDailyQuotaNotice(answerText, finalReasoning)) {
+          console.warn('[QwenAI] upstream returned a daily-quota refusal; parking the account', JSON.stringify({
+            requestId: context.requestId,
+            accountId: this.account?.id,
+            notice: answerText.trim().slice(0, 80),
+          }))
+          failStream(createQwenAiDailyQuotaError())
           return
         }
 
