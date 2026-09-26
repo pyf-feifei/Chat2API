@@ -135,7 +135,6 @@ dev-data/
 *dev-data/
 
 # Rebuilt codex replay payloads — large transcripts of real sessions, never commit
-codex-replay-payload.json
 codex-replay-*.json
 
 # Local test/debug artifacts
@@ -179,3 +178,16 @@ cred.json
 # produce these from captured replays; they are 60MB of derived JSON and are
 # reproducible, so they belong in neither the index nor a clone.
 scripts/compress/tmp/
+
+# Stray diagnostics that kept landing in the repo root. All of these are
+# reproducible artefacts, and a few of them (gh_*.py scraped account data,
+# tmp-wskeys) carried live credentials, so they must never be committed.
+electron.vite.config.*.mjs
+replay-*.mjs
+tmp-wskeys*
+tmp-ws-group.cjs
+tmp-codex-*.log
+test-*-context.cjs
+dev-*.log
+gh_*.py
+gh_*.txt
