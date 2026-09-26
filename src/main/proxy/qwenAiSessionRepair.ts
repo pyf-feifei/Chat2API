@@ -2,6 +2,7 @@ import type { Account, Provider } from '../store/types'
 import { storeManager } from '../store/store'
 import {
   hasQwenAiSessionCookie,
+  qwenAiRefreshRiskGateRemainingMs,
   qwenAiTokenRefresher,
 } from './adapters/qwen-ai-token-refresh'
 
@@ -10,12 +11,14 @@ const DEFAULT_RESCAN_INTERVAL_MS = 60_000
 const DEFAULT_FAILURE_RETRY_MS = 5 * 60_000
 const DEFAULT_CREDENTIAL_RETRY_MS = 6 * 60 * 60_000
 const DEFAULT_RISK_COOLDOWN_MS = 180_000
+const DEFAULT_PROBE_INTERVAL_MS = 6 * 60 * 60_000
 
 export type QwenAiSessionRepairState =
   | 'ready'
   | 'pending'
   | 'repairing'
   | 'backoff'
+  | 'probe'
   | 'unrepairable'
 
 export interface QwenAiSessionRepairAccountStatus {
@@ -63,6 +66,29 @@ export function isQwenAiWebSessionRepairable(account: Account): boolean {
   return Boolean(account.credentials.email && account.credentials.password)
 }
 
+function probeIntervalMs(): number {
+  return envDuration(
+    'CHAT2API_QWEN_AI_SESSION_REPAIR_PROBE_INTERVAL_MS',
+    DEFAULT_PROBE_INTERVAL_MS,
+    60_000,
+  )
+}
+
+/**
+ * When a non-active account becomes eligible for a re-probe.
+ *
+ * Derived from the account's own `updatedAt` (the moment it was frozen) so the
+ * schedule survives a process restart instead of restarting from zero. It is
+ * deterministic on purpose: this method is called from the management view.
+ */
+export function qwenAiSessionRepairProbeDeadline(account: Account, now: number = Date.now()): number {
+  const frozenAt = Number(account.updatedAt)
+  if (!Number.isFinite(frozenAt) || frozenAt <= 0 || frozenAt > now) {
+    return 0
+  }
+  return frozenAt + probeIntervalMs()
+}
+
 function safeErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : 'Unknown session repair failure'
   return message
@@ -92,7 +118,8 @@ export class QwenAiSessionRepairService {
 
     const summary = this.getPoolSummary()
     console.info(
-      `[QwenAI Session Repair] started ready=${summary.ready} pending=${summary.pending} unrepairable=${summary.unrepairable}`,
+      `[QwenAI Session Repair] started ready=${summary.ready} pending=${summary.pending} `
+      + `probe=${summary.probe} unrepairable=${summary.unrepairable}`,
     )
     this.schedule(0)
   }
@@ -112,11 +139,33 @@ export class QwenAiSessionRepairService {
   }
 
   getAccountStatus(account: Account, now = Date.now()): QwenAiSessionRepairAccountStatus {
-    // Persisted inactive/error accounts are intentionally excluded from the
-    // repair queue. Treat them as unrepairable here as well so the management
-    // view does not report a retryable pending session for a disabled account.
+    if (this.inFlightAccountId === account.id) {
+      return { state: 'repairing', ready: false, repairable: true }
+    }
+
     if (account.status !== 'active') {
-      return { state: 'unrepairable', ready: false, repairable: false }
+      // A frozen account still holds its login credentials, so the pool must
+      // stay recoverable. Excluding it from this queue forever made the
+      // refresher unable to undo its own "not registered" verdict: on
+      // 2026-09-22 all 340 accounts were frozen within 2.4h and Qwen stayed
+      // dark even though every signin succeeded when retried by hand. Probe a
+      // repairable account on a long interval instead of parking it.
+      if (!isQwenAiWebSessionRepairable(account)) {
+        return { state: 'unrepairable', ready: false, repairable: false }
+      }
+
+      const nextAttemptAt = Math.max(
+        qwenAiSessionRepairProbeDeadline(account, now),
+        this.retryAfterByAccount.get(account.id) || 0,
+        this.globalPauseUntil,
+      )
+
+      return {
+        state: 'probe',
+        ready: false,
+        repairable: true,
+        ...(nextAttemptAt > now ? { nextAttemptAt } : {}),
+      }
     }
 
     if (isQwenAiWebSessionReady(account)) {
@@ -126,10 +175,6 @@ export class QwenAiSessionRepairService {
     const repairable = isQwenAiWebSessionRepairable(account)
     if (!repairable) {
       return { state: 'unrepairable', ready: false, repairable: false }
-    }
-
-    if (this.inFlightAccountId === account.id) {
-      return { state: 'repairing', ready: false, repairable: true }
     }
 
     const nextAttemptAt = Math.max(
@@ -175,11 +220,20 @@ export class QwenAiSessionRepairService {
       return { status: 'paused', nextAttemptAt: this.globalPauseUntil }
     }
 
+    // While the refresh endpoint is under WAF risk control, no credential is
+    // being judged here - the endpoint is answering challenge pages. Picking an
+    // account anyway records a failure against a healthy one and, because the
+    // next scan is immediate, re-arms the gate before it can expire. That is
+    // what turned one flagged egress into a livelock outliving the underlying
+    // verdict by hours. Pause the whole loop instead.
+    const refreshGateRemainingMs = qwenAiRefreshRiskGateRemainingMs()
+    if (refreshGateRemainingMs > 0) {
+      this.globalPauseUntil = now + refreshGateRemainingMs
+      return { status: 'paused', nextAttemptAt: this.globalPauseUntil }
+    }
+
     const accounts = this.getQwenAiAccounts()
-    const candidate = accounts.find(account => {
-      const status = this.getAccountStatus(account, now)
-      return account.status === 'active' && status.state === 'pending'
-    })
+    const candidate = this.selectCandidate(accounts, now)
 
     if (!candidate) {
       const nextAttemptAt = this.getEarliestRetryAt(now)
@@ -187,15 +241,28 @@ export class QwenAiSessionRepairService {
     }
 
     this.inFlightAccountId = candidate.id
+    const isProbe = candidate.status !== 'active'
     try {
-      const repaired = await qwenAiTokenRefresher.repairWebSession(candidate, signal)
+      // A probe must prove the credentials still work before the account is
+      // allowed back into the pool. `repairWebSession` is a no-op for an
+      // account that still holds its session cookie, which is exactly the
+      // state the 2026-09-22 freeze left behind: the probe would report
+      // "repaired" forever while the account stayed inactive and unusable.
+      const repaired = isProbe
+        ? await qwenAiTokenRefresher.refreshAfterUnauthorized(candidate, signal)
+        : await qwenAiTokenRefresher.repairWebSession(candidate, signal)
       if (!isQwenAiWebSessionReady(repaired)) {
         throw new Error('Qwen AI signin did not return the required session cookie')
       }
+      if (repaired.status !== 'active') {
+        throw new Error('Qwen AI signin did not reactivate the frozen account')
+      }
 
       this.retryAfterByAccount.delete(candidate.id)
-      console.info(`[QwenAI Session Repair] repaired account=${candidate.id}`)
-      storeManager.addLog('info', 'Qwen AI web session repaired', {
+      console.info(
+        `[QwenAI Session Repair] ${isProbe ? 're-probed' : 'repaired'} account=${candidate.id}`,
+      )
+      storeManager.addLog('info', `Qwen AI web session ${isProbe ? 're-probed' : 'repaired'}`, {
         accountId: candidate.id,
         providerId: candidate.providerId,
       })
@@ -216,7 +283,14 @@ export class QwenAiSessionRepairService {
             10_000,
           )
       const nextAttemptAt = Date.now() + retryDelay
-      this.retryAfterByAccount.set(candidate.id, nextAttemptAt)
+      // A locally generated gate rejection carries no evidence about this
+      // account: the request never left the process. Recording it would push a
+      // healthy account into backoff for a verdict the upstream never made, so
+      // only the global pause is updated.
+      const gatedByEgress = repairError.code === 'qwen_ai_token_refresh_gated'
+      if (!gatedByEgress) {
+        this.retryAfterByAccount.set(candidate.id, nextAttemptAt)
+      }
 
       if (riskControlled) {
         const riskCooldownMs = envDuration(
@@ -225,6 +299,19 @@ export class QwenAiSessionRepairService {
           60_000,
         )
         this.globalPauseUntil = Date.now() + riskCooldownMs
+      }
+
+      if (gatedByEgress) {
+        // One line per pause, not one per account: a long gate would otherwise
+        // bury the pool log and hide the real state.
+        console.info(
+          `[QwenAI Session Repair] refresh gate active; deferring repairs for `
+          + `${Math.max(0, Math.ceil((this.globalPauseUntil - Date.now()) / 1000))}s`,
+        )
+        return {
+          status: 'paused',
+          nextAttemptAt: Math.max(this.globalPauseUntil, nextAttemptAt),
+        }
       }
 
       const message = safeErrorMessage(error)
@@ -250,6 +337,20 @@ export class QwenAiSessionRepairService {
     }
   }
 
+  /**
+   * Active accounts are served first; a due probe of a frozen account is the
+   * fallback, so re-probing never delays the accounts that are live today.
+   */
+  private selectCandidate(accounts: Account[], now: number): Account | undefined {
+    const isDueActive = (account: Account) => account.status === 'active'
+      && this.getAccountStatus(account, now).state === 'pending'
+    const isDueProbe = (account: Account) => account.status !== 'active'
+      && this.getAccountStatus(account, now).state === 'probe'
+      && !this.getAccountStatus(account, now).nextAttemptAt
+
+    return accounts.find(isDueActive) || accounts.find(isDueProbe)
+  }
+
   private getQwenAiAccounts(): Account[] {
     const providers = storeManager.getProviders()
     const providerIds = new Set(
@@ -259,18 +360,27 @@ export class QwenAiSessionRepairService {
       .filter(account => providerIds.has(account.providerId))
   }
 
-  private getPoolSummary(): { ready: number; pending: number; unrepairable: number } {
+  private getPoolSummary(): { ready: number; pending: number; probe: number; unrepairable: number } {
     return this.getQwenAiAccounts().reduce((summary, account) => {
       const status = this.getAccountStatus(account)
       if (status.ready) return { ...summary, ready: summary.ready + 1 }
       if (!status.repairable) return { ...summary, unrepairable: summary.unrepairable + 1 }
+      if (status.state === 'probe') return { ...summary, probe: summary.probe + 1 }
       return { ...summary, pending: summary.pending + 1 }
-    }, { ready: 0, pending: 0, unrepairable: 0 })
+    }, { ready: 0, pending: 0, probe: 0, unrepairable: 0 })
   }
 
   private getEarliestRetryAt(now: number): number | undefined {
+    const nextProbeAt = this.getQwenAiAccounts().reduce((earliest, account) => {
+      if (account.status === 'active') return earliest
+      const deadline = qwenAiSessionRepairProbeDeadline(account, now)
+      if (deadline <= now) return earliest
+      return earliest === 0 ? deadline : Math.min(earliest, deadline)
+    }, 0)
+
     const candidates = [
       this.globalPauseUntil,
+      nextProbeAt,
       ...this.retryAfterByAccount.values(),
     ].filter(timestamp => timestamp > now)
     return candidates.length > 0 ? Math.min(...candidates) : undefined

@@ -592,6 +592,7 @@
         "pending": "Pending repair",
         "repairing": "Repairing",
         "backoff": "Retry backoff",
+        "probe": "Frozen — re-probe scheduled",
         "unrepairable": "Missing login"
       },
       "queue": "Queue",

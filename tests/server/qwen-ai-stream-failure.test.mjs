@@ -28,6 +28,10 @@ import {
   normalizeQwenAiModelModeName as realNormalizeQwenAiModelModeName,
   resolveQwenAiModelMode as realResolveQwenAiModelMode,
 } from '../../src/main/providers/qwen-ai-model-mode.ts'
+// Real import, not a stub: `qwen-ai-depth-prompt` is a pure module, and stubbing
+// it would let every stream test pass under the assumption that the depth
+// directive does not exist. See the localModules entry for the full reasoning.
+import * as realQwenAiDepthPrompt from '../../src/main/proxy/adapters/qwen-ai-depth-prompt.ts'
 import { consumeQwenAiAccountNeutralReplaySlot as realConsumeQwenAiAccountNeutralReplaySlot } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 import { platformToolDiagnosticPattern as realPlatformToolDiagnosticPattern } from '../../src/main/proxy/toolCalling/promptGuidance.ts'
 import {
@@ -204,6 +208,14 @@ function loadQwenAiStreamHandler(overrides = {}) {
         || realNormalizeQwenAiModelModeName,
       resolveQwenAiModelMode: overrides.resolveQwenAiModelMode || realResolveQwenAiModelMode,
     },
+    // Real module, not a stub. `qwen-ai-depth-prompt` is pure: no I/O, no mutable
+    // module state beyond a write-once warn flag, env-driven configuration. A
+    // stub would make these 200+ tests pass under the assumption that the depth
+    // directive does not exist, which is a false green rather than a fix. This
+    // matches how the real ToolStreamParser / managedToolResultGuard /
+    // qwen-ai-model-mode modules above are already handled in this file.
+    './qwen-ai-depth-prompt': realQwenAiDepthPrompt,
+    './qwen-ai-depth-prompt.ts': realQwenAiDepthPrompt,
   }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) {
@@ -222,6 +234,24 @@ function loadQwenAiStreamHandler(overrides = {}) {
           getWebshareProxyAgent: () => undefined,
           webshareProxyUrlForLog: () => undefined,
         }
+      }
+      if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+        return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+      }
+      if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+        return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+      }
+      if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+        return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+      }
+      if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+        return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+      }
+      if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+        return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+      }
+      if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+        return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
       }
       throw new Error(`Unexpected Qwen AI stream test import: ${specifier}`)
     }

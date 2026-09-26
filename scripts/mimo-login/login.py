@@ -49,6 +49,8 @@ MIMO_LOGIN_SELECTORS = [
     "button:has-text('Login')",
     "button:has-text('登录')",
     "a:has-text('登录')",
+    "button:has-text('立即登录')",
+    "a:has-text('立即登录')",
 ]
 def _default_gmail_helper() -> str:
     """Locate the Maton Gmail helper without baking in a machine-specific path."""
@@ -319,14 +321,22 @@ def wait_for_login_form(page, timeout_s: float = 12.0) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            email_loc = page.locator("input[name='account']").first
-            pass_loc = page.locator("input[name='password']").first
-            if email_loc.count() and pass_loc.count():
-                return True
-            if email_loc.count() and email_loc.is_visible(timeout=200):
-                cand = page.locator("input[type='password']").first
-                if cand.count():
-                    return True
+            email_candidates = [
+                page.locator("input[name='account']").first,
+                page.locator("input[name='user']").first,
+                page.locator("input[type='email']").first,
+                page.locator("input[type='text']").first,
+            ]
+            password_candidates = [
+                page.locator("input[name='password']").first,
+                page.locator("input[type='password']").first,
+            ]
+            for email_loc in email_candidates:
+                if not email_loc.count() or not email_loc.is_visible(timeout=200):
+                    continue
+                for pass_loc in password_candidates:
+                    if pass_loc.count() and pass_loc.is_visible(timeout=200):
+                        return True
         except Exception:
             pass
         page.wait_for_timeout(400)

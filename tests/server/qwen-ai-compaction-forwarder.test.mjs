@@ -461,6 +461,8 @@ function loadRequestForwarder(overrides = {}) {
       }),
     },
     './services/contextManagementService': {
+      getUpstreamTokenOptimizerSettings: () => ({}),
+      optimizeUpstreamRequest: request => request,
       createContextManagementService: () => ({
         process: async messages => ({
           messages,
@@ -479,6 +481,22 @@ function loadRequestForwarder(overrides = {}) {
         textChars: 100,
         lastUserTextChars: 100,
       }),
+    },
+    './qwenAiRiskCircuit': {
+      createQwenAiRiskFingerprint: request => JSON.stringify(request),
+      getQwenAiRiskCircuitEntry: () => undefined,
+      qwenAiRiskCircuitThreshold: () => 2,
+      openQwenAiRiskCircuit: fingerprint => ({ fingerprint, until: Date.now() + 60_000, failures: 1 }),
+      clearQwenAiRiskCircuit: () => {},
+      getQwenAiEgressCircuitEntry: () => undefined,
+      recordQwenAiEgressRiskVerdict: () => undefined,
+      clearQwenAiEgressCircuit: () => {},
+    },
+
+    './services/retrievalTool.ts': {
+
+      stripRetrievalTool: tools => tools,
+
     },
     './qwenAiCompactionBoundary': {
       estimateQwenAiRequestInputTokens: () => 1,
@@ -537,6 +555,27 @@ function loadRequestForwarder(overrides = {}) {
     }
     if (specifier === './toolCalling/m365Transcript' || specifier === './toolCalling/m365Transcript.ts') {
       return { appendManagedReplayTurns: (replayText, _assistantText, nudgeContent) => replayText + '\n\n' + String(nudgeContent) }
+    }
+    if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+      return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+    }
+    if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+      return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+    }
+    if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+      return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+    }
+    if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+      return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+    }
+    if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+      return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+    }
+    if (specifier === './services/retrievalStream' || specifier === './services/retrievalStream.ts') {
+      return { createRetrievalAwareStream: ({ source }) => source }
+    }
+    if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+      return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
     }
     if (specifier.startsWith('.')) throw new Error(`Unexpected import: ${specifier}`)
     return runtimeRequire(specifier)

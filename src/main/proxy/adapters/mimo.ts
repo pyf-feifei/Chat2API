@@ -11,11 +11,18 @@ import type { Account, Provider } from '../../store/types'
 import { storeManager } from '../../store/store.ts'
 import type { ChatMessage } from '../types.ts'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser.ts'
+import {
+  ManagedToolResultGuard,
+  createManagedToolResultWrapperLeakError,
+  stripManagedToolResultWrappers,
+} from '../toolCalling/managedToolResultGuard.ts'
 import type { ToolCallingPlan } from '../toolCalling/types.ts'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
 import {
   prepareMimoAttachments,
   mimoRequestTimeoutMs,
+  mimoQueryMaxChars,
+  compactMimoMessagesForQuery,
   type MimoMediaEntry,
 } from './mimo-files.ts'
 
@@ -49,6 +56,26 @@ export type MimoUpstreamError = Error & {
   retryable?: boolean
   accountFault?: boolean
   errorCode?: string
+}
+
+export function mimoManagedContinuationAttempts(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.MIMO_MANAGED_CONTINUATION_ATTEMPTS
+  if (raw === undefined || String(raw).trim() === '') return 1
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return 1
+  return Math.min(Math.floor(parsed), 3)
+}
+
+export function mimoManagedContinuationTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.MIMO_MANAGED_CONTINUATION_TIMEOUT_MS
+  if (raw === undefined || String(raw).trim() === '') return 120_000
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return 120_000
+  return Math.floor(parsed)
 }
 
 interface MimoUsage {
@@ -462,7 +489,25 @@ export class MimoAdapter {
         `[Mimo] offloaded oversized context to ${attachments.offloadedFiles.length} attachment(s): ${attachments.offloadedFiles.join(', ')}`,
       )
     }
-    const query = buildMimoQuery(attachments.messages)
+    const queryPlan = compactMimoMessagesForQuery(
+      attachments.messages,
+      mimoQueryMaxChars(),
+      candidate => buildMimoQuery(candidate).length,
+    )
+    const query = buildMimoQuery(queryPlan.messages)
+    console.info('[Mimo] query shape', JSON.stringify({
+      queryChars: query.length,
+      beforeChars: queryPlan.beforeChars,
+      afterChars: queryPlan.afterChars,
+      messageCount: queryPlan.messages.length,
+    }))
+    if (queryPlan.compacted) {
+      console.warn('[Mimo] compacted query context', JSON.stringify({
+        beforeChars: queryPlan.beforeChars,
+        afterChars: queryPlan.afterChars,
+        renderedChars: query.length,
+      }))
+    }
 
     let response = await this.sendChatRequest(
       request,
@@ -782,20 +827,88 @@ export class MimoStreamHandler {
   private thinkingCitationBuffer: { value: string } = { value: '' }
   private toolStreamParser?: ToolStreamParser
   private malformedEvents = 0
+  private readonly deferOutput: boolean
+  private readonly tolerateProtocolError: boolean
+  private readonly managedToolProtocol: ToolCallingPlan['protocol'] | null
+  private readonly reasoningResultGuard?: ManagedToolResultGuard
+  private protocolErrorSeen: Error | null = null
+  private deferredChunks: string[] = []
+  private pipeToolCallRecovered = false
 
   constructor(
     model: string,
     conversationId: string,
     thinkingMode: 'passthrough' | 'strip' | 'separate' = 'strip',
-    toolCallingPlan?: ToolCallingPlan
+    toolCallingPlan?: ToolCallingPlan,
+    options: { deferOutput?: boolean; tolerateProtocolError?: boolean } = {},
   ) {
     this.model = model
     this.conversationId = conversationId
     this.thinkingMode = thinkingMode
     this.toolStreamParser = toolCallingPlan?.shouldParseResponse ? new ToolStreamParser(toolCallingPlan) : undefined
+    this.managedToolProtocol = toolCallingPlan?.shouldParseResponse ? toolCallingPlan.protocol : null
+    // MiMo can place managed tool protocol in its <think> channel. The
+    // regular ToolStreamParser only sees assistant content, while the route
+    // boundary treats unmanaged call/result markup as a leak. Use the strict
+    // (protocol-less) guard here so generic tool-call drift is suppressed in
+    // reasoning just like it is at the final assistant boundary.
+    this.reasoningResultGuard = this.managedToolProtocol
+      ? new ManagedToolResultGuard(null, { stripOnly: true })
+      : undefined
+    this.deferOutput = options.deferOutput === true
+    this.tolerateProtocolError = options.tolerateProtocolError === true
+  }
+
+  /** True once the managed parser emitted at least one tool call for this turn. */
+  hasEmittedToolCall(): boolean {
+    return this.toolStreamParser?.hasEmittedToolCall() === true
+  }
+
+  /** The managed protocol error observed on the last turn, if any. */
+  getProtocolError(): Error | null {
+    return this.protocolErrorSeen ?? this.toolStreamParser?.getProtocolError() ?? null
+  }
+
+  private noteProtocolError(error: Error | null | undefined): void {
+    if (error && !this.protocolErrorSeen) this.protocolErrorSeen = error
+  }
+
+  private guardReasoningContent(content: string): string {
+    if (!this.reasoningResultGuard || !content) return content
+    const guarded = this.reasoningResultGuard.push(content)
+    if (guarded.suppressed || this.reasoningResultGuard.hasDetectedWrapperLeak()) {
+      this.noteProtocolError(createManagedToolResultWrapperLeakError('reasoning_content'))
+    }
+    return guarded.content
+  }
+
+  private flushReasoningContent(): string {
+    if (!this.reasoningResultGuard) return ''
+    const guarded = this.reasoningResultGuard.flush()
+    if (guarded.suppressed || this.reasoningResultGuard.hasDetectedWrapperLeak()) {
+      this.noteProtocolError(createManagedToolResultWrapperLeakError('reasoning_content'))
+    }
+    return guarded.content
   }
 
   async *handleStream(stream: NodeJS.ReadableStream): AsyncGenerator<string> {
+    if (!this.deferOutput) {
+      yield* this.streamChunks(stream)
+      return
+    }
+    for await (const chunk of this.streamChunks(stream)) {
+      this.deferredChunks.push(chunk)
+    }
+    const buffered = this.pipeToolCallRecovered
+      ? this.deferredChunks.filter(chunk => !isVisibleAssistantTextChunk(chunk))
+      : this.deferredChunks
+    this.deferredChunks = []
+    for (const chunk of buffered) {
+      yield chunk
+    }
+  }
+
+  private async *streamChunks(stream: NodeJS.ReadableStream): AsyncGenerator<string> {
     const id = `chatcmpl-${uuid(false)}`
     const created = Math.floor(Date.now() / 1000)
 
@@ -872,8 +985,9 @@ export class MimoStreamHandler {
                     const cleanedThink = stripThinkTags(thinkContent)
                     const cleanedThinkWithCitations = stripCitationsWithBuffer(cleanedThink, this.thinkingCitationBuffer)
                     
-                    if (cleanedThinkWithCitations && this.thinkingMode === 'separate') {
-                      yield this.formatOpenAIChunk(id, created, { reasoning_content: cleanedThinkWithCitations })
+                    const guardedThink = this.guardReasoningContent(cleanedThinkWithCitations)
+                    if (guardedThink && this.thinkingMode === 'separate') {
+                      yield this.formatOpenAIChunk(id, created, { reasoning_content: guardedThink })
                     }
                     
                     // Move past the end tag
@@ -885,8 +999,9 @@ export class MimoStreamHandler {
                     const cleanedThink = stripThinkTags(thinkContent)
                     const cleanedThinkWithCitations = stripCitationsWithBuffer(cleanedThink, this.thinkingCitationBuffer)
                     
-                    if (cleanedThinkWithCitations && this.thinkingMode === 'separate') {
-                      yield this.formatOpenAIChunk(id, created, { reasoning_content: cleanedThinkWithCitations })
+                    const guardedThink = this.guardReasoningContent(cleanedThinkWithCitations)
+                    if (guardedThink && this.thinkingMode === 'separate') {
+                      yield this.formatOpenAIChunk(id, created, { reasoning_content: guardedThink })
                     }
                     
                     lastProcessedIndex = totalContent.length
@@ -937,9 +1052,40 @@ export class MimoStreamHandler {
       }
     }
 
+    const trailingReasoning = this.flushReasoningContent()
+    if (trailingReasoning && this.thinkingMode === 'separate') {
+      yield this.formatOpenAIChunk(id, created, { reasoning_content: trailingReasoning })
+    }
+
+    const recoveredPipeChunks = this.toolStreamParser?.recoverFromContent(
+      this.content,
+      this.createBaseChunk(id, created),
+    ) ?? []
+    if (recoveredPipeChunks.length > 0) {
+      this.pipeToolCallRecovered = true
+      console.warn('[Mimo] recovered pipe-delimited tool call(s)', JSON.stringify({
+        count: recoveredPipeChunks.length,
+        contentChars: this.content.length,
+      }))
+      for (const chunk of recoveredPipeChunks) {
+        yield `data: ${JSON.stringify(chunk)}\n\n`
+      }
+    } else if (this.managedToolProtocol && /(?:^|\\s)[A-Za-z0-9_.:-]+>[A-Za-z_][A-Za-z0-9_-]*>/.test(this.content)) {
+      console.warn('[Mimo] pipe-delimited tool-call candidate was not recovered', JSON.stringify({
+        contentChars: this.content.length,
+      }))
+    }
+
     const flushChunks = this.toolStreamParser?.flush(this.createBaseChunk(id, created)) ?? []
-    const protocolError = this.toolStreamParser?.getProtocolError()
-    if (protocolError) throw protocolError
+    const protocolError = this.getProtocolError()
+    if (protocolError) {
+      this.noteProtocolError(protocolError)
+      if (!this.tolerateProtocolError) throw protocolError
+      console.warn(
+        '[Mimo] managed tool protocol violation tolerated so the caller can replay the turn:',
+        protocolError.message,
+      )
+    }
     for (const chunk of flushChunks) {
       yield `data: ${JSON.stringify(chunk)}\n\n`
     }
@@ -1026,6 +1172,24 @@ export class MimoStreamHandler {
     finalContent = stripCitations(finalContent)
     if (reasoningContent) {
       reasoningContent = stripCitations(reasoningContent)
+    }
+
+    // The non-streaming path does not feed ToolStreamParser incrementally,
+    // so apply the same wrapper guard once to both assistant channels before
+    // the response can reach the route-level output boundary.
+    if (this.managedToolProtocol) {
+      const guardedContent = stripManagedToolResultWrappers(finalContent, this.managedToolProtocol)
+      if (guardedContent.wrapperLeakDetected) {
+        this.noteProtocolError(createManagedToolResultWrapperLeakError('content'))
+      }
+      finalContent = guardedContent.content
+      if (reasoningContent) {
+        const guardedReasoning = stripManagedToolResultWrappers(reasoningContent, this.managedToolProtocol)
+        if (guardedReasoning.wrapperLeakDetected) {
+          this.noteProtocolError(createManagedToolResultWrapperLeakError('reasoning_content'))
+        }
+        reasoningContent = guardedReasoning.content
+      }
     }
 
     const id = `chatcmpl-${uuid(false)}`
@@ -1184,6 +1348,29 @@ export class MimoStreamHandler {
   getUsage(): MimoUsage | null {
     return this.usage
   }
+}
+
+function isVisibleAssistantTextChunk(chunk: string): boolean {
+  for (const line of chunk.split('\\n')) {
+    if (!line.startsWith('data: ')) continue
+    const raw = line.slice(6).trim()
+    if (!raw || raw === '[DONE]') continue
+    try {
+      const payload = JSON.parse(raw) as Record<string, any>
+      const choices = Array.isArray(payload.choices) ? payload.choices : []
+      for (const choice of choices) {
+        const delta = choice?.delta
+        if (!delta || typeof delta !== 'object') continue
+        if (['content', 'reasoning_content', 'reasoning', 'thinking', 'summary']
+          .some(field => typeof delta[field] === 'string' && delta[field].length > 0)) {
+          return true
+        }
+      }
+    } catch {
+      // Preserve non-JSON/comment frames; they cannot be classified as text.
+    }
+  }
+  return false
 }
 
 export const mimoAdapter = {

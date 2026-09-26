@@ -189,7 +189,8 @@ function effectiveConfig(): { enabled: boolean; proxyUrl: string | undefined } {
 export function isWebshareProxyEnabled(): boolean {
   const { enabled } = effectiveConfig()
   if (!enabled) return false
-  return poolEntries.length > 0 || Boolean(webshareActiveProxyUrl())
+  if (poolEntries.length > 0) return healthyPoolEntries().length > 0
+  return Boolean(webshareActiveProxyUrl())
 }
 
 function healthyPoolEntries(now = Date.now()): PoolEntryState[] {
@@ -198,18 +199,14 @@ function healthyPoolEntries(now = Date.now()): PoolEntryState[] {
 
 /**
  * The next pool exit. `failover` sticks to the first healthy entry;
- * `round-robin` steps; `random` picks. Falls back to any enabled
- * entry (even cooled) when every entry is cooling — a stale exit is
- * better than no exit for a one-shot recovery retry.
+ * `round-robin` steps; `random` picks. If every entry is cooling, no
+ * recovery exit is returned. Reusing a cooled entry after an HTTP 402
+ * only creates another reconnect loop.
  */
 function nextPoolProxyUrl(now = Date.now()): string | undefined {
   if (poolEntries.length === 0) return undefined
   const healthy = healthyPoolEntries(now)
-  if (healthy.length === 0) {
-    const anyEnabled = poolEntries.filter(entry => entry.enabled)
-    if (anyEnabled.length === 0) return undefined
-    return anyEnabled[0].proxyUrl
-  }
+  if (healthy.length === 0) return undefined
   if (rotationStrategy === 'failover') return healthy[0].proxyUrl
   if (rotationStrategy === 'random') {
     return healthy[Math.floor(Math.random() * healthy.length)].proxyUrl
@@ -359,11 +356,7 @@ export function getWebshareProxyAgent(): HttpsProxyAgent<string> | undefined {
 function peekPoolProxyUrl(now = Date.now()): string | undefined {
   if (poolEntries.length === 0) return undefined
   const healthy = healthyPoolEntries(now)
-  if (healthy.length === 0) {
-    const anyEnabled = poolEntries.filter(entry => entry.enabled)
-    if (anyEnabled.length === 0) return undefined
-    return anyEnabled[0].proxyUrl
-  }
+  if (healthy.length === 0) return undefined
   if (rotationStrategy === 'failover') return healthy[0].proxyUrl
   if (rotationStrategy === 'random') return healthy[0].proxyUrl
   return healthy[roundRobinIndex % healthy.length].proxyUrl
@@ -383,7 +376,14 @@ export function webshareProxyUrlForLog(): string | undefined {
 }
 
 function redactProxyUrl(proxyUrl: string): string {
-  return proxyUrl
+  try {
+    const parsed = new URL(proxyUrl)
+    if (parsed.username) parsed.username = '***'
+    if (parsed.password) parsed.password = '***'
+    return parsed.toString()
+  } catch {
+    return '<invalid-proxy-url>'
+  }
 }
 
 // ---------------------------------------------------------------------------

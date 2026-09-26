@@ -40,6 +40,30 @@ function loadTypeScriptModule(path, localModules = {}) {
           webshareProxyUrlForLog: () => undefined,
         }
       }
+      if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+        return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+      }
+      if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+        return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+      }
+      if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+        return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+      }
+      if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+        return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+      }
+      if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+        return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+      }
+      if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+        return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+      }
+      if (specifier === './services/retrievalStream' || specifier === './services/retrievalStream.ts') {
+        return { createRetrievalAwareStream: ({ source }) => source }
+      }
+      if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+        return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
+      }
       throw new Error(`Unexpected Chat tool-call test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -239,10 +263,19 @@ function loadChatRouteHarness(options = {}) {
       createQwenAiContentFailoverStopRule: () => () => false,
       combineQwenAiFailoverStopRules: rule => rule ?? (() => false),
     },
+    
+    // Provider-neutral image slimming (Phase 2/4): the route asks the
+    // Provider-neutral image slimming (Phase 2/4): the route asks the policy
+    // layer instead of the Qwen-only trigger, and the harness declines to slim
+    // so it keeps exercising the accounting path.
     '../replayImageSlimming': {
       slimQwenAiReplayImages: messages => messages,
       qwenAiImageSlimModeFromEnv: () => 'off',
       shouldSlimQwenAiAttemptImages: () => false,
+    },
+    '../imageSlimPolicy': {
+      resolveImageSlimPolicy: () => undefined,
+      imageSlimModeFromEnv: () => 'off',
     },
     './accountStatus': {
       markAccountErrorIfPermanent: async () => {},
@@ -331,6 +364,9 @@ function loadChatRouteHarness(options = {}) {
         getWebshareProxyAgent: () => undefined,
         webshareProxyUrlForLog: () => undefined,
       }
+    }
+    if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+      return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
     }
     throw new Error(`Unexpected Chat tool-call test import: ${specifier}`)
   }

@@ -13,7 +13,8 @@ import {
   combineQwenAiFailoverStopRules,
   createQwenAiContentFailoverStopRule,
 } from '../qwenContentFailover'
-import { slimQwenAiReplayImages, qwenAiImageSlimModeFromEnv, shouldSlimQwenAiAttemptImages } from '../replayImageSlimming'
+import { slimQwenAiReplayImages } from '../replayImageSlimming'
+import { resolveImageSlimPolicy, imageSlimModeFromEnv } from '../imageSlimPolicy'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import {
@@ -78,6 +79,7 @@ import {
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
   qwenAiAccountRetryScope,
+  qwenAiManagedMaxAccountFailoversFromEnv,
 } from '../qwenAiAccountPolicy'
 
 function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
@@ -118,6 +120,39 @@ function clientIp(ctx: Context): string {
     ?? (Array.isArray(forwarded) ? forwarded[0] : forwarded)
     ?? ctx.ip
     ?? 'unknown'
+}
+
+function headerValue(ctx: Context, names: string[]): string | undefined {
+  for (const name of names) {
+    const value = ctx.headers[name]
+    const text = Array.isArray(value) ? value[0] : value
+    if (typeof text === 'string' && text.trim()) return text.trim().slice(0, 256)
+  }
+  return undefined
+}
+
+function codexSessionRiskKey(ctx: Context, request: unknown): string | undefined {
+  const direct = headerValue(ctx, ['session-id', 'thread-id', 'x-codex-window-id'])
+  if (direct) return `codex-session:${direct}`
+
+  const metadata = headerValue(ctx, ['x-codex-turn-metadata'])
+  if (metadata) {
+    try {
+      const parsed = JSON.parse(metadata) as Record<string, unknown>
+      const session = [parsed.session_id, parsed.thread_id, parsed.context_window_id]
+        .find(value => typeof value === 'string' && value.trim())
+      if (typeof session === 'string') return `codex-session:${session.trim().slice(0, 256)}`
+    } catch {
+      // Ignore malformed optional client metadata; the body key remains a fallback.
+    }
+  }
+
+  const promptCacheKey = request && typeof request === 'object'
+    ? (request as Record<string, unknown>).prompt_cache_key
+    : undefined
+  return typeof promptCacheKey === 'string' && promptCacheKey.trim()
+    ? `codex-session:${promptCacheKey.trim().slice(0, 256)}`
+    : undefined
 }
 
 function writeInvalidRequest(
@@ -1000,6 +1035,11 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     deferManagedStreamCommit = false,
   ): ProxyContext => {
     const qwenAiSessionBridge = qwenAiSessionBridgeForSelection(selection)
+    const clientSessionKey = codexSessionRiskKey(ctx, request)
+    const chainKey = pendingStickyChainKey ?? stickyChainEntry?.chainKey
+    const qwenAiRiskKey = clientSessionKey
+      ? `${clientSessionKey}:${chainKey ?? 'default'}`
+      : chainKey
     return {
       requestId: responseId,
       providerId: selection.provider.id,
@@ -1015,6 +1055,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       ...(qwenAiEgressRecoveryState ? { qwenAiEgressRecoveryState } : {}),
       ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
       ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
+      ...(qwenAiRiskKey ? { qwenAiRiskKey } : {}),
     }
   }
   let { account, provider, actualModel } = initialSelection
@@ -1037,14 +1078,16 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       .filter(candidate => candidate.status === 'active')
       .length
     : 0
+  const deferManagedStreamCommit = initialProviderIsQwenAi
+    && shouldDeferQwenAiManagedStreamCommit(chatRequest)
   const maxFailovers = resolveAccountFailoverLimit({
     configuredMaxFailovers: config.retryCount,
     qwenAiProvider: initialProviderIsQwenAi,
     activeAccountCount,
-    qwenAiMaxAccountFailovers: process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
+    qwenAiMaxAccountFailovers: deferManagedStreamCommit
+      ? String(qwenAiManagedMaxAccountFailoversFromEnv())
+      : process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
   })
-  const deferManagedStreamCommit = initialProviderIsQwenAi
-    && shouldDeferQwenAiManagedStreamCommit(chatRequest)
 
   const applyEffectiveSelection = (
     effectiveAccountId?: string,
@@ -1431,16 +1474,42 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     // first attempt is slimmed too, keeping ordinary turns below the
     // per-minute getstsToken quota. The store keeps its own transcript copy,
     // so slimming never mutates stored history.
-    const imageSlimMode = qwenAiImageSlimModeFromEnv()
     let slimImagesOnNextAttempt = false
     const failoverPromise = forwardWithAccountFailover({
       initialSelection,
       maxFailovers,
       signal: abort.controller.signal,
       forward: async ({ selection }) => {
-        const requestForAttempt = QwenAiAdapter.isQwenAiProvider(selection.provider)
-            && shouldSlimQwenAiAttemptImages(imageSlimMode, slimImagesOnNextAttempt)
-          ? { ...chatRequest, messages: slimQwenAiReplayImages(chatRequest.messages) }
+        // Provider-neutral since the image-slimming Phase 4. The policy layer
+        // owns the capability table, the provider's variable family, and the
+        // rule that a busy verdict only means something for Qwen.
+        const imageSlimPolicy = resolveImageSlimPolicy({
+          provider: selection.provider,
+          actualModel: selection.actualModel,
+          mode: imageSlimModeFromEnv(selection.provider),
+          afterBusyRejection: slimImagesOnNextAttempt,
+        })
+        const requestForAttempt = imageSlimPolicy
+          ? (() => {
+            const slimmed = slimQwenAiReplayImages(chatRequest.messages, imageSlimPolicy)
+            // Counts only. A data URL, a filename or a placeholder body is
+            // identifying, and image payloads routinely carry file content, so
+            // none of it reaches the log. `charsSlimmed` converts into the same
+            // units as the text optimizer's `estimatedSaved`, so the two tracks
+            // can be added.
+            console.info('[ChatSlim] replay image slimming', JSON.stringify({
+              providerId: selection.provider.id,
+              actualModel: selection.actualModel,
+              imageSlimApplied: true,
+              imageSlimReason: imageSlimPolicy.reason,
+              imageSlimKeepFirst: imageSlimPolicy.keepFirstImageMessages,
+              imageSlimKeepLast: imageSlimPolicy.keepLastImageMessages,
+              imageMessagesSlimmed: slimmed.messagesSlimmed,
+              imagePartsSlimmed: slimmed.partsSlimmed,
+              imageCharsSlimmed: slimmed.charsSlimmed,
+            }))
+            return { ...chatRequest, messages: slimmed.messages }
+          })()
           : chatRequest
         const result = await requestForwarder.forwardChatCompletion(
           requestForAttempt,
@@ -1600,6 +1669,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
           type: 'api_error',
           param: null,
           code: result.errorCode ?? null,
+          ...(typeof result.retryable === 'boolean' ? { retryable: result.retryable } : {}),
         },
       }
       return
@@ -1640,8 +1710,15 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       // arguments remain untouched by the boundary implementation.
       // Context compaction only needs the envelopes gone — failing the
       // summary because the model echoed history wrappers is never useful.
+      // MiMo's web model occasionally echoes managed protocol markup into a
+      // visible text delta. The adapter already replays/repairs that turn; at
+      // the final route boundary, suppress the marker instead of converting a
+      // recoverable provider drift into a Codex stream disconnect.
+      const stripManagedOutput = requestIntent.intent === 'context_compaction'
+        || provider.id === 'mimo'
+        || provider.name?.toLowerCase().includes('mimo') === true
       const assistantStream = createAssistantOutputBoundaryStream(null, {
-        stripOnly: requestIntent.intent === 'context_compaction',
+        stripOnly: stripManagedOutput,
       })
       const responsesStream = createResponsesStreamTransform({
         request,
@@ -1798,10 +1875,13 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     }
+    const stripManagedOutput = requestIntent.intent === 'context_compaction'
+      || provider.id === 'mimo'
+      || provider.name?.toLowerCase().includes('mimo') === true
     const guardedBody = guardAssistantOutputCompletion(
       result.body ?? fallbackCompletion,
       null,
-      { stripOnly: requestIntent.intent === 'context_compaction' },
+      { stripOnly: stripManagedOutput },
     )
     const response = await chatCompletionToResponse(guardedBody, request, {
       id: responseId,

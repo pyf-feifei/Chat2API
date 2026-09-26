@@ -44,17 +44,17 @@ test('_Auto floats so an explicit effort can take over', () => {
   const untouched = applyQwenAiEffortToModelMode(auto, undefined)
   assert.equal(untouched.thinkingMode, 'Auto')
 
-  // The default effort (codex high) maps to Auto — no behavior change.
+  // effort only decides whether the model thinks; depth is prompt-side.
   const highApplied = applyQwenAiEffortToModelMode(auto, 'high')
-  assert.equal(highApplied.thinkingMode, 'Auto')
+  assert.equal(highApplied.thinkingMode, 'Thinking')
   assert.equal(highApplied.thinkingEnabled, true)
-  assert.equal(highApplied.autoThinking, true)
+  assert.equal(highApplied.autoThinking, false)
 })
 
 test('minimal maps like low; raw flag aliases pin their derived mode', () => {
   const auto = resolveQwenAiModelMode('Qwen3.8-Max_Auto')
   assert.equal(applyQwenAiEffortToModelMode(auto, 'minimal').thinkingMode, 'Fast')
-  assert.equal(applyQwenAiEffortToModelMode(auto, 'medium').thinkingMode, 'Fast')
+  assert.equal(applyQwenAiEffortToModelMode(auto, 'medium').thinkingMode, 'Thinking')
 
   const rawFast = resolveQwenAiModelMode('Qwen3.8-Max_TeF_AtF')
   assert.equal(rawFast.precedence, 'pinned')
@@ -68,8 +68,8 @@ test('default effort table matches the agreed mapping', () => {
   const table = qwenAiEffortModeMapFromEnv()
   assert.equal(table.minimal, 'Fast')
   assert.equal(table.low, 'Fast')
-  assert.equal(table.medium, 'Fast')
-  assert.equal(table.high, 'Auto')
+  assert.equal(table.medium, 'Thinking')
+  assert.equal(table.high, 'Thinking')
   assert.equal(table.xhigh, 'Thinking')
   assert.equal(table.ultracode, 'Thinking')
   assert.equal(table.max, 'Thinking')
@@ -86,7 +86,7 @@ test('effort map is overridable via env and invalid values fall back', () => {
 
     process.env.CHAT2API_QWEN_AI_EFFORT_MODE_MAP = 'garbage!!'
     const fallback = qwenAiEffortModeMapFromEnv()
-    assert.equal(fallback.high, 'Auto')
+    assert.equal(fallback.high, 'Thinking')
     assert.equal(fallback.xhigh, 'Thinking')
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_EFFORT_MODE_MAP

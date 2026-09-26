@@ -1,0 +1,117 @@
+{
+ "label": "off",
+ "model": "Qwen3.8-Max",
+ "at": "2026-09-26T07:33:53.268Z",
+ "armA": {
+  "n": 0,
+  "pass": 0,
+  "errors": 0,
+  "medianLatency": 0,
+  "toolCallTotal": 0
+ },
+ "armB": {
+  "n": 8,
+  "pass": 8,
+  "errors": 0,
+  "medianLatency": 4623,
+  "toolCallTotal": 0
+ },
+ "results": [
+  {
+   "id": "old-pin",
+   "arm": "B",
+   "expect": "7734",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "7734",
+   "latency": 4517,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-fruit",
+   "arm": "B",
+   "expect": "kiwi",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "kiwi",
+   "latency": 6618,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-room",
+   "arm": "B",
+   "expect": "4127",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "4127",
+   "latency": 4484,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-word",
+   "arm": "B",
+   "expect": "quartzite",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "quartzite",
+   "latency": 6364,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-code",
+   "arm": "B",
+   "expect": "9058",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "9058",
+   "latency": 4623,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-animal",
+   "arm": "B",
+   "expect": "pangolin",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "pangolin",
+   "latency": 4306,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-city",
+   "arm": "B",
+   "expect": "Kyoto",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "Kyoto",
+   "latency": 4612,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  },
+  {
+   "id": "old-sum",
+   "arm": "B",
+   "expect": "6567",
+   "pass": true,
+   "ok": true,
+   "error": null,
+   "reply": "6567",
+   "latency": 5110,
+   "toolCallCount": 0,
+   "finishReason": "stop"
+  }
+ ]
+}

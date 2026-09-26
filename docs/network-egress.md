@@ -402,10 +402,118 @@ docker logs chat2api 2>&1 | grep -i egress
 
 ---
 
+## 8.5 Containers: Docker Desktop Forces a VM-Level Proxy
+
+The single most misdiagnosed failure in this project. It produced a long run of
+wrong conclusions on 2026-09-25/26 - IP reputation, user-agent persona, cookie
+freshness, token type and "the slider" were each blamed, and each was wrong.
+
+### Symptom
+
+Every container request comes back as an aliyun WAF challenge, while the same
+account in the host browser works fine:
+
+```
+<meta name="aliyun_waf_aa" content="ff926c7f07e45e2e487a29a6197d3460">
+```
+
+### Diagnosis: two commands
+
+```bash
+$ docker info | grep -A2 "^ *Proxy"
+ HTTP Proxy:  http.docker.internal:3128
+ HTTPS Proxy: http.docker.internal:3128
+
+$ curl -s --noproxy '*' https://ipinfo.io/ip
+221.213.36.92                                            # host, real egress
+$ docker exec chat2api node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
+195.242.178.82                                            # NOT the same
+```
+
+Different addresses mean Docker Desktop routes all container traffic through its
+VM proxy. The WAF verdict is about that egress, not about the request.
+
+### Fix
+
+1. Windows system proxy off (`ProxyEnable=0`) - otherwise Docker re-applies it
+   on every start.
+2. Docker Desktop proxy mode -> manual with no address. Persisted in
+   `%APPDATA%\Docker\marlin.dat` as
+   `"proxyHTTPMode":{"Source":"defaults","Value":"system",...}` -> `"manual"`.
+3. Restart Docker Desktop, then confirm `docker info` reports no proxy and the
+   container egress matches the host's.
+
+### What not to try
+
+Setting `HTTP_PROXY=` / `NO_PROXY=*` inside the container, `--network host`,
+editing `~/.docker/config.json`, or toggling the Windows proxy page alone - all
+measured on 2026-09-26, all ineffective. The proxy is applied in the VM network
+layer, below the container's own stack and above its filesystem.
+
+### After the fix
+
+Clash rules are no longer what rescues the container, because traffic never
+enters mihomo. One clean residential egress is more predictable than rotating a
+proxy pool. Webshare stays useful as a fallback - the forwarder engages it only
+after a verdict - not as the primary path.
+
+### DNS poisoning masquerades as an invalid key
+
+`proxy.webshare.io` is DNS-poisoned on filtered networks. Every resolver returns
+Meta or Dropbox addresses, so the pool sync fails with
+`401 Webshare API rejected the key` for **every** key, which reads exactly like
+bad credentials:
+
+```
+2a03:2880:...:face:b00c::   Meta        108.160.163.117   Dropbox
+162.125.80.5 / 157.240.8.36               54.89.135.129
+```
+
+`face:b00c` in an IPv6 answer is Meta's signature. A Chinese resolver's own DoH
+endpoint can be poisoned as well, so DoH is not automatically a fix.
+
+```bash
+# poisoned direct, clean through a tunnel
+curl -s --noproxy '*' https://proxy.webshare.io/api/v2/proxy/list/ -o /dev/null -w '%{http_code}\n'
+curl -s --proxy http://127.0.0.1:7897 https://proxy.webshare.io/api/v2/proxy/list/ -o /dev/null -w '%{http_code}\n'
+```
+
+`000` direct and `200` tunnelled is poisoning, not a bad key. Pin the real
+addresses - fetched from a resolver on the clean path - with `extra_hosts` so
+they survive a container recreate:
+
+```yaml
+extra_hosts:
+  - "proxy.webshare.io:54.38.13.175"
+```
+
+Validate a candidate before pinning:
+`docker run --rm --add-host "proxy.webshare.io:<ip>" <image> ...`
+
+### Storing the pool by hand
+
+`webshareProxyConfig` is stored **in plain text**: `normalizeWebshareApiKey` and
+`normalizeWebshareEntry` in `src/main/store/types.ts` do not encrypt
+`apiKey` / `proxyUrl`. Encrypting them by hand - natural, since every other
+credential in the store is encrypted - makes the runtime transmit the ciphertext
+as the key, which surfaces only as a sync `401`. Check the normaliser before
+hand-editing `data.json`.
+
+### Report a pool by usable count, not record count
+
+`entries: 180` counts records, not working proxies. Probe before claiming a pool
+is usable. On 2026-09-26 the local pool held 180 records: 160 stale ones
+returning `402 Bandwidth limit` and 20 live ones from a fresh key. "180 enabled"
+was wrong; 20 were usable. State the usable count and which subset was tested.
+
+---
+
 ## 9. Symptom → cause
 
 | Symptom | Likely cause | Where to look |
 | --- | --- | --- |
+| **Container** always returns `aliyun_waf_aa`, browser works | Docker Desktop VM proxy forcing all container traffic through a proxy | `docker info \| grep -A2 "^ *Proxy"`; §8.5 |
+| Every Webshare key returns `401` simultaneously | `proxy.webshare.io` is DNS-poisoned, so no request reaches Webshare | `nslookup proxy.webshare.io`; pin real IPs via `extra_hosts` |
 | **Every** request `403 qwen_ai_token_refresh_gated`, accounts look frozen, `401 email not found` | **Missing or mismatched `CHAT2API_STORAGE_ENCRYPTION_KEY`** | `[Session Repair] started ready=0 pending=339`; `docker exec <c> printenv CHAT2API_STORAGE_ENCRYPTION_KEY`. See §10 |
 | `ready=339 pending=0` on one host but `ready=0 pending=339` on another | Same store, different key (or one host never got the variable) | Compare the two startup lines; compare key length and value |
 | `qwen_ai_content_verdict`, `RGV587`, `bxpunish` | Egress IP flagged, **or** genuine content match | `ipinfo.io/ip`; compare against the [2026-09-22 diagnosis](diag-2026-09-22-codex-bxpunish.md) |

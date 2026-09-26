@@ -47,6 +47,24 @@ function loadTokenRefreshModule({ post, updateAccount } = {}) {
         webshareProxyUrlForLog: () => undefined,
       }
     }
+    if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+      return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+    }
+    if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+      return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+    }
+    if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+      return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+    }
+    if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+      return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+    }
+    if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+      return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+    }
+    if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+      return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+    }
     throw new Error(`Unexpected token refresher test import: ${specifier}`)
   }
 
@@ -357,7 +375,10 @@ test('Qwen AI refresh treats a successful HTTP response without a token as an ac
       && error.retryScope === 'next-account'
       && /not registered/.test(error.message),
   )
-  assert.equal(persisted.status, 'inactive')
+  // A single verdict must not freeze the account: the 2026-09-22 storm used
+  // exactly this response for 340 healthy accounts.
+  assert.equal(persisted.status, undefined)
+  assert.equal(persisted.unregisteredStrikes, 1)
   assert.match(persisted.errorMessage, /not registered/)
 })
 
@@ -387,7 +408,8 @@ test('Qwen AI refresh persists an explicit Chinese unregistered-account response
       && error.accountFault === true
       && error.retryScope === 'next-account',
   )
-  assert.equal(persisted.status, 'inactive')
+  assert.equal(persisted.status, undefined)
+  assert.equal(persisted.unregisteredStrikes, 1)
 })
 
 test('Qwen AI refresh treats a WAF challenge as account-neutral and stops account sweeping', async () => {

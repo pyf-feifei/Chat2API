@@ -179,6 +179,42 @@ test('deferred final failover failure reaches Responses as a structured terminal
   assert.equal(events.find(event => event.type === 'response.failed')?.response?.error?.code, 'qwen_ai_request_timeout')
 })
 
+test('risk circuit open reaches Codex Responses as a terminal failure', async () => {
+  const selected = selection('account-risk-circuit')
+  const deferred = createDeferredQwenAiFailoverStream(Promise.resolve({
+    selection: selected,
+    result: {
+      success: false,
+      status: 503,
+      error: 'Qwen AI risk-control circuit is open for this request.',
+      errorCode: 'qwen_ai_risk_circuit_open',
+      retryable: false,
+      accountFault: false,
+      headers: { 'Retry-After': '600' },
+    },
+    failoverCount: 0,
+    excludedAccountIds: new Set<string>(),
+  }))
+  const responses = createResponsesStreamTransform({
+    request: { model: 'test-model', input: 'hello', stream: true },
+    responseId: 'resp_risk_circuit',
+    model: 'test-model',
+  }).start()
+  const chunks: string[] = []
+  responses.on('data', chunk => chunks.push(chunk.toString()))
+  const ended = once(responses, 'end')
+  deferred.pipe(responses)
+
+  await ended
+  const output = chunks.join('')
+  const events = output.split('\n\n')
+    .filter(Boolean)
+    .map(block => JSON.parse(block.split('\n').find(line => line.startsWith('data: '))!.slice(6)))
+  assert.equal(events.at(-1)?.type, 'response.failed')
+  assert.equal(events.find(event => event.type === 'response.failed')?.response?.error?.code, 'qwen_ai_risk_circuit_open')
+  assert.match(output, /risk-control circuit is open/)
+})
+
 test('deferred Qwen stream retains the live Responses session state', async () => {
   const selected = selection('account-session')
   const sessionState = {

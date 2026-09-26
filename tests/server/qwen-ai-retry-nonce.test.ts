@@ -32,7 +32,7 @@ const { applyQwenAiRetryNonce } = loadFilesModule()
 
 const SAMPLE = 'chat transcript body\nline two'
 
-test('retry nonce with default always scope perturbs attempt >= 1', () => {
+test('retry nonce defaults to always scope and preserves reconnect immunity', () => {
   assert.equal(applyQwenAiRetryNonce(SAMPLE, undefined), SAMPLE, 'missing nonce stays pristine')
   assert.match(applyQwenAiRetryNonce(SAMPLE, 1), /\[chat2api transport note: conversation resync 1-/, 'default always scope perturbs attempt 1')
 

@@ -1,3 +1,8 @@
+// Must be evaluated before any network module: keeps provider traffic off the
+// local HTTP proxy (see egressPolicy.ts for the 2026-09-25 Qwen incident).
+// The module self-applies on import, so no explicit call is needed here.
+import '../main/proxy/egressPolicy'
+
 import { setRuntime } from '../main/runtime'
 import { nodeRuntime } from '../main/runtime/nodeRuntime'
 import { proxyServer } from '../main/proxy/server'

@@ -1,4 +1,6 @@
 import { Transform, type TransformCallback } from 'node:stream'
+import { parsePipeDelimitedToolCalls } from '../toolCalling/ToolStreamParser.ts'
+import type { ToolCallingPlan } from '../toolCalling/types.ts'
 import {
   chatUsageToResponseUsage,
   createResponseObject,
@@ -93,6 +95,121 @@ function mergeIncremental(current: string, fragment: unknown): { value: string; 
     return { value: fragment, delta: fragment.slice(current.length) }
   }
   return { value: current + fragment, delta: fragment }
+}
+
+function responseToolParameters(request: ResponseCreateRequest, name: string): Record<string, any> | undefined {
+  const tools = [
+    ...(request.tools ?? []),
+    ...(request.additional_tools ?? []),
+  ]
+  const tool = tools.find(candidate => (
+    candidate && typeof candidate === 'object'
+    && (candidate as Record<string, any>).type === 'function'
+    && (candidate as Record<string, any>).name === name
+  )) as Record<string, any> | undefined
+  const parameters = tool?.parameters
+  return parameters && typeof parameters === 'object' ? parameters as Record<string, any> : undefined
+}
+
+function unwrapTransportCdata(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  const trimmed = value.trim()
+  // Some web models echo a literal CDATA sentinel instead of a complete
+  // <![CDATA[...]]> section. Treat it as an empty optional value; the
+  // schema-aware pass below supplies only safe transport defaults.
+  if (trimmed === '<![CDATA>' || trimmed === '<![CDATA[]]>' || trimmed === '<![CDATA[]]') return ''
+  const match = trimmed.match(/^<!\[CDATA\[([\s\S]*?)\]\]>(?:\s*<!\[CDATA\[([\s\S]*?)\]\]>)*$/)
+  if (match) {
+    return match[1] + (match[2] ?? '')
+  }
+  return trimmed
+}
+
+function normalizeTransportArguments(value: unknown, schema: Record<string, any> | undefined, key = ''): unknown {
+  const unwrapped = unwrapTransportCdata(value)
+  if (Array.isArray(unwrapped)) return unwrapped.map(item => normalizeTransportArguments(item, schema))
+  if (unwrapped && typeof unwrapped === 'object') {
+    const properties = schema?.properties && typeof schema.properties === 'object'
+      ? schema.properties as Record<string, any>
+      : {}
+    const normalized: Record<string, unknown> = {}
+    for (const [childKey, childValue] of Object.entries(unwrapped as Record<string, unknown>)) {
+      normalized[childKey] = normalizeTransportArguments(childValue, properties[childKey], childKey)
+    }
+    return normalized
+  }
+
+  const propertySchema = schema?.type ? schema : schema?.properties?.[key]
+  const type = propertySchema?.type
+  if ((type === 'number' || type === 'integer') && typeof unwrapped === 'string') {
+    if (unwrapped === '' && (key === 'yield_time_ms' || key === 'max_output_tokens')) {
+      return key === 'yield_time_ms' ? 30000 : 10000
+    }
+    const numeric = Number(unwrapped)
+    if (Number.isFinite(numeric)) return numeric
+  }
+  if (type === 'boolean' && typeof unwrapped === 'string') {
+    if (/^(true|false)$/i.test(unwrapped)) return /^true$/i.test(unwrapped)
+  }
+  return unwrapped
+}
+
+function normalizeFunctionArgumentSnapshot(
+  value: unknown,
+  request: ResponseCreateRequest,
+  name: string,
+): unknown {
+  if (typeof value !== 'string') return value
+  try {
+    const parsed = JSON.parse(value)
+    return JSON.stringify(normalizeTransportArguments(parsed, responseToolParameters(request, name)))
+  } catch {
+    return value
+  }
+}
+
+function responsePipeToolCalls(text: string, request: ResponseCreateRequest): any[] {
+  const tools = (request.tools ?? []).filter(tool => (
+    tool && (tool as Record<string, any>).type === 'function'
+    && typeof (tool as Record<string, any>).name === 'string'
+  )) as Array<Record<string, any>>
+  if (tools.length === 0) return []
+  const plan = {
+    mode: 'managed',
+    protocol: 'managed_xml',
+    clientAdapterId: 'standard-openai-tools',
+    providerId: 'mimo',
+    tools: tools.map(tool => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters ?? {},
+      source: 'openai',
+    })),
+    shouldInjectPrompt: true,
+    shouldParseResponse: true,
+    toolChoiceMode: 'auto',
+    allowedToolNames: new Set(tools.map(tool => tool.name)),
+    allowedUpstreamToolNames: new Set(tools.map(tool => tool.name)),
+    workflowContinuation: false,
+    failedToolResultPending: false,
+    diagnostics: {
+      clientAdapterId: 'standard-openai-tools',
+      providerId: 'mimo',
+      toolSource: 'openai',
+      mode: 'managed',
+      protocol: 'managed_xml',
+      toolCount: tools.length,
+      injected: false,
+      reason: 'responses_pipe_fallback',
+      workflowContinuation: false,
+      failedToolResultPending: false,
+    },
+  } as unknown as ToolCallingPlan
+  try {
+    return parsePipeDelimitedToolCalls(text, plan)
+  } catch {
+    return []
+  }
 }
 
 function toolKey(call: Record<string, any>, fallbackIndex: number): string {
@@ -292,7 +409,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
       const choice = chunk.choices?.[0]
       if (!choice || typeof choice !== 'object') continue
       if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
-        this.finishReason = choice.finish_reason
+        this.finishReason = this.toolStates.size > 0 ? 'tool_calls' : choice.finish_reason
       }
       const delta = choice.delta ?? {}
 
@@ -300,8 +417,17 @@ export class ChatCompletionsToResponsesStream extends Transform {
         this.appendReasoning(delta.reasoning_content)
       }
       if (typeof delta.content === 'string' && delta.content.length > 0) {
-        this.finishReasoning()
-        this.appendText(delta.content)
+        const pipeCalls = responsePipeToolCalls(delta.content, this.request)
+        if (pipeCalls.length > 0) {
+          this.finishReasoning()
+          this.finishReason = 'tool_calls'
+          pipeCalls.forEach((call: Record<string, any>, index: number) => {
+            this.appendToolCall(call, index)
+          })
+        } else {
+          this.finishReasoning()
+          this.appendText(delta.content)
+        }
       }
       if (Array.isArray(delta.tool_calls)) {
         if (delta.tool_calls.length > 0) this.finishReasoning()
@@ -435,7 +561,12 @@ export class ChatCompletionsToResponsesStream extends Transform {
     if (!existing) this.nextOutputIndex += 1
 
     const nameMerge = mergeIncremental(existing?.name ?? '', call.function?.name)
-    const argumentMerge = mergeIncremental(existing?.arguments ?? '', call.function?.arguments)
+    const normalizedArguments = normalizeFunctionArgumentSnapshot(
+      call.function?.arguments,
+      this.request,
+      nameMerge.value,
+    )
+    const argumentMerge = mergeIncremental(existing?.arguments ?? '', normalizedArguments)
     const callId = typeof call.id === 'string' && call.id
       ? call.id
       : existing?.callId

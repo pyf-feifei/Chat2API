@@ -26,6 +26,7 @@ const {
   qwenAiAccountNeutralReplayScopeAfterRecovery,
   qwenAiSafeExplicitRetryScope,
   qwenAiAccountRetryScope,
+  qwenAiManagedMaxAccountFailoversFromEnv,
 } = loadPolicy()
 
 test('nested Proxy 503 wrapper preserves a real 401 account fault', () => {
@@ -146,6 +147,19 @@ test('account-neutral recovery failures retain or derive a bounded pool replay s
       ...failure,
       retryScope: 'next-account',
     }), 'next-account')
+  }
+})
+
+test('managed Codex requests default to one account failover', () => {
+  const previous = process.env.CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS
+  delete process.env.CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS
+  try {
+    assert.equal(qwenAiManagedMaxAccountFailoversFromEnv(), 1)
+    process.env.CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS = '3'
+    assert.equal(qwenAiManagedMaxAccountFailoversFromEnv(), 3)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS
+    else process.env.CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS = previous
   }
 })
 

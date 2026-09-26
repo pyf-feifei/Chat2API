@@ -12,9 +12,23 @@ export function buildToolCallingRuntimePlan(input: {
   model?: string
   config: ToolCallingConfig
   clientRequest: NormalizedClientToolRequest
+  /**
+   * Proxy-internal tools, taught to the model but owned by this process.
+   *
+   * These are added to `plan.tools` and to the parser's allowlist, so the prompt
+   * teaches them and a call to them parses. They are deliberately NOT in
+   * `clientRequest.tools`: that is the client contract, and the client never
+   * declared them. The response path partitions them out before they can reach
+   * the client, and the adapter boundary strips them from the wire payload.
+   */
+  localTools?: NormalizedToolDefinition[]
 }): ToolCallingPlan {
   const profile = getProviderToolProfile(input.providerProfileKey ?? input.providerId)
-  const tools = input.clientRequest.tools
+  const clientTools = input.clientRequest.tools
+  const localTools = (input.localTools ?? []).filter(
+    (tool) => !clientTools.some((client) => client.name === tool.name),
+  )
+  const tools = [...clientTools, ...localTools]
   const toolNames = new Set(tools.map((tool) => tool.name))
   const forcedName = input.clientRequest.toolChoice.forcedName
 
@@ -22,6 +36,9 @@ export function buildToolCallingRuntimePlan(input: {
     throw new Error(`Forced tool ${forcedName} is not declared`)
   }
 
+  // A forced tool choice means the client pinned one tool. Teaching the model
+  // a second one it may not call would be noise, so local tools are dropped
+  // rather than silently ignored.
   const allowedToolNames = forcedName ? new Set([forcedName]) : toolNames
   const allowedTools = forcedName ? tools.filter((tool) => tool.name === forcedName) : tools
   // Qwen's platform owns a native tool registry, and a client tool whose name

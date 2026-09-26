@@ -20,6 +20,21 @@ ENV CHAT2API_DATA_DIR=/data
 # Keep the proxy transport-only by default. Clients that need the explicit
 # compaction workflow can opt in with CHAT2API_COMPACTION_DETECTION=auto.
 ENV CHAT2API_COMPACTION_DETECTION=off
+# Upstream token optimizer, on by default in `safe` mode: it rewrites
+# only old, CLOSED tool results and archives the original text, so the
+# omission is recoverable. Verified 2026-09-26 (21264 -> 18001 prompt
+# tokens on a 12-tool-call history, answer intact; ordinary prose saved
+# nothing because it has no eligible content). `dry-run` measures
+# without rewriting, `balanced` drops omitted lines, `off` disables.
+ENV CHAT2API_UPSTREAM_TOKEN_OPTIMIZER=safe
+ENV CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_TOKENS=20000
+ENV CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_RECENT_MESSAGES=8
+ENV CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_SAVINGS=64
+ENV CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MAX_TOOL_TEXT_CHARS=16000
+# MiMo Web rejects rendered queries around 44k–52k characters. Leave room for
+# managed tool prompts and the active turn when offloading long Codex history.
+ENV MIMO_FILE_OFFLOAD_THRESHOLD_CHARS=8000
+ENV MIMO_QUERY_MAX_CHARS=32000
 ENV CHAT2API_QWEN_AI_COMPACTION_THINKING=auto
 # Compaction input uses live model limits first; these values are deployment
 # controls for an explicit override, optional metadata cap, or a
@@ -37,6 +52,9 @@ ENV CHAT2API_QWEN_AI_COMPACTION_MAX_ACCOUNT_ATTEMPTS=0
 ENV CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE=2
 # Keep failover bounded even when a large account pool is configured.
 ENV CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=5
+ENV CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS=1
+ENV CHAT2API_QWEN_AI_RISK_CIRCUIT_THRESHOLD=2
+ENV CHAT2API_QWEN_AI_RISK_CIRCUIT_COOLDOWN_MS=600000
 # Keep the adaptive pacing floor aligned with the validated multi-account
 # deployment; upstream 429/risk responses still control account cooldowns.
 ENV CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
@@ -50,6 +68,19 @@ ENV CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS=180000
 # not a credential problem: stop issuing refreshes for this window after the
 # first hit so healthy accounts are not frozen one by one.
 ENV CHAT2API_QWEN_AI_REFRESH_RISK_GATE_MS=300000
+# One upstream "this account does not exist" verdict is not enough to freeze an
+# account. Require N consecutive verdicts inside the window; a single verdict
+# only records a strike and keeps the account serving traffic.
+ENV CHAT2API_QWEN_AI_UNREGISTERED_STRIKES=3
+ENV CHAT2API_QWEN_AI_UNREGISTERED_STRIKE_WINDOW_MS=1800000
+# Several accounts rejected in a row is an egress verdict, not N dead
+# credentials: open the same shared refresh gate instead of sweeping the pool.
+ENV CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_LIMIT=5
+ENV CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_WINDOW_MS=300000
+# A frozen account still holds its login credentials, so the pool stays
+# recoverable: re-authenticate it on this interval instead of parking it.
+# Without this, one bad verdict could take the whole pool offline for good.
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_PROBE_INTERVAL_MS=21600000
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_FAILURE_RETRY_MS=300000
 ENV CHAT2API_QWEN_AI_SESSION_REPAIR_CREDENTIAL_RETRY_MS=21600000
 # Docker deployments allow long active generations within the cumulative
@@ -172,14 +203,10 @@ ENV ZAI_REFRESH_ALLOW_HUMAN=0
 # Qwen RGV587 risk-session refresher (aliyun slider solve -> x5sec cookie harvest)
 ENV QWEN_CAPTCHA_SOLVER_PATH=/app/scripts/qwen-captcha/refresh.py
 ENV QWEN_CAPTCHA_ARTIFACT_DIR=/tmp/qwen-captcha
-# Perturb uploaded transcripts on retries (>= 2) so RGV587's content-verdict
-# cache cannot pin identical resubmissions. 'false' disables.
+# Perturb uploaded transcripts for every attempt. Reconnect-driven replays
+# otherwise reuse the upstream content-fingerprint verdict; the risk circuit
+# stops repeated terminal failures after the first request.
 ENV CHAT2API_QWEN_AI_RETRY_NONCE=true
-# Perturb EVERY attempt, not just attempt >= 2. The upstream content-fingerprint
-# verdict cache persists across requests, so a client reconnect that resubmits
-# an unchanged transcript is pinned even though account rotation changed the
-# account: rotating accounts does not change the payload hash. 'always' costs
-# the transcript upload-cache hit and buys fingerprint immunity.
 ENV CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=always
 # Mimo has no refresh endpoint: serviceToken renewal re-runs the Xiaomi password
 # login. HTTP passport is risk-controlled from datacenter IPs, so auto mode

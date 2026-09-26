@@ -335,6 +335,10 @@ export interface QwenAiEgressRecoveryState {
   webshareVerdictSeen?: boolean
   /** Distinct proxy-routed draws that returned the content verdict. */
   webshareVerdictExits?: number
+  /** A risk verdict was observed before a proxy bandwidth failure. */
+  riskVerdictObserved?: boolean
+  /** A terminal risk verdict already closed this logical request. */
+  riskVerdictSeen?: boolean
 }
 
 export interface ProxyContext {
@@ -363,6 +367,8 @@ export interface ProxyContext {
    * exchange without replaying the whole client transcript.
    */
   qwenAiSessionBridge?: QwenAiSessionBridge
+  /** Stable Responses chain key used to circuit-break reconnecting Codex turns. */
+  qwenAiRiskKey?: string
 }
 
 /**

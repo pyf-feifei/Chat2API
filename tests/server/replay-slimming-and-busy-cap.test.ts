@@ -6,6 +6,7 @@ import {
   qwenAiImageSlimModeFromEnv,
   shouldSlimQwenAiAttemptImages,
 } from '../../src/main/proxy/replayImageSlimming.ts'
+import { resolveImageSlimPolicy, imageSlimModeFromEnv } from '../../src/main/proxy/imageSlimPolicy.ts'
 import { createQwenAiBusyFailoverStopRule } from '../../src/main/proxy/qwenBusyFailover.ts'
 import {
   createQwenAiContentFailoverStopRule,
@@ -38,7 +39,7 @@ test('replay slimming keeps only the newest image-bearing message intact', () =>
     },
   ]
 
-  const slimmed = slimQwenAiReplayImages(messages)
+  const slimmed = slimQwenAiReplayImages(messages).messages
   assert.equal(slimmed.length, messages.length)
   // oldest two image messages got placeholders, text preserved
   assert.deepEqual((slimmed[1].content as any[])[0].text, 'old screenshot analysis')
@@ -67,7 +68,7 @@ test('replay slimming keeps the first N image-bearing messages as reference anch
     img('RENDER_V4'),
   ]
 
-  const slimmed = slimQwenAiReplayImages(messages, { keepFirstImageMessages: 2, keepLastImageMessages: 2 })
+  const slimmed = slimQwenAiReplayImages(messages, { keepFirstImageMessages: 2, keepLastImageMessages: 2 }).messages
   const url = (index: number) => (slimmed[index].content as any[])[0].image_url?.url || ''
   const text = (index: number) => (slimmed[index].content as any[])[0].text || ''
 
@@ -89,7 +90,7 @@ test('replay slimming placeholder tells the model how to recover the image', () 
     { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,OLD' } }] },
     { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,NEW' } }] },
   ]
-  const slimmed = slimQwenAiReplayImages(messages)
+  const slimmed = slimQwenAiReplayImages(messages).messages
   assert.match((slimmed[0].content as any[])[0].text, /view it again with your image tool/)
 })
 
@@ -97,7 +98,7 @@ test('replay slimming is a no-op with only one image-bearing message', () => {
   const messages: ChatMessage[] = [
     { role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] },
   ]
-  const slimmed = slimQwenAiReplayImages(messages)
+  const slimmed = slimQwenAiReplayImages(messages).messages
   assert.equal((slimmed[0].content as any)[0].image_url.url, 'x')
 })
 
@@ -309,33 +310,93 @@ test('first-attempt slimming decision follows the mode, not the busy flag alone'
   assert.equal(shouldSlimQwenAiAttemptImages('off', true), false)
 })
 
-test('slimming stays functional under always mode and disabled under off', () => {
-  const saved = process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+test('the transform takes explicit values and reads no environment of its own', () => {
+  // Env reading moved to `resolveImageSlimPolicy`. The transform is a pure
+  // function of its arguments, so a caller that passes explicit keep counts is
+  // no longer silently overridden by the process environment. An earlier
+  // version of this test set CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES and called the
+  // transform with no options; that contract is gone by design, and the mode
+  // decision is pinned end to end in the next test.
+  const messages: ChatMessage[] = [
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,OLD' } }] },
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,MID' } }] },
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,NEW' } }] },
+  ]
+
+  const slimmed = slimQwenAiReplayImages(messages, {
+    keepFirstImageMessages: 0,
+    keepLastImageMessages: 1,
+    placeholder: '[gone]',
+  }).messages
+  assert.match((slimmed[0].content as any[])[0].text, /^\[gone\]/)
+  assert.match((slimmed[1].content as any[])[0].text, /^\[gone\]/)
+  assert.equal((slimmed[2].content as any[])[0].image_url.url, 'data:image/png;base64,NEW')
+
+  // Nothing to slim when the images all fit inside the keep set.
+  const untouched = slimQwenAiReplayImages(messages, {
+    keepFirstImageMessages: 1,
+    keepLastImageMessages: 2,
+  }).messages
+  for (const [index, message] of untouched.entries()) {
+    assert.equal((message.content as any[])[0].type, 'image_url', `index ${index} should be untouched`)
+  }
+})
+
+test('the newest image survives even when keepLast is 0', () => {
+  // Defense in depth. The policy clamps keepLast to 1, and the transform
+  // independently guarantees it, so a hand-built config cannot discard the image
+  // the model is about to reason about.
   const messages: ChatMessage[] = [
     { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,OLD' } }] },
     { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,NEW' } }] },
   ]
-  try {
-    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'always'
-    const slimmed = slimQwenAiReplayImages(messages)
-    assert.match((slimmed[0].content as any[])[0].text, /^\[image omitted from replayed history/)
-    assert.equal((slimmed[1].content as any[])[0].image_url.url, 'data:image/png;base64,NEW')
-
-    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = 'off'
-    const untouched = slimQwenAiReplayImages(messages)
-    assert.equal((untouched[0].content as any[])[0].image_url.url, 'data:image/png;base64,OLD')
-  } finally {
-    if (saved === undefined) delete process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
-    else process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = saved
-  }
+  const slimmed = slimQwenAiReplayImages(messages, {
+    keepFirstImageMessages: 0,
+    keepLastImageMessages: 0,
+  }).messages
+  assert.equal((slimmed[0].content as any[])[0].type, 'text', 'the old image may be slimmed')
+  assert.equal((slimmed[1].content as any[])[0].image_url.url, 'data:image/png;base64,NEW',
+    'the newest image must survive keepLast: 0')
 })
 
-test('both failover routes consult the slim mode on every attempt', () => {
+test('Qwen end-to-end behavior is unchanged by moving env reading into the policy', () => {
+  // Critical Constraint 1. The transform no longer reads the mode, so the whole
+  // Qwen decision now runs through the policy. These are the exact verdicts the
+  // old in-transform env check produced.
+  const qwen = { id: 'qwen-ai', name: 'qwen-ai', modelCapabilities: {} } as any
+  const withMode = (mode: string, afterBusy = false) => {
+    const saved = process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+    process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = mode
+    try {
+      return resolveImageSlimPolicy({
+        provider: qwen,
+        actualModel: 'qwen-max',
+        mode: imageSlimModeFromEnv(qwen),
+        afterBusyRejection: afterBusy,
+      })
+    } finally {
+      if (saved === undefined) delete process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES
+      else process.env.CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES = saved
+    }
+  }
+
+  assert.equal(withMode('off', true), undefined, 'off never slims, even after a busy verdict')
+  assert.equal(withMode('on-busy', false), undefined, 'on-busy does not slim the first attempt')
+  assert.equal(withMode('on-busy', true)?.reason, 'qwen-busy', 'on-busy slims after a busy verdict')
+  assert.equal(withMode('always', false)?.reason, 'proactive', 'always slims up front')
+})
+
+test('both failover routes resolve the image slim policy on every attempt', () => {
   const chatRoute = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
   const responsesRoute = fs.readFileSync('src/main/proxy/routes/responses.ts', 'utf8')
   for (const [name, source] of [['chat', chatRoute], ['responses', responsesRoute]] as const) {
-    assert.match(source, /qwenAiImageSlimModeFromEnv/, `${name} route reads the slim mode`)
-    assert.match(source, /shouldSlimQwenAiAttemptImages\(imageSlimMode, slimImagesOnNextAttempt\)/, `${name} route slims per attempt`)
+    assert.match(source, /resolveImageSlimPolicy\(/, `${name} route resolves the policy`)
+    assert.match(source, /imageSlimModeFromEnv\(selection\.provider\)/, `${name} route reads the mode per provider`)
+    assert.doesNotMatch(
+      source,
+      /shouldSlimQwenAiAttemptImages\(/,
+      `${name} route still calls the Qwen-only trigger`,
+    )
   }
 })
 
@@ -343,9 +404,25 @@ test('docker-compose passes the image slimming knobs through', () => {
   const source = fs.readFileSync('docker-compose.yml', 'utf8')
   assert.match(source, /CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES/)
   assert.match(source, /CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES/)
+  // Provider-neutral family, added by image-slimming Phase 5.
+  for (const knob of [
+    'CHAT2API_REPLAY_SLIM_IMAGES',
+    'CHAT2API_REPLAY_SLIM_PROVIDERS',
+    'CHAT2API_REPLAY_SLIM_MODELS',
+    'CHAT2API_REPLAY_KEEP_LAST_IMAGE_MESSAGES',
+    'CHAT2API_REPLAY_KEEP_FIRST_IMAGE_MESSAGES',
+    'CHAT2API_REPLAY_IMAGE_PLACEHOLDER',
+  ]) {
+    assert.match(source, new RegExp(knob), `docker-compose should pass through ${knob}`)
+  }
+  assert.match(
+    source,
+    /CHAT2API_REPLAY_SLIM_IMAGES:-\s*off\}/,
+    'the provider-neutral mode must default to off, not inherit the Qwen default',
+  )
 })
 
-test('retry nonce scope: always perturbs attempt 1, retry preserves cache path, off disables', async (t) => {
+test('retry nonce scope: always is the default, retry preserves the cache path, off disables', async (t) => {
   const { applyQwenAiRetryNonce, qwenAiRetryNonceScopeFromEnv } = await import('../../src/main/proxy/adapters/qwen-ai-files.ts')
   t.after(() => {
     delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
@@ -365,7 +442,7 @@ test('retry nonce scope: always perturbs attempt 1, retry preserves cache path, 
   assert.equal(qwenAiRetryNonceScopeFromEnv(), 'off')
 
   delete process.env.CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE
-  assert.equal(qwenAiRetryNonceScopeFromEnv(), 'always', 'default scope is always (reconnect fingerprint immunity)')
+  assert.equal(qwenAiRetryNonceScopeFromEnv(), 'always', 'default scope protects reconnect fingerprint immunity')
 })
 
 test('capacity_limit (429 quota_limit) classifies as busy-family for the webshare recovery lever', async (t) => {

@@ -161,3 +161,16 @@ backups/
 # config, tokens and command output from the session.
 pi-session-*.html
 codex-session-*.md
+
+# One-off diagnostic scratch files. These are throwaway probes, not project
+# assets; several of them transiently held live credentials (decrypted account
+# cookies, Webshare API keys, Webshare proxy URLs) while a failure was being
+# isolated, so they must never reach the index.
+tmp-*.mjs
+tmp-*.py
+tmp-*.json
+sd[0-9]*.txt
+scratch-*.mjs
+scratch-*.py
+cred.json
+*.patch

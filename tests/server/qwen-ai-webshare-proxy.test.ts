@@ -73,24 +73,25 @@ test('webshare proxy agent is cached per proxy URL', () => {
   clearWebshareEnv()
 })
 
-test('webshare proxy log URL shows credentials', () => {
+test('webshare proxy log URL redacts credentials', () => {
   clearWebshareEnv()
   clearRuntimeConfig()
   process.env.WEBSHARE_PROXY_URL = 'http://user:secret@proxy.webshare.io:8080'
   const logged = webshareProxyUrlForLog()
   assert.ok(logged)
-  assert.ok(logged.includes('secret'))
-  assert.ok(logged.includes('proxy.webshare.io:8080'))
+  assert.doesNotMatch(logged, /secret/)
+  assert.match(logged, /proxy\.webshare\.io:8080/)
   clearWebshareEnv()
 })
 
-test('webshare key-as-username is shown in log URL', () => {
+test('webshare key-as-username is redacted in log URL', () => {
   clearWebshareEnv()
   clearRuntimeConfig()
   process.env.WEBSHARE_PROXY_ENABLED = 'true'
   process.env.WEBSHARE_PROXY_URL = 'http://zsv6keyexample:@proxy.webshare.io:8080'
   const logged = webshareProxyUrlForLog() ?? ''
-  assert.ok(logged.includes('zsv6keyexample'), 'the key should appear in the log URL')
+  assert.doesNotMatch(logged, /zsv6keyexample/)
+  assert.match(logged, /proxy\.webshare\.io:8080/)
   clearWebshareEnv()
 })
 
@@ -120,7 +121,7 @@ test('runtime config from the management UI overrides env and applies immediatel
   assert.equal(isWebshareProxyEnabled(), true)
   const logged = webshareProxyUrlForLog() ?? ''
   assert.ok(logged.includes('proxy.ui.example:8080'), 'runtime URL must be used')
-  assert.ok(logged.includes('ui-pass'), 'runtime credentials should be shown in logs')
+  assert.doesNotMatch(logged, /ui-pass/)
 
   // snapshot reflects the runtime config
   const snapshot = webshareProxyConfigSnapshot()
@@ -244,7 +245,7 @@ test('consecutive failures double the cooldown', () => {
   clearRuntimeConfig()
 })
 
-test('all entries cooling still returns an exit rather than none', () => {
+test('all entries cooling disables recovery instead of replaying a dead exit', () => {
   clearWebshareEnv()
   clearRuntimeConfig()
   setWebshareProxyConfig(
@@ -252,10 +253,10 @@ test('all entries cooling still returns an exit rather than none', () => {
     [{ proxyUrl: 'http://key1:@proxy.webshare.io:8080' }],
     'round-robin',
   )
+  assert.ok(getWebshareProxyAgent())
   reportWebshareProxyFailure()
-  // single-entry pool fully cooling must not disable recovery entirely
-  assert.equal(isWebshareProxyEnabled(), true)
-  assert.ok(getWebshareProxyAgent(), 'a cooling pool still hands out its only exit')
+  assert.equal(isWebshareProxyEnabled(), false)
+  assert.equal(getWebshareProxyAgent(), undefined)
   clearRuntimeConfig()
 })
 
@@ -289,6 +290,42 @@ test('bandwidth 402 cools every exit of the drained key and leaves other keys al
   assert.ok(next, 'healthy exits remain available')
   assert.notEqual(next!.proxyUrl, 'http://a1:@pool.example:1001')
   assert.notEqual(next!.proxyUrl, 'http://a2:@pool.example:1002')
+  clearRuntimeConfig()
+})
+
+test('large exhausted Webshare pools stop checkout instead of replaying dead exits', () => {
+  clearWebshareEnv()
+  clearRuntimeConfig()
+  const entries = Array.from({ length: 160 }, (_, index) => ({
+    proxyUrl: `http://key-${index % 16}:@pool-${index}.example:100${index % 10}`,
+    sourceKeyId: `key-${index % 16}`,
+  }))
+  setWebshareProxyConfig({ enabled: true, proxyUrl: '' }, entries, 'round-robin')
+  for (let index = 0; index < 16; index += 1) {
+    reportWebshareKeyBandwidthExhausted(entries[index].proxyUrl)
+  }
+  assert.equal(isWebshareProxyEnabled(), false)
+  for (let index = 0; index < 100; index += 1) {
+    assert.equal(getWebshareProxyAgent(), undefined)
+  }
+  clearRuntimeConfig()
+})
+
+test('bandwidth-exhausted keys do not fall back to cooled exits', () => {
+  clearWebshareEnv()
+  clearRuntimeConfig()
+  setWebshareProxyConfig(
+    { enabled: true, proxyUrl: '' },
+    [
+      { proxyUrl: 'http://a1:@pool.example:1001', sourceKeyId: 'key-A' },
+      { proxyUrl: 'http://b1:@pool.example:2001', sourceKeyId: 'key-B' },
+    ],
+    'round-robin',
+  )
+  reportWebshareKeyBandwidthExhausted('http://a1:@pool.example:1001')
+  reportWebshareKeyBandwidthExhausted('http://b1:@pool.example:2001')
+  assert.equal(isWebshareProxyEnabled(), false)
+  assert.equal(getWebshareProxyAgent(), undefined)
   clearRuntimeConfig()
 })
 

@@ -2,7 +2,11 @@ import axios from 'axios'
 import { createHash, randomUUID } from 'crypto'
 
 const MIMO_API_BASE = 'https://aistudio.xiaomimimo.com'
-const DEFAULT_OFFLOAD_THRESHOLD_CHARS = 32_000
+// MiMo's web chat rejects the rendered query around 44k–52k characters.
+// Leave headroom for the managed tool prompt and current turn; Codex sessions
+// with many tools can otherwise pass the text-only threshold and still fail
+// upstream with `query is too long`.
+const DEFAULT_OFFLOAD_THRESHOLD_CHARS = 8_000
 const MIN_OFFLOAD_CHARS = 2_000
 const DEFAULT_MEDIA_MAX_BYTES = 10 * 1024 * 1024
 const DEFAULT_MEDIA_MAX_ITEMS = 8
@@ -40,7 +44,6 @@ export interface MimoMediaInput {
 export type MimoMessageLike = {
   role: string
   content: unknown
-  [key: string]: unknown
 }
 
 export type MimoMediaCandidate =
@@ -125,6 +128,12 @@ export function mimoRequestTimeoutMs(
   env: Record<string, string | undefined> = process.env,
 ): number {
   return positiveEnvInt(env, 'MIMO_REQUEST_TIMEOUT_MS', 300_000)
+}
+
+export function mimoQueryMaxChars(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  return positiveEnvInt(env, 'MIMO_QUERY_MAX_CHARS', 32_000)
 }
 
 export function parseMimoDataUrl(url: string): { mimeType: string; base64: string } | null {
@@ -244,6 +253,7 @@ export function extractMimoPlainText(content: unknown): string {
 export function planMimoFileOffload(
   messages: MimoMessageLike[],
   thresholdChars: number = mimoFileOffloadThresholdChars(),
+  protectedIndexes: ReadonlySet<number> = new Set(),
 ): MimoOffloadPlan {
   const sizes = messages.map((message) => extractMimoPlainText(message.content).length)
   let remainingChars = sizes.reduce((total, size) => total + size, 0)
@@ -258,19 +268,116 @@ export function planMimoFileOffload(
     let candidateIndex = -1
     let candidateSize = MIN_OFFLOAD_CHARS - 1
     for (let index = 0; index < sizes.length; index += 1) {
-      if (offloaded.has(index)) continue
+      if (offloaded.has(index) || protectedIndexes.has(index)) continue
       if (sizes[index] > candidateSize) {
         candidateSize = sizes[index]
         candidateIndex = index
       }
     }
-    if (candidateIndex === -1) break
+    if (candidateIndex === -1) {
+      // A long Codex transcript can contain many small tool-result messages.
+      // Once the large messages are gone, their aggregate can still exceed
+      // MiMo's query ceiling. For a genuinely long transcript, continue
+      // offloading the largest remaining old message even when it is below
+      // the per-message minimum; short two-message requests retain the old
+      // no-tiny-attachment behavior.
+      if (messages.length <= 16) break
+      candidateSize = 0
+      for (let index = 0; index < sizes.length; index += 1) {
+        if (offloaded.has(index) || protectedIndexes.has(index)) continue
+        if (sizes[index] > candidateSize) {
+          candidateSize = sizes[index]
+          candidateIndex = index
+        }
+      }
+      if (candidateIndex === -1) break
+    }
     offloaded.add(candidateIndex)
     offloadIndexes.push(candidateIndex)
     remainingChars -= sizes[candidateIndex]
   }
 
   return { offloadIndexes, remainingChars }
+}
+
+function compactTextForQuery(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  const marker = '\n\n[上下文已压缩；完整内容已保存为附件]\n\n'
+  const available = Math.max(0, maxChars - marker.length)
+  const headLength = Math.ceil(available * 0.55)
+  const tailLength = Math.max(0, available - headLength)
+  return text.slice(0, headLength) + marker + (tailLength > 0 ? text.slice(-tailLength) : '')
+}
+
+/**
+ * Keep the rendered MiMo query below the web endpoint's hard limit even when
+ * a long transcript contains many small messages. Offload handles the large
+ * payloads; this final pass protects the active turn and the managed prompt
+ * when their aggregate still exceeds the limit.
+ */
+export function compactMimoMessagesForQuery(
+  messages: MimoMessageLike[],
+  maxChars: number,
+  measure: (candidate: MimoMessageLike[]) => number = candidate => candidate.reduce(
+    (total, message) => total + extractMimoPlainText(message.content).length,
+    0,
+  ),
+): { messages: MimoMessageLike[]; beforeChars: number; afterChars: number; compacted: boolean } {
+  const beforeChars = measure(messages)
+  if (maxChars <= 0 || beforeChars <= maxChars) {
+    return { messages, beforeChars, afterChars: beforeChars, compacted: false }
+  }
+
+  let latestInstructionIndex = -1
+  for (let index = 0; index < messages.length; index += 1) {
+    const role = String(messages[index].role || '').toLowerCase()
+    if (role === 'system' || role === 'developer') latestInstructionIndex = index
+  }
+  const keep = new Set<number>([messages.length - 1])
+  if (latestInstructionIndex >= 0) keep.add(latestInstructionIndex)
+  // Only the active turn and its immediate result are needed to continue;
+  // older assistant tool-call payloads are represented by the saved
+  // attachment pointer instead of being replayed verbatim.
+  for (let index = Math.max(0, messages.length - 2); index < messages.length; index += 1) keep.add(index)
+
+  let next = messages.map((message, index) => {
+    if (keep.has(index)) {
+      if (Array.isArray((message as { tool_calls?: unknown }).tool_calls)
+        && index < messages.length - 1
+      ) {
+        return { role: message.role, content: '[历史工具调用已压缩；完整内容已保存为附件]' }
+      }
+      return { ...message }
+    }
+    return {
+      role: message.role,
+      content: '[历史上下文已压缩；完整内容已保存为附件]'
+    }
+  })
+
+  let afterChars = measure(next)
+  if (afterChars <= maxChars) {
+    return { messages: next, beforeChars, afterChars, compacted: true }
+  }
+
+  // The managed instruction/tool contract is the one block we must not drop.
+  // Trim its middle only as a last resort, retaining both the beginning and
+  // the active tail so the current tool declaration remains visible.
+  const defaultBudget = Math.max(2_000, Math.floor(maxChars / 8))
+  const instructionBudget = Math.max(6_000, Math.floor(maxChars / 2))
+  next = next.map((message, index) => {
+    if (!keep.has(index)) return message
+    const perMessageBudget = index === latestInstructionIndex ? instructionBudget : defaultBudget
+    const renderedLength = measure([message])
+    const text = extractMimoPlainText(message.content)
+    if (renderedLength <= perMessageBudget && text.length <= perMessageBudget) return message
+    return {
+      role: message.role,
+      content: compactTextForQuery(text, perMessageBudget)
+    }
+  })
+  afterChars = measure(next)
+  return { messages: next, beforeChars, afterChars, compacted: true }
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -475,7 +582,28 @@ export async function prepareMimoAttachments(options: {
   }
 
   const offloadedFiles: string[] = []
-  const plan = planMimoFileOffload(messages, mimoFileOffloadThresholdChars(env))
+  const protectedIndexes = new Set<number>()
+  let latestInstructionIndex = -1
+  for (let index = 0; index < messages.length; index += 1) {
+    const role = String(messages[index].role || '').toLowerCase()
+    if (role === 'system' || role === 'developer') latestInstructionIndex = index
+  }
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]
+    const text = extractMimoPlainText(message.content)
+    if (
+      index === latestInstructionIndex
+      || (/##\s*Available Tools/i.test(text) && index >= latestInstructionIndex - 1)
+      || index === messages.length - 1
+    ) {
+      protectedIndexes.add(index)
+    }
+  }
+  const plan = planMimoFileOffload(
+    messages,
+    mimoFileOffloadThresholdChars(env),
+    protectedIndexes,
+  )
   if (plan.offloadIndexes.length > 0) {
     const next = [...messages]
     for (const index of plan.offloadIndexes) {

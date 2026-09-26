@@ -196,6 +196,25 @@ prepend:
 
 **完整配置、验证与排障：[docs/network-egress.md](docs/network-egress.md)。**
 
+### 容器：先查 Docker 的 VM 级代理
+
+如果**容器**的每个请求都返回阿里云 WAF 挑战页（`aliyun_waf_aa`），而同一账号在
+浏览器里正常，那原因几乎一定是 Docker Desktop 的代理，而不是服务商：
+
+```bash
+docker info | grep -A2 "^ *Proxy"     # 会打印 http.docker.internal:3128 吗？
+```
+
+如果打印了，说明 Docker 把所有容器流量都走了这个代理，容器的出口就成了代理的地址
+而不是你自己的。修法：关掉 Windows 系统代理，并把 Docker Desktop 的代理模式改为
+manual 且不填地址（存于 `%APPDATA%\Docker\marlin.dat`，把
+`"proxyHTTPMode":{...,"Value":"system"}` 改为 `"manual"`），然后重启 Docker Desktop。
+
+**容器内部无法覆盖它**——`HTTP_PROXY`、`NO_PROXY=*`、`--network host` 全部无效。
+
+完整步骤，以及“所有 Webshare key 同时报 401”其实是 DNS 污染而非 key 失效的情形，
+见 [docs/network-egress.md §8.5](docs/network-egress.md)。
+
 ### 不要在工作机上跑全量账号池
 
 服务商的限流维度是**出口 IP**，不是账号。无论账号从何而来，单一 IP（尤其是共享机房

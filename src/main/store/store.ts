@@ -54,6 +54,7 @@ import { ENCRYPTION_PREFIX } from '../runtime/types.ts'
 import { NodeJsonStore } from './storage/nodeJsonStore.ts'
 import { createElectronJsonStore } from './storage/electronJsonStore.ts'
 import { mergeProviderModelCapabilities } from '../providers/modelSync.ts'
+import { applyDailyUsage, getLocalDayKey, resetDailyUsage } from './dailyUsage.ts'
 
 /**
  * Storage Instance Type Definition
@@ -109,6 +110,7 @@ class StoreManager {
       this.initializeDefaultModelMappings()
       await this.initializeDefaultProviders()
       this.runCredentialSelfCheck()
+      this.rollOverDailyUsage()
       this.isInitialized = true
       this.initializationError = null
     } catch (error) {
@@ -134,6 +136,7 @@ class StoreManager {
         this.initializeDefaultModelMappings()
         await this.initializeDefaultProviders()
         this.runCredentialSelfCheck()
+        this.rollOverDailyUsage()
         this.isInitialized = true
         this.initializationError = null
         console.log('[Store] Successfully recovered from corrupted data')
@@ -525,6 +528,46 @@ class StoreManager {
   /**
    * Ensure Storage is Initialized
    */
+  /**
+   * Zero `todayUsed` for every account whose `todayUsedDate` is not today.
+   *
+   * Without this, the daily counter shown in the UI keeps counting across
+   * days (and across restarts), so 总请求数 and 今日已用 are always the same
+   * number. Runs on startup; the per-increment check in
+   * `incrementAccountUsage` covers the case where the process stays up past
+   * midnight.
+   */
+  private rollOverDailyUsage(now: number = Date.now()): void {
+    const today = getLocalDayKey(now)
+    const accounts = this.store!.get('accounts') as Account[] || []
+    let changed = false
+
+    const next = accounts.map((account) => {
+      if (account.todayUsedDate === today) {
+        return account
+      }
+      changed = true
+      return { ...account, ...resetDailyUsage(now) }
+    })
+
+    if (changed) {
+      this.store!.set('accounts', next)
+    }
+  }
+
+  /** Reset every account's daily counter to zero (explicit, manual use). */
+  resetDailyUsageAll(now: number = Date.now()): number {
+    this.ensureInitialized()
+    const accounts = this.store!.get('accounts') as Account[] || []
+
+    this.store!.set(
+      'accounts',
+      accounts.map((account) => ({ ...account, ...resetDailyUsage(now) }))
+    )
+
+    return accounts.length
+  }
+
   private ensureInitialized(): void {
     if (!this.isInitialized || !this.store) {
       const errorMsg = this.initializationError 
@@ -913,7 +956,9 @@ class StoreManager {
       ...current,
       lastUsed: now,
       requestCount: (current.requestCount || 0) + 1,
-      todayUsed: (current.todayUsed || 0) + 1,
+      // A counter that never rolls over is a copy of requestCount, not a
+      // daily figure. Reset here on the day boundary so the two can differ.
+      ...applyDailyUsage(current, now),
       updatedAt: now,
     }
 

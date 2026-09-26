@@ -7,6 +7,7 @@ import { loadBalancer } from '../../loadbalancer'
 import { qwenAiRequestGovernor } from '../../qwenAiRequestGovernor'
 import { qwenAiSessionRepairService } from '../../qwenAiSessionRepair'
 import { refreshQwenAiRiskSession } from '../../adapters/qwen-risk-refresh'
+import { getQwenAiRefreshFaultStatus } from '../../adapters/qwen-ai-token-refresh'
 import type {
   ManagementApiResponse,
   QwenAiGovernorConfig,
@@ -43,6 +44,7 @@ router.get('/status', async (ctx: Context) => {
     data: {
       ...status,
       sessionRepair: qwenAiSessionRepairService.getRuntimeStatus(),
+      refreshFaults: getQwenAiRefreshFaultStatus(),
       accounts: status.accounts.map(accountStatus => {
         const account = accountById.get(accountStatus.accountId)
         if (!account) return accountStatus

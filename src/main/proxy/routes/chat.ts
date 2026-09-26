@@ -25,7 +25,8 @@ import {
   combineQwenAiFailoverStopRules,
   createQwenAiContentFailoverStopRule,
 } from '../qwenContentFailover'
-import { slimQwenAiReplayImages, qwenAiImageSlimModeFromEnv, shouldSlimQwenAiAttemptImages } from '../replayImageSlimming'
+import { slimQwenAiReplayImages } from '../replayImageSlimming'
+import { resolveImageSlimPolicy, imageSlimModeFromEnv } from '../imageSlimPolicy'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
@@ -66,6 +67,7 @@ import { isQwenAiStickySessionMode } from '../../store/types'
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
   qwenAiAccountRetryScope,
+  qwenAiManagedMaxAccountFailoversFromEnv,
 } from '../qwenAiAccountPolicy'
 
 function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
@@ -631,14 +633,16 @@ router.post('/completions', async (ctx: Context) => {
       .filter(candidate => candidate.status === 'active')
       .length
     : 0
+  const deferManagedStreamCommit = initialProviderIsQwenAi
+    && shouldDeferQwenAiManagedStreamCommit(request)
   const maxFailovers = resolveAccountFailoverLimit({
     configuredMaxFailovers: config.retryCount,
     qwenAiProvider: initialProviderIsQwenAi,
     activeAccountCount,
-    qwenAiMaxAccountFailovers: process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
+    qwenAiMaxAccountFailovers: deferManagedStreamCommit
+      ? String(qwenAiManagedMaxAccountFailoversFromEnv())
+      : process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
   })
-  const deferManagedStreamCommit = initialProviderIsQwenAi
-    && shouldDeferQwenAiManagedStreamCommit(request)
 
   // Busy-failover stop reports the storm here once rotation is capped, so
   // the governor can bench the busy chain's accounts and engage the global
@@ -656,7 +660,6 @@ router.post('/completions', async (ctx: Context) => {
     // re-sending the shape that just tripped the upstream risk page. In
     // 'always' mode the first attempt is slimmed too, so long visual sessions
     // never batch-trigger the per-minute getstsToken quota upstream.
-    const imageSlimMode = qwenAiImageSlimModeFromEnv()
     let slimImagesOnNextAttempt = false
     return forwardWithAccountFailover({
       initialSelection,
@@ -667,9 +670,37 @@ router.post('/completions', async (ctx: Context) => {
           selection,
           deferManagedStreamCommit,
         )
-        const requestForAttempt = QwenAiAdapter.isQwenAiProvider(selection.provider)
-            && shouldSlimQwenAiAttemptImages(imageSlimMode, slimImagesOnNextAttempt)
-          ? { ...request, messages: slimQwenAiReplayImages(request.messages) }
+        // Provider-neutral since the image-slimming Phase 4. The policy layer
+        // decides: it knows the capability table, the provider's own variable
+        // family, and that `afterBusyRejection` only means something for Qwen.
+        const imageSlimPolicy = resolveImageSlimPolicy({
+          provider: selection.provider,
+          actualModel: selection.actualModel,
+          mode: imageSlimModeFromEnv(selection.provider),
+          afterBusyRejection: slimImagesOnNextAttempt,
+        })
+        const requestForAttempt = imageSlimPolicy
+          ? (() => {
+            const slimmed = slimQwenAiReplayImages(request.messages, imageSlimPolicy)
+            // Counts only. A data URL, a filename or a placeholder body is
+            // identifying, and image payloads routinely carry file content, so
+            // none of it reaches the log. `charsSlimmed` converts into the same
+            // units as the text optimizer's `estimatedSaved`, so the two tracks
+            // can be added.
+            console.info('[ChatSlim] replay image slimming', JSON.stringify({
+              requestId: context.requestId,
+              providerId: selection.provider.id,
+              actualModel: selection.actualModel,
+              imageSlimApplied: true,
+              imageSlimReason: imageSlimPolicy.reason,
+              imageSlimKeepFirst: imageSlimPolicy.keepFirstImageMessages,
+              imageSlimKeepLast: imageSlimPolicy.keepLastImageMessages,
+              imageMessagesSlimmed: slimmed.messagesSlimmed,
+              imagePartsSlimmed: slimmed.partsSlimmed,
+              imageCharsSlimmed: slimmed.charsSlimmed,
+            }))
+            return { ...request, messages: slimmed.messages }
+          })()
           : request
         const result = await requestForwarder.forwardChatCompletion(
           requestForAttempt,
@@ -1254,8 +1285,11 @@ router.post('/completions', async (ctx: Context) => {
         // Built-in adapters already emit OpenAI-compatible SSE. Enforce the
         // reserved assistant-output boundary once more at the route edge so
         // every provider and visible text channel receives the same policy.
+        const stripManagedOutput = requestIntent.intent === 'context_compaction'
+          || provider.id === 'mimo'
+          || provider.name?.toLowerCase().includes('mimo') === true
         const guardedStream = createAssistantOutputBoundaryStream(undefined, {
-          stripOnly: requestIntent.intent === 'context_compaction',
+          stripOnly: stripManagedOutput,
         })
         sourceStream.once('error', (error: Error) => guardedStream.destroy(error))
         guardedStream.once('error', (error: Error) => {
@@ -1295,8 +1329,11 @@ router.post('/completions', async (ctx: Context) => {
             storeManager.addLog('debug', `Stream response completed`, { requestId })
           }
         )
+        const stripManagedOutput = requestIntent.intent === 'context_compaction'
+          || provider.id === 'mimo'
+          || provider.name?.toLowerCase().includes('mimo') === true
         const guardedStream = createAssistantOutputBoundaryStream(undefined, {
-          stripOnly: requestIntent.intent === 'context_compaction',
+          stripOnly: stripManagedOutput,
         })
         sourceStream.once('error', (error: Error) => transformStream.destroy(error))
         transformStream.once('error', (error: Error) => guardedStream.destroy(error))
@@ -1340,8 +1377,11 @@ router.post('/completions', async (ctx: Context) => {
 
       if (result.body) {
         const body = result.body as ChatCompletionResponse
+        const stripManagedOutput = requestIntent.intent === 'context_compaction'
+          || provider.id === 'mimo'
+          || provider.name?.toLowerCase().includes('mimo') === true
         const sanitizedBody = guardAssistantOutputCompletion(body, null, {
-          stripOnly: requestIntent.intent === 'context_compaction',
+          stripOnly: stripManagedOutput,
         })
         // Check if we need to transform to Anthropic format
         if (isAnthropicToolFormat(request.tool_format)) {

@@ -10,6 +10,7 @@ import { getToolProtocol } from './protocols/index.ts'
 import { getToolClientAdapter } from './clientAdapters/index.ts'
 import { getProviderToolProfile } from './providerProfiles.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
+import { partitionLocalToolCalls } from './localToolCalls.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 import { aliasManagedToolDefinitions } from './qwenAiToolNameAlias.ts'
@@ -331,6 +332,14 @@ export class ToolCallingEngine {
     providerProfileKey?: string
     actualModel: string
     requestId?: string
+    /**
+     * Proxy-internal tools to teach the model for this request.
+     *
+     * Set by the forwarder when the request advertised retrievable archive
+     * markers and retrieval is enabled. Left undefined by every other caller,
+     * which is what keeps the plan byte-identical for them.
+     */
+    localTools?: NormalizedToolDefinition[]
   }): ToolCallingTransformResult {
     const { request, provider, providerProfileKey, actualModel, requestId } = input
     const adapter = getToolClientAdapter(this.config.clientAdapterId)
@@ -343,6 +352,7 @@ export class ToolCallingEngine {
       model: request.model,
       config: this.config,
       clientRequest,
+      localTools: input.localTools,
     })
     const shouldInjectPrompt = plan.shouldInjectPrompt
     const failedToolResultPending = hasUnresolvedFailedToolResult(request.messages)
@@ -485,15 +495,26 @@ export class ToolCallingEngine {
       return
     }
 
-    const callIdPrefix = `call_${randomUUID().replace(/-/g, '')}`
     message.content = parseResult.content || null
-    message.tool_calls = deduplicated.toolCalls.map((toolCall, index) => ({
-      ...toolCall,
-      id: `${callIdPrefix}_${index}`,
-    }))
+    // Partition proxy-internal tool calls out BEFORE they reach
+    // `message.tool_calls`. `retrieve_tool_output` is taught to the model but
+    // executed by this process, so surfacing it to the client would offer the
+    // client a tool it never declared. With no active retrieval context this is
+    // a pass-through and the id assignment is byte-identical to before.
+    //
+    // The ids the partition assigns are used verbatim. Re-prefixing them here
+    // would break the pairing with `plan.localToolCalls`, which is what the
+    // continuation turn names in its `tool_call_id`.
+    const partitioned = partitionLocalToolCalls({
+      plan,
+      toolCalls: deduplicated.toolCalls,
+    })
+    message.tool_calls = partitioned.clientCalls
 
     const choice = choices[0]
-    choice.finish_reason = 'tool_calls'
+    choice.finish_reason = partitioned.local.length > 0 && partitioned.clientCalls.length === 0
+      ? 'stop'
+      : 'tool_calls'
   }
 }
 

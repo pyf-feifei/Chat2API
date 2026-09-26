@@ -15,6 +15,7 @@ import {
   parseMimoDataUrl,
   planMimoFileOffload,
   prepareMimoAttachments,
+  compactMimoMessagesForQuery,
   splitMimoContentParts,
 } from '../../src/main/proxy/adapters/mimo-files.ts'
 
@@ -101,10 +102,43 @@ test('planMimoFileOffload never offloads tiny messages and can be disabled', () 
   assert.deepEqual(planMimoFileOffload(messages, 0).offloadIndexes, [])
 })
 
+test('planMimoFileOffload keeps protected system and active messages inline', () => {
+  const messages = [
+    { role: 'system', content: 'Available Tools\n<|CHAT2API|tool_calls>'.repeat(20_000) },
+    { role: 'user', content: 'old context '.repeat(20_000) },
+    { role: 'user', content: 'current request' },
+  ]
+  const plan = planMimoFileOffload(messages, 1_000, new Set([0, 2]))
+  assert.deepEqual(plan.offloadIndexes, [1])
+})
+
+test('query compaction preserves the active turn and current instruction', () => {
+  const messages = [
+    { role: 'system', content: 'tool contract '.repeat(20_000) },
+    ...Array.from({ length: 20 }, (_, index) => ({ role: 'user', content: 'old '.repeat(1_000) + index })),
+    { role: 'user', content: 'current request' },
+  ]
+  const result = compactMimoMessagesForQuery(messages, 32_000)
+  assert.equal(result.compacted, true)
+  assert.ok(result.afterChars < result.beforeChars)
+  assert.equal(result.messages.at(-1)?.content, 'current request')
+  assert.match(String(result.messages[0].content), /tool contract/)
+})
+
+test('long transcripts offload small old messages when aggregate size still exceeds the limit', () => {
+  const messages = Array.from({ length: 20 }, (_, index) => ({
+    role: index === 19 ? 'user' : 'assistant',
+    content: 'x'.repeat(100),
+  }))
+  const plan = planMimoFileOffload(messages, 50, new Set([19]))
+  assert.ok(plan.offloadIndexes.length > 0)
+  assert.equal(plan.remainingChars, 100)
+})
+
 test('environment knobs fall back to documented defaults', () => {
-  assert.equal(mimoFileOffloadThresholdChars({}), 32_000)
+  assert.equal(mimoFileOffloadThresholdChars({}), 8_000)
   assert.equal(mimoFileOffloadThresholdChars({ MIMO_FILE_OFFLOAD_THRESHOLD_CHARS: '120000' }), 120_000)
-  assert.equal(mimoFileOffloadThresholdChars({ MIMO_FILE_OFFLOAD_THRESHOLD_CHARS: 'nope' }), 32_000)
+  assert.equal(mimoFileOffloadThresholdChars({ MIMO_FILE_OFFLOAD_THRESHOLD_CHARS: 'nope' }), 8_000)
   assert.equal(mimoMediaMaxBytes({}), 10 * 1024 * 1024)
   assert.equal(mimoMediaMaxBytes({ MIMO_MEDIA_MAX_BYTES: '1024' }), 1024)
   assert.equal(mimoMediaMaxItems({ MIMO_MEDIA_MAX_ITEMS: '2' }), 2)

@@ -206,6 +206,28 @@ from an unprivileged shell, so reload the profile in the UI.
 **Full setup, verification and troubleshooting:
 [docs/network-egress.md](docs/network-egress.md).**
 
+### Containers: check the Docker VM proxy first
+
+If **every** request from a container returns an aliyun WAF challenge
+(`aliyun_waf_aa`) while the same account works in your browser, the cause is
+almost always Docker Desktop's proxy, not the provider:
+
+```bash
+docker info | grep -A2 "^ *Proxy"     # prints http.docker.internal:3128 ?
+```
+
+If it does, Docker routes all container traffic through that proxy, so the
+container egress is the proxy's address rather than yours. Fix it by turning the
+Windows system proxy off and setting Docker Desktop's proxy mode to manual with
+no address (stored in `%APPDATA%\Docker\marlin.dat` as
+`"proxyHTTPMode":{...,"Value":"system"}` → `"manual"`), then restarting Docker
+Desktop. Nothing set inside the container can override it — not `HTTP_PROXY`,
+not `NO_PROXY=*`, not `--network host`.
+
+See [docs/network-egress.md §8.5](docs/network-egress.md) for the full
+procedure, plus the DNS-poisoning case that makes every Webshare key look
+invalid.
+
 ### Do not run the full account pool from your workstation
 
 Providers rate-limit by **egress IP**, not by account. A pool of ~340 accounts

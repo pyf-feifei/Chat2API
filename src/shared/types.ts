@@ -179,6 +179,10 @@ export interface QwenAiGovernorStatus {
     nextRunAt?: number
     globalPauseUntil?: number
   }
+  refreshFaults?: {
+    rejectionStreak: number
+    riskGateRemainingMs: number
+  }
   accounts: QwenAiGovernorAccountStatus[]
 }
 
@@ -201,6 +205,12 @@ export interface Account {
   requestCount?: number
   dailyLimit?: number
   todayUsed?: number
+  /** Local day (`YYYY-MM-DD`) that `todayUsed` belongs to */
+  todayUsedDate?: string
+  /** Consecutive upstream "this account does not exist" verdicts */
+  unregisteredStrikes?: number
+  firstUnregisteredAt?: number
+  lastUnregisteredAt?: number
 }
 
 export interface ProviderModelCapability {
@@ -210,6 +220,20 @@ export interface ProviderModelCapability {
   maxContextLength?: number
   /** Maximum tokens reserved for a provider-generated context summary. */
   maxSummaryGenerationLength?: number
+  /**
+   * Whether the provider adapter actually forwards inline image content parts
+   * for this model.
+   *
+   * This is a statement about Chat2API's adapter, not about the vendor's API.
+   * A provider whose public API accepts images but whose Chat2API adapter never
+   * uploads them is `false` here, because the only thing this flag gates is
+   * image slimming, and slimming a request whose images were already being
+   * dropped upstream would be measuring the wrong thing.
+   *
+   * See `VISION_PROVIDER_DEFAULTS` in `src/main/proxy/imageSlimPolicy.ts` for
+   * the per-adapter evidence behind each default.
+   */
+  vision?: boolean
 }
 
 export interface Provider {

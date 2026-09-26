@@ -3,6 +3,17 @@ services:
     image: chat2api-local:latest
     container_name: chat2api
     restart: unless-stopped
+    # proxy.webshare.io is DNS-poisoned on this network: the router and every
+    # public resolver (AliDNS, Cloudflare, Google) answer with Meta
+    # (2a03:2880:...:face:b00c::) or Dropbox (108.160.163.117) addresses, so
+    # the pool sync fails with ECONNREFUSED. Only mihomo's own encrypted DNS
+    # returns the real addresses, and containers do not traverse the system
+    # proxy. Pin them here so the hosts entries survive a recreate.
+    extra_hosts:
+      - "proxy.webshare.io:54.38.13.175"
+      - "proxy.webshare.io:54.38.13.221"
+      - "proxy.webshare.io:141.94.134.156"
+      - "proxy.webshare.io:162.19.20.229"
     # Match the server's default 14-minute request budget plus a small margin;
     # override for deployments with a different shutdown drain policy.
     stop_grace_period: ${CHAT2API_STOP_GRACE_PERIOD:-10m}
@@ -21,6 +32,52 @@ services:
       # Detect the protocol-level Claude context-summary turn from its
       # structural instructions. Set to off when a deployment owns this path.
       CHAT2API_COMPACTION_DETECTION: ${CHAT2API_COMPACTION_DETECTION:-off}
+      # Optional upstream token optimizer. `dry-run` measures only; `safe`
+      # rewrites eligible old tool text; `balanced` is an experimental lossy
+      # task-aware excerpt mode.
+      # Upstream token optimizer. Default is `safe`: it rewrites only OLD,
+      # CLOSED tool results (an orphan `tool` message with no matching declared
+      # tool_call is left untouched, because there is no safe lifecycle anchor
+      # for it), and it archives the original text so the omission is
+      # recoverable. Verified end to end on 2026-09-26: 12 closed tool-call
+      # turns went 21264 -> 18001 prompt tokens (15.3% saved) with the answer
+      # intact, while ordinary prose conversations saved 0 because they have no
+      # eligible content. Set to off, or to `dry-run` to measure without
+      # rewriting, or `balanced` to drop omitted lines outright.
+      CHAT2API_UPSTREAM_TOKEN_OPTIMIZER: ${CHAT2API_UPSTREAM_TOKEN_OPTIMIZER:-safe}
+      CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_TOKENS: ${CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_TOKENS:-20000}
+      CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_RECENT_MESSAGES: ${CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_RECENT_MESSAGES:-8}
+      CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_SAVINGS: ${CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_SAVINGS:-64}
+      CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MAX_TOOL_TEXT_CHARS: ${CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MAX_TOOL_TEXT_CHARS:-16000}
+      # Live-zone floor. Messages below this index are treated as the provider's
+      # frozen prompt-cache prefix and are never rewritten. 0 derives the floor
+      # from client `cache_control` breakpoints.
+      CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_FROZEN_PREFIX_MESSAGES: ${CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_FROZEN_PREFIX_MESSAGES:-0}
+      # Recoverable compression (CCR). `balanced` archives the text it drops and
+      # replaces it with a content-addressed marker.
+      CHAT2API_COMPRESS_ARCHIVE_TTL_MS: ${CHAT2API_COMPRESS_ARCHIVE_TTL_MS:-86400000}
+      CHAT2API_COMPRESS_ARCHIVE_MAX_CHARS: ${CHAT2API_COMPRESS_ARCHIVE_MAX_CHARS:-67108864}
+      # Unset derives the path from CHAT2API_DATA_DIR, which is the right
+      # default: the archive is tool output and must sit with the other stored
+      # state, not in a temp directory.
+      CHAT2API_COMPRESS_ARCHIVE_PATH: ${CHAT2API_COMPRESS_ARCHIVE_PATH-}
+      # Compute backend for the block rewrite. `ts` is the reference
+      # implementation, has no dependency, and is the guaranteed floor: an
+      # unknown or unavailable value degrades to it rather than failing.
+      CHAT2API_COMPRESS_BACKEND: ${CHAT2API_COMPRESS_BACKEND:-ts}
+      # Retrieval is the expansion half: the model is taught a
+      # `retrieve_tool_output` tool ONLY on requests that already carry an
+      # archive marker, and the call is resolved in this process.
+      #
+      # Off by default. When on, a streaming turn that asks to retrieve buffers
+      # its first turn and emits the continuation instead, so time-to-first-token
+      # for those turns is the full first turn. A turn that never asks emits its
+      # first turn byte-identical to an unarmed one.
+      CHAT2API_COMPRESS_RETRIEVAL: ${CHAT2API_COMPRESS_RETRIEVAL:-off}
+      CHAT2API_COMPRESS_MAX_RETRIEVALS_PER_REQUEST: ${CHAT2API_COMPRESS_MAX_RETRIEVALS_PER_REQUEST:-4}
+      # Leave headroom for MiMo's rendered-query limit and managed tool prompt.
+      MIMO_FILE_OFFLOAD_THRESHOLD_CHARS: ${MIMO_FILE_OFFLOAD_THRESHOLD_CHARS:-8000}
+      MIMO_QUERY_MAX_CHARS: ${MIMO_QUERY_MAX_CHARS:-32000}
       # Summary turns default to provider answer mode; set true only when the
       # upstream model explicitly requires a thinking phase for summaries.
       CHAT2API_QWEN_AI_COMPACTION_THINKING: ${CHAT2API_QWEN_AI_COMPACTION_THINKING:-auto}
@@ -42,6 +99,33 @@ services:
       # the active Qwen pool. Ordinary 5xx and chat/session errors stay on the
       # current account. A positive value can impose a deployment-specific cap.
       CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:-5}
+      # Codex managed-tool turns use a tighter account budget so a risk/busy
+      # response cannot spend the whole request window rotating the pool.
+      CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS:-1}
+      CHAT2API_QWEN_AI_RISK_CIRCUIT_THRESHOLD: ${CHAT2API_QWEN_AI_RISK_CIRCUIT_THRESHOLD:-2}
+      CHAT2API_QWEN_AI_RISK_CIRCUIT_COOLDOWN_MS: ${CHAT2API_QWEN_AI_RISK_CIRCUIT_COOLDOWN_MS:-600000}
+      # Egress-level circuit. A bxpunish/RGV587 verdict is decided by the egress
+      # path, not by one payload, so the per-fingerprint circuit above cannot
+      # stop the rest of the pool. After this many DISTINCT payloads are
+      # rejected inside the window, all new Qwen AI traffic is refused with
+      # 503 qwen_ai_risk_circuit_open *before* another account is consumed. One
+      # accepted upstream response closes it.
+      #
+      # The threshold is deliberately high. Measured 2026-09-26: at a threshold
+      # of 3 an ordinary burst of testing tripped it, and because the verdict is
+      # usually spurious the circuit then blocked ALL traffic for 10 minutes,
+      # turning a healthy pool into a total outage. Upstream was never actually
+      # blocking anything in that incident (a direct probe returned 422 with no
+      # WAF page). A circuit that misfires on normal traffic is worse than no
+      # circuit, so it must only trip on a sustained run of distinct verdicts.
+      CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD: ${CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD:-12}
+      CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS: ${CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS:-180000}
+      CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS: ${CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS:-300000}
+      # Keep provider traffic off any host-level HTTP proxy. "on" (default)
+      # appends the provider domains to NO_PROXY so axios/undici connect
+      # directly; a shared datacenter egress is the usual trigger for
+      # Qwen risk-control verdicts. "off" restores proxying.
+      CHAT2API_EGRESS_DIRECT: ${CHAT2API_EGRESS_DIRECT:-on}
       # Mimo serviceToken has no refresh grant: renewal re-runs the Xiaomi
       # password login. auto = try HTTP passport first, then fall back to the
       # patchright driver in scripts/mimo-login (Geetest slide + email OTP).
@@ -55,6 +139,20 @@ services:
       CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS: ${CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS:-180000}
       CHAT2API_QWEN_AI_SESSION_REPAIR_FAILURE_RETRY_MS: ${CHAT2API_QWEN_AI_SESSION_REPAIR_FAILURE_RETRY_MS:-300000}
       CHAT2API_QWEN_AI_SESSION_REPAIR_CREDENTIAL_RETRY_MS: ${CHAT2API_QWEN_AI_SESSION_REPAIR_CREDENTIAL_RETRY_MS:-21600000}
+      # A frozen account still holds its login credentials, so the pool stays
+      # recoverable: re-authenticate it on this interval instead of parking it
+      # forever. On 2026-09-22 one bad upstream verdict froze 340 healthy
+      # accounts and the repair queue (active-only) could never undo it.
+      CHAT2API_QWEN_AI_SESSION_REPAIR_PROBE_INTERVAL_MS: ${CHAT2API_QWEN_AI_SESSION_REPAIR_PROBE_INTERVAL_MS:-21600000}
+      # Require this many consecutive "account does not exist" verdicts inside
+      # the window before an account is frozen. One verdict only records a
+      # strike and leaves the account serving traffic.
+      CHAT2API_QWEN_AI_UNREGISTERED_STRIKES: ${CHAT2API_QWEN_AI_UNREGISTERED_STRIKES:-3}
+      CHAT2API_QWEN_AI_UNREGISTERED_STRIKE_WINDOW_MS: ${CHAT2API_QWEN_AI_UNREGISTERED_STRIKE_WINDOW_MS:-1800000}
+      # Several accounts rejected in a row is an egress verdict, not N dead
+      # credentials: open the shared refresh gate instead of sweeping the pool.
+      CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_LIMIT: ${CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_LIMIT:-5}
+      CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_WINDOW_MS: ${CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_WINDOW_MS:-300000}
       # Queue admission has its own limit, but remains inside the cumulative
       # request deadline. Keep it configurable so deployments can choose how
       # long clients wait for a governor slot before receiving a retryable 429.
@@ -66,6 +164,24 @@ services:
       # Hold managed tool frames until their arguments pass terminal
       # validation. Context compaction strips tools and bypasses this path.
       CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-true}
+      # Client reasoning_effort -> upstream Qwen3.8-Max thinking_mode enum.
+      # Upstream only understands three levels (Fast/Auto/Thinking), so every
+      # effort has to collapse onto one of them.
+      CHAT2API_QWEN_AI_EFFORT_MODE_MAP: ${CHAT2API_QWEN_AI_EFFORT_MODE_MAP:-minimal:fast,low:fast,medium:thinking,high:thinking,xhigh:thinking,ultracode:thinking,max:thinking,default:auto}
+      # The enum is an on/off switch, so reasoning *depth* is prompt-side:
+      # effort -> light|medium|deep directive, sent only while thinking is on.
+      # A deep directive multiplies generation time, so managed tool-calling
+      # turns are never given one.
+      CHAT2API_QWEN_AI_EFFORT_PROMPT: ${CHAT2API_QWEN_AI_EFFORT_PROMPT:-true}
+      CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP: ${CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP:-medium:light,high:medium,xhigh:deep,ultracode:deep,max:deep}
+      CHAT2API_QWEN_AI_DEPTH_PROMPT_LIGHT: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_LIGHT:-}
+      CHAT2API_QWEN_AI_DEPTH_PROMPT_MEDIUM: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_MEDIUM:-}
+      CHAT2API_QWEN_AI_DEPTH_PROMPT_DEEP: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_DEEP:-}
+      # user = prepend to the user turn (request-scoped, effort can change per
+      # turn). native = merge into the upstream system_message field, which the
+      # provider applies per *chat* and therefore sticks for the whole session:
+      # cleaner for clients that pin one effort, wrong when effort varies.
+      CHAT2API_QWEN_AI_DEPTH_PROMPT_CHANNEL: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_CHANNEL:-user}
       # Managed tool protocol for qwen-ai. Default hermes; qwen_native opts
       # into the <function_calls> wire format.
       CHAT2API_QWEN_AI_MANAGED_PROTOCOL: ${CHAT2API_QWEN_AI_MANAGED_PROTOCOL:-qwen_hermes}
@@ -157,7 +273,7 @@ services:
       # silently zero the managed tool path).
       CHAT2API_RESPONSES_DEBUG_REQUEST: ${CHAT2API_RESPONSES_DEBUG_REQUEST:-false}
       CHAT2API_QWEN_AI_RETRY_NONCE: ${CHAT2API_QWEN_AI_RETRY_NONCE:-true}
-      CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE: ${CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE:-retry}
+      CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE: ${CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE:-always}
       # Complete tool docs remain attached; zero omits only inline routing summaries.
       CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS: ${CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240}
       # Non-negative retry counts are bounded by the cumulative request deadline.
@@ -283,6 +399,30 @@ services:
       # first attempt so ordinary turns never batch-trigger that quota;
       # 'off' disables. KEEP_LAST counts image-bearing messages, not images.
       CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES: ${CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES:-on-busy}
+      # Provider-neutral image slimming. The Qwen family above applies to Qwen
+      # only and wins outright for it. This family applies to every other
+      # vision provider.
+      #
+      # 'off' is the default and is NOT inherited from the Qwen value: a
+      # deployment running Qwen at 'on-busy' must not silently turn on
+      # proactive slimming for its other providers. 'always' slims from the
+      # first attempt; 'on-busy' is honoured for Qwen only, because the
+      # reactive trigger is a Qwen getstsToken-quota defense.
+      CHAT2API_REPLAY_SLIM_IMAGES: ${CHAT2API_REPLAY_SLIM_IMAGES:-off}
+      # Comma-separated provider / model allowlists. Empty means "no extra
+      # restriction"; a provider not listed in the capability table is never
+      # slimmed regardless of these values.
+      CHAT2API_REPLAY_SLIM_PROVIDERS: ${CHAT2API_REPLAY_SLIM_PROVIDERS-}
+      CHAT2API_REPLAY_SLIM_MODELS: ${CHAT2API_REPLAY_SLIM_MODELS-}
+      # KEEP_LAST counts image-bearing messages, not images, and is clamped to
+      # at least 1 so the current turn's reference image always survives. An
+      # unset value falls back to the Qwen-named variable so a deployment that
+      # already tuned keep counts gets the same numbers everywhere.
+      CHAT2API_REPLAY_KEEP_LAST_IMAGE_MESSAGES: ${CHAT2API_REPLAY_KEEP_LAST_IMAGE_MESSAGES:-1}
+      CHAT2API_REPLAY_KEEP_FIRST_IMAGE_MESSAGES: ${CHAT2API_REPLAY_KEEP_FIRST_IMAGE_MESSAGES:-0}
+      # Falls back to CHAT2API_QWEN_AI_REPLAY_IMAGE_PLACEHOLDER, then to a
+      # built-in string that tells the model how to view the image again.
+      CHAT2API_REPLAY_IMAGE_PLACEHOLDER: ${CHAT2API_REPLAY_IMAGE_PLACEHOLDER-}
       # Fresh-chat replay slimming: head+tail message boundary in bytes.
       # 0 = full replay (unchanged behavior). A positive value (e.g. 65536)
       # keeps only the system prompt + first user message + last N bytes

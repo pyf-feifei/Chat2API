@@ -35,6 +35,30 @@ function loadTypeScriptModule(path, localModules = {}) {
         webshareProxyUrlForLog: () => undefined,
       }
     }
+    if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+      return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+    }
+    if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+      return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+    }
+    if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+      return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+    }
+    if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+      return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+    }
+    if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+      return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+    }
+    if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+      return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+    }
+    if (specifier === './services/retrievalStream' || specifier === './services/retrievalStream.ts') {
+      return { createRetrievalAwareStream: ({ source }) => source }
+    }
+    if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+      return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
+    }
     if (specifier.startsWith('.')) throw new Error(`Unexpected policy test import: ${specifier}`)
     return runtimeRequire(specifier)
   }
@@ -61,6 +85,29 @@ function loadRequestForwarder(overrides = {}) {
   }).outputText
   const module = { exports: {} }
   const StreamHandler = class {}
+  const riskCircuitEntries = new Map()
+  const riskCircuit = {
+    createQwenAiRiskFingerprint: request => JSON.stringify(request),
+    getQwenAiRiskCircuitEntry: fingerprint => {
+      const entry = riskCircuitEntries.get(fingerprint)
+      return entry && entry.failures >= 2 ? entry : undefined
+    },
+    qwenAiRiskCircuitThreshold: () => 2,
+    openQwenAiRiskCircuit: fingerprint => {
+      const previous = riskCircuitEntries.get(fingerprint)
+      const entry = {
+        fingerprint,
+        until: Date.now() + 60_000,
+        failures: (previous?.failures ?? 0) + 1,
+      }
+      riskCircuitEntries.set(fingerprint, entry)
+      return entry
+    },
+    clearQwenAiRiskCircuit: fingerprint => riskCircuitEntries.delete(fingerprint),
+    getQwenAiEgressCircuitEntry: () => undefined,
+    recordQwenAiEgressRiskVerdict: () => undefined,
+    clearQwenAiEgressCircuit: () => {},
+  }
   const localModules = {
     axios: { create: () => ({}) },
     http2: {},
@@ -187,6 +234,7 @@ function loadRequestForwarder(overrides = {}) {
         || { run: (_accountId, operation) => operation() },
     },
     './qwenAiAccountPolicy': qwenAiAccountPolicy,
+    './qwenAiRiskCircuit': riskCircuit,
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
       bufferValidatedSseStream: overrides.bufferValidatedSseStream || (async stream => stream),
@@ -199,6 +247,8 @@ function loadRequestForwarder(overrides = {}) {
       sessionManager: { shouldDeleteAfterChat: () => true },
     },
     './services/contextManagementService': {
+      getUpstreamTokenOptimizerSettings: () => ({}),
+      optimizeUpstreamRequest: request => request,
       createContextManagementService: () => ({
         process: overrides.processContextMessages || (async messages => ({
           messages,
@@ -208,11 +258,21 @@ function loadRequestForwarder(overrides = {}) {
         })),
       }),
     },
+    './services/upstreamTokenOptimizer.ts': {
+      getUpstreamTokenOptimizerSettings: () => ({}),
+      optimizeUpstreamRequest: request => request,
+    },
     './requestIntent': {
       classifyChatRequest: () => ({
         intent: 'normal',
         textChars: 0,
       }),
+    },
+
+    './services/retrievalTool.ts': {
+
+      stripRetrievalTool: tools => tools,
+
     },
     './qwenAiCompactionBoundary': {
       estimateQwenAiRequestInputTokens: overrides.estimateQwenAiRequestInputTokens
@@ -274,6 +334,33 @@ function loadRequestForwarder(overrides = {}) {
       }
       if (specifier === './toolCalling/m365Transcript' || specifier === './toolCalling/m365Transcript.ts') {
         return { appendManagedReplayTurns: (replayText, _assistantText, nudgeContent) => replayText + '\n\n' + String(nudgeContent) }
+      }
+      // Recoverable compression (2.3b). This harness has a SECOND
+      // `testRequire` from the one at the top of the file, so it needs its own
+      // stubs; a file-level "already declared" check silently misses this one.
+      if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+        return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+      }
+      if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+        return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+      }
+      if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+        return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+      }
+      if (specifier === './services/retrievalStream' || specifier === './services/retrievalStream.ts') {
+        return { createRetrievalAwareStream: ({ source }) => source }
+      }
+      if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+        return { CompressionArchive: class { record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+      }
+      if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+        return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+      }
+      if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+        return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+      }
+      if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+        return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
       }
       throw new Error(`Unexpected forwarder recovery test import: ${specifier}`)
     }
@@ -3346,7 +3433,7 @@ test('a webshare bandwidth-402 surfaces honestly once the direct retry is spent'
   assert.equal(attempts.length, 2, 'exactly one direct retry after the bandwidth-402, then stop')
 })
 
-test('a second drained key after the extra escalation re-arms the direct fallback', async () => {
+test('a risk verdict followed by proxy 402 stops without another direct replay', async () => {
   const RequestForwarder = loadRequestForwarder({
     qwenAiRequestTimeoutMs: 600_000,
     webshareEnabled: true,
@@ -3361,9 +3448,9 @@ test('a second drained key after the extra escalation re-arms the direct fallbac
     forwarder.doForward = async (...args) => {
       const options = args.at(-1)
       attempts.push(options)
-      // 1 direct verdict → 2 proxy 402 (key A) → 3 direct verdict →
-      // 4 proxy 402 (key B, bandwidthSpentOneExtra) → 5 direct must still run.
-      if (attempts.length === 1 || attempts.length === 3) {
+      // Direct verdict → proxy 402. The 402 is not evidence that the
+      // transcript recovered, so the request must stop at this boundary.
+      if (attempts.length === 1) {
         return {
           success: false,
           status: 503,
@@ -3395,13 +3482,11 @@ test('a second drained key after the extra escalation re-arms the direct fallbac
       { signal: new AbortController().signal },
     )
 
-    assert.equal(result.success, true, 'the re-armed direct fallback must run after the second 402')
-    assert.equal(attempts.length, 5, 'direct, proxy-402, direct, proxy-402, direct')
-    assert.deepEqual(
-      attempts.map(item => item.qwenAiWebshareProxy),
-      [false, true, false, true, false],
-      'the second drained key must re-arm one more direct attempt, not surface a raw 402',
-    )
+    assert.equal(result.success, false)
+    assert.equal(result.errorCode, 'qwen_ai_content_verdict')
+    assert.equal(attempts.length, 2, 'direct verdict then proxy 402, then stop')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
+    assert.match(result.error, /bandwidth limit/i)
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
@@ -3450,6 +3535,148 @@ test('a spent direct fallback after bandwidth-402 rewrites the raw 402 into an a
 // ---------------------------------------------------------------------------
 // Content verdict (bxpunish/RGV587) must prefer Webshare before fail-fast
 // ---------------------------------------------------------------------------
+
+test('a terminal risk verdict opens a fingerprint circuit for Codex reconnects', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: false,
+  })
+  const forwarder = new RequestForwarder()
+  let attempts = 0
+  forwarder.delay = async () => true
+  forwarder.doForward = async () => {
+    attempts += 1
+    return {
+      success: false,
+      status: 503,
+      headers: { bxpunish: '1' },
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+    }
+  }
+  const request = {
+    model: 'model-1',
+    messages: [{ role: 'user', content: 'same Codex turn' }],
+    stream: true,
+  }
+  const provider = { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' }
+  const account = { id: 'account-1' }
+  const context = () => ({
+    requestId: `risk-circuit-${attempts}`,
+    model: 'model-1',
+    startTime: Date.now(),
+    isStream: true,
+    signal: new AbortController().signal,
+  })
+
+  const first = await forwarder.forwardChatCompletion(request, account, provider, 'model-1', context())
+  const replays = []
+  for (let i = 0; i < 20; i += 1) {
+    replays.push(await forwarder.forwardChatCompletion(request, account, provider, 'model-1', context()))
+  }
+
+  assert.equal(first.errorCode, 'qwen_ai_content_verdict')
+  assert.equal(replays[0].errorCode, 'qwen_ai_content_verdict', 'one fresh retry is allowed for nonce recovery')
+  assert.equal(replays.slice(1).every(result => result.errorCode === 'qwen_ai_risk_circuit_open'), true)
+  assert.equal(replays.slice(1).every(result => result.retryable === false), true)
+  assert.equal(replays.slice(1).every(result => result.accountFault === false), true)
+  assert.equal(replays.slice(1).every(result => result.headers?.['Retry-After'] !== undefined), true)
+  assert.equal(attempts, 2, '20 identical reconnects are bounded to one probe plus the terminal circuit')
+})
+
+test('a risk circuit allows one fresh retry and clears after recovery', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: false,
+  })
+  const forwarder = new RequestForwarder()
+  let attempts = 0
+  forwarder.delay = async () => true
+  forwarder.doForward = async () => {
+    attempts += 1
+    if (attempts === 1) {
+      return {
+        success: false,
+        status: 503,
+        headers: { bxpunish: '1' },
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+  const request = { model: 'model-1', messages: [{ role: 'user', content: 'recoverable turn' }], stream: true }
+  const provider = { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' }
+  const account = { id: 'account-1' }
+  const context = () => ({
+    requestId: `risk-recovery-${attempts}`,
+    model: 'model-1',
+    startTime: Date.now(),
+    isStream: true,
+    signal: new AbortController().signal,
+  })
+
+  const first = await forwarder.forwardChatCompletion(request, account, provider, 'model-1', context())
+  const second = await forwarder.forwardChatCompletion(request, account, provider, 'model-1', context())
+  const third = await forwarder.forwardChatCompletion(request, account, provider, 'model-1', context())
+
+  assert.equal(first.errorCode, 'qwen_ai_content_verdict')
+  assert.equal(second.success, true)
+  assert.equal(third.success, true)
+  assert.equal(attempts, 3, 'the successful recovery must clear the circuit')
+})
+
+test('a changed request fingerprint is not blocked by another request risk circuit', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    webshareEnabled: false,
+  })
+  const forwarder = new RequestForwarder()
+  let attempts = 0
+  forwarder.delay = async () => true
+  forwarder.doForward = async () => {
+    attempts += 1
+    return {
+      success: false,
+      status: 503,
+      headers: { bxpunish: '1' },
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+    }
+  }
+  const provider = { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' }
+  const account = { id: 'account-1' }
+  const context = () => ({
+    requestId: `risk-circuit-different-${attempts}`,
+    model: 'model-1',
+    startTime: Date.now(),
+    isStream: true,
+    signal: new AbortController().signal,
+  })
+
+  await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [{ role: 'user', content: 'first' }], stream: true },
+    account,
+    provider,
+    'model-1',
+    context(),
+  )
+  await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [{ role: 'user', content: 'second' }], stream: true },
+    account,
+    provider,
+    'model-1',
+    context(),
+  )
+
+  assert.equal(attempts, 2)
+})
 
 test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast)', async () => {
   const engagements = []
@@ -3500,6 +3727,7 @@ test('a direct bxpunish verdict escalates to Webshare and recovers (no fail-fast
     assert.equal(result.errorCode, undefined)
     assert.equal(attempts.length, 2, 'direct verdict then one proxy recovery attempt')
     assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
+    assert.equal(attempts[1].qwenAiMessageTransport, 'inline', 'risk recovery must not switch a small request into document transport')
     assert.equal(engagements.length, 1, 'proxy recovery success must engage sticky mode')
     assert.deepEqual(reports, ['success'])
     assert.deepEqual(riskBenches, [], 'an account-neutral verdict must not hard-cool the account on the balancer')
@@ -3670,7 +3898,7 @@ test('a direct bxpunish verdict with Webshare disabled fails fast as content_ver
   }
 })
 
-test('proxy bandwidth-402 then a direct verdict spends one extra Webshare escalation', async () => {
+test('proxy bandwidth-402 after a direct risk verdict does not re-escalate', async () => {
   const reports = []
   const RequestForwarder = loadRequestForwarder({
     qwenAiRequestTimeoutMs: 600_000,
@@ -3688,9 +3916,9 @@ test('proxy bandwidth-402 then a direct verdict spends one extra Webshare escala
     forwarder.doForward = async (...args) => {
       const options = args.at(-1)
       attempts.push(options)
-      // 1 direct verdict → 2 proxy 402 (never tested the verdict) →
-      // 3 direct verdict again → must re-escalate once onto a healthy key.
-      if (attempts.length === 1 || attempts.length === 3) {
+      // Direct verdict → proxy 402. A drained proxy is not a reason to
+      // replay the same risky transcript through the direct exit again.
+      if (attempts.length === 1) {
         return {
           success: false,
           status: 503,
@@ -3722,22 +3950,19 @@ test('proxy bandwidth-402 then a direct verdict spends one extra Webshare escala
       { signal: new AbortController().signal },
     )
 
-    assert.equal(result.success, true, 'the extra proxy escalation must recover after a bandwidth-402')
-    assert.equal(attempts.length, 4, 'direct verdict, proxy 402, direct verdict, healthy proxy')
-    assert.deepEqual(
-      attempts.map(item => item.qwenAiWebshareProxy),
-      [false, true, false, true],
-      'the second verdict must re-engage Webshare after the 402, not fail fast',
-    )
+    assert.equal(result.success, false)
+    assert.equal(result.errorCode, 'qwen_ai_content_verdict')
+    assert.equal(attempts.length, 2, 'direct verdict then proxy 402, then stop')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
     assert.ok(reports.includes('bandwidth'), 'the drained key must be cooled as a whole')
-    assert.ok(reports.includes('success'), 'the healthy proxy exit must clear the request')
+    assert.equal(reports.includes('success'), false)
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
   }
 })
 
-test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwidth note', async () => {
+test('a proxy 402 after a direct risk verdict fails fast with the bandwidth note', async () => {
   const RequestForwarder = loadRequestForwarder({
     qwenAiRequestTimeoutMs: 600_000,
     webshareEnabled: true,
@@ -3755,8 +3980,8 @@ test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwid
     forwarder.doForward = async (...args) => {
       const options = args.at(-1)
       attempts.push(options)
-      // Direct verdict → proxy 402 → direct verdict → second proxy also
-      // draws the verdict (exit budget spent). Give up with an honest note.
+      // Direct verdict → proxy 402. Stop at the first drained recovery
+      // boundary instead of manufacturing another proxy/direct replay.
       if (attempts.length === 2) {
         return {
           success: false,
@@ -3790,13 +4015,9 @@ test('after a proxy 402 a second proxy verdict still fail-fasts with the bandwid
     assert.equal(result.errorCode, 'qwen_ai_content_verdict')
     assert.equal(result.retryable, false)
     assert.equal(result.retryScope, undefined)
-    assert.equal(attempts.length, 4, 'direct, proxy-402, direct, proxy-verdict then stop')
-    assert.deepEqual(
-      attempts.map(item => item.qwenAiWebshareProxy),
-      [false, true, false, true],
-    )
-    assert.match(result.error, /also received the verdict/i, 'the second proxy draw is a real verdict')
-    assert.match(result.error, /on 1 exit/i, 'the give-up note reports the single tested proxy exit')
+    assert.equal(attempts.length, 2, 'direct, proxy-402 then stop')
+    assert.deepEqual(attempts.map(item => item.qwenAiWebshareProxy), [false, true])
+    assert.match(result.error, /bandwidth limit/i)
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous

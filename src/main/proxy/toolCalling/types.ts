@@ -62,6 +62,16 @@ export interface ToolCallDiagnostics {
   failedToolResultPending: boolean
 }
 
+export interface LocalToolCallRecord {
+  /** The id assigned to the upstream-visible call, for the continuation turn. */
+  id: string
+  name: string
+  arguments: string
+  /** Resolved content, or an explanatory error string. Never an exception. */
+  content: string
+  isError: boolean
+}
+
 export interface ToolCallingPlan {
   mode: ToolCallingMode
   protocol: ToolProtocolId
@@ -81,6 +91,17 @@ export interface ToolCallingPlan {
   allowedUpstreamToolNames?: Set<string>
   workflowContinuation: boolean
   failedToolResultPending: boolean
+  /**
+   * Proxy-internal tool calls resolved out of a response, waiting to be sent
+   * back upstream as a continuation.
+   *
+   * The managed tool system assumes every declared tool belongs to the client
+   * and every parsed call reaches the client. `retrieve_tool_output` inverts
+   * that: the model may call it, this process resolves it, and the client never
+   * sees it. Those calls are partitioned here so they never enter
+   * `message.tool_calls`.
+   */
+  localToolCalls?: LocalToolCallRecord[]
   /**
    * The conversation contains at least one matched tool-call/result exchange
    * that was never closed with a completion marker, even when the trailing

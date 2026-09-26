@@ -177,32 +177,25 @@ export class AccountManager {
 
   /**
    * Increment request count
+   *
+   * Delegates to the store so the daily counter goes through the same day
+   * rollover as the proxy paths. Incrementing both fields here duplicated the
+   * logic and had no rollover, which made 今日已用 equal 总请求数 forever.
    * @param id Account ID
    */
   static incrementRequestCount(id: string): void {
-    const account = storeManager.getAccountById(id)
-    
-    if (account) {
-      storeManager.updateAccount(id, {
-        requestCount: (account.requestCount || 0) + 1,
-        todayUsed: (account.todayUsed || 0) + 1,
-        lastUsed: Date.now(),
-      })
-    }
+    storeManager.incrementAccountUsage(id)
   }
 
   /**
-   * Reset daily usage count
-   * Should be called at midnight
+   * Reset daily usage count for all accounts.
+   *
+   * Kept for explicit/manual use; the normal rollover happens on startup and
+   * lazily on the first request of a new day.
    */
   static resetDailyUsage(): void {
-    const accounts = storeManager.getAccounts()
-    
-    for (const account of accounts) {
-      storeManager.updateAccount(account.id, { todayUsed: 0 })
-    }
-    
-    storeManager.addLog('info', 'Reset daily usage count for all accounts')
+    const count = storeManager.resetDailyUsageAll()
+    storeManager.addLog('info', `Reset daily usage count for ${count} accounts`)
   }
 
   /**

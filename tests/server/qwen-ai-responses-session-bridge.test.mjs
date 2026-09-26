@@ -42,6 +42,30 @@ function loadTypeScriptModule(path, localModules = {}) {
       if (specifier === './toolCalling/m365Transcript' || specifier === './toolCalling/m365Transcript.ts') {
         return { appendManagedReplayTurns: (replayText, _assistantText, nudgeContent) => replayText + '\n\n' + String(nudgeContent) }
       }
+      if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+        return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+      }
+      if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+        return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+      }
+      if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+        return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+      }
+      if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+        return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+      }
+      if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+        return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+      }
+      if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+        return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+      }
+      if (specifier === './services/retrievalStream' || specifier === './services/retrievalStream.ts') {
+        return { createRetrievalAwareStream: ({ source }) => source }
+      }
+      if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+        return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
+      }
       throw new Error(`Unexpected session bridge test import: ${specifier}`)
     }
     return runtimeRequire(specifier)
@@ -690,6 +714,13 @@ function loadResponsesRouteHarness(options = {}) {
       qwenAiImageSlimModeFromEnv: () => 'off',
       shouldSlimQwenAiAttemptImages: () => false,
     },
+    // Provider-neutral image slimming (Phase 2/4): the route asks the policy
+    // layer instead of the Qwen-only trigger. The harness declines to slim so
+    // it keeps exercising the session-bridge path.
+    '../imageSlimPolicy': {
+      resolveImageSlimPolicy: () => undefined,
+      imageSlimModeFromEnv: () => 'off',
+    },
     '../qwenAiDeferredStream': {
       createDeferredQwenAiFailoverStream: () => { throw new Error('unexpected deferred stream') },
     },
@@ -722,6 +753,24 @@ function loadResponsesRouteHarness(options = {}) {
         getWebshareProxyAgent: () => undefined,
         webshareProxyUrlForLog: () => undefined,
       }
+    }
+    if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+      return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+    }
+    if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+      return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+    }
+    if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+      return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+    }
+    if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+      return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+    }
+    if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+      return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+    }
+    if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+      return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
     }
     if (specifier.startsWith('.')) throw new Error(`Unexpected Responses bridge route import: ${specifier}`)
     return runtimeRequire(specifier)
@@ -1536,6 +1585,16 @@ function loadForwarderForBridgeTests(overrides = {}) {
       qwenAiRequestGovernor: { run: (_accountId, operation) => operation() },
     },
     './qwenAiAccountPolicy': qwenAiAccountPolicy,
+    './qwenAiRiskCircuit': {
+      createQwenAiRiskFingerprint: request => JSON.stringify(request),
+      getQwenAiRiskCircuitEntry: () => undefined,
+      qwenAiRiskCircuitThreshold: () => 2,
+      openQwenAiRiskCircuit: fingerprint => ({ fingerprint, until: Date.now() + 60_000, failures: 1 }),
+      clearQwenAiRiskCircuit: () => {},
+      getQwenAiEgressCircuitEntry: () => undefined,
+      recordQwenAiEgressRiskVerdict: () => undefined,
+      clearQwenAiEgressCircuit: () => {},
+    },
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
       bufferValidatedSseStream: async stream => stream,
@@ -1546,6 +1605,8 @@ function loadForwarderForBridgeTests(overrides = {}) {
     },
     './sessionManager': { sessionManager: { shouldDeleteAfterChat: () => true } },
     './services/contextManagementService': {
+      getUpstreamTokenOptimizerSettings: () => ({}),
+      optimizeUpstreamRequest: request => request,
       createContextManagementService: () => ({
         process: async messages => ({
           messages,
@@ -1583,6 +1644,12 @@ function loadForwarderForBridgeTests(overrides = {}) {
     },
     './qwenAiDeferredStream': {
       createDeferredQwenAiFailoverStream: () => { throw new Error('unexpected deferred stream') },
+    },
+
+    './services/retrievalTool.ts': {
+
+      stripRetrievalTool: tools => tools,
+
     },
     './qwenAiCompactionBoundary': {
       estimateQwenAiRequestInputTokens: () => 1,
@@ -1635,6 +1702,32 @@ function loadForwarderForBridgeTests(overrides = {}) {
     }
     if (specifier === './toolCalling/m365Transcript' || specifier === './toolCalling/m365Transcript.ts') {
       return { appendManagedReplayTurns: (replayText, _assistantText, nudgeContent) => replayText + '\n\n' + String(nudgeContent) }
+    }
+    // Recoverable compression (2.3b). This is a third `testRequire` in the
+    // file, so the stubs declared in the earlier ones do not reach it.
+    if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+      return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+    }
+    if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+      return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+    }
+    if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+      return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+    }
+    if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+      return { CompressionArchive: class { record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+    }
+    if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+      return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+    }
+    if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+      return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
+    }
+    if (specifier === './services/retrievalStream' || specifier === './services/retrievalStream.ts') {
+      return { createRetrievalAwareStream: ({ source }) => source }
+    }
+    if (specifier === './services/compressionSettings' || specifier === './services/compressionSettings.ts') {
+      return { getCompressionSettings: () => ({ mode: 'ts', retrieval: { enabled: false, maxRetrievalsPerRequest: 4 }, archiveTtlMs: 86400000, archiveMaxChars: 67108864 }), resolveCompressionBackend: async () => ({ id: 'ts', available: async () => true, compact: async () => undefined }), tsBackend: { id: 'ts', available: async () => true, compact: async () => undefined } }
     }
     if (specifier.startsWith('.')) throw new Error(`Unexpected forwarder bridge import: ${specifier}`)
     return runtimeRequire(specifier)

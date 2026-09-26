@@ -933,6 +933,77 @@ test('function streaming merges cumulative arguments and emits argument events',
   assert.equal(completed.output[0].arguments, '{"city":"Shanghai"}')
 })
 
+test('Responses streaming converts a provider pipe call that reached the text channel', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"content":"exec_command>cmd>Get-ChildItem C:\\\\tmp; echo done"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ], {
+    tools: [{
+      type: 'function',
+      name: 'exec_command',
+      parameters: {
+        type: 'object',
+        properties: { cmd: { type: 'string' } },
+        required: ['cmd'],
+      },
+    }],
+  })
+
+  const functionDone = events.find(event => event.type === 'response.output_item.done')
+  assert.equal(functionDone?.item?.type, 'function_call')
+  assert.equal(functionDone?.item?.name, 'exec_command')
+  assert.equal(JSON.parse(functionDone?.item?.arguments ?? '{}').cmd, 'Get-ChildItem C:\\tmp; echo done')
+  assert.equal(events.some(event => event.type === 'response.output_text.delta'), false)
+})
+
+test('Responses pipe fallback maps shell_command to exec_command', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"content":"shell_command>command>Get-ChildItem C:\\\\tmp"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ], {
+    tools: [{
+      type: 'function',
+      name: 'exec_command',
+      parameters: { type: 'object', properties: { cmd: { type: 'string' } }, required: ['cmd'] },
+    }],
+  })
+  const done = events.find(event => event.type === 'response.output_item.done')
+  assert.equal(done?.item?.name, 'exec_command')
+  assert.equal(JSON.parse(done?.item?.arguments ?? '{}').cmd, 'Get-ChildItem C:\\tmp')
+})
+
+test('function streaming normalizes provider CDATA sentinels in numeric arguments', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_exec","type":"function","function":{"name":"exec_command","arguments":"{\\"cmd\\":\\"pwd\\",\\"yield_time_ms\\":\\"<![CDATA>\\",\\"max_output_tokens\\":\\"<![CDATA>\\"}"}}]}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+    'data: [DONE]\n\n',
+  ], {
+    tools: [{
+      type: 'function',
+      name: 'exec_command',
+      parameters: {
+        type: 'object',
+        properties: {
+          cmd: { type: 'string' },
+          yield_time_ms: { type: 'number' },
+          max_output_tokens: { type: 'number' },
+        },
+        required: ['cmd'],
+      },
+    }],
+  })
+
+  const completed = events.at(-1).response
+  assert.equal(completed.output[0].type, 'function_call')
+  assert.deepEqual(JSON.parse(completed.output[0].arguments), {
+    cmd: 'pwd',
+    yield_time_ms: 30000,
+    max_output_tokens: 10000,
+  })
+})
+
 test('custom tool streaming restores raw input and official custom events', async () => {
   const rawInput = '*** Begin Patch\n*** Update File: example.txt\n@@\n-old\n+new\n*** End Patch'
   const wrapped = JSON.stringify({ input: rawInput })

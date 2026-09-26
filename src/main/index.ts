@@ -1,4 +1,7 @@
 import 'dotenv/config'
+// Must be evaluated before any network module: keeps provider traffic off the
+// local HTTP proxy (see egressPolicy.ts for the 2026-09-25 Qwen incident).
+import './proxy/egressPolicy'
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
 import { createWindow, getMainWindow, loadUrl, loadFile, openDevTools } from './window/manager'

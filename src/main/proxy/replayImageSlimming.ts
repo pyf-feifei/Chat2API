@@ -96,35 +96,105 @@ function placeholderFromEnv(): string {
   const raw = String(process.env.CHAT2API_QWEN_AI_REPLAY_IMAGE_PLACEHOLDER ?? '').trim()
   return raw || DEFAULT_IMAGE_PLACEHOLDER
 }
+/**
+ * Result of a slimming pass.
+ *
+ * The counters are the whole reason this returns an object instead of the message
+ * array. `charsSlimmed` converts into the same token units the routes already
+ * record via `estimateQwenAiRequestInputTokens`, so the image track and the
+ * text-compression track can be added without double counting.
+ *
+ * Counts only. A part count is not identifying; a data URL, a filename or a
+ * placeholder body is, and tool output routinely carries all three.
+ */
+export interface ImageSlimResult {
+  messages: ChatMessage[]
+  messagesSlimmed: number
+  partsSlimmed: number
+  charsSlimmed: number
+}
 
+function measureImagePartChars(part: unknown): number {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) return 0
+  const record = part as { type?: unknown; image_url?: unknown; input_image?: unknown }
+  if (!IMAGE_PART_TYPES.has(String(record.type || ''))) return 0
+  const holder = record.image_url ?? record.input_image
+  const url = typeof holder === 'string'
+    ? holder
+    : typeof (holder as { url?: unknown } | undefined)?.url === 'string'
+      ? String((holder as { url: string }).url)
+      : ''
+  return url.length
+}
+
+/**
+ * Slim old inline images out of a replayed conversation.
+ *
+ * The keep set is the FIRST `keepFirst` and the LAST `keepLast` image-bearing
+ * messages. The newest one is included unconditionally regardless of
+ * configuration, because a placeholder is a downgrade and the newest attachment
+ * is the current turn's reference: the model is about to reason about it.
+ * `resolveImageSlimPolicy` clamps `keepLast` to 1 for the same reason; this is
+ * the second, independent guard, so a caller that constructs keep counts by hand
+ * still cannot slim the current turn away.
+ *
+ * Env reading lives entirely in the policy layer. This function takes every
+ * value it needs as an argument, so a caller that passes explicit keep counts is
+ * not silently overridden by the environment.
+ */
 export function slimQwenAiReplayImages(
   messages: readonly ChatMessage[],
-  options: { keepLastImageMessages?: number; keepFirstImageMessages?: number } = {},
-): ChatMessage[] {
-  if (!isEnabledFromEnv()) return [...messages]
-
+  options: { keepLastImageMessages?: number; keepFirstImageMessages?: number; placeholder?: string } = {},
+): ImageSlimResult {
   const keepLast = options.keepLastImageMessages ?? keepLastFromEnv()
   const keepFirst = options.keepFirstImageMessages ?? keepFirstFromEnv()
+  const placeholder = options.placeholder ?? placeholderFromEnv()
   const imageBearing: number[] = []
   messages.forEach((message, index) => {
     if (messageImagePartCount(message) > 0) imageBearing.push(index)
   })
-  if (imageBearing.length <= keepFirst + keepLast) return [...messages]
+
+  // The newest image-bearing message always survives. Without this the keep set
+  // could be empty, or could exclude the live turn, and the model would lose
+  // access to the image the user just sent.
+  const newestImageIndex = imageBearing.length > 0
+    ? imageBearing[imageBearing.length - 1]
+    : undefined
+  const effectiveKeepLast = Math.max(keepLast, newestImageIndex === undefined ? 0 : 1)
+
+  if (imageBearing.length <= keepFirst + effectiveKeepLast) {
+    return { messages: [...messages], messagesSlimmed: 0, partsSlimmed: 0, charsSlimmed: 0 }
+  }
 
   const keepSet = new Set([
     ...imageBearing.slice(0, keepFirst),
-    ...imageBearing.slice(imageBearing.length - keepLast),
+    ...(newestImageIndex === undefined ? [] : [newestImageIndex]),
+    ...imageBearing.slice(imageBearing.length - effectiveKeepLast),
   ])
   const slimSet = new Set(imageBearing.filter(index => !keepSet.has(index)))
-  const placeholder = placeholderFromEnv()
 
-  return messages.map((message, index) => {
+  let messagesSlimmed = 0
+  let partsSlimmed = 0
+  let charsSlimmed = 0
+
+  const rewritten = messages.map((message, index) => {
     if (!slimSet.has(index) || !Array.isArray(message.content)) return message
+    let touched = false
     const content = (message.content as Array<Record<string, unknown>>).map(part => {
       if (!part || typeof part !== 'object' || Array.isArray(part)) return part
       if (!IMAGE_PART_TYPES.has(String(part.type || ''))) return part
+      touched = true
+      partsSlimmed += 1
+      // Only the dropped payload counts. The text part of the same message
+      // survives as the placeholder, so counting the whole message would
+      // overstate the saving.
+      charsSlimmed += measureImagePartChars(part)
       return { type: 'text', text: placeholder }
     })
+    if (!touched) return message
+    messagesSlimmed += 1
     return { ...message, content }
   })
+
+  return { messages: rewritten, messagesSlimmed, partsSlimmed, charsSlimmed }
 }

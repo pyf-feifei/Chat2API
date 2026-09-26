@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { ToolCall } from '../types.ts'
 import type { ToolCallDiagnostics, ToolCallingPlan } from './types.ts'
 import { getManagedProtocols, getToolProtocol } from './protocols/index.ts'
-import { getMissingRequiredArguments } from './protocols/shared.ts'
+import { getMissingRequiredArguments, buildToolCall } from './protocols/shared.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 import {
   createManagedToolResultWrapperLeakError,
@@ -509,9 +509,13 @@ export class ToolStreamParser {
     }
 
     const parsed = parseFirstValidToolBlock(guarded.content, this.plan, { allowPartial: true })
-    if (parsed.toolCalls.length === 0) return []
+    const pipeToolCalls = parsed.toolCalls.length === 0
+      ? parsePipeDelimitedToolCalls(guarded.content, this.plan)
+      : []
+    const recoveredToolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : pipeToolCalls
+    if (recoveredToolCalls.length === 0) return []
 
-    const chunks = uniqueResponseToolCalls(parsed.toolCalls).flatMap((toolCall, index) => {
+    const chunks = uniqueResponseToolCalls(recoveredToolCalls).flatMap((toolCall, index) => {
       const indexedToolCall = {
         ...toolCall,
         index: this.nextToolCallIndex,
@@ -644,6 +648,179 @@ function sentenceStartBefore(text: string, index: number): number {
     }
   }
   return floor
+}
+
+function escapePipeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function pipeToolSchema(
+  tool: ToolCallingPlan['tools'][number] | undefined,
+): { properties: Record<string, any>; required: string[] } {
+  const schema = tool?.parameters && typeof tool.parameters === 'object'
+    ? tool.parameters as Record<string, any>
+    : {}
+  const fallback: Record<string, Record<string, any>> = {
+    exec_command: {
+      cmd: { type: 'string' },
+      workdir: { type: 'string' },
+      yield_time_ms: { type: 'number' },
+      max_output_tokens: { type: 'number' },
+    },
+    view_image: { path: { type: 'string' } },
+    write_stdin: {
+      session_id: { type: ['integer', 'string'] },
+      chars: { type: 'string' },
+      yield_time_ms: { type: 'number' },
+      max_output_tokens: { type: 'number' },
+    },
+  }
+  const fallbackRequired: Record<string, string[]> = {
+    exec_command: ['cmd'],
+    view_image: ['path'],
+    write_stdin: ['session_id'],
+  }
+  const declaredProperties = schema.properties && typeof schema.properties === 'object'
+    ? schema.properties as Record<string, any>
+    : {}
+  return {
+    properties: {
+      ...(fallback[tool?.name ?? ''] ?? {}),
+      ...declaredProperties,
+    },
+    required: Array.isArray(schema.required)
+      ? schema.required.filter((name): name is string => typeof name === 'string')
+      : (fallbackRequired[tool?.name ?? ''] ?? []),
+  }
+}
+
+function decodePipeValue(
+  raw: string,
+  schema: Record<string, any> | undefined,
+): { ok: boolean; value: unknown } {
+  let value = raw.trim()
+  if (value.startsWith('<![CDATA[') && value.endsWith(']]>')) {
+    value = value.slice('<![CDATA['.length, -']]>'.length).trim()
+  }
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1)
+  }
+  const type = schema?.type
+  if (type === 'number' || type === 'integer') {
+    if (!value) return { ok: true, value: '' }
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? { ok: true, value: parsed } : { ok: false, value: undefined }
+  }
+  if (type === 'boolean') {
+    if (/^(true|false)$/i.test(value)) return { ok: true, value: /^true$/i.test(value) }
+    return { ok: false, value: undefined }
+  }
+  if (type === 'null') return { ok: true, value: null }
+  if (type === 'array' || type === 'object') {
+    if (!value) return { ok: true, value: '' }
+    try { return { ok: true, value: JSON.parse(value) } } catch { return { ok: false, value: undefined } }
+  }
+  return { ok: true, value }
+}
+
+/**
+ * Salvage the compact pipe-delimited call syntax emitted by some MiMo
+ * responses (`tool>param>value...`). Only declared tools with complete,
+ * schema-valid required fields are accepted; ordinary prose is never run.
+ */
+const PIPE_TOOL_ALIASES: Record<string, string> = {
+  bash: 'exec_command',
+  shell: 'exec_command',
+  shell_command: 'exec_command',
+  powershell: 'exec_command',
+  'view-image': 'view_image',
+}
+
+export function parsePipeDelimitedToolCalls(
+  content: string,
+  plan: ToolCallingPlan,
+): ToolCall[] {
+  if (!content || !plan.shouldParseResponse) return []
+  const toolNames = [...plan.allowedToolNames].filter(name => /^[A-Za-z0-9_.:-]+$/.test(name))
+  if (toolNames.length === 0) return []
+  const aliases = plan.providerId === 'mimo' ? PIPE_TOOL_ALIASES : {}
+  const pipeNames = [...new Set([
+    ...toolNames,
+    ...Object.keys(aliases).filter(alias => toolNames.includes(aliases[alias])),
+  ])]
+  const namePattern = pipeNames.map(escapePipeRegExp).join('|')
+  const first = new RegExp(`(?:^|\\s)(${namePattern})>([A-Za-z_][A-Za-z0-9_-]*)>`).exec(content)
+  if (!first) return []
+
+  const toolByName = new Map(plan.tools.map(tool => [tool.name, tool]))
+  const calls: ToolCall[] = []
+  const firstHeaderLength = first[1].length + first[2].length + 2
+  let cursor = first.index + first[0].length - firstHeaderLength
+
+  while (cursor < content.length && calls.length <= 16) {
+    const header = new RegExp(`^(${namePattern})>([A-Za-z_][A-Za-z0-9_-]*)>`).exec(content.slice(cursor))
+    if (!header) break
+    const name = header[1]
+    const canonicalName = aliases[name] ?? name
+    const firstParam = header[2]
+    const tool = toolByName.get(canonicalName)
+    if (!tool || !plan.allowedToolNames.has(canonicalName)) return []
+    const { properties, required } = pipeToolSchema(tool)
+    let paramName = firstParam === 'command' && Object.prototype.hasOwnProperty.call(properties, 'cmd')
+      ? 'cmd'
+      : firstParam
+    if (!Object.prototype.hasOwnProperty.call(properties, paramName)) return []
+
+    const args: Record<string, unknown> = {}
+    let valueStart = cursor + header[0].length
+    let boundary = content.length
+    let nextToolCursor = content.length
+
+    const findBoundary = (from: number): { index: number; kind: 'param' | 'tool'; name: string } | null => {
+      let selected: { index: number; kind: 'param' | 'tool'; name: string } | null = null
+      for (const candidate of Object.keys(properties)) {
+        const index = content.indexOf(`${candidate}>`, from)
+        if (index >= 0 && (!selected || index < selected.index)) selected = { index, kind: 'param', name: candidate }
+      }
+      for (const candidate of pipeNames) {
+        const index = content.indexOf(`${candidate}>`, from)
+        if (index >= 0 && (!selected || index < selected.index)) selected = { index, kind: 'tool', name: candidate }
+      }
+      return selected
+    }
+
+    while (true) {
+      const next = findBoundary(valueStart)
+      if (!next || next.index <= valueStart) {
+        const decoded = decodePipeValue(content.slice(valueStart, content.length), properties[paramName])
+        if (!decoded.ok) return []
+        args[paramName] = decoded.value
+        break
+      }
+      boundary = next.index
+      const decoded = decodePipeValue(content.slice(valueStart, boundary), properties[paramName])
+      if (!decoded.ok) return []
+      args[paramName] = decoded.value
+      if (next.kind === 'tool') {
+        nextToolCursor = boundary
+        break
+      }
+      paramName = next.name
+      valueStart = boundary + next.name.length + 1
+    }
+
+    if (required.some(requiredName => {
+      const value = args[requiredName]
+      return !Object.prototype.hasOwnProperty.call(args, requiredName) || value === '' || value === null || value === undefined
+    })) return []
+    calls.push(buildToolCall('', calls.length, canonicalName, args, undefined, tool))
+    cursor = nextToolCursor
+  }
+
+  if (calls.length === 0) return []
+  const trailing = content.slice(cursor).trim()
+  if (trailing && !/^[`)'".,;\s]+$/.test(trailing)) return []
+  return calls
 }
 
 function uniqueResponseToolCalls<T extends ToolCall>(toolCalls: readonly T[]): T[] {  const result = deduplicateEquivalentToolCalls(toolCalls)

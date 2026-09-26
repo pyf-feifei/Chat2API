@@ -165,11 +165,7 @@ router.post('/completions', async (ctx: Context) => {
 
     proxyStatusManager.recordRequestSuccess(latency)
 
-    storeManager.updateAccount(account.id, {
-      lastUsed: Date.now(),
-      requestCount: (account.requestCount || 0) + 1,
-      todayUsed: (account.todayUsed || 0) + 1,
-    })
+    storeManager.incrementAccountUsage(account.id)
 
     storeManager.addLog('debug', `Request succeeded`, {
       requestId,

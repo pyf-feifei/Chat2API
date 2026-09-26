@@ -14,3 +14,8 @@ yarn-debug.log*
 yarn-error.log*
 *.log
 docs/screenshots
+.env
+.env.*
+!.env.example
+codex-session-*.md
+*.rollout

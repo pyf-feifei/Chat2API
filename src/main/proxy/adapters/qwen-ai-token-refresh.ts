@@ -5,6 +5,57 @@ import { storeManager } from '../../store/store'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const REFRESH_THRESHOLD_MS = 6 * 60 * 60 * 1000
+const DEFAULT_UNREGISTERED_STRIKES = 3
+const DEFAULT_UNREGISTERED_STRIKE_WINDOW_MS = 30 * 60 * 1000
+const DEFAULT_REJECTION_STREAK_LIMIT = 5
+const DEFAULT_REJECTION_STREAK_WINDOW_MS = 5 * 60 * 1000
+
+function envPositiveInt(name: string, fallback: number, minimum: number): number {
+  const raw = String(process.env[name] ?? '').trim()
+  if (raw === '') return fallback
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value >= minimum ? value : fallback
+}
+
+function envPositiveDuration(name: string, fallback: number, minimum: number): number {
+  const raw = String(process.env[name] ?? '').trim()
+  if (raw === '') return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= minimum ? Math.floor(value) : fallback
+}
+
+/** Consecutive "this account does not exist" verdicts required before freezing. */
+function unregisteredStrikesRequired(): number {
+  return envPositiveInt(
+    'CHAT2API_QWEN_AI_UNREGISTERED_STRIKES',
+    DEFAULT_UNREGISTERED_STRIKES,
+    1,
+  )
+}
+
+function unregisteredStrikeWindowMs(): number {
+  return envPositiveDuration(
+    'CHAT2API_QWEN_AI_UNREGISTERED_STRIKE_WINDOW_MS',
+    DEFAULT_UNREGISTERED_STRIKE_WINDOW_MS,
+    60_000,
+  )
+}
+
+function rejectionStreakLimit(): number {
+  return envPositiveInt(
+    'CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_LIMIT',
+    DEFAULT_REJECTION_STREAK_LIMIT,
+    1,
+  )
+}
+
+function rejectionStreakWindowMs(): number {
+  return envPositiveDuration(
+    'CHAT2API_QWEN_AI_REFRESH_REJECTION_STREAK_WINDOW_MS',
+    DEFAULT_REJECTION_STREAK_WINDOW_MS,
+    10_000,
+  )
+}
 
 type SetCookieHeader = string | string[] | undefined
 
@@ -14,6 +65,8 @@ type QwenAiRefreshError = Error & {
   retryable?: boolean
   accountFault?: boolean
   retryScope?: 'next-account'
+  /** The upstream explicitly reported that this account does not exist. */
+  unregistered?: boolean
   /** Persisted account state for an explicit, permanent credential result. */
   accountStatus?: 'inactive'
 }
@@ -210,6 +263,15 @@ function isRiskControlled(body: unknown, contentType?: string): boolean {
  * that has never been registered. Keep this classifier deliberately narrow:
  * ordinary invalid passwords and transient HTTP 401s must retain normal
  * account-failover semantics without permanently disabling the account.
+ *
+ * 2026-09-22 (local Docker): an egress-level rejection storm answered
+ * `email not found` for 340 healthy accounts, one after another. The previous
+ * pattern also accepted a bare `email ... not found`, so every account was
+ * persisted as `inactive` within ~2.4h and the pool never recovered: the
+ * session-repair queue only accepts `active` accounts, so the refresher could
+ * not undo its own verdict. A bare lookup miss is therefore NOT conclusive —
+ * only explicit absence wording (or an upstream error code) counts, and even
+ * then the verdict must repeat before it is persisted.
  */
 function isUnregisteredAccountResponse(body: unknown, detail?: string): boolean {
   let serialized = ''
@@ -219,22 +281,154 @@ function isUnregisteredAccountResponse(body: unknown, detail?: string): boolean 
     serialized = ''
   }
 
-  return /(?:not[\s_-]*registered|unregistered|(?:account|user|email)[\s_-]*(?:does[\s_-]*not|is[\s_-]*not|not)[\s_-]*(?:exist|found|registered)|user[\s_-]*not[\s_-]*found|account[\s_-]*not[\s_-]*found|USER_NOT_REGISTERED|ACCOUNT_NOT_REGISTERED|USER_NOT_FOUND|ACCOUNT_NOT_FOUND|(?:\u5e10\u6237|\u8d26\u6237|\u8d26\u53f7|\u7528\u6237)(?:\u672a\u6ce8\u518c|\u4e0d\u5b58\u5728))/i
+  return /(?:USER_NOT_REGISTERED|ACCOUNT_NOT_REGISTERED|USER_NOT_FOUND|ACCOUNT_NOT_FOUND|EMAIL_NOT_REGISTERED|not[\s_-]*registered|unregistered|(?:account|user|email)[\s_-]*(?:does[\s_-]*not[\s_-]*exist|is[\s_-]*not[\s_-]*registered|did[\s_-]*not[\s_-]*register)|(?:\u5e10\u6237|\u5e10\u6236|\u8d26\u6237|\u8d26\u6236|\u8d26\u53f7|\u7528\u6237|\u90ae\u7bb1|\u90ae\u4ef6\u7535\u5b50\u8d26\u6237|\u90f5\u7bb1)(?:\u672a\u6ce8\u518c|\u4e0d\u5b58\u5728))/i
     .test(`${detail || ''} ${serialized}`)
 }
 
-function persistUnregisteredAccount(account: Account, error: QwenAiRefreshError): void {
-  if (error.accountStatus !== 'inactive') return
+type UnregisteredStrikeState = {
+  strikes: number
+  firstAt: number
+  lastAt: number
+}
+
+function readUnregisteredStrikes(account: Account): UnregisteredStrikeState | undefined {
+  const strikes = Number(account.unregisteredStrikes)
+  const lastAt = Number(account.lastUnregisteredAt)
+  if (!Number.isFinite(strikes) || strikes <= 0 || !Number.isFinite(lastAt) || lastAt <= 0) {
+    return undefined
+  }
+
+  const firstAt = Number(account.firstUnregisteredAt)
+  return {
+    strikes,
+    lastAt,
+    firstAt: Number.isFinite(firstAt) && firstAt > 0 ? firstAt : lastAt,
+  }
+}
+
+/**
+ * Record one "account does not exist" verdict and freeze the account only once
+ * the upstream repeats it. Below the threshold the account keeps its current
+ * status: on 2026-09-22 the chat path of every "frozen" account was still
+ * healthy, so dropping it from the pool was pure loss.
+ */
+function persistUnregisteredAccount(
+  account: Account,
+  error: QwenAiRefreshError,
+  now: number = Date.now(),
+): { strikes: number; confirmed: boolean } {
+  const required = unregisteredStrikesRequired()
+  const previous = readUnregisteredStrikes(account)
+  const withinWindow = previous !== undefined
+    && now - previous.lastAt <= unregisteredStrikeWindowMs()
+  const strikes = (withinWindow ? previous!.strikes : 0) + 1
+  const firstAt = withinWindow ? previous!.firstAt : now
+  const confirmed = strikes >= required
+
+  error.accountStatus = confirmed ? 'inactive' : undefined
 
   try {
     storeManager.updateAccount(account.id, {
-      status: 'inactive',
+      ...(confirmed ? { status: 'inactive' as const } : {}),
       errorMessage: error.message,
+      unregisteredStrikes: strikes,
+      firstUnregisteredAt: firstAt,
+      lastUnregisteredAt: now,
     })
   } catch (persistError) {
     // Keep the auth failure visible even while persistence is unavailable.
     console.warn('[QwenAI] Failed to persist unregistered account state:', persistError)
   }
+
+  return { strikes, confirmed }
+}
+
+function clearUnregisteredStrikes(account: Account): void {
+  if (readUnregisteredStrikes(account) === undefined) return
+
+  try {
+    storeManager.updateAccount(account.id, {
+      unregisteredStrikes: 0,
+      firstUnregisteredAt: undefined,
+      lastUnregisteredAt: undefined,
+    })
+  } catch (persistError) {
+    console.warn('[QwenAI] Failed to clear unregistered account strikes:', persistError)
+  }
+}
+
+/** Exported for the background sweep: forget strikes after a healthy signin. */
+export { clearUnregisteredStrikes }
+
+// A burst of credential rejections across accounts is an egress/upstream
+// verdict, not N dead credentials. Several in a row inside a short window is
+// the same shape as the 2026-09-22 storm, so stop issuing refresh requests
+// instead of letting the sweep condemn the pool one account at a time.
+let refreshRejectionStreak = 0
+let refreshRejectionWindowStartedAt = 0
+let refreshRejectionStreakLoggedAt = 0
+
+function noteRefreshRejection(error: QwenAiRefreshError, now: number = Date.now()): void {
+  if (error.accountFault !== true) {
+    return
+  }
+
+  const windowMs = rejectionStreakWindowMs()
+  if (now - refreshRejectionWindowStartedAt > windowMs) {
+    refreshRejectionWindowStartedAt = now
+    refreshRejectionStreak = 0
+  }
+
+  refreshRejectionStreak += 1
+  if (refreshRejectionStreak < rejectionStreakLimit()) {
+    return
+  }
+
+  const streak = refreshRejectionStreak
+  const gateMs = openQwenAiRefreshRiskGate(now)
+  error.code = 'qwen_ai_token_refresh_rejected_storm'
+  error.message += ` — ${streak} consecutive credential rejections opened a `
+    + `${Math.ceil(gateMs / 1000)}s refresh gate`
+  refreshRejectionStreak = 0
+  refreshRejectionWindowStartedAt = 0
+
+  if (now - refreshRejectionStreakLoggedAt > 30_000) {
+    refreshRejectionStreakLoggedAt = now
+    console.warn('[QwenAI] credential-rejection storm — gating refreshes', JSON.stringify({
+      streak,
+      gateMs,
+    }))
+  }
+}
+
+function noteRefreshSuccess(): void {
+  refreshRejectionStreak = 0
+  refreshRejectionWindowStartedAt = 0
+}
+
+export interface QwenAiRefreshFaultStatus {
+  rejectionStreak: number
+  rejectionWindowStartedAt: number
+  riskGateRemainingMs: number
+}
+
+/** Fault-tracking snapshot for the governor/management views. */
+export function getQwenAiRefreshFaultStatus(now: number = Date.now()): QwenAiRefreshFaultStatus {
+  return {
+    rejectionStreak: refreshRejectionStreak,
+    rejectionWindowStartedAt: refreshRejectionWindowStartedAt,
+    riskGateRemainingMs: qwenAiRefreshRiskGateRemainingMs(now),
+  }
+}
+
+/** Reset the module-level fault trackers (tests and manual recovery). */
+export function resetQwenAiRefreshFaultTracking(): void {
+  refreshRejectionStreak = 0
+  refreshRejectionWindowStartedAt = 0
+  refreshRejectionStreakLoggedAt = 0
+  refreshRiskGateUntil = 0
+  refreshRiskGateHits = 0
+  refreshRiskGateLogged = 0
 }
 
 // A token-refresh risk-control hit is an aliyun WAF verdict against the EGRESS
@@ -326,7 +520,7 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
   }
 
   if (unregistered) {
-    return createRefreshError({
+    const unregisteredError = createRefreshError({
       message: `Qwen AI account is not registered${detailSuffix}`,
       status: 401,
       retryable: false,
@@ -334,6 +528,8 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
       retryScope: 'next-account',
       accountStatus: 'inactive',
     })
+    unregisteredError.unregistered = true
+    return unregisteredError
   }
 
   if (upstreamStatus >= 200 && upstreamStatus < 300) {
@@ -507,11 +703,14 @@ export class QwenAiTokenRefresher {
     const token = extractSignInToken(response.data)
     if (response.status !== 200 || !token || typeof token !== 'string') {
       const refreshError = createRefreshResponseError(response)
-      // Keep an explicitly unregistered account out of both the request
-      // load-balancer and the background session-repair queue until its
-      // login is fixed. Other 401/403/429 cases preserve their normal
-      // account-failover semantics.
-      persistUnregisteredAccount(account, refreshError)
+      // Both guards below exist because one upstream/egress verdict once took
+      // the whole 340-account pool offline (2026-09-22): a cross-account
+      // rejection burst opens the shared refresh gate, and only a repeated
+      // "account does not exist" verdict freezes an individual account.
+      noteRefreshRejection(refreshError)
+      if (refreshError.unregistered) {
+        persistUnregisteredAccount(account, refreshError)
+      }
       throw refreshError
     }
 
@@ -525,11 +724,15 @@ export class QwenAiTokenRefresher {
       ...(cookies ? { cookies } : {}),
     }
 
+    noteRefreshSuccess()
     const updated = storeManager.updateAccount(account.id, {
       email: account.credentials.email,
       credentials,
       status: 'active',
       errorMessage: undefined,
+      unregisteredStrikes: 0,
+      firstUnregisteredAt: undefined,
+      lastUnregisteredAt: undefined,
     })
 
     return updated ? {
@@ -541,6 +744,9 @@ export class QwenAiTokenRefresher {
       credentials,
       status: 'active',
       errorMessage: undefined,
+      unregisteredStrikes: 0,
+      firstUnregisteredAt: undefined,
+      lastUnregisteredAt: undefined,
       updatedAt: Date.now(),
     }
   }

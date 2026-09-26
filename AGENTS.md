@@ -637,6 +637,31 @@ supportedModels: ['GLM-5-Turbo', 'GLM-5', 'GLM-4.7', ...]
 **Read this before investigating any provider risk-control / ban / `RGV587` /
 `bxpunish` / `qwen_ai_content_verdict` issue.**
 
+### Check the credential chain FIRST, before the network at all
+
+Both failure modes below present identically: every request 403, the refresh
+gate closes, and the log fills with risk-control wording. The credential one
+takes one second to rule out and was missed for a full working session on
+2026-09-26, during which the egress IP, the Clash node and WAF rate limiting
+were all blamed in turn. None of them was the cause.
+
+```bash
+# Rule out unreadable credentials before touching the network.
+docker logs <container> 2>&1 | grep "Session Repair\] started"
+```
+
+`ready=0 pending=339` is the missing encryption key, not a ban. See
+[Credential Encryption](#credential-encryption-a-missing-key-looks-exactly-like-risk-control).
+`ready=339 pending=0` means the credentials are readable and a 403 is genuinely
+upstream, at which point the egress investigation below is the right next step.
+
+Order of investigation, cheapest first:
+
+1. `[Session Repair] started ready=N pending=M` — one second, local, no network
+2. `docker exec <c> printenv CHAT2API_STORAGE_ENCRYPTION_KEY` — is the key present
+3. the container's actual egress IP and its `org` field
+4. only then provider-side rate limits
+
 A recurring and expensive mistake is concluding that the operator's "residential
 IP got flagged". On 2026-09-25 this produced a wrong root cause and a wrong fix
 for a full Qwen pool outage. The rules:
@@ -726,19 +751,122 @@ $ docker exec chat2api node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).
 195.242.178.82      # the Clash node, not the residential IP
 ```
 
+### Find it in one command
+
+`docker info` names the culprit. If it prints a proxy, every container inherits
+it regardless of the container's own env:
+
+```bash
+$ docker info | grep -A2 "^ *Proxy"
+ HTTP Proxy:  http.docker.internal:3128
+ HTTPS Proxy: http.docker.internal:3128
+```
+
+Compare that address against the host's real egress. They differing is the
+diagnosis:
+
+```bash
+curl -s --noproxy '*' https://ipinfo.io/ip        # host, real egress
+docker exec <c> node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
+```
+
+### What does NOT work
+
+Do not spend time on these; each was measured and failed:
+
+| Attempt | Result |
+| --- | --- |
+| Set `HTTP_PROXY=` / `NO_PROXY=*` inside the container | no effect |
+| `docker run --network host` | no effect |
+| Turning off the Windows "Proxy" settings page alone | no effect — Docker re-detects on restart |
+| Editing `~/.docker/config.json` `proxies` | no effect — the value is not stored there |
+
+The interception happens in Docker Desktop's **VM network layer**, below the
+container's own network stack and above the container filesystem. Nothing set
+inside a container can reach it.
+
+### What does work
+
+1. Turn the Windows system proxy OFF (`ProxyEnable=0`) — otherwise Docker
+   re-applies it on every start.
+2. Set Docker Desktop's proxy mode to manual-with-no-address. It is persisted in
+   `%APPDATA%\Docker\marlin.dat` as a JSON fragment, not in `settings-store.json`:
+   `"proxyHTTPMode":{"Source":"defaults","Value":"system",...}` → `"manual"`.
+   Restart Docker Desktop afterwards.
+3. Verify:
+   ```bash
+   docker info | grep -A2 "^ *Proxy"          # expect nothing
+   docker exec <c> node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
+   ```
+
+Clash rules alone are **not** a fix for the container path: `DOMAIN-SUFFIX,...,DIRECT`
+in mihomo only affects traffic that traverses the proxy, and the container's
+direct traffic never reaches mihomo.
+
 Consequences when reasoning about Docker deployments:
 
-- `NO_PROXY` **inside the container is useless**, because the container has no
-  `HTTP_PROXY` to bypass. The interception happens below the container's network
-  stack, in Docker Desktop.
-- `egressPolicy.ts` is therefore a no-op for containers, and a no-op for any
-  process that has no proxy env to begin with.
-- The only effective fix for a proxied Docker host is `DOMAIN-SUFFIX,...,DIRECT`
-  rules in Clash/mihomo, because that operates at the socket layer.
+- `egressPolicy.ts` is a no-op for containers, and a no-op for any process that
+  has no proxy env to begin with.
+- With the egress now corrected, a single clean residential egress beats
+  rotating an unknown proxy pool for a modest account count. Webshare stays
+  useful as a *fallback* (the forwarder engages it only after a verdict), not as
+  the primary path.
 
 Corollary for desktop apps: turning off the Windows "Proxy" settings page does
 **not** stop Node/Electron, which read `HTTP_PROXY`/`HTTPS_PROXY` environment
 variables rather than WinINET settings. This is the most common false fix.
+
+## DNS Poisoning Looks Like A Dead API Key
+
+A `Webshare API rejected the key (HTTP 401)` on every key does not mean the keys
+are bad. On a filtered network `proxy.webshare.io` is poisoned and no request
+reaches Webshare, so every key fails identically:
+
+```bash
+$ for d in 192.168.31.1 223.5.5.5 1.1.1.1 8.8.8.8; do nslookup proxy.webshare.io $d; done
+  -> 2a03:2880:...:face:b00c::   (Meta/Facebook)  and  108.160.163.117  (Dropbox)
+```
+
+`face:b00c` in an IPv6 answer is Meta's signature; the 108.160.x / 162.125.x /
+157.240.x answers are Dropbox. Even a Chinese resolver's own DoH endpoint can be
+poisoned, so DoH is not automatically trustworthy here.
+
+Distinguish the two failures before touching credentials:
+
+```bash
+# direct (poisoned) vs through a tunnel with clean DNS
+curl -s --noproxy '*'  https://proxy.webshare.io/api/v2/proxy/list/ -o /dev/null -w '%{http_code}\n'
+curl -s --proxy http://127.0.0.1:7897 https://proxy.webshare.io/api/v2/proxy/list/ -o /dev/null -w '%{http_code}\n'
+```
+
+`000` direct and `200` via the tunnel is poisoning, not an invalid key. Fix it by
+pinning the real addresses, which containers keep across recreates:
+
+```yaml
+extra_hosts:
+  - "proxy.webshare.io:<real-ip>"
+```
+
+Get the real addresses from a resolver that is *not* on the poisoned path
+(mihomo's own DNS), and re-verify with
+`docker run --rm --add-host "proxy.webshare.io:<ip>" <image> …` before pinning.
+
+## Store Secrets Plainly Where the App Expects Plain Text
+
+`webshareProxyConfig` is stored **unencrypted** — `normalizeWebshareApiKey` and
+`normalizeWebshareEntry` in `src/main/store/types.ts` pass `apiKey` / `proxyUrl`
+through untouched, and production holds them in clear text. Encrypting them by
+hand (because every other credential in the store is encrypted) makes the
+runtime send the ciphertext as the API key, which surfaces only as a
+`401` in the sync log.
+
+Before hand-editing `data.json`, check how the field is read back:
+
+```bash
+grep -rn "normalizeWebshare" src/main/store/types.ts
+```
+
+If there is no `encryptData`/`decryptData` in that path, write plain text.
 
 ## Credential Encryption: A Missing Key Looks Exactly Like Risk Control
 
@@ -852,3 +980,33 @@ controlled. Both looked conclusive.
    reasoning from a log timeline.
 
 State the variable you are holding constant, and say which ones you are not.
+
+## Assert That A Measurement Is Physically Possible
+
+A third wrong number on 2026-09-26 came not from a bad experiment but from
+reporting a figure that cannot exist: a token saving of 252% of the baseline,
+produced by adding two measurements that overlapped. The baseline was 2,116,615
+and the reported saving was 5,348,553.
+
+Two independent contributions of the same session:
+
+1. **Add a range check to every aggregation before reporting it.** The cheapest
+   form is one line, and it has now caught every bad number in this repo:
+   ```js
+   if (saving < 0 || saving > baseline) {
+     console.error('the saving is outside [0, baseline]; this run is not usable')
+   }
+   ```
+   A reduction above 100%, a negative saving, or a `before` total smaller than
+   the corpus it came from means the aggregation is wrong, not that the feature
+   is unusually effective.
+2. **Know what your baseline is measured with, and prove the two agree.** When a
+   proxy reports its own `before`/`after`, a locally reimplemented estimator is a
+   cross-check, not a substitute. A 79% gap between them meant the local
+   estimator was dropping a whole content-part type. Do not report a local
+   number when the component under test already reports the same one.
+
+Corollary for shared infrastructure: a log is not a private scratch space.
+Correlate the lines you read back to the requests you sent (by `requestId`, or
+any per-request marker) before summing. Summing every line produced a total
+larger than the corpus, because another agent was writing to the same container.

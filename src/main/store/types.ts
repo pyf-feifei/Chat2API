@@ -338,8 +338,13 @@ export interface Account {
   requestCount?: number
   /** Daily request limit */
   dailyLimit?: number
-  /** Today used count */
+  /** Today used count (rolled over at the local day boundary) */
   todayUsed?: number
+  /**
+   * Local day key (`YYYY-MM-DD`) that `todayUsed` belongs to. Absent on older
+   * records, which is why the rollover treats a missing key as stale.
+   */
+  todayUsedDate?: string
   /**
    * Consecutive upstream "this account does not exist" verdicts. A single
    * verdict is never enough to freeze an account (see qwen-ai-token-refresh).
@@ -353,10 +358,10 @@ export interface Account {
    * End of the daily-quota exhaustion window (epoch ms), set when the upstream
    * answers a request with a quota notice in the message body.
    *
-   * Deliberately separate from `todayUsed`/`dailyLimit`: that counter is only
-   * ever incremented and `resetDailyUsage()` has no caller, so it can never be
-   * trusted as a per-day figure, and `dailyLimit` is unset on every account,
-   * which leaves the `todayUsed >= dailyLimit` guard in loadbalancer inert.
+   * Deliberately separate from `todayUsed`/`dailyLimit`: that counter is a
+   * local per-process estimate of usage, not the upstream's own quota state,
+   * and `dailyLimit` is unset on every account, which leaves the
+   * `todayUsed >= dailyLimit` guard in loadbalancer inert.
    * A quota resets at the upstream's day boundary, so the isolation has to
    * survive until then rather than for the minutes a risk cooldown lasts.
    */

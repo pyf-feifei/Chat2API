@@ -108,15 +108,32 @@ function applyPersistedConfigNow(): void {
 }
 
 function redactProxyUrl(proxyUrl: string): string {
-  return proxyUrl
+  try {
+    const parsed = new URL(proxyUrl)
+    if (parsed.username) parsed.username = '***'
+    if (parsed.password) parsed.password = '***'
+    return parsed.toString()
+  } catch {
+    return '<invalid-proxy-url>'
+  }
 }
 
 function statusPayload(config: WebshareProxyConfig | undefined): WebshareProxyStatusPayload {
   const runtimeEntries = websharePoolSnapshot()
   const sticky = webshareStickySnapshot()
+  const safeConfig = config
+    ? {
+        ...config,
+        proxyUrl: config.proxyUrl ? redactProxyUrl(config.proxyUrl) : '',
+        ...(config.apiKeys
+          ? {
+              apiKeys: config.apiKeys.map(key => ({ ...key, apiKey: '***' })),
+            }
+          : {}),
+      }
+    : { enabled: false, proxyUrl: '' }
   return {
-    ...(config ?? { enabled: false, proxyUrl: '' }),
-    // URLs shown in full for management UI; edits are by id.
+    ...safeConfig,
     entries: config?.entries?.map(entry => ({ ...entry, proxyUrl: redactProxyUrl(entry.proxyUrl) })),
     effective: {
       enabled: isWebshareProxyEnabled(),

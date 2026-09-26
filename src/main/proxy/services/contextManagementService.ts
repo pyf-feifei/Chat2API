@@ -8,6 +8,11 @@
 
 import type { ChatMessage } from '../types'
 
+export {
+  getUpstreamTokenOptimizerSettings,
+  optimizeUpstreamRequest,
+} from './upstreamTokenOptimizer.ts'
+
 /**
  * Sliding Window Strategy Configuration
  */

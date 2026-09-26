@@ -336,6 +336,13 @@ export function isQwenAiAccountFault(value: QwenAiAccountFailureClassification |
 }
 
 /** The only inferred retry scope that is safe to use for account rotation. */
+export function qwenAiManagedMaxAccountFailoversFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS
+  if (raw === undefined || raw.trim() === '') return 1
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 20) : 1
+}
+
 export function qwenAiAccountRetryScope(
   value: QwenAiAccountFailureClassification | undefined,
 ): 'next-account' | undefined {

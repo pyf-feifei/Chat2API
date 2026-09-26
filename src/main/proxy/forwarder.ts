@@ -1856,14 +1856,6 @@ export class RequestForwarder {
         // tests). Leave those to the governor's short account-neutral bench.
         if (result.accountFault !== false) {
           loadBalancer.markQwenAiRiskControl(account.id)
-          // A daily-quota refusal is account-bound and lasts until the
-          // upstream's day boundary, far longer than any risk cooldown, so a
-          // cooldown is the wrong tool: park the account instead. A quota
-          // notice carries no RGV587 envelope, so this cannot live in the
-          // risk-challenge branch.
-          if (result.errorCode === 'qwen_ai_daily_quota_exhausted') {
-            markAccountDailyQuotaExhausted(account.id)
-          }
         }
         void import('./adapters/qwen-risk-refresh')
           .then(module => module.noteQwenAiRiskChallenge(
@@ -2502,6 +2494,15 @@ export class RequestForwarder {
           lastRetryScope = undefined
         }
 
+        // A daily-quota refusal carries no RGV587 envelope and no bxpunish
+        // header, so it never reaches the risk branch inside
+        // scheduleQwenAiBusyRetry, and that closure returns early for anything
+        // that is not upstream-busy. Park it here, where every result passes:
+        // the account can only refuse again until the upstream's day boundary,
+        // whereas a risk cooldown lasts minutes.
+        if (result.errorCode === 'qwen_ai_daily_quota_exhausted') {
+          markAccountDailyQuotaExhausted(account.id)
+        }
         if (scheduleQwenAiBusyRetry(result)) {
           continue
         }

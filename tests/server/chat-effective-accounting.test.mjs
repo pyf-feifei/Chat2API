@@ -8,6 +8,7 @@ import { createAssistantOutputBoundaryStream } from '../../src/main/proxy/toolCa
 import {
   isQwenAiAccountFault,
   qwenAiAccountRetryScope,
+  qwenAiManagedMaxAccountFailoversFromEnv,
 } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
@@ -265,7 +266,11 @@ function loadChatRoute({
       createAssistantOutputBoundaryStream,
       guardAssistantOutputCompletion: completion => completion,
     },
-    '../qwenAiAccountPolicy': { isQwenAiAccountFault, qwenAiAccountRetryScope },
+    '../qwenAiAccountPolicy': {
+      isQwenAiAccountFault,
+      qwenAiAccountRetryScope,
+      qwenAiManagedMaxAccountFailoversFromEnv,
+    },
     '../qwenBusyFailover': {
       createQwenAiBusyFailoverStopRule: () => () => false,
     },
@@ -277,6 +282,13 @@ function loadChatRoute({
       slimQwenAiReplayImages: messages => messages,
       qwenAiImageSlimModeFromEnv: () => 'off',
       shouldSlimQwenAiAttemptImages: () => false,
+    },
+    // Provider-neutral image slimming (Phase 2/4): the route asks the policy
+    // layer instead of the Qwen-only trigger. The harness declines to slim so
+    // it keeps exercising the accounting path.
+    '../imageSlimPolicy': {
+      resolveImageSlimPolicy: () => undefined,
+      imageSlimModeFromEnv: () => 'off',
     },
   }
   const testRequire = specifier => {
@@ -293,6 +305,24 @@ function loadChatRoute({
         getWebshareProxyAgent: () => undefined,
         webshareProxyUrlForLog: () => undefined,
       }
+    }
+    if (specifier === './services/retrievalTool' || specifier === './services/retrievalTool.ts') {
+      return { stripRetrievalTool: tools => tools, extractArchiveHashes: () => [] }
+    }
+    if (specifier === './services/retrievalSettings' || specifier === './services/retrievalSettings.ts') {
+      return { getRetrievalSettings: () => ({ enabled: false, maxRetrievalsPerRequest: 4 }), nonNegativeEnv: (_k, d) => d }
+    }
+    if (specifier === './services/retrievalLoop' || specifier === './services/retrievalLoop.ts') {
+      return { runWithRetrievalLoop: async ({ attempt, baseRequest }) => ({ response: await attempt(baseRequest), turns: 0, resolved: [] }) }
+    }
+    if (specifier === './services/compressionArchive' || specifier === './services/compressionArchive.ts') {
+      return { CompressionArchive: class { constructor() { this.records = new Map() } record() { return undefined } resolve() { return undefined } forget() {} stats() { return { entries: 0, chars: 0, maxChars: 0, ttlMs: 0 } } }, buildScope: (p, a, c) => [p, a, c || 'req'].join(':') }
+    }
+    if (specifier === './toolCalling/localToolCalls' || specifier === './toolCalling/localToolCalls.ts') {
+      return { partitionLocalToolCalls: ({ toolCalls }) => ({ clientCalls: toolCalls, local: [] }), runWithLocalToolContext: (_c, fn) => fn(), getLocalToolContext: () => undefined }
+    }
+    if (specifier === '../runtime/index' || specifier === '../runtime/index.ts') {
+      return { getRuntime: () => ({ getDataDir: () => process.cwd(), getResourcePath: (f) => f, kind: 'node' }) }
     }
     throw new Error(`Unexpected chat route test import: ${specifier}`)
   }

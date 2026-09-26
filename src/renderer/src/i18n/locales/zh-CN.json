@@ -592,6 +592,7 @@
         "pending": "等待修复",
         "repairing": "修复中",
         "backoff": "退避重试",
+        "probe": "已冻结 — 等待重新探测",
         "unrepairable": "缺少登录信息"
       },
       "queue": "排队",

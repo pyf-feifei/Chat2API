@@ -132,7 +132,13 @@ export function normalizeQwenAiModelModeName(modelName: string): string {
  * xhigh|default and modes fast|auto|thinking. Unknown or malformed entries
  * fall back to the verified default table rather than failing the request.
  */
-const QWEN_AI_EFFORT_MODE_MAP_DEFAULT = 'minimal:fast,low:fast,medium:fast,high:auto,xhigh:thinking,ultracode:thinking,max:thinking,default:auto'
+// Verified against chat.qwen.ai on 2026-09-25: the upstream thinking_mode enum
+// is an on/off switch, not a depth dial, and its "Thinking" member is not
+// deeper than "Auto" (high/Auto ~4.5k reasoning chars vs xhigh/Thinking ~3.5k,
+// n=4 each). prompt-side directives cannot switch the phase on (Fast + deep
+// directive is still 0, n=3), so this table only decides *whether* the model
+// thinks, while depth is carried by qwen-ai-depth-prompt.ts.
+const QWEN_AI_EFFORT_MODE_MAP_DEFAULT = 'minimal:fast,low:fast,medium:thinking,high:thinking,xhigh:thinking,ultracode:thinking,max:thinking,default:auto'
 
 let warnedUnknownEffortModeMap = false
 
