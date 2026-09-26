@@ -1846,7 +1846,6 @@ export class RequestForwarder {
       const bxpunishHeaderEarly = Object.entries(result.headers || {})
         .find(([key]) => key.toLowerCase() === 'bxpunish')?.[1]
       const riskChallengeEvidence = /FAIL_SYS_USER_VALIDATE|RGV587/i.test(result.error ?? '')
-        || (bxpunishHeaderEarly !== undefined && bxpunishHeaderEarly !== '' && bxpunishHeaderEarly !== '0')
       if (riskChallengeEvidence) {
         // Account-bound challenges (FAIL_SYS_USER_VALIDATE on a sticky session)
         // still need an immediate balancer bench so the pool rotates off the
@@ -1858,9 +1857,10 @@ export class RequestForwarder {
         if (result.accountFault !== false) {
           loadBalancer.markQwenAiRiskControl(account.id)
           // A daily-quota refusal is account-bound and lasts until the
-          // upstream's day boundary, far longer than any risk cooldown. Park
-          // the account so the balancer stops selecting it: re-selecting it
-          // only spends another request to receive the same notice.
+          // upstream's day boundary, far longer than any risk cooldown, so a
+          // cooldown is the wrong tool: park the account instead. A quota
+          // notice carries no RGV587 envelope, so this cannot live in the
+          // risk-challenge branch.
           if (result.errorCode === 'qwen_ai_daily_quota_exhausted') {
             markAccountDailyQuotaExhausted(account.id)
           }
