@@ -43,6 +43,7 @@ import {
   sanitizeDeepSeekModelOverrides,
 } from './types.ts'
 import { BUILTIN_PROMPTS } from '../data/builtin-prompts.ts'
+import { assertCredentialHealth, CredentialUnreadableError } from './credentialSelfCheck.ts'
 import { RequestLogManager } from '../requestLogs/manager.ts'
 import { normalizeRequestLogConfig } from '../requestLogs/types.ts'
 import { normalizeToolCallingConfig } from '../../shared/toolCalling.ts'
@@ -107,9 +108,20 @@ class StoreManager {
       await this.initializeRequestLogManager(storagePath)
       this.initializeDefaultModelMappings()
       await this.initializeDefaultProviders()
+      this.runCredentialSelfCheck()
       this.isInitialized = true
       this.initializationError = null
     } catch (error) {
+      // An unreadable-but-intact store is not corruption. Backing the file up
+      // and re-initializing would start the process with credentials that
+      // cannot be used, which is the silent risk-control degradation the
+      // self-check exists to prevent, so surface it and stop.
+      if (error instanceof CredentialUnreadableError) {
+        console.error('[Store] Initialization aborted:', error.message)
+        this.initializationError = error
+        throw error
+      }
+
       console.error('[Store] Failed to initialize storage:', error)
       this.initializationError = error instanceof Error ? error : new Error(String(error))
       
@@ -121,6 +133,7 @@ class StoreManager {
         await this.initializeRequestLogManager(storagePath)
         this.initializeDefaultModelMappings()
         await this.initializeDefaultProviders()
+        this.runCredentialSelfCheck()
         this.isInitialized = true
         this.initializationError = null
         console.log('[Store] Successfully recovered from corrupted data')
@@ -188,6 +201,30 @@ class StoreManager {
     return getRuntime().isEncryptionAvailable()
       ? 'chat2api-fixed-encryption-key-v1'
       : undefined
+  }
+
+  /**
+   * Refuse to start when the stored credentials cannot be read.
+   *
+   * A missing CHAT2API_STORAGE_ENCRYPTION_KEY does not throw anywhere: the
+   * runtime simply returns the `c2a:v1:…` ciphertext unchanged, every account
+   * then looks like it has no session, and the instance degrades into upstream
+   * risk control instead of reporting a configuration error. On 2026-09-26
+   * that cost a full debugging session because it presented as an account
+   * outage. See credentialSelfCheck.ts for the full chain.
+   */
+  private runCredentialSelfCheck(): void {
+    const accounts = (this.store?.get('accounts') || []) as Account[]
+    if (accounts.length === 0) return
+
+    const runtime = getRuntime()
+    assertCredentialHealth(
+      accounts,
+      runtime.isEncryptionAvailable(),
+      // Deliberately the same path the rest of the store uses, so the check
+      // observes exactly what the request path will observe.
+      (value) => this.decryptData(value),
+    )
   }
 
   /**
