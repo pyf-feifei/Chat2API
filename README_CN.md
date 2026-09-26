@@ -129,6 +129,183 @@ print(response.choices[0].message.content)
 
 Codex CLI 请使用 Responses 接口并参考 [docs/codex.md](docs/codex.md)。
 
+## 网络出口：让服务商流量绕过本地代理
+
+Chat2API 必须通过你**真实**的网络路径访问服务商 API，而不是走本地 HTTP/SOCKS
+代理。一旦走错，会出现一整类看起来像“账号问题”或“内容问题”、实则是出口问题的
+上游故障。
+
+这不是假设。2026-09-25，一台开启了 Clash Verge 且设置了
+`HTTP_PROXY`/`HTTPS_PROXY=http://127.0.0.1:7897` 的 Windows 主机，把**所有**服务商
+请求都发到了一个托管在 `195.242.178.82` 的 `hysteria2` 节点上——而那台机器正是运行
+生产环境的服务器。于是 Qwen 看到的是一个共享的美国机房出口，而不是家宽 IP，阿里云
+WAF 随之返回 `bxpunish` / `RGV587` 风控判定（`qwen_ai_content_verdict`、
+“egress-IP flag”）。**家宽 IP 从未被封，它只是压根没被用上。**
+
+### 自动防护
+
+`src/main/proxy/egressPolicy.ts` 在 Electron 主进程与无头服务端中均先于任何网络模块
+执行，它会把服务商域名追加到 `NO_PROXY`/`no_proxy`。之所以能立即生效，是因为 axios
+使用的解析库 `proxy-from-env` 会在**每次请求时**读取 `process.env`，因此对已经创建
+好的 axios 实例同样生效。你**无需**做任何配置。
+
+默认直连的域名：`.qwen.ai`、`.qianwen.com`、`.aliyuncs.com`、`.alibabacloud.com`、
+`.alicdn.com`，以及 `localhost` 和 `127.0.0.1`。
+
+| 变量 | 作用 |
+| --- | --- |
+| `CHAT2API_EGRESS_DIRECT=off` | 关闭该策略（服务商流量重新走代理） |
+| `CHAT2API_EGRESS_DIRECT=a.com,b.com` | 替换内置列表 |
+| `CHAT2API_EGRESS_DIRECT_EXTRA=c.com` | 追加到内置列表 |
+
+### 自行验证出口
+
+```bash
+# 策略生效后应用会走的路径
+node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https://chat.qwen.ai/api/v1/chat')||'DIRECT')"
+
+# 真实网络出口
+curl -s https://ipinfo.io/ip
+```
+
+第一个命令输出 `DIRECT` 是预期结果。如果第二个命令返回的是机房 AS（如 `AS7488`），
+说明 Chat2API 上游仍有东西在代理。（`AS4837` 属于正常家宽运营商。）
+
+### Clash Verge / Mihomo
+
+应用层策略管不到浏览器。如果同一账号在浏览器和 Chat2API 上使用不同出口，上游会看到
+账号在两个 IP 之间“跳动”，这在风控看来极像账号被盗。请在订阅覆写里把相同域名加为
+`DIRECT`，且必须放在 `MATCH,PROXY` **之前**：
+
+```yaml
+prepend:
+  - DOMAIN-SUFFIX,qwen.ai,DIRECT
+  - DOMAIN-SUFFIX,qianwen.com,DIRECT
+  - DOMAIN-SUFFIX,aliyuncs.com,DIRECT
+  - DOMAIN-SUFFIX,alibabacloud.com,DIRECT
+  - DOMAIN-SUFFIX,alicdn.com,DIRECT
+```
+
+在 Clash Verge 中，该文件位于
+`%APPDATA%/io.github.clash-verge-rev.clash-verge-rev/profiles/<uid>.yaml`。
+改完后需在 UI 里重载订阅；核心以服务方式运行，无管理员权限的 shell 无法重启它。
+
+> **Docker 注意**：Docker Desktop 的网络层会继承 Windows 系统代理，所以即使容器内
+> **没有** `HTTP_PROXY`，流量照样被本地代理接管。在容器内设 `NO_PROXY` 无效。对
+> Docker 部署而言，**上面这些 Clash 规则才是真正的修复**，而不是应用层策略。
+
+**完整配置、验证与排障：[docs/network-egress.md](docs/network-egress.md)。**
+
+### 不要在工作机上跑全量账号池
+
+服务商的限流维度是**出口 IP**，不是账号。无论账号从何而来，单一 IP（尤其是共享机房
+IP）上驱动约 340 个账号，本身就是一个异常形态。请把完整账号池留在生产服务器上，
+本地只用一个账号做功能验证。
+
+一旦出现风控判定，Chat2API 会自动兜底。`bxpunish` / `RGV587` 判定由出口路径决定，
+而非某个特定请求体，所以除了按请求指纹的熔断之外，还有一个**进程级出口熔断**：
+当 `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS`（默认 5 分钟）窗口内有
+`CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD`（默认 3）个**不同请求体**被判风控时，
+所有新的 Qwen AI 流量会直接以 `503 qwen_ai_risk_circuit_open` 和 `Retry-After`
+拒绝，**在消耗下一个账号之前**就停住。只要有一次上游成功响应即自动关闭，因此修好路由
+后能立即恢复，而不必等完整个冷却期。
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `3` | 多少个不同请求体被拒后停住整个出口；设为 `0` 则首次判定即停 |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `600000` | 出口停住的时长 |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` | `300000` | 统计风控判定的时间窗口 |
+
+## 必须配置存储加密密钥
+
+账号凭据在落盘时会被加密。**密钥必须在所有共用同一份数据文件的实例之间保持一致，
+并且必须真正传到进程里。**
+
+```bash
+CHAT2API_STORAGE_ENCRYPTION_KEY=change-this-to-a-long-random-secret
+```
+
+选一次值，固定写在 `.env` 里，桌面端和所有共用该存储的 Docker 部署都用同一个值。
+
+```bash
+# 确认密钥已进入进程
+docker exec chat2api printenv CHAT2API_STORAGE_ENCRYPTION_KEY
+```
+
+> **容器必须用 `docker compose up -d` 启动，不要用 `docker run`。** 用
+> `docker run` 创建的容器没有 compose 标签，`docker compose up` 会拒绝接管它，
+> `.env` 也就永远不会被注入——进程会在没有密钥的情况下静默运行。
+
+### 如果密钥缺失或与数据不匹配
+
+不会抛任何错。运行时会原样返回 `c2a:v1:…` 密文，于是每个账号都被当成"没有会话"，
+修复队列每 25 秒对 339 个账号发起 signin，上游返回 `401 email not found`，
+拒绝风暴打开风控闸门（300s → 600s → 1200s → 2400s），最终**包括普通聊天在内的所有
+请求都返回 `403 qwen_ai_token_refresh_gated`**。它表现为一次风控故障，实际上是配置错误。
+
+现在启动自检会直接拦住它：
+
+```
+[CredentialSelfCheck] Credential data is encrypted (c2a:v1:…) but encryption is
+not available. … Set CHAT2API_STORAGE_ENCRYPTION_KEY … and recreate the instance
+so the variable actually reaches the process (a container started with `docker run`
+never reads .env).
+[Store] Initialization aborted: Credential data is encrypted but
+CHAT2API_STORAGE_ENCRYPTION_KEY is not usable
+```
+
+修好后必须**重建**容器（环境变量只在进程启动时读取一次，`docker restart` 不够）：
+
+```bash
+docker compose up -d --force-recreate
+```
+
+区分它和真实风控最快的办法——对比两个环境的 session repair 启动行：
+
+```
+已损坏:  [QwenAI Session Repair] started ready=0 pending=339
+健康:    [QwenAI Session Repair] started ready=339 pending=0
+```
+
+`ready=0 pending=339` 说明凭据读不出来，而不是上游在拦你。只有存储确实是明文时，
+才用 `CHAT2API_CREDENTIAL_SELF_CHECK=off` 绕过该自检。
+
+## 本地与生产部署注意事项
+
+在同一台机器上让桌面端和 Docker 服务端共用同一批账号，需要多加注意。
+
+| 关注点 | 桌面端（工作机） | Docker（生产） |
+| --- | --- | --- |
+| 建议账号数量 | 1–3 个，仅做功能验证 | 完整账号池 |
+| 出口 | 家宽 IP，不走代理 | 固定服务器 IP，不走代理 |
+| 禁止 | 驱动生产账号池，或从本机做压测 | — |
+
+- **不要**让本地实例和生产容器在同时运行时指向同一个 `accounts.json`/`/data` 卷。
+  双方会互相覆盖 `status`/`errorMessage` 字段，且各自的修复队列会与对方的判定相互
+  干扰。
+- **不要**在工作机上做压测或长时间浸泡测试。上游限流是按出口 IP 计的，本机压测损害的
+  是生产账号池，而不是在度量代码。
+- **不要**在容器运行时直接改数据卷。请先停容器、改完再启动；否则内存态会在下一次保存时
+  把你的修改覆盖掉。动手前先备份：
+  ```bash
+  docker exec chat2api cat /data/data.json > data.json.backup
+  ```
+- 桌面端会自动应用直连策略；若你在同样配置了代理的主机上跑 Docker 镜像，无头服务端会
+  应用同一策略。只有当你**确实希望**该路径经过代理时，才设置
+  `CHAT2API_EGRESS_DIRECT=off`。但 Docker 主机仍需配置 Clash 规则，详见
+  [docs/network-egress.md](docs/network-egress.md)。
+
+两种长得一样但根因无关的故障，详见
+[docs/network-egress.md](docs/network-egress.md#9-symptom--cause)：
+
+| 现象 | 根因 |
+| --- | --- |
+| 出口显示机房 AS | 本地代理被 Docker Desktop 继承 |
+| 所有请求 403、账号"假死" | 存储加密密钥缺失/不匹配 |
+
+另见 2026-09-25 全池故障的复盘：
+[docs/diag-2026-09-25-qwen-egress.md](docs/diag-2026-09-25-qwen-egress.md)。
+
 ## 截图
 
 | 仪表盘 | 服务商 |

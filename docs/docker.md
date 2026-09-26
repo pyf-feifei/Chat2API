@@ -186,6 +186,27 @@ CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED=true
 CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT=20
 CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
 CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS=30000
+# Codex managed-tool turns use at most one account failover by default.
+CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=5
+CHAT2API_QWEN_AI_MANAGED_MAX_ACCOUNT_FAILOVERS=1
+# A terminal risk verdict blocks identical transcript replays for 10 minutes.
+CHAT2API_QWEN_AI_RISK_CIRCUIT_COOLDOWN_MS=600000
+CHAT2API_QWEN_AI_RISK_CIRCUIT_THRESHOLD=2
+# Egress-level circuit. A bxpunish/RGV587 verdict is decided by the egress path,
+# not by one payload, so the per-fingerprint circuit above cannot stop the rest
+# of the pool. After this many DISTINCT payloads are rejected inside the window,
+# all new Qwen AI traffic is refused with 503 qwen_ai_risk_circuit_open *before*
+# another account is consumed. One accepted upstream response closes it. Set
+# THRESHOLD=0 to park on the first verdict. See docs/network-egress.md.
+CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD=3
+CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS=600000
+CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS=300000
+# Keep provider traffic off any host-level HTTP proxy. "on" (default) appends
+# the provider domains to NO_PROXY. NOTE: on Docker Desktop the container's
+# network layer inherits the Windows system proxy, so this cannot help a
+# container — configure DIRECT rules in Clash/mihomo instead. See
+# docs/network-egress.md.
+CHAT2API_EGRESS_DIRECT=on
 QWEN_AI_REQUEST_TIMEOUT_MS=840000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
@@ -216,12 +237,70 @@ CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL=native
 # Keep context compaction detection disabled so the proxy forwards the full
 # client history; set to auto only when the service should own compaction.
 CHAT2API_COMPACTION_DETECTION=off
+# Optional upstream token optimizer. `dry-run` only reports candidate
+# savings; `safe` compacts eligible old tool text; `balanced` enables the
+# explicit experimental lossy task-aware excerpt mode. Default is off.
+CHAT2API_UPSTREAM_TOKEN_OPTIMIZER=off
+CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_TOKENS=20000
+CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_RECENT_MESSAGES=8
+CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MIN_SAVINGS=64
+CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_MAX_TOOL_TEXT_CHARS=16000
+# Live-zone floor. Messages below this index are treated as the provider's
+# frozen prompt-cache prefix and are never rewritten. 0 derives the floor from
+# client `cache_control` breakpoints, and falls back to 0 when none are sent.
+CHAT2API_UPSTREAM_TOKEN_OPTIMIZER_FROZEN_PREFIX_MESSAGES=0
+# Recoverable compression (CCR). When `balanced` omits a span, the dropped text
+# is archived and the marker carries a content hash.
+#
+# Retrieval is the expansion half. Off by default. When on, the model is taught
+# a `retrieve_tool_output` tool ONLY on requests that already carry an archive
+# marker, and the call is resolved in this process; the client never sees it.
+#
+# STREAMING BEHAVIOUR. An armed streaming turn that asks to retrieve buffers its
+# first turn, resolves, continues, and emits only the continuation — so
+# time-to-first-token for those turns is the whole first turn. A turn that never
+# asks emits its first turn byte-identical to an unarmed one. A turn whose
+# continuation fails, or that exhausts the budget, still emits its first turn:
+# the client already paid for it.
+CHAT2API_COMPRESS_RETRIEVAL=off
+CHAT2API_COMPRESS_MAX_RETRIEVALS_PER_REQUEST=4
+# Defaults to <CHAT2API_DATA_DIR>/compression-archive.json. The store is shared
+# process-wide; isolation is by scope, not by file, so one account can never
+# read another account's spans.
+CHAT2API_COMPRESS_ARCHIVE_PATH=
+CHAT2API_COMPRESS_ARCHIVE_TTL_MS=86400000
+CHAT2API_COMPRESS_ARCHIVE_MAX_CHARS=67108864
+# Replay image slimming, Qwen only. `on-busy` (default) reacts to an
+# upstream-busy rejection; `always` slims from the first attempt. The reactive
+# trigger is a Qwen getstsToken-quota defense and is not honoured elsewhere.
+CHAT2API_QWEN_AI_REPLAY_SLIM_IMAGES=on-busy
+CHAT2API_QWEN_AI_REPLAY_KEEP_LAST_IMAGE_MESSAGES=1
+CHAT2API_QWEN_AI_REPLAY_KEEP_FIRST_IMAGE_MESSAGES=0
+CHAT2API_QWEN_AI_REPLAY_IMAGE_PLACEHOLDER=
+# Replay image slimming, every other vision provider. See the precedence rules
+# below; the short version is that Qwen reads only the Qwen family above, and
+# this mode defaults to off WITHOUT inheriting the Qwen value.
+CHAT2API_REPLAY_SLIM_IMAGES=off
+CHAT2API_REPLAY_SLIM_PROVIDERS=
+CHAT2API_REPLAY_SLIM_MODELS=
+# Unset values fall back to the Qwen-named knobs. KEEP_LAST is clamped to at
+# least 1 so the newest image-bearing message always survives; it counts
+# image-bearing MESSAGES, not images.
+CHAT2API_REPLAY_KEEP_LAST_IMAGE_MESSAGES=1
+CHAT2API_REPLAY_KEEP_FIRST_IMAGE_MESSAGES=0
+CHAT2API_REPLAY_IMAGE_PLACEHOLDER=
+# MiMo Web query headroom: long history is uploaded as a file attachment before
+# the rendered query reaches the upstream 44k–52k character limit.
+MIMO_FILE_OFFLOAD_THRESHOLD_CHARS=8000
+MIMO_QUERY_MAX_CHARS=32000
 CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
 CHAT2API_QWEN_AI_RETRY_COUNT=1
 # RGV587/overload busy windows usually clear within seconds: retry the same
 # account once with exponential backoff before account rotation. 0 rotates
 # immediately (old policy).
 CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+# Perturb every attempt so reconnect-driven replays do not reuse a cached verdict.
+CHAT2API_QWEN_AI_RETRY_NONCE_SCOPE=always
 # Content-determined 422 failures (dangling answers, wrapper leaks, malformed
 # tool calls) follow the request, not the account: the cap bounds how many
 # extra accounts replay the identical content. 0 = one second account (the
@@ -470,6 +549,90 @@ penalize or rotate the account. If a response resume returns `The request is
 ended!`, Chat2API abandons that response ID and replays the complete request
 once in a fresh chat on the same credential; a second ended result is returned
 as an explicit `502`.
+
+## Replay Image Slimming
+
+A replayed conversation re-sends every embedded image. On a visual-iteration
+session that is tens of 200 KB base64 payloads per turn. In a real captured
+Codex replay, **90.7% of the estimated input tokens** were inline base64 images
+inside tool results (17 of 181 outputs). Slimming replaces the older ones with a
+short text placeholder.
+
+There are two variable families and the precedence between them is not
+symmetric.
+
+| | Qwen family | Provider-neutral family |
+| --- | --- | --- |
+| Variables | `CHAT2API_QWEN_AI_REPLAY_*` | `CHAT2API_REPLAY_*` |
+| Applies to | `qwen-ai` only | every other vision provider |
+| Default mode | `on-busy` | `off` |
+| `on-busy` honoured | yes | **no** |
+
+Rules, in order:
+
+1. **Qwen AI reads only the Qwen family.** Setting `CHAT2API_REPLAY_*` has no
+   effect on it. A Qwen deployment behaves identically whether or not the newer
+   variables exist.
+2. **Other providers read the provider-neutral family.**
+3. **Unset keep counts and the placeholder fall back to the Qwen-named values.**
+   A deployment that already tuned `KEEP_LAST` gets the same numbers everywhere.
+4. **The mode itself does NOT fall back.** This is the asymmetry that matters: a
+   deployment running Qwen at `on-busy` must not silently start proactively
+   slimming its other providers because a new variable was added.
+5. **`on-busy` is Qwen-only.** It reacts to `qwen_ai_upstream_busy`, which is a
+   `getstsToken` per-minute quota defense. Another provider reporting busy is a
+   different failure and does not imply that re-sending the same images helps.
+
+### Which providers are eligible
+
+Eligibility comes from `src/main/proxy/imageSlimPolicy.ts`. The flag describes
+**Chat2API's adapter**, not the vendor's API: a provider whose public API
+accepts images but whose adapter never uploads them is not eligible, because
+slimming such a request would be measuring the wrong thing.
+
+| Eligible | Not eligible |
+| --- | --- |
+| `qwen-ai`, `glm`, `zai`, `mimo`, `m365-copilot` | `kimi`, `minimax` (mention `image_url` but only to pick a focus message) |
+| | `qwen`, `deepseek`, `perplexity` (no image handling) |
+| | any unlisted or custom provider |
+
+A custom provider can opt in with `modelCapabilities[model].vision = true` in its
+provider config. An unlisted provider is treated as not eligible and logs once
+per process.
+
+`CHAT2API_REPLAY_SLIM_PROVIDERS` and `CHAT2API_REPLAY_SLIM_MODELS` narrow the
+set further. They cannot widen it.
+
+### Keep-set invariants
+
+- The **newest** image-bearing message is never slimmed, regardless of
+  configuration. `KEEP_LAST` is clamped to at least 1, and the transform
+  independently guarantees it, so a hand-built config cannot discard the image
+  the model is about to reason about.
+- `KEEP_FIRST` and `KEEP_LAST` count image-bearing **messages**, not images.
+- Only `image_url`, `input_image`, and `image` parts are touched. `file` parts
+  are left alone.
+
+### Measurement
+
+When slimming runs, both routes log:
+
+```text
+[ChatSlim] replay image slimming {"imageSlimApplied":true,"imageSlimReason":"proactive",
+ "imageSlimKeepFirst":0,"imageSlimKeepLast":1,"imageMessagesSlimmed":12,
+ "imagePartsSlimmed":12,"imageCharsSlimmed":2411728}
+```
+
+`imageCharsSlimmed` converts into the same token units the text optimizer
+reports as `estimatedSaved`, so the two tracks can be added without double
+counting. The log carries counts only: a data URL, a filename, or a placeholder
+body is identifying, and image payloads routinely carry file content.
+
+### Desktop
+
+The desktop build needs no extra runtime for this feature. It does not bundle a
+Python interpreter and does not need one here. If no eligible provider is
+selected, the request reaching the provider is byte-identical to `off`.
 
 ## Upstream Update Flow
 

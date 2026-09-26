@@ -151,3 +151,13 @@ scripts/zai-captcha/__pycache__/
 # Mimo browser-login local debug artifacts (screenshots / geetest captures)
 scripts/mimo-login/artifacts/
 scripts/mimo-login/__pycache__/
+
+# Pre-deploy data snapshots. These are full store exports containing every
+# account's `credentials` blob (encrypted, but still the live account pool).
+# Never commit them; keep them out of the repo entirely.
+backups/
+
+# Agent session transcripts exported as documents. Large, and they quote live
+# config, tokens and command output from the session.
+pi-session-*.html
+codex-session-*.md

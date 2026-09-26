@@ -130,6 +130,209 @@ print(response.choices[0].message.content)
 
 For Codex CLI, use the Responses endpoint and the configuration in [docs/codex.md](docs/codex.md).
 
+## Network egress: keep provider traffic off your local proxy
+
+Chat2API must reach provider APIs over your **real** network path, not through a
+local HTTP/SOCKS proxy. If it does not, an entire class of upstream failures
+appears that looks like an account or content problem but is really an egress
+problem.
+
+This is not hypothetical. On 2026-09-25 a Windows host with Clash Verge and
+`HTTP_PROXY`/`HTTPS_PROXY=http://127.0.0.1:7897` sent **every** provider request
+through a `hysteria2` node hosted on `195.242.178.82` — the same machine running
+the production deployment. Qwen therefore saw a shared US-datacenter egress
+instead of the residential IP, and Aliyun WAF answered with `bxpunish` /
+`RGV587` risk verdicts (`qwen_ai_content_verdict`, "egress-IP flag"). The home
+IP was never banned; it was simply never used.
+
+### Automatic protection
+
+`src/main/proxy/egressPolicy.ts` runs before any network module in both the
+Electron main process and the headless server, and appends the provider domains
+to `NO_PROXY`/`no_proxy`. It works because `proxy-from-env` — the resolver axios
+uses — reads `process.env` on every request, so the change takes effect
+immediately for axios instances that already exist. You do **not** need to
+configure anything.
+
+Domains kept direct by default: `.qwen.ai`, `.qianwen.com`, `.aliyuncs.com`,
+`.alibabacloud.com`, `.alicdn.com`, plus `localhost` and `127.0.0.1`.
+
+| Variable | Effect |
+| --- | --- |
+| `CHAT2API_EGRESS_DIRECT=off` | Disable the policy (route provider traffic through the proxy again) |
+| `CHAT2API_EGRESS_DIRECT=a.com,b.com` | Replace the built-in list |
+| `CHAT2API_EGRESS_DIRECT_EXTRA=c.com` | Append to the built-in list |
+
+### Verify your own egress
+
+```bash
+# What your app will use after the policy runs
+node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https://chat.qwen.ai/api/v1/chat')||'DIRECT')"
+
+# What the network really is
+curl -s https://ipinfo.io/ip
+```
+
+`DIRECT` on the first command is expected. If the second command returns a
+datacenter AS (`AS7488`, `AS4837` is fine — that is a residential carrier),
+something upstream of Chat2API is still proxying.
+
+### Clash Verge / Mihomo
+
+The app-level policy does not cover your browser. If the same account is used in
+the browser and through Chat2API on different egresses, the upstream sees the
+account "hop" between IPs, which looks like a stolen account. Add the same
+domains as `DIRECT` rules in the profile enhancement **before** `MATCH,PROXY`:
+
+```yaml
+prepend:
+  - DOMAIN-SUFFIX,qwen.ai,DIRECT
+  - DOMAIN-SUFFIX,qianwen.com,DIRECT
+  - DOMAIN-SUFFIX,aliyuncs.com,DIRECT
+  - DOMAIN-SUFFIX,alibabacloud.com,DIRECT
+  - DOMAIN-SUFFIX,alicdn.com,DIRECT
+```
+
+Edit the profile's **rules enhancement** (`profiles/<uid>.yaml`), not the
+subscription body — the subscription is regenerated on every update and your
+edits are lost. The mihomo core runs as a Windows service and cannot be killed
+from an unprivileged shell, so reload the profile in the UI.
+
+> **Docker note:** Docker Desktop's network layer honours the Windows system
+> proxy, so a container with **no** `HTTP_PROXY` in it still egresses through
+> the local proxy. Setting `NO_PROXY` inside the container cannot help. For
+> Docker deployments these Clash rules are the real fix, not the app policy.
+
+**Full setup, verification and troubleshooting:
+[docs/network-egress.md](docs/network-egress.md).**
+
+### Do not run the full account pool from your workstation
+
+Providers rate-limit by **egress IP**, not by account. A pool of ~340 accounts
+driven from one IP — especially a shared datacenter one — is an anomaly shape
+regardless of how the accounts were obtained. Keep the full pool on the
+production server, and use a single account locally for functional checks.
+
+Chat2API enforces this automatically once a verdict appears. A `bxpunish` /
+`RGV587` verdict is decided by the egress path, not by one payload, so the
+per-request risk circuit is joined by a **process-wide egress circuit**: after
+`CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` distinct payloads (default 3) are
+rejected inside `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` (default 5 min), all
+new Qwen AI traffic is refused with `503 qwen_ai_risk_circuit_open` and a
+`Retry-After` header *before* another account is consumed. One accepted upstream
+response closes it again, so a fixed route recovers immediately instead of
+waiting out the cooldown.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `3` | Distinct payloads that must be rejected before the egress is parked; `0` parks on the first verdict |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `600000` | How long the egress stays parked |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` | `300000` | Window in which verdicts are counted |
+
+## Set the storage encryption key (required)
+
+Account credentials are encrypted at rest. **The key must be identical across
+every instance that shares the same data file**, and it must actually reach the
+process.
+
+```bash
+CHAT2API_STORAGE_ENCRYPTION_KEY=change-this-to-a-long-random-secret
+```
+
+Pick a value once, keep it in `.env`, and use the same value for the desktop app
+and every Docker deployment of the same store.
+
+```bash
+# confirm the key reached the process
+docker exec chat2api printenv CHAT2API_STORAGE_ENCRYPTION_KEY
+```
+
+> **Start containers with `docker compose up -d`, never `docker run`.** A
+> container created with `docker run` has no compose label, so `docker compose up`
+> refuses to manage it and `.env` is never injected — the process silently runs
+> without the key.
+
+### If the key is missing or does not match
+
+Nothing throws. The runtime returns the `c2a:v1:…` ciphertext unchanged, so every
+account is treated as having no session, the repair queue signs in 339 accounts
+every 25 s, the upstream answers `401 email not found`, a rejection storm opens
+the refresh risk gate (300 s → 600 s → 1200 s → 2400 s), and **every request,
+including plain chat, fails `403 qwen_ai_token_refresh_gated`**. It presents as a
+risk-control outage; it is a configuration error.
+
+A startup self-check now catches it:
+
+```
+[CredentialSelfCheck] Credential data is encrypted (c2a:v1:…) but encryption is
+not available. … Set CHAT2API_STORAGE_ENCRYPTION_KEY … and recreate the instance
+so the variable actually reaches the process (a container started with `docker run`
+never reads .env).
+[Store] Initialization aborted: Credential data is encrypted but
+CHAT2API_STORAGE_ENCRYPTION_KEY is not usable
+```
+
+Fix it and **recreate** the container (environment variables are read once at
+process start; `docker restart` is not enough):
+
+```bash
+docker compose up -d --force-recreate
+```
+
+Fastest way to tell this apart from a real risk-control block — compare the
+session-repair line between environments:
+
+```
+broken:  [QwenAI Session Repair] started ready=0 pending=339
+healthy: [QwenAI Session Repair] started ready=339 pending=0
+```
+
+`ready=0 pending=339` means the credentials are unreadable, not that the upstream
+is blocking you. Bypass the check with `CHAT2API_CREDENTIAL_SELF_CHECK=off` only
+for a genuinely plaintext store.
+
+## Local versus production deployment
+
+Running the desktop app and the Docker server on the same machine against the
+same account pool needs a little care.
+
+| Concern | Desktop (workstation) | Docker (production) |
+| --- | --- | --- |
+| Recommended pool size | 1–3 accounts, functional checks | Full pool |
+| Egress | Residential IP, no proxy | Fixed server IP, no proxy |
+| Never do | Drive the production pool, or run a load test from here | — |
+
+- **Do not** point a local instance and the production container at the same
+  `accounts.json`/`/data` volume while both are running. They will overwrite each
+  other's `status`/`errorMessage` fields and each one's repair queue will fight
+  the other's verdicts.
+- **Do not** run load or soak tests from a workstation. Upstream rate limiting
+  is per egress IP, so a local load test degrades the production pool rather
+  than measuring the code.
+- **Do not** edit a data volume while the container is running. Stop it, edit,
+  then start it; otherwise the in-memory state overwrites your change on the next
+  save. Back up first:
+  ```bash
+  docker exec chat2api cat /data/data.json > data.json.backup
+  ```
+- The desktop app applies the direct-egress policy automatically. If you run the
+  Docker image on a host that also has a proxy configured, the headless server
+  applies the same policy; set `CHAT2API_EGRESS_DIRECT=off` only if you
+  deliberately want the proxy in that path. See
+  [docs/network-egress.md](docs/network-egress.md) for the Clash rules a Docker
+  host still needs.
+
+Two failure modes that look identical but are unrelated — see
+[docs/network-egress.md](docs/network-egress.md#9-symptom--cause):
+
+| Symptom | Root cause |
+| --- | --- |
+| Egress shows a datacenter AS | Local proxy inherited by Docker Desktop |
+| Every request 403, accounts "frozen" | Missing/mismatched storage encryption key |
+
+See also the post-mortem for the 2026-09-25 pool outage:
+[docs/diag-2026-09-25-qwen-egress.md](docs/diag-2026-09-25-qwen-egress.md).
+
 ## Screenshots
 
 | Dashboard | Providers |
