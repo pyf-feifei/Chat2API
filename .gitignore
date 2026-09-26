@@ -174,3 +174,8 @@ scratch-*.mjs
 scratch-*.py
 cred.json
 *.patch
+
+# Generated compression corpora. `build-corpus.mjs` and `measure-from-log.mjs`
+# produce these from captured replays; they are 60MB of derived JSON and are
+# reproducible, so they belong in neither the index nor a clone.
+scripts/compress/tmp/
