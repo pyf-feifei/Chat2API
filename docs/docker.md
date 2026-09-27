@@ -634,6 +634,75 @@ The desktop build needs no extra runtime for this feature. It does not bundle a
 Python interpreter and does not need one here. If no eligible provider is
 selected, the request reaching the provider is byte-identical to `off`.
 
+## Production Update Flow
+
+The production server never builds from source. The image is the deployment
+artifact, and the same image reference is what both sides use:
+
+```text
+developer machine                      Docker Hub                 production server
+-----------------                      ----------                 -----------------
+build-push.ps1  --build +push-->   skatef/chat2api:<tag>   --pull-->   server-update.sh
+                                                                    (pull, recreate, verify)
+```
+
+```powershell
+# one step: build, push, then update the server
+.\scripts\deploy\build-push.ps1 -Deploy -Server 195.242.178.82
+
+# or the two halves separately
+.\scripts\deploy\build-push.ps1 -Tag my-change
+scp scripts/deploy/server-update.sh root@SERVER:/opt/chat2api/server-update.sh
+ssh root@SERVER 'bash /opt/chat2api/server-update.sh skatef/chat2api:my-change'
+```
+
+The tag defaults to the short git SHA plus `-dirty` when the working tree has
+uncommitted changes, so an image is always traceable to the source that built
+it. Use `-Tag <name>` for a descriptive release tag.
+
+### What the server-side script guarantees
+
+`server-update.sh` refuses to continue in the two situations that are
+indistinguishable from an upstream outage, and rolls back automatically
+otherwise:
+
+| Stage | Failure it catches |
+| --- | --- |
+| Preflight | missing `env.chat2api`, or an empty `CHAT2API_STORAGE_ENCRYPTION_KEY` |
+| Pull | a tag that does not exist, or a registry that cannot be reached |
+| Restart | the container exiting during startup, or `/health` never answering within `CHAT2API_READY_TIMEOUT` |
+| Credentials | `[QwenAI Session Repair] started ready=0 pending=N`, i.e. the store did not decrypt |
+| Live completion | one real `/v1/chat/completions` request that does not return 200 |
+
+The last one matters: `/health` returning 200 only proves the listener is up. A
+green health check can otherwise hide a pool that cannot answer.
+
+The outgoing container is stopped and **renamed** to `chat2api-rollback`, never
+removed, so a rollback is a rename rather than a rebuild:
+
+```bash
+docker rm -f chat2api
+docker rename chat2api-rollback chat2api && docker start chat2api
+```
+
+The data volume is only ever read and backed up (`data.json.bak.deploy-<ts>`,
+newest `CHAT2API_BACKUP_KEEP` kept). Stop the container before inspecting or
+restoring those files by hand — the app rewrites `data.json` in memory on save.
+
+### The stop timeout is not optional
+
+A Codex managed-tool turn can legitimately run for many minutes, and
+`CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS` (default 540000) is what lets the process
+finish in-flight streams on SIGTERM. `server-update.sh` therefore passes
+`--stop-timeout 600`. A container started without it gets Docker's 10-second
+default, which SIGKILLs the process mid-generation and looks to the client like
+an unexplained stream truncation. `stop_grace_period: 10m` in
+`docker-compose.yml` sets the same value; the two must not disagree.
+
+```bash
+docker inspect chat2api --format '{{.Config.StopTimeout}}'   # nil means the 10s default
+```
+
 ## Upstream Update Flow
 
 The Docker-specific patch surface is intentionally small:
