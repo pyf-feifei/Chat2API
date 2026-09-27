@@ -10,6 +10,18 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(here, '..', '..')
 const require = createRequire(import.meta.url)
 const esbuild = require('esbuild')
+const ts = require('typescript')
+
+/** Load the shipped account policy so the factory is checked against it. */
+function loadPolicy() {
+  const source = fs.readFileSync(path.join(repoRoot, 'src', 'main', 'proxy', 'qwenAiAccountPolicy.ts'), 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', output)(require, module, module.exports)
+  return module.exports
+}
 
 /**
  * Extract the two exported quota helpers from qwen-ai.ts. The file is huge and
@@ -148,5 +160,20 @@ describe('qwen ai daily quota notice', () => {
     assert.equal(e.accountFault, true)
     assert.equal(e.retryable, false)
     assert.match(String(e.message), /daily conversation quota/i)
+  })
+
+  it('the shipped error shape yields a next-account retry scope', async () => {
+    // Couples this factory to the account policy: `retryable: false` stops the
+    // forwarder's inner loop, so the rotation must come from the retry scope
+    // the policy derives. If the factory's fields drift, this fails here rather
+    // than as a 429 in the client.
+    const { createQwenAiDailyQuotaError } = await loadQuotaHelpers()
+    const { qwenAiAccountFailureDetails } = loadPolicy()
+    const e = createQwenAiDailyQuotaError()
+
+    assert.equal(
+      qwenAiAccountFailureDetails({ ...e, status: e.status, errorCode: e.code }).retryScope,
+      'next-account',
+    )
   })
 })

@@ -180,6 +180,31 @@ test('ordinary upstream failures cannot acquire an account-neutral replay scope'
   }
 })
 
+test('429 daily conversation quota rotates off the spent account', () => {
+  // Shape produced by createQwenAiDailyQuotaError(): status 429, non-retryable
+  // on the same account, accountFault true. Without a retry scope the refusal
+  // broke the inner retry loop, no scope reached forwardWithAccountFailover,
+  // and the 429 went to the client on the first exhausted account drawn
+  // (observed 2026-09-27: 16 of 340 accounts parked, 324 still usable).
+  const error = {
+    status: 429,
+    code: 'qwen_ai_daily_quota_exhausted',
+    accountFault: true,
+    retryable: false,
+  }
+
+  assert.equal(isQwenAiAccountFault(error), true)
+  assert.equal(qwenAiAccountRetryScope(error), 'next-account')
+})
+
+test('the daily-quota rotation is not reachable from an account-neutral wrapper', () => {
+  const neutral = { status: 429, code: 'qwen_ai_daily_quota_exhausted', accountFault: false }
+
+  assert.equal(qwenAiAccountRetryScope(neutral), undefined)
+  assert.equal(qwenAiAccountNeutralReplayScopeAfterRecovery(neutral), undefined)
+  assert.equal(qwenAiSafeExplicitRetryScope({ ...neutral, retryScope: 'next-account' }), undefined)
+})
+
 test('402 quota exhaustion is an account fault with next-account rotation', () => {
   const error = { status: 402, code: 'PAYMENT_REQUIRED', message: 'insufficient quota' }
 

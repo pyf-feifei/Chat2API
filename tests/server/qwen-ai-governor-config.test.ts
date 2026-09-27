@@ -16,6 +16,26 @@ type ConfigManagerShape = {
   validate(config: Record<string, unknown>): { valid: boolean; errors: string[] }
 }
 
+/**
+ * `config.ts` imports the real API-key mask helpers, and the governor
+ * validation path calls `validate` on arbitrary partial configs. Load the actual
+ * module rather than a stand-in so the mask guard is genuinely exercised here
+ * rather than being silently stubbed away.
+ */
+function loadApiKeyHelpers(): { maskedApiKeyNames: (apiKeys: unknown) => string[] } {
+  const source = fs.readFileSync('src/main/store/apiKeys.ts', 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+  }).outputText
+  const module = { exports: {} as Record<string, unknown> }
+  new Function('require', 'module', 'exports', output)(() => ({}), module, module.exports)
+  return module.exports as unknown as { maskedApiKeyNames: (apiKeys: unknown) => string[] }
+}
+
 function loadConfigManagerForValidation(): ConfigManagerShape {
   const source = fs.readFileSync('src/main/store/config.ts', 'utf8')
   const output = ts.transpileModule(source, {
@@ -26,7 +46,9 @@ function loadConfigManagerForValidation(): ConfigManagerShape {
     },
   }).outputText
   const module = { exports: {} as Record<string, unknown> }
+  const apiKeyHelpers = loadApiKeyHelpers()
   const testRequire = (specifier: string) => {
+    if (specifier === './apiKeys') return apiKeyHelpers
     if (specifier === './store') return { storeManager: {} }
     if (specifier === './types') {
       return {

@@ -329,10 +329,16 @@ export function isQwenAiAccountFault(value: QwenAiAccountFailureClassification |
   // correct, and the governor's cooldown stops the pool from re-selecting
   // the dead-credit account on the next request (observed 2026-09-10: 20
   // 402 attempts burned across 7 accounts in 2 minutes with no cooldown).
+  // QWEN_AI_DAILY_QUOTA_EXHAUSTED belongs to the same per-account class: the
+  // upstream spends one account's daily conversation allowance and answers
+  // 200 with a notice, so no other account is implicated. Classifying it as an
+  // account fault also drops the Codex continuation binding for that account
+  // instead of handing a chat the next account does not own.
   return status === 401
     || status === 402
     || status === 403
     || (status === 429 && code === 'QWEN_AI_CAPACITY_LIMIT')
+    || (status === 429 && code === 'QWEN_AI_DAILY_QUOTA_EXHAUSTED')
 }
 
 /** The only inferred retry scope that is safe to use for account rotation. */
@@ -351,10 +357,21 @@ export function qwenAiAccountRetryScope(
   }
   const status = statusOf(value)
   const code = codeOf(value)
+  // QWEN_AI_DAILY_QUOTA_EXHAUSTED is a per-ACCOUNT daily allowance, not pool
+  // congestion: the refusal is decided by the upstream's own day boundary and
+  // another account still has quota. Without this arm the adapter's
+  // `retryable: false` broke the inner loop, no retry scope reached
+  // forwardWithAccountFailover, and the 429 went straight to the client even
+  // with a nearly untouched pool (observed 2026-09-27: 16 of 340 accounts
+  // parked, 324 still usable, every Codex request failed on the first
+  // exhausted account it drew). The refused account is already parked by
+  // markAccountDailyQuotaExhausted, so rotation cannot re-select it, and the
+  // pool-wide failover cap bounds the burn when a whole pool really is spent.
   return status === 401
     || status === 402
     || status === 403
     || (status === 429 && code === 'QWEN_AI_CAPACITY_LIMIT')
+    || (status === 429 && code === 'QWEN_AI_DAILY_QUOTA_EXHAUSTED')
     ? 'next-account'
     : undefined
 }
