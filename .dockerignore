@@ -8,6 +8,7 @@ out-admin
 dist
 coverage
 backup
+backups
 logs
 npm-debug.log*
 yarn-debug.log*
@@ -19,3 +20,30 @@ docs/screenshots
 !.env.example
 codex-session-*.md
 *.rollout
+
+# Local runtime state. These are bind-mounted as /data in a local container or
+# produced by ad-hoc probes, never inputs to a build. The store dumps are the
+# important ones: `data.json` copies hold account credentials, and `COPY . .` in
+# the build stage would carry them into the build context on every build.
+dev-data
+.chat2api-docker-data
+.codex-local-test
+.testimg
+.local
+.claude
+.kilo
+.devin
+.workbuddy-ai
+data.json
+store.json
+*-store.json
+*store*.json
+docker-export.json
+
+# Scratch scripts from interactive debugging sessions. `scripts/` itself is
+# REQUIRED: the runtime stage copies the captcha/login drivers out of it.
+/*.cjs
+/*.mjs
+/*.py
+/*.txt
+
