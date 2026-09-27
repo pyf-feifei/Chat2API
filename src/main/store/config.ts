@@ -4,6 +4,7 @@
  */
 
 import { storeManager } from './store'
+import { maskedApiKeyNames } from './apiKeys'
 import {
   AppConfig,
   LoadBalanceStrategy,
@@ -37,6 +38,21 @@ function validateNonNegativeInteger(
 }
 
 /**
+ * Reject a config update that carries display masks instead of real API keys.
+ * See ./apiKeys for why a round-tripped mask destroys the stored value.
+ */
+function assertNoMaskedApiKeys(updates: Partial<AppConfig>): void {
+  const masked = maskedApiKeyNames((updates as { apiKeys?: unknown }).apiKeys)
+  if (masked.length === 0) return
+  throw new Error(
+    `Refusing to persist masked API key values for: ${masked.join(', ')}. `
+    + 'A client sent back a display mask instead of the real key. Change a key through '
+    + 'PUT /v0/management/api-keys/:id or POST /v0/management/api-keys, which read the '
+    + 'stored value, instead of writing the whole apiKeys array back.'
+  )
+}
+
+/**
  * Config Manager class
  * Provides all operations related to app configuration
  */
@@ -54,6 +70,11 @@ export class ConfigManager {
    * @returns Updated complete configuration
    */
   static update(updates: Partial<AppConfig>): AppConfig {
+    // Defence in depth. `validate` is the caller-facing gate that returns a
+    // clean 400, but the IPC path reaches this directly, and losing every API
+    // key in the store to a silent write is far worse than a thrown error.
+    assertNoMaskedApiKeys(updates)
+
     const current = this.get()
     const newConfig = { ...current, ...updates }
     
@@ -357,6 +378,17 @@ export class ConfigManager {
       if (config.retryCount < 0 || config.retryCount > 10) {
         errors.push('Retry count must be between 0-10')
       }
+    }
+
+    // A masked key reaching this point means a client round-tripped a display
+    // value. Reject with the offending names instead of storing the mask.
+    const masked = maskedApiKeyNames((config as { apiKeys?: unknown }).apiKeys)
+    if (masked.length > 0) {
+      errors.push(
+        `API key value is a display mask, not a real key (affected: ${masked.join(', ')}). `
+        + 'Use the /v0/management/api-keys endpoints to change a key; writing the whole '
+        + 'apiKeys array back overwrites the stored keys with their masked form.'
+      )
     }
 
     if (

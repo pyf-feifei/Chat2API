@@ -8,6 +8,7 @@ import type { Context } from 'koa'
 import { randomUUID } from 'crypto'
 import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import { storeManager } from '../../../store/store'
+import { generateApiKeyValue, maskApiKeyValue } from '../../../store/apiKeys'
 import type { 
   ApiKey,
   CreateApiKeyRequest,
@@ -17,35 +18,15 @@ import type {
 
 const router = new Router({ prefix: '/v0/management' })
 
-const API_KEY_PREFIX = 'sk-mgmt-'
-const KEY_RANDOM_LENGTH = 32
-
-/**
- * Generate a new API key value
- * Format: sk-mgmt-{random-string}
- */
-function generateApiKeyValue(): string {
-  const randomBytes = new Uint8Array(KEY_RANDOM_LENGTH)
-  crypto.getRandomValues(randomBytes)
-  const randomString = Array.from(randomBytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, KEY_RANDOM_LENGTH)
-  return `${API_KEY_PREFIX}${randomString}`
-}
-
 /**
  * Mask API key value for display
- * Shows only the last 8 characters
+ * The rules live in store/apiKeys so this route, the IPC handlers, and the
+ * config guard cannot disagree about what a mask looks like.
  */
 function maskApiKey(key: ApiKey): ApiKey {
-  const maskedKey = key.key.length > 8 
-    ? `${API_KEY_PREFIX}...${key.key.slice(-8)}`
-    : `${API_KEY_PREFIX}...`
-  
   return {
     ...key,
-    key: maskedKey,
+    key: maskApiKeyValue(key.key),
   }
 }
 

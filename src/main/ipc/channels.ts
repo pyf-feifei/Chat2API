@@ -10,6 +10,14 @@ export const IpcChannels = {
   CONFIG_UPDATE: 'config:update',
   CONFIG_CHANGED: 'config:changed',
 
+  // Per-key operations. The page must never write the whole apiKeys array back:
+  // it only ever holds masked values, and a wholesale replace persists the mask
+  // over the real keys. These read the stored value and change one field.
+  API_KEYS_GET_ALL: 'apiKeys:getAll',
+  API_KEYS_ADD: 'apiKeys:add',
+  API_KEYS_UPDATE: 'apiKeys:update',
+  API_KEYS_REMOVE: 'apiKeys:remove',
+
   STORE_GET: 'store:get',
   STORE_SET: 'store:set',
   STORE_DELETE: 'store:delete',

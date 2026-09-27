@@ -37,18 +37,10 @@ import { toast } from '@/hooks/use-toast'
 import { useSettingsStore } from '@/stores/settingsStore'
 import type { ApiKey } from '@/types/electron'
 
-function generateApiKey(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  let key = 'sk-'
-  for (let i = 0; i < 48; i++) {
-    key += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return key
-}
-
-function generateId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).substr(2)
-}
+// Key values are generated and stored server-side (see src/main/store/apiKeys.ts).
+// They used to be generated here and written back through config.update, which
+// meant this page had to hold — and echo back — a value it never legitimately
+// had access to.
 
 async function copyTextToClipboard(text: string): Promise<boolean> {
   try {
@@ -109,13 +101,25 @@ export default function ApiKeysPage() {
     fetchConfig()
   }, [fetchConfig])
 
-  const apiKeys = config?.apiKeys || []
+  // Read from the dedicated per-key endpoint rather than config.apiKeys. The
+  // config route masks every key to `***`, so a list built from it can only ever
+  // be written back as a mask — which is how creating one key on 2026-09-27 left
+  // 6 of 7 keys stored as the literal string `***`. The masked value is fine for
+  // display; it must never be treated as a value this page owns.
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
+
+  useEffect(() => {
+    let cancelled = false
+    window.electronAPI?.apiKeys
+      ?.getAll()
+      .then(keys => { if (!cancelled) setApiKeys(keys || []) })
+      .catch(() => { if (!cancelled) setApiKeys([]) })
+    return () => { cancelled = true }
+  }, [])
 
   const handleToggleEnabled = async (keyId: string, enabled: boolean) => {
-    const updatedKeys = apiKeys.map(k => 
-      k.id === keyId ? { ...k, enabled } : k
-    )
-    await updateConfig({ apiKeys: updatedKeys })
+    await window.electronAPI.apiKeys.update(keyId, { enabled })
+    setApiKeys(keys => keys.map(k => (k.id === keyId ? { ...k, enabled } : k)))
     toast({
       title: enabled ? t('apiKeys.keyEnabled') : t('apiKeys.keyDisabled'),
       description: enabled ? t('apiKeys.keyEnabled') : t('apiKeys.keyDisabled'),
@@ -132,25 +136,19 @@ export default function ApiKeysPage() {
       return
     }
 
-    const newKey: ApiKey = {
-      id: generateId(),
-      name: newKeyName.trim(),
-      key: generateApiKey(),
-      enabled: true,
-      createdAt: Date.now(),
-      usageCount: 0,
-    }
-
-    await updateConfig({ apiKeys: [...apiKeys, newKey] })
+    // The server generates the value and appends it to the stored array, so no
+    // other key is read, rewritten, or overwritten here.
+    const created = await window.electronAPI.apiKeys.add(newKeyName.trim())
+    setApiKeys(keys => [...keys, created])
     setShowAddDialog(false)
     setNewKeyName('')
   }
 
   const handleDeleteKey = async () => {
     if (!deleteKeyId) return
-    
-    const updatedKeys = apiKeys.filter(k => k.id !== deleteKeyId)
-    await updateConfig({ apiKeys: updatedKeys })
+
+    await window.electronAPI.apiKeys.remove(deleteKeyId)
+    setApiKeys(keys => keys.filter(k => k.id !== deleteKeyId))
     setDeleteKeyId(null)
     toast({
       title: t('apiKeys.deleted'),

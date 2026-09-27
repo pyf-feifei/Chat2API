@@ -12,6 +12,7 @@ import type {
   LogEntry,
   ProviderVendor,
   AppConfig,
+  ApiKey,
   SystemPrompt,
   PromptType,
   EffectiveModel,
@@ -520,6 +521,25 @@ const appAPI = {
   },
 }
 
+const apiKeysAPI = {
+  /**
+   * Per-key operations. The API Key page is only ever handed masked values, so
+   * it must never write a key value back; these read the stored array and touch
+   * one entry each. See src/main/store/apiKeys.ts.
+   */
+  getAll: (): Promise<ApiKey[]> =>
+    ipcRenderer.invoke(IpcChannels.API_KEYS_GET_ALL),
+
+  add: (name: string, description?: string): Promise<ApiKey> =>
+    ipcRenderer.invoke(IpcChannels.API_KEYS_ADD, name, description),
+
+  update: (id: string, updates: { name?: string; description?: string; enabled?: boolean }): Promise<ApiKey> =>
+    ipcRenderer.invoke(IpcChannels.API_KEYS_UPDATE, id, updates),
+
+  remove: (id: string): Promise<boolean> =>
+    ipcRenderer.invoke(IpcChannels.API_KEYS_REMOVE, id),
+}
+
 const configAPI = {
   get: (): Promise<AppConfig> => 
     ipcRenderer.invoke(IpcChannels.CONFIG_GET),
@@ -915,6 +935,7 @@ const electronAPI = {
   statistics: statisticsAPI,
   app: appAPI,
   config: configAPI,
+  apiKeys: apiKeysAPI,
   prompts: promptsAPI,
   session: sessionAPI,
   managementApi: managementApiAPI,

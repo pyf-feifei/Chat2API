@@ -1,5 +1,6 @@
 ﻿import type {
   Account,
+  ApiKey,
   AppConfig,
   EffectiveModel,
   LogEntry,
@@ -989,6 +990,35 @@ const app = {
   onUpdateError: () => noOpUnsubscribe(),
 }
 
+/**
+ * Per-key API key operations.
+ *
+ * The web admin can only ever receive masked key values (the config route
+ * returns `***`, the api-keys route returns `sk-mgmt-...last8`), so it must
+ * never write a key value back. These map onto the per-key management routes,
+ * which read the stored array and change a single entry — the same contract the
+ * Electron IPC handlers implement. Writing the whole array through
+ * `config.update` is what destroyed 6 of 7 keys on 2026-09-27.
+ */
+const apiKeys = {
+  getAll: (): Promise<ApiKey[]> => managementFetch<ApiKey[]>('/api-keys'),
+  add: (name: string, description?: string): Promise<ApiKey> =>
+    managementFetch<ApiKey>('/api-keys', {
+      method: 'POST',
+      body: JSON.stringify({ name, description }),
+    }),
+  update: (
+    id: string,
+    updates: { name?: string; description?: string; enabled?: boolean },
+  ): Promise<ApiKey> =>
+    managementFetch<ApiKey>(`/api-keys/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    }),
+  remove: (id: string): Promise<boolean> =>
+    managementFetch<boolean>(`/api-keys/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+}
+
 const config = {
   get: getConfig,
   update: updateConfig,
@@ -1295,6 +1325,7 @@ window.electronAPI = {
   statistics,
   app,
   config,
+  apiKeys,
   prompts,
   session,
   managementApi,

@@ -15,7 +15,9 @@ import { proxyStatusManager } from '../proxy/status'
 import { sessionManager } from '../proxy/sessionManager'
 import { TrayManager } from '../tray/TrayManager'
 import { ConfigManager } from '../store/config'
+import { generateApiKeyValue } from '../store/apiKeys'
 import { generateManagementSecret } from '../proxy/middleware/managementAuth'
+import { randomUUID } from 'crypto'
 import { testCaptchaVisionConnection } from '../lib/captchaVision'
 import { testGmailConnection } from '../lib/matonGmail'
 import type { CaptchaVisionConfig, GmailConfig } from '../store/types'
@@ -29,7 +31,7 @@ import { PerplexityAdapter } from '../proxy/adapters/perplexity'
 import { QwenAdapter } from '../proxy/adapters/qwen'
 import { QwenAiAdapter } from '../proxy/adapters/qwen-ai'
 import { ZaiAdapter } from '../proxy/adapters/zai'
-import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, ProviderModelCapability } from '../../shared/types'
+import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, ProviderModelCapability, ApiKey } from '../../shared/types'
 import type { SystemPrompt, SessionConfig, SessionRecord, ManagementApiConfig } from '../store/types'
 import type { ProviderType } from '../oauth/types'
 
@@ -223,6 +225,75 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
       }
     })
     
+    return true
+  })
+
+  // Per-key operations for the API Key page. See the note on the channels: the
+  // page is only ever handed masked values, so a wholesale `config.update({
+  // apiKeys })` would persist the mask and destroy every key it did not create.
+  // Each handler here reads the stored array, touches exactly one entry, and
+  // writes it back, so no key value the caller never had is affected.
+  ipcMain.handle(IpcChannels.API_KEYS_GET_ALL, async (): Promise<ApiKey[]> => {
+    return storeManager.getConfig().apiKeys || []
+  })
+
+  ipcMain.handle(IpcChannels.API_KEYS_ADD, async (_, name: string, description?: string): Promise<ApiKey> => {
+    const trimmed = typeof name === 'string' ? name.trim() : ''
+    if (!trimmed) throw new Error('API key name is required')
+
+    const apiKeys = [...(storeManager.getConfig().apiKeys || [])]
+    const newKey: ApiKey = {
+      id: randomUUID(),
+      name: trimmed,
+      key: generateApiKeyValue(),
+      enabled: true,
+      createdAt: Date.now(),
+      usageCount: 0,
+      description: typeof description === 'string' ? description.trim() : undefined,
+    }
+    apiKeys.push(newKey)
+    storeManager.updateConfig({ apiKeys })
+    storeManager.addLog('info', `Created API key: ${newKey.name}`, { data: { keyId: newKey.id } })
+    return newKey
+  })
+
+  ipcMain.handle(
+    IpcChannels.API_KEYS_UPDATE,
+    async (_, id: string, updates: { name?: string; description?: string; enabled?: boolean }): Promise<ApiKey> => {
+      const apiKeys = [...(storeManager.getConfig().apiKeys || [])]
+      const index = apiKeys.findIndex(k => k.id === id)
+      if (index === -1) throw new Error(`API key not found: ${id}`)
+
+      const existing = apiKeys[index]
+      if (updates.name !== undefined) {
+        const trimmed = typeof updates.name === 'string' ? updates.name.trim() : ''
+        if (!trimmed) throw new Error('API key name cannot be empty')
+        existing.name = trimmed
+      }
+      if (updates.description !== undefined) {
+        existing.description = updates.description?.trim()
+      }
+      if (updates.enabled !== undefined) {
+        if (typeof updates.enabled !== 'boolean') throw new Error('API key enabled must be a boolean')
+        existing.enabled = updates.enabled
+      }
+      // `key` is intentionally not updatable through this channel. Regenerating
+      // a value is a separate, explicit operation.
+      apiKeys[index] = existing
+      storeManager.updateConfig({ apiKeys })
+      storeManager.addLog('info', `Updated API key: ${existing.name}`, { data: { keyId: id } })
+      return existing
+    }
+  )
+
+  ipcMain.handle(IpcChannels.API_KEYS_REMOVE, async (_, id: string): Promise<boolean> => {
+    const apiKeys = [...(storeManager.getConfig().apiKeys || [])]
+    const index = apiKeys.findIndex(k => k.id === id)
+    if (index === -1) throw new Error(`API key not found: ${id}`)
+
+    const [deleted] = apiKeys.splice(index, 1)
+    storeManager.updateConfig({ apiKeys })
+    storeManager.addLog('info', `Deleted API key: ${deleted.name}`, { data: { keyId: id } })
     return true
   })
 

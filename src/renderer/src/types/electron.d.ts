@@ -339,6 +339,21 @@ interface AppAPI {
   openExternal: (url: string) => Promise<void>
 }
 
+interface ApiKeysAPI {
+  /**
+   * Per-key operations. The API Key page only ever receives masked key values,
+   * so it must never write a key value back through `config.update`. Each of
+   * these reads the stored array server-side and changes a single entry.
+   */
+  getAll: () => Promise<ApiKey[]>
+  add: (name: string, description?: string) => Promise<ApiKey>
+  update: (
+    id: string,
+    updates: { name?: string; description?: string; enabled?: boolean },
+  ) => Promise<ApiKey>
+  remove: (id: string) => Promise<boolean>
+}
+
 interface ConfigAPI {
   get: () => Promise<AppConfig>
   update: (updates: Partial<AppConfig>) => Promise<boolean>
@@ -587,6 +602,7 @@ interface ElectronAPI {
   statistics: StatisticsAPI
   app: AppAPI
   config: ConfigAPI
+  apiKeys: ApiKeysAPI
   prompts: PromptsAPI
   session: SessionAPI
   managementApi: ManagementApiAPI
