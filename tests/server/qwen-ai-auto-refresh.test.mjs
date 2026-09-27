@@ -123,7 +123,9 @@ test('Qwen AI adapter refreshes expiring web tokens by signing in with saved ema
   assert.match(refresherSource, /mergeCookieHeaders/)
   assert.match(refresherSource, /response\.headers\['set-cookie'\]/)
   assert.match(refresherSource, /const credentials = \{\s*\.\.\.account\.credentials,\s*token,\s*\.\.\.\(cookies \? \{ cookies \} : \{\}\),\s*\}/s)
-  assert.match(refresherSource, /!this\.isTokenExpiringSoon\(account\.credentials\.token \|\| ''\)/)
+  // The expiry check moved into a named `expiring` local so the skip branch can
+  // also record why it declined; the predicate itself is unchanged.
+  assert.match(refresherSource, /const expiring = this\.isTokenExpiringSoon\(account\.credentials\.token \|\| ''\)/)
   assert.match(refresherSource, /source:\s*'web'/)
   assert.match(refresherSource, /Version:\s*'0\.2\.67'/)
   assert.match(refresherSource, /Timezone:\s*currentTimezoneHeader\(\)/)
@@ -133,7 +135,9 @@ test('Qwen AI adapter refreshes expiring web tokens by signing in with saved ema
   assert.match(adapterSource, /await this\.tokenRefresher\.refreshAfterUnauthorized\(this\.account, options\.signal\)/)
   assert.match(adapterSource, /createOptions: \(\) => Record<string, any>/)
   assert.match(adapterSource, /resolveQwenAiAuthHeaders\(token, cookies\)/)
-  assert.match(refresherSource, /async refreshIfNeeded\(account: Account, signal\?: AbortSignal\)/)
+  // refreshIfNeeded gained a third `lastFailure` parameter so a recorded
+  // challenge can make a dead session refreshable.
+  assert.match(refresherSource, /async refreshIfNeeded\(\s*account: Account,\s*signal\?: AbortSignal,\s*lastFailure\?: string,/s)
   assert.match(refresherSource, /async repairWebSession\(account: Account, signal\?: AbortSignal\)/)
   assert.match(refresherSource, /async refreshAfterUnauthorized\(account: Account, signal\?: AbortSignal\)/)
   assert.match(refresherSource, /timeout:\s*15000,\s*signal,/)

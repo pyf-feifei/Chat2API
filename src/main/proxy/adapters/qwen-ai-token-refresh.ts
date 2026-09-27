@@ -618,6 +618,43 @@ function createRefreshTransportError(error: unknown, signal?: AbortSignal): Qwen
  */
 const lastChallengeByAccount = new Map<string, string>()
 
+/**
+ * Why accounts are not being renewed, counted per reason.
+ *
+ * Measured 2026-09-27: INVALID_CRED appeared zero times in the logs of a
+ * 340-account pool whose credentials had all been retired upstream, because the
+ * refresher declined every account and never called signin. The pool still
+ * reported ready=339, so the only symptom was an aliyun WAF verdict that reads
+ * exactly like an egress block. These counters make the skip visible:
+ * `looks-healthy` dominating means the pool believes it is fine while the
+ * upstream disagrees, and a rising `challenged` count means sessions are being
+ * retired faster than signin can replace them.
+ */
+const refreshSkipCounters = new Map<string, number>()
+let lastRefreshSkipLogAt = 0
+
+function noteRefreshSkip(accountId: string, reason: string): void {
+  refreshSkipCounters.set(reason, (refreshSkipCounters.get(reason) || 0) + 1)
+  const now = Date.now()
+  if (now - lastRefreshSkipLogAt < 60_000) return
+  lastRefreshSkipLogAt = now
+  const summary: Record<string, number> = {}
+  refreshSkipCounters.forEach((value, key) => { summary[key] = value })
+  console.warn(
+    '[QwenAI Token Refresh] declining refresh ' + JSON.stringify({ ...summary, sample: accountId }),
+  )
+}
+
+export function getQwenAiRefreshSkipSummary(): Record<string, number> {
+  const out: Record<string, number> = {}
+  refreshSkipCounters.forEach((value, key) => { out[key] = value })
+  return out
+}
+
+export function resetQwenAiRefreshSkipSummary(): void {
+  refreshSkipCounters.clear()
+  lastRefreshSkipLogAt = 0
+}
 export function noteQwenAiChallenge(accountId: string | undefined, evidence: string): void {
   if (!accountId) return
   lastChallengeByAccount.set(accountId, String(evidence).slice(0, 120))
@@ -672,10 +709,24 @@ export class QwenAiTokenRefresher {
     const cookies = String(account.credentials.cookies || account.credentials.cookie || '').trim()
     const incompleteWebSession = Boolean(cookies) && !hasQwenAiSessionCookie(cookies)
     const challenged = this.isSessionFinishedBy(lastFailure ?? pendingChallenge(account.id))
-    if (
-      !this.canRefresh(account)
-      || (!incompleteWebSession && !challenged && !this.isTokenExpiringSoon(account.credentials.token || ''))
-    ) {
+    const expiring = this.isTokenExpiringSoon(account.credentials.token || '')
+    const refreshable = this.canRefresh(account)
+    if (!refreshable || (!incompleteWebSession && !challenged && !expiring)) {
+      // Observed 2026-09-27: a pool whose upstream credentials had been retired
+      // reported ready=339 and never once called signin, so INVALID_CRED never
+      // appeared in any log and the only symptom was an aliyun WAF verdict that
+      // reads exactly like an egress block. A silent skip is indistinguishable
+      // from a healthy pool, so record why this account is not being renewed.
+      const reason = !refreshable
+        ? 'no-credentials'
+        : challenged
+          ? 'challenged'
+          : incompleteWebSession
+            ? 'incomplete-web-session'
+            : expiring
+              ? 'token-expiring'
+              : 'looks-healthy'
+      noteRefreshSkip(account.id, reason)
       return account
     }
 
