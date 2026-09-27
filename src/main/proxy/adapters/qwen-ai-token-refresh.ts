@@ -608,6 +608,29 @@ function createRefreshTransportError(error: unknown, signal?: AbortSignal): Qwen
   })
 }
 
+/**
+ * Evidence that the stored session no longer works, keyed by account id.
+ *
+ * Recorded when a response comes back as a challenge. refreshIfNeeded then
+ * treats the jar as finished even though it still carries a `token=` cookie
+ * whose JWT has not expired. Without that, a credential the provider has
+ * retired looks exactly like an egress block and is never renewed.
+ */
+const lastChallengeByAccount = new Map<string, string>()
+
+export function noteQwenAiChallenge(accountId: string | undefined, evidence: string): void {
+  if (!accountId) return
+  lastChallengeByAccount.set(accountId, String(evidence).slice(0, 120))
+}
+
+export function clearQwenAiChallenge(accountId: string | undefined): void {
+  if (accountId) lastChallengeByAccount.delete(accountId)
+}
+
+function pendingChallenge(accountId: string | undefined): string | undefined {
+  return accountId ? lastChallengeByAccount.get(accountId) : undefined
+}
+
 export class QwenAiTokenRefresher {
   isTokenExpiringSoon(token: string, now: number = Date.now()): boolean {
     const payload = decodeJwtPayload(token)
@@ -618,16 +641,45 @@ export class QwenAiTokenRefresher {
     return payload.exp * 1000 - now <= REFRESH_THRESHOLD_MS
   }
 
-  async refreshIfNeeded(account: Account, signal?: AbortSignal): Promise<Account> {
+
+  /**
+   * A challenge is evidence that this session is finished. Measured
+   * 2026-09-27: a pool whose upstream credentials had been retired still
+   * reported ready=339 and never refreshed, because the jar carried a
+   * `token=` cookie and the JWT was valid for another two weeks. Every request
+   * reused that dead session and came back as an aliyun WAF challenge
+   * (ff926c7f07e45e2e487a29a6197d3460), which reads as an egress block and
+   * sends the investigation after IP, TLS and browser identity. None of those
+   * were the cause; signin answered INVALID_CRED for every account checked.
+   */
+  private isSessionFinishedBy(evidence: string | undefined): boolean {
+    const text = String(evidence ?? '')
+    if (!text) return false
+    return /FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|baxia|x5sec|aliyun_waf/i.test(text)
+  }
+
+  /**
+   * Refresh when the jar is incomplete, the token is expiring, or the previous
+   * attempt came back as a challenge. The risk gate inside refresh() still
+   * applies, so a genuine egress block keeps failing fast instead of hammering
+   * the endpoint.
+   */
+  async refreshIfNeeded(
+    account: Account,
+    signal?: AbortSignal,
+    lastFailure?: string,
+  ): Promise<Account> {
     const cookies = String(account.credentials.cookies || account.credentials.cookie || '').trim()
     const incompleteWebSession = Boolean(cookies) && !hasQwenAiSessionCookie(cookies)
+    const challenged = this.isSessionFinishedBy(lastFailure ?? pendingChallenge(account.id))
     if (
-      !this.canRefresh(account) ||
-      (!incompleteWebSession && !this.isTokenExpiringSoon(account.credentials.token || ''))
+      !this.canRefresh(account)
+      || (!incompleteWebSession && !challenged && !this.isTokenExpiringSoon(account.credentials.token || ''))
     ) {
       return account
     }
 
+    clearQwenAiChallenge(account.id)
     return this.refresh(account, signal)
   }
 
