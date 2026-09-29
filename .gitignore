@@ -57,6 +57,9 @@ __pycache__/
 # Test
 coverage/
 
+# Test suite. Local verification only; nothing in the shipped bundle reads it.
+tests/
+
 # Manual live test scripts (local debugging only)
 tests/manual/*-live.mjs
 

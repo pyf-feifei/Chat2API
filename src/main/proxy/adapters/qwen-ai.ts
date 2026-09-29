@@ -3879,6 +3879,7 @@ export function resolveQwenAiFeatureMode(
   capability: ProviderModelCapability | undefined,
   reasoningEffort?: string | null,
   managedToolCalling?: boolean,
+  contextCompaction?: boolean,
 ): {
   thinkingEnabled: boolean
   autoThinking: boolean
@@ -3898,6 +3899,7 @@ export function resolveQwenAiFeatureMode(
       thinkingEnabled,
       modePinned,
       managedToolCalling,
+      contextCompaction,
     })
 
   const modelMode = resolveQwenAiModelMode(requestedModel)
@@ -4970,6 +4972,7 @@ export class QwenAiAdapter {
         modelCapability,
         request.reasoning_effort ?? request.reasoningEffort,
         request.managedToolCalling,
+        request.requestIntent === 'context_compaction',
       )
       const featureConfig = createQwenAiFeatureConfig({
         thinkingEnabled: featureMode.thinkingEnabled,
@@ -5294,6 +5297,7 @@ export class QwenAiAdapter {
       modelCapability,
       request.reasoning_effort ?? request.reasoningEffort,
       request.managedToolCalling,
+      request.requestIntent === 'context_compaction',
     )
     const featureConfig = createQwenAiFeatureConfig({
       thinkingEnabled: featureMode.thinkingEnabled,

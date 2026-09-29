@@ -59,7 +59,7 @@ const DEFAULT_DEPTH_DIRECTIVES: Record<QwenAiDepthTier, string> = {
 }
 
 /** Effort -> depth tier. Efforts with no tier keep the model's own default. */
-const DEFAULT_EFFORT_TIER_MAP = 'medium:light,high:medium,xhigh:deep,ultracode:deep,max:deep'
+const DEFAULT_EFFORT_TIER_MAP = 'medium:light,high:medium,xhigh:deep,ultracode:deep,max:deep,ultra:deep'
 
 let warnedUnknownDepthMap = false
 
@@ -135,12 +135,23 @@ export interface QwenAiDepthDirectiveOptions {
    */
   modePinned: boolean
   managedToolCalling?: boolean
+  /**
+   * A context-compaction turn. Summarizing an existing transcript is an
+   * extraction task, not a problem to solve: the directive buys nothing and
+   * costs a measured 4-5x in generation time. This matters because compaction
+   * turns carry the client's pinned session effort (`xhigh`), and stripping
+   * the tool schema is exactly what makes `managedToolCalling` false - so
+   * without this gate a correctly classified compaction turn becomes the
+   * slowest request in the session.
+   */
+  contextCompaction?: boolean
 }
 
 /**
  * Resolve the prompt-side depth directive, or undefined when none applies.
  * Returns undefined for a disabled deployment, an effort without a tier, a
- * disabled reasoning phase, a pinned mode, and managed tool-calling turns.
+ * disabled reasoning phase, a pinned mode, managed tool-calling turns, and
+ * context-compaction turns.
  */
 export function resolveQwenAiDepthDirective(
   options: QwenAiDepthDirectiveOptions,
@@ -149,6 +160,7 @@ export function resolveQwenAiDepthDirective(
   if (!options.thinkingEnabled) return undefined
   if (options.modePinned) return undefined
   if (options.managedToolCalling === true) return undefined
+  if (options.contextCompaction === true) return undefined
   const effort = options.reasoningEffort?.trim().toLowerCase()
   if (!effort) return undefined
   const tier = qwenAiEffortDepthMapFromEnv()[effort]

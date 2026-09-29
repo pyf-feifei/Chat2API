@@ -138,7 +138,12 @@ export function normalizeQwenAiModelModeName(modelName: string): string {
 // n=4 each). prompt-side directives cannot switch the phase on (Fast + deep
 // directive is still 0, n=3), so this table only decides *whether* the model
 // thinks, while depth is carried by qwen-ai-depth-prompt.ts.
-const QWEN_AI_EFFORT_MODE_MAP_DEFAULT = 'minimal:fast,low:fast,medium:thinking,high:thinking,xhigh:thinking,ultracode:thinking,max:thinking,default:auto'
+// `ultra` sits beside `ultracode` because both are the same tier under
+// different client releases: Codex 0.157.1 ships "ultra" (15 occurrences in
+// the binary) where an earlier build shipped "ultracode" (0 occurrences), and
+// a table carrying only the older name silently dropped the newer one onto the
+// `default` row. Both are kept so either client resolves.
+const QWEN_AI_EFFORT_MODE_MAP_DEFAULT = 'minimal:fast,low:fast,medium:thinking,high:thinking,xhigh:thinking,ultracode:thinking,max:thinking,ultra:thinking,default:auto'
 
 let warnedUnknownEffortModeMap = false
 
@@ -170,9 +175,34 @@ export function qwenAiEffortModeMapFromEnv(): Record<string, QwenAiThinkingModeN
 }
 
 /**
+ * Effort names we have seen from a client that this build cannot place in the
+ * table. A renamed Codex tier is the realistic case: 0.157.1 sends `ultra`
+ * where an earlier build sent `ultracode`, and the mismatch was silent — the
+ * request quietly ran on the table's own `default` and nothing said so.
+ * Reported once per distinct name so the fix is a one-line env addition.
+ */
+const warnedUnknownEfforts = new Set<string>()
+
+function warnUnknownEffort(effort: string, known: string[]): void {
+  if (warnedUnknownEfforts.has(effort)) return
+  warnedUnknownEfforts.add(effort)
+  console.warn(
+    `[QwenAI] Unknown reasoning effort "${effort}"; it maps to the table default. `
+    + `Known efforts: ${known.join(', ')}. If the client renamed its tiers, add the new name `
+    + 'to CHAT2API_QWEN_AI_EFFORT_MODE_MAP (and CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP for depth) '
+    + '— without it this request runs on the default mode, not the tier that was asked for.'
+  )
+}
+
+/**
  * Apply the effort mapping to a floating model mode. Pinned modes (explicit
  * _Fast/_Thinking suffix) are returned unchanged; a floating mode with no
  * effort keeps its Auto rendering.
+ *
+ * An effort the table does not name falls back to the `default` entry, which
+ * is what that entry exists for. An unknown effort used to return the model
+ * mode untouched, which produced the same answer while making the `default`
+ * row unreachable and hiding the mismatch entirely.
  */
 export function applyQwenAiEffortToModelMode(
   modelMode: QwenAiModelMode,
@@ -183,7 +213,18 @@ export function applyQwenAiEffortToModelMode(
   if (!normalizedEffort) return modelMode
   const table = qwenAiEffortModeMapFromEnv()
   const mapped = table[normalizedEffort]
-  if (!mapped) return modelMode
+  if (!mapped) {
+    warnUnknownEffort(normalizedEffort, Object.keys(table).filter(key => key !== 'default'))
+    const fallback = table.default
+    if (!fallback) return modelMode
+    if (fallback === modelMode.thinkingMode) return modelMode
+    return {
+      ...modelMode,
+      thinkingEnabled: fallback !== 'Fast',
+      autoThinking: fallback === 'Auto',
+      thinkingMode: fallback,
+    }
+  }
   if (mapped === modelMode.thinkingMode) return modelMode
   return {
     ...modelMode,

@@ -243,6 +243,36 @@ function customToolNames(request: ResponseCreateRequest): string[] {
   ))
 }
 
+/**
+ * Read a backoff hint off a failure, wherever the forwarder attached it.
+ *
+ * Pre-stream failures still carry a real `Retry-After` header, but that header
+ * is gone by the time a mid-stream failure reaches the client, so the value has
+ * to be recovered from the error object. A missing or unparseable hint returns
+ * undefined rather than a guess: a wrong backoff is worse than none.
+ */
+function retryAfterSecondsFromError(error: Error): number | undefined {
+  const candidate = error as Error & {
+    retryAfterSeconds?: unknown
+    retryAfter?: unknown
+    headers?: Record<string, unknown>
+  }
+  const raw = [candidate.retryAfterSeconds, candidate.retryAfter]
+  for (const value of raw) {
+    const parsed = Number(value)
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed
+  }
+  const headers = candidate.headers
+  if (headers && typeof headers === 'object') {
+    for (const [name, value] of Object.entries(headers)) {
+      if (name.toLowerCase() !== 'retry-after') continue
+      const parsed = Number(value)
+      if (Number.isSafeInteger(parsed) && parsed > 0) return parsed
+    }
+  }
+  return undefined
+}
+
 export class ChatCompletionsToResponsesStream extends Transform {
   private readonly parser = new IncrementalSseParser()
   private readonly request: ResponseCreateRequest
@@ -318,7 +348,12 @@ export class ChatCompletionsToResponsesStream extends Transform {
     this.start()
     this.finalized = true
     this.stopProgressTimer()
-    const responseError: { code: string; message: string; retryable?: boolean } = {
+    const responseError: {
+      code: string
+      message: string
+      retryable?: boolean
+      retry_after_seconds?: number
+    } = {
       code: typeof (error as Error & { code?: unknown }).code === 'string'
         ? (error as Error & { code: string }).code
         : 'upstream_error',
@@ -331,11 +366,23 @@ export class ChatCompletionsToResponsesStream extends Transform {
     if (typeof retryable === 'boolean') {
       responseError.retryable = retryable
     }
+    // A failure raised after the response started has already spent the status
+    // line, so a Retry-After header is unreachable by the client - the only
+    // remaining channel is the payload of the terminal event. Without it a
+    // client that backs off has nothing to read and re-sends immediately into
+    // the same circuit. Checked 2026-09-29: a per-payload risk circuit parked
+    // retries for 600s that the client could not see, which presented as an
+    // outage rather than a rate limit.
+    const retryAfterSeconds = retryAfterSecondsFromError(error)
+    if (retryAfterSeconds !== undefined) {
+      responseError.retry_after_seconds = retryAfterSeconds
+    }
     this.enqueueEvent('error', {
       code: responseError.code,
       message: responseError.message,
       param: null,
       ...(typeof retryable === 'boolean' ? { retryable } : {}),
+      ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
     })
     const response = createResponseObject(this.request, {
       id: this.responseId,

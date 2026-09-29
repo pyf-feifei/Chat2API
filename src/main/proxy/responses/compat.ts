@@ -625,6 +625,58 @@ function textFormatToChatResponseFormat(text: ResponseCreateRequest['text']): Re
   return undefined
 }
 
+/**
+ * Reasoning-effort names the Responses path forwards to the chat layer.
+ *
+ * Anything outside this set is dropped, so a typo'd or unsupported tier cannot
+ * silently select a mode downstream. The authoritative effort -> thinking_mode
+ * table lives in providers/qwen-ai-model-mode.ts; this set is the wire-level
+ * allowlist and the two must stay in step.
+ *
+ * `ultracode` and `ultra` are the same tier under different client releases:
+ * Codex 0.157.1 sends `ultra`, an earlier build sent `ultracode`, and listing
+ * only the older name dropped the newer one to `undefined` — which made the
+ * request run on the provider default with nothing logged. `max` is the third
+ * spelling the Qwen table accepts.
+ */
+const RESPONSES_PASSTHROUGH_EFFORTS: ReadonlySet<string> = new Set([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'ultracode',
+  'ultra',
+  'max',
+])
+
+/**
+ * Dropped tiers are reported once per name. Without this an unknown tier is
+ * invisible: the request runs on the provider default, nothing fails, and the
+ * only symptom is a client quietly running shallower than it asked for.
+ */
+const warnedDroppedEfforts = new Set<string>()
+
+function forwardedEffort(
+  effort: string | undefined | null
+): ChatCompletionRequest['reasoning_effort'] {
+  const raw = String(effort ?? '').trim()
+  if (!raw) return undefined
+  const normalized = raw.toLowerCase()
+  if (RESPONSES_PASSTHROUGH_EFFORTS.has(normalized)) {
+    return effort as ChatCompletionRequest['reasoning_effort']
+  }
+  if (!warnedDroppedEfforts.has(normalized)) {
+    warnedDroppedEfforts.add(normalized)
+    console.warn(
+      `[Responses] Unsupported reasoning effort "${raw}"; it is dropped and the request `
+      + `runs on the provider default. Supported here: ${Array.from(RESPONSES_PASSTHROUGH_EFFORTS).join(', ')}. `
+      + 'A client that renamed its tiers needs its new name added to this set.'
+    )
+  }
+  return undefined
+}
+
 export function responsesRequestToChatCompletion(
   request: ResponseCreateRequest,
   previousMessages: ChatMessage[] = [],
@@ -682,15 +734,17 @@ export function responsesRequestToChatCompletion(
     top_p: typeof request.top_p === 'number' ? request.top_p : undefined,
     max_tokens: typeof request.max_output_tokens === 'number' ? request.max_output_tokens : undefined,
     user: typeof request.user === 'string' ? request.user : undefined,
-    reasoning_effort: (
-      request.reasoning?.effort === 'minimal'
-        || request.reasoning?.effort === 'low'
-        || request.reasoning?.effort === 'medium'
-        || request.reasoning?.effort === 'high'
-        || request.reasoning?.effort === 'xhigh'
-        ? request.reasoning.effort
-        : undefined
-    ) as ChatCompletionRequest['reasoning_effort'],
+    // Effort names the Responses path will forward. A name outside this set is
+    // dropped rather than passed through, so a typo'd tier cannot silently
+    // select a mode downstream. The Qwen AI side keeps the authoritative
+    // effort -> thinking_mode table in providers/qwen-ai-model-mode.ts; keep
+    // the two in step. `ultracode` and `ultra` are the same tier under
+    // different client releases (Codex 0.157.1 ships `ultra`, where an earlier
+    // build shipped `ultracode`), so both are listed.
+    // Compared case-insensitively: Codex sends the tier capitalised (`Ultra`)
+    // while the set and the Qwen effort table are lowercased. A case-sensitive
+    // comparison here drops a valid tier before the table ever sees it.
+    reasoning_effort: forwardedEffort(request.reasoning?.effort),
     tools,
     tool_choice: toChatToolChoice(request.tool_choice, Boolean(tools?.length), Boolean(imageGeneration)),
     web_search: webSearch || undefined,

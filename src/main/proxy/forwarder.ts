@@ -2822,19 +2822,29 @@ export class RequestForwarder {
         || getQwenAiWebshareProxy()
       const bandwidthBlocked = qwenAiEgressRecoveryState?.webshareBandwidthExhausted === true
       const webshareNote = proxySawVerdict
-        ? `Webshare proxy recovery also received the verdict on ${verdictProxyExitDraws} exit(s). `
+        ? `Webshare proxy recovery also received the verdict on ${verdictProxyExitDraws} exit(s), so the verdict is not specific to one exit. `
         : bandwidthBlocked
           ? 'Webshare proxy recovery hit a bandwidth limit (HTTP 402) before it could retest this verdict on a different exit. '
           : getQwenAiWebshareRetries() > 0
             ? 'Webshare proxy recovery was attempted for this request. '
             : isWebshareProxyEnabled()
               ? 'Webshare proxy recovery was unavailable or already spent for this request. '
-              : 'Webshare proxy recovery is not configured, so the flagged direct egress was reused. '
-      lastError = 'Qwen AI returned a risk-control verdict (bxpunish/RGV587). '
+              : 'Webshare proxy recovery is not configured. '
+      // The verdict header says the upstream judged THIS request. It carries no
+      // evidence about the egress, and the two have very different fixes, so the
+      // message must not assert one. Measured 2026-09-29 on a residential AS4837
+      // egress: ordinary requests on the same path succeeded seconds later, so
+      // "the flagged direct egress was reused" sent the reader after the network
+      // and proxy. That is the 2026-09-25 misdiagnosis, and it cost a full
+      // session before the real cause was found.
+      lastError = 'Qwen AI returned a risk-control verdict (bxpunish/RGV587) for this request. '
         + webshareNote
-        + 'This can be an egress-IP flag or a blocked task pattern; retrying '
-        + 'cannot clear it from the same path. Rephrase the task, trim the '
-        + 'transcript, or try again later.'
+        + 'The upstream did not say the egress is at fault: it judges the request '
+        + 'payload, so the transcript contents are the first thing to check. '
+        + 'Repeating the identical request is blocked by a per-payload circuit; '
+        + 'rephrase the task, trim the transcript, or start a new session. '
+        + 'Before changing network settings, confirm the egress is actually '
+        + 'involved by checking whether unrelated requests still succeed. '
       lastRetryable = false
       lastRetryScope = undefined
       // Content/egress verdict: never a credential fault. Explicit false

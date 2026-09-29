@@ -29,9 +29,20 @@ services:
       CHAT2API_LOG_LEVEL: info
       CHAT2API_LOAD_BALANCER_DEBUG: "true"
       CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
-      # Detect the protocol-level Claude context-summary turn from its
-      # structural instructions. Set to off when a deployment owns this path.
-      CHAT2API_COMPACTION_DETECTION: ${CHAT2API_COMPACTION_DETECTION:-off}
+      # Detect the protocol-level Claude/Codex context-summary turn from its
+      # structural instructions.
+      #
+      # This is what turns on output stripping for a compaction turn
+      # (`stripManagedOutput = intent === 'context_compaction'` in the chat and
+      # responses routes). With it off, a compaction request is labelled
+      # `intent: normal`, the managed tool-result guard runs in fail mode, and
+      # a summary that happens to echo the internal `<|CHAT2API|tool_result>`
+      # envelope aborts the whole stream - the client then reports
+      # "stream disconnected before completion" and re-issues the request, which
+      # is how a 2.19M-token compaction turned into a reconnect loop. A summary
+      # is not a tool channel, so there is nothing to protect by failing it.
+      # Set to off only when a deployment owns this path itself.
+      CHAT2API_COMPACTION_DETECTION: ${CHAT2API_COMPACTION_DETECTION:-auto}
       # Optional upstream token optimizer. `dry-run` measures only; `safe`
       # rewrites eligible old tool text; `balanced` is an experimental lossy
       # task-aware excerpt mode.
@@ -167,13 +178,15 @@ services:
       # Client reasoning_effort -> upstream Qwen3.8-Max thinking_mode enum.
       # Upstream only understands three levels (Fast/Auto/Thinking), so every
       # effort has to collapse onto one of them.
-      CHAT2API_QWEN_AI_EFFORT_MODE_MAP: ${CHAT2API_QWEN_AI_EFFORT_MODE_MAP:-minimal:fast,low:fast,medium:thinking,high:thinking,xhigh:thinking,ultracode:thinking,max:thinking,default:auto}
+      # `ultracode` and `ultra` are the same tier under different client
+      # releases; both are listed so neither client silently loses it.
+      CHAT2API_QWEN_AI_EFFORT_MODE_MAP: ${CHAT2API_QWEN_AI_EFFORT_MODE_MAP:-minimal:fast,low:fast,medium:thinking,high:thinking,xhigh:thinking,ultracode:thinking,max:thinking,ultra:thinking,default:auto}
       # The enum is an on/off switch, so reasoning *depth* is prompt-side:
       # effort -> light|medium|deep directive, sent only while thinking is on.
       # A deep directive multiplies generation time, so managed tool-calling
       # turns are never given one.
       CHAT2API_QWEN_AI_EFFORT_PROMPT: ${CHAT2API_QWEN_AI_EFFORT_PROMPT:-true}
-      CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP: ${CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP:-medium:light,high:medium,xhigh:deep,ultracode:deep,max:deep}
+      CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP: ${CHAT2API_QWEN_AI_EFFORT_DEPTH_MAP:-medium:light,high:medium,xhigh:deep,ultracode:deep,max:deep,ultra:deep}
       CHAT2API_QWEN_AI_DEPTH_PROMPT_LIGHT: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_LIGHT:-}
       CHAT2API_QWEN_AI_DEPTH_PROMPT_MEDIUM: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_MEDIUM:-}
       CHAT2API_QWEN_AI_DEPTH_PROMPT_DEEP: ${CHAT2API_QWEN_AI_DEPTH_PROMPT_DEEP:-}
@@ -268,6 +281,11 @@ services:
       # Debug: log upstream request payload summaries (confirm injected texts).
       CHAT2API_QWEN_AI_DEBUG_REQUEST: ${CHAT2API_QWEN_AI_DEBUG_REQUEST:-false}
       CHAT2API_QWEN_AI_DEBUG_STREAM: ${CHAT2API_QWEN_AI_DEBUG_STREAM:-false}
+      # Full outbound payload instead of the summary, so the effective
+      # feature_config (thinking_mode, and the depth directive) can be
+      # read back off the wire. Noisy and message-bearing: local diagnostics
+      # only.
+      CHAT2API_QWEN_AI_DEBUG_PAYLOAD: ${CHAT2API_QWEN_AI_DEBUG_PAYLOAD:-false}
       # Debug: log the RAW client tool types on /v1/responses (codex switches
       # shell to `local_shell` for gpt-5-family model names; dropped types
       # silently zero the managed tool path).
@@ -288,6 +306,19 @@ services:
       # account rotation so one client request cannot burn the pool with
       # identical replays. 'off' disables the cap.
       CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX: ${CHAT2API_QWEN_AI_CONTENT_FAILOVER_ROTATION_MAX:-0}
+      # An aliyun content verdict (bxpunish / RGV587, HTTP 200 + `bxpunish: 1`
+      # + a `_____tmd_____/punish?action=captcha` body) is normally an
+      # egress-IP challenge and a 2026-09-22 measurement saw one transcript
+      # draw the identical verdict on 6 consecutive accounts. The default -1
+      # therefore stops on the first hit and returns 503 to the client at once.
+      #
+      # N >= 0 buys N extra accounts per request: the same account is retried
+      # first, and only then does the failover loop rotate. That is worth
+      # spending when the verdict correlates with the session rather than the
+      # address, and it is cheap with Webshare disabled (a direct retry is
+      # ~4.5s, against ~79s when the drained proxy pool is engaged first).
+      # 'off' restores the -1 behaviour explicitly.
+      CHAT2API_QWEN_AI_CONTENT_VERDICT_ROTATION_MAX: ${CHAT2API_QWEN_AI_CONTENT_VERDICT_ROTATION_MAX:--1}
       # A busy page on >= N distinct accounts within one logical request is a
       # storm (IP-level risk control masquerading as capacity): report it to
       # the governor so the busy chain cools down and the global risk circuit

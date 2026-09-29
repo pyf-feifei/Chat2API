@@ -220,6 +220,29 @@ function isShortContinuation(text: string): boolean {
   return /^(?:continue|continuing|go on|keep going|resume|next|proceed|again|继续|接着|继续吧|往下|下一步)$/.test(normalized)
 }
 
+/**
+ * Codex (core/src/compact.rs) asks for a handoff summary with a fixed
+ * instruction that carries neither of the two markers the terminal-text
+ * classifier requires: it never says "text only" and never forbids tools.
+ * Only "summary" is present, so the turn was classified as a normal request,
+ * the tool schema stayed attached, and the model answered the summarization
+ * request with a protocol tool call instead of prose. Codex discards a
+ * tool_call on a compaction turn and retries, so every attempt paid a full
+ * generation (~3-6 min observed) and never produced a summary.
+ *
+ * Every alternative is an imperative - the shape a client protocol uses to
+ * issue an instruction, not the shape a person uses to mention the feature.
+ * A bare "context checkpoint compaction" match was tried and rejected: it
+ * captures "explain how context checkpoint compaction works", which is a
+ * question about the feature and must stay a normal turn. That distinction is
+ * the same one explicitCompactionMarker() above keeps for the system prompt.
+ */
+function codexHandoffCompactionInstruction(text: string): boolean {
+  return /\byou\s+are\s+performing\s+(?:a\s+)?context\s+checkpoint\s+compaction\b/i.test(text)
+    || /\bcreate\s+a\s+handoff\s+summary\s+for\s+another\s+(?:llm|language\s+model)\b/i.test(text)
+    || /\bhelping\s+the\s+next\s+(?:llm|language\s+model)\s+seamlessly\s+continue\b/i.test(text)
+}
+
 function compactionInstructionSignals(text: string): string[] {
   if (!text) return []
   const textOnly = /\b(?:respond|reply|output|return|provide)\b[\s\S]{0,500}\b(?:plain\s+)?text\s+only\b/i.test(text)
@@ -251,7 +274,10 @@ function classifyTerminalText(
   const lastUserText = [...messages].reverse().find(message => message.role === 'user')
   const lastUser = lastUserText ? messageText(lastUserText) : ''
   const signals = compactionInstructionSignals(lastUser)
-  const hasTerminalCompactionInstruction = isCompleteCompactionInstruction(signals)
+  const isCodexHandoff = codexHandoffCompactionInstruction(lastUser)
+  if (isCodexHandoff) signals.push('terminal_codex_handoff')
+  const hasTerminalCompactionInstruction = isCodexHandoff
+    || isCompleteCompactionInstruction(signals)
   const hasToolHistorySummaryInstruction = toolResultCount > 0
     && signals.includes('terminal_text_only')
     && signals.includes('terminal_summary_requested')
@@ -318,9 +344,11 @@ export function classifyChatRequest(request: ChatCompletionRequest): ChatRequest
     : terminal.matched
       ? terminal.signals.includes('continuation_after_compaction_instruction')
         ? 'continuation_after_compaction_instruction'
-        : terminal.signals.includes('terminal_tool_history')
-          ? 'text_only_summary_with_tool_history'
-          : 'text_only_tool_prohibition_summary'
+        : terminal.signals.includes('terminal_codex_handoff')
+          ? 'codex_handoff_compaction'
+          : terminal.signals.includes('terminal_tool_history')
+            ? 'text_only_summary_with_tool_history'
+            : 'text_only_tool_prohibition_summary'
       : 'no_compaction_signal'
 
   return {
