@@ -5,6 +5,11 @@ import { dirname, join } from 'path'
 import { fileURLToPath } from 'url'
 import { storeManager } from '../../store/store'
 import type { Account } from '../../../shared/types'
+import {
+  mergeRiskCookiesIntoJar,
+  riskCookiesForPeers,
+  rebindForeignIdentity,
+} from './qwen-ai-cookie-identity'
 
 // Resolve the bundled solver so the default works in every layout:
 //   dev/tsx   : this file sits at <repo>/src/main/proxy/adapters -> repo/scripts
@@ -186,11 +191,15 @@ async function doRefresh(account: Account): Promise<Account | null> {
           const harvestedToken = parsed.token && !/^c2a:/i.test(String(parsed.token).trim())
             ? parsed.token
             : undefined
+          // The browser was seeded with the stored jar, so identity cookies of
+          // another user already in it come straight back; keep only this
+          // account's own session in its jar.
+          const ownCookies = rebindForeignIdentity(harvestedCookies, String(harvestedToken || token))
           const updated = storeManager.updateAccount(account.id, {
             credentials: {
               ...account.credentials,
-              cookies: harvestedCookies,
-              cookie: harvestedCookies,
+              cookies: ownCookies,
+              cookie: ownCookies,
               ...(harvestedToken ? { token: harvestedToken } : {}),
             },
           })
@@ -204,16 +213,29 @@ async function doRefresh(account: Account): Promise<Account | null> {
           // other qwen-ai account so the whole pool behind the same flagged
           // exit benefits from a single slider pass — otherwise each account
           // would keep failing until it individually re-triggered a refresh.
+          // Only the cookies this refresh produced travel, and never the
+          // signed-in identity: copying the whole jar made all 340 accounts
+          // present one account's session (2026-09-29).
+          const riskCookies = riskCookiesForPeers(
+            cookies,
+            harvestedCookies,
+            [token, String(harvestedToken || '')],
+          )
           let propagated = 0
           try {
-            const peers = storeManager.getAccountsByProviderId('qwen-ai', true)
+            const peers = riskCookies.size > 0
+              ? storeManager.getAccountsByProviderId('qwen-ai', true)
+              : []
             for (const peer of peers) {
               if (peer.id === account.id) continue
+              const peerJar = String(peer.credentials.cookies || peer.credentials.cookie || '')
+              const merged = mergeRiskCookiesIntoJar(peerJar, riskCookies)
+              if (merged === peerJar) continue
               storeManager.updateAccount(peer.id, {
                 credentials: {
                   ...peer.credentials,
-                  cookies: harvestedCookies,
-                  cookie: harvestedCookies,
+                  cookies: merged,
+                  cookie: merged,
                 },
               })
               propagated += 1
@@ -224,6 +246,7 @@ async function doRefresh(account: Account): Promise<Account | null> {
           console.info('[QwenAI Risk Refresh] credentials updated', JSON.stringify({
             accountId: account.id,
             solvedSlider: parsed.solved_slider === true,
+            sharedCookies: Array.from(riskCookies.keys()),
             propagatedToAccounts: propagated,
           }))
           resolve(updated)

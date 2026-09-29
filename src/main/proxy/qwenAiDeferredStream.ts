@@ -37,6 +37,16 @@ function failureFromResult(result: ForwardResult): QwenAiFailure {
   })
 }
 
+function retryAfterSecondsFromHeaders(headers: Record<string, string> | undefined): number | undefined {
+  if (!headers || typeof headers !== 'object') return undefined
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== 'retry-after') continue
+    const parsed = Number(value)
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed
+  }
+  return undefined
+}
+
 function missingStreamFailure(): QwenAiFailure {
   return Object.assign(new Error('Qwen AI returned no stream after account failover'), {
     status: 502,
@@ -128,12 +138,18 @@ export function createDeferredQwenAiFailoverStream(
     const code = typeof details.code === 'string' && details.code.trim()
       ? details.code
       : 'qwen_ai_stream_error'
+    // The Retry-After header of a failed attempt cannot reach the client once
+    // this stream is open, so carry the backoff inside the error frame.
+    const retryAfterSeconds = retryAfterSecondsFromHeaders(
+      (error as QwenAiFailure).headers,
+    )
     const payload = {
       error: {
         message: error.message,
         type,
         code,
         ...(status === undefined ? {} : { status }),
+        ...(retryAfterSeconds === undefined ? {} : { retry_after_seconds: retryAfterSeconds }),
         ...(typeof details.retryable === 'boolean' ? { retryable: details.retryable } : {}),
         ...(typeof details.accountFault === 'boolean' ? { accountFault: details.accountFault } : {}),
         ...(typeof details.upstreamState === 'string' ? { upstream_state: details.upstreamState } : {}),

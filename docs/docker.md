@@ -198,14 +198,24 @@ CHAT2API_QWEN_AI_RISK_CIRCUIT_THRESHOLD=2
 # all new Qwen AI traffic is refused with 503 qwen_ai_risk_circuit_open *before*
 # another account is consumed. One accepted upstream response closes it. Set
 # THRESHOLD=0 to park on the first verdict. See docs/network-egress.md.
-CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD=3
-CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS=600000
+CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD=12
+CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS=180000
 CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS=300000
+# A content verdict is transient: retry the SAME request on a paced schedule
+# (60s, then doubled, capped at 240s, never past the request deadline) instead
+# of failing over. 0 restores fail-fast.
+CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES=2
+CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_DELAY_MS=60000
+CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_MAX_DELAY_MS=240000
+# Codex only backs off on rate_limit_exceeded + "try again in Ns"; every other
+# code is retried within a second. Retryable Responses failures are rewritten
+# to that shape (real code kept in upstream_code). "off" keeps provider codes.
+CHAT2API_RESPONSES_PACED_FAILURE_CODE=rate_limit_exceeded
 # Keep provider traffic off any host-level HTTP proxy. "on" (default) appends
 # the provider domains to NO_PROXY. NOTE: on Docker Desktop the container's
-# network layer inherits the Windows system proxy, so this cannot help a
-# container — configure DIRECT rules in Clash/mihomo instead. See
-# docs/network-egress.md.
+# network layer can inherit the Windows system proxy, which neither this nor
+# Clash rules reach — fix Docker Desktop's proxy mode. See
+# docs/network-egress.md §8.5.
 CHAT2API_EGRESS_DIRECT=on
 QWEN_AI_REQUEST_TIMEOUT_MS=840000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0
@@ -371,7 +381,7 @@ results within the current user turn. It returns
 reached. Add long-polling tools to the comma-separated ignored list so normal
 wait cycles do not count as repeated work.
 
-Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
+Set `CHAT2API_STORAGE_ENCRYPTION_KEY` for server-side credential encryption. It is optional only for a new, plaintext store. Once a store holds `c2a:v1:` values, the same key must reach every process that opens it: a missing or different key makes the startup self-check refuse to start (see README, "Set the storage encryption key").
 
 For Qwen AI, `active` means the stored JWT passed account validation. It does
 not by itself mean that the account has the `token=...` cookie required by the
@@ -714,7 +724,6 @@ src/main/store/storage/
 src/renderer/admin.html
 src/renderer/src/web-main.tsx
 src/renderer/src/web-admin-api.ts
-tests/server/
 Dockerfile
 docker-compose.yml
 .dockerignore
@@ -729,7 +738,7 @@ When pulling upstream:
 git fetch upstream
 git merge upstream/main
 npm install
-npm run test:server-compat
+npm run test:server-compat   # needs the local tests/ copy; not in the repo
 npm run build:server
 docker build -t chat2api:server .
 ```

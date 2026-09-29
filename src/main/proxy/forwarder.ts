@@ -805,6 +805,49 @@ function qwenAiVerdictProxyExitMaxFromEnv(): number {
   return value
 }
 
+function boundedIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value)) return fallback
+  return Math.min(max, Math.max(min, value))
+}
+
+/**
+ * Same-request retries after a content verdict when no other egress is
+ * available. The verdict is transient: measured 2026-09-29, a 138KB Codex
+ * transcript refused on six consecutive attempts within four minutes completed
+ * when replayed byte-for-byte an hour later, and unrelated small requests on
+ * the same exit kept succeeding throughout. Refusing the turn outright hands
+ * the wait to the client, which retries at once and meets the per-payload
+ * circuit. Waiting here keeps the client stream open instead. 0 restores the
+ * fail-fast behavior.
+ */
+function qwenAiVerdictPacedRetryCountFromEnv(): number {
+  return boundedIntegerFromEnv('CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES', 2, 0, 20)
+}
+
+/**
+ * Wait before paced verdict retry `index` (0-based): the base delay doubled per
+ * retry and capped. Spacing the attempts is what separates this from the retry
+ * storms that used to escalate a verdict: one probe per window, never a burst.
+ */
+function qwenAiVerdictPacedRetryDelayMs(index: number): number {
+  const baseMs = boundedIntegerFromEnv(
+    'CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_DELAY_MS',
+    60_000,
+    1_000,
+    60 * 60 * 1000,
+  )
+  const maxMs = boundedIntegerFromEnv(
+    'CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_MAX_DELAY_MS',
+    240_000,
+    baseMs,
+    60 * 60 * 1000,
+  )
+  return Math.min(maxMs, baseMs * (2 ** Math.min(20, Math.max(0, index))))
+}
+
 /**
  * How long a daily-quota refusal keeps an account out of rotation.
  *
@@ -1773,6 +1816,7 @@ export class RequestForwarder {
     let attempt = 0
     let standardRetriesUsed = 0
     let qwenAiBusyRetries = 0
+    let qwenAiVerdictPacedRetries = 0
     let qwenAiCapacityBackoffExceedsDeadline = false
     // Document-pipeline escape phases: parse/upload failure first downgrades
     // to locked inline on the same account; only if that inline retry is
@@ -1943,6 +1987,32 @@ export class RequestForwarder {
           && !context.signal?.aborted
           && observedAt + webshareDelayMs < qwenAiRequestDeadline
         if (!canEscalateVerdictToWebshare) {
+          // No other egress can retest the verdict, but time still can: keep
+          // the client's stream open and probe again after a spaced wait
+          // instead of refusing the turn (see qwenAiVerdictPacedRetryCountFromEnv).
+          const pacedRetryLimit = qwenAiVerdictPacedRetryCountFromEnv()
+          const pacedDelayMs = qwenAiVerdictPacedRetryDelayMs(qwenAiVerdictPacedRetries)
+          if (
+            qwenAiVerdictPacedRetries < pacedRetryLimit
+            && !context.signal?.aborted
+            && observedAt + pacedDelayMs < qwenAiRequestDeadline
+          ) {
+            qwenAiVerdictPacedRetries += 1
+            nextRetryDelayMs = pacedDelayMs
+            nextRetryDelayOverrideMs = undefined
+            attempt += 1
+            console.warn('[QwenAI] content verdict (bxpunish/RGV587) — pacing a same-request retry', JSON.stringify({
+              requestId: context.requestId,
+              accountId: account.id,
+              attempt,
+              pacedRetry: qwenAiVerdictPacedRetries,
+              pacedRetryLimit,
+              retryDelayMs: pacedDelayMs,
+              elapsedMs: observedAt - startTime,
+              remainingBudgetMs,
+            }))
+            return true
+          }
           riskVerdictSeen = true
           if (qwenAiEgressRecoveryState) qwenAiEgressRecoveryState.riskVerdictSeen = true
           console.warn('[QwenAI] content verdict (bxpunish/RGV587) — failing fast, no failover burn', JSON.stringify({
@@ -1950,6 +2020,7 @@ export class RequestForwarder {
             accountId: account.id,
             attempt: attempt + 1,
             elapsedMs: observedAt - startTime,
+            pacedRetries: qwenAiVerdictPacedRetries,
             alreadyOnProxy: getQwenAiWebshareProxy(),
             webshareRetries: getQwenAiWebshareRetries(),
             webshareEnabled: isWebshareProxyEnabled(),
@@ -2104,6 +2175,7 @@ export class RequestForwarder {
         && (
           previousRecoveryHint === 'managed_tool_stream_validation'
           || qwenAiBusyRetries > 0
+          || qwenAiVerdictPacedRetries > 0
           || getQwenAiWebshareRetries() > 0
         )
 
@@ -2814,6 +2886,18 @@ export class RequestForwarder {
             ...(lastHeaders || {}),
             'Retry-After': String(retryAfterSeconds),
           }
+        }
+      }
+      // Even before the circuit blocks, an immediate resend of this turn is
+      // known to be futile. Tell the client how long to wait, using the same
+      // spacing the paced retries above use, so its retry lands in a new
+      // window instead of on the circuit.
+      if (!Object.keys(lastHeaders || {}).some(name => name.toLowerCase() === 'retry-after')) {
+        lastHeaders = {
+          ...(lastHeaders || {}),
+          'Retry-After': String(Math.max(1, Math.ceil(
+            qwenAiVerdictPacedRetryDelayMs(qwenAiVerdictPacedRetries) / 1000,
+          ))),
         }
       }
       const verdictProxyExitDraws = qwenAiEgressRecoveryState?.webshareVerdictExits ?? 0

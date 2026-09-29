@@ -198,10 +198,10 @@ subscription body — the subscription is regenerated on every update and your
 edits are lost. The mihomo core runs as a Windows service and cannot be killed
 from an unprivileged shell, so reload the profile in the UI.
 
-> **Docker note:** Docker Desktop's network layer honours the Windows system
-> proxy, so a container with **no** `HTTP_PROXY` in it still egresses through
-> the local proxy. Setting `NO_PROXY` inside the container cannot help. For
-> Docker deployments these Clash rules are the real fix, not the app policy.
+> **Docker note:** Docker Desktop can route container traffic through the
+> Windows system proxy even when the container has no `HTTP_PROXY`. Neither
+> `NO_PROXY` inside the container nor these Clash rules fix that; see the next
+> section.
 
 **Full setup, verification and troubleshooting:
 [docs/network-egress.md](docs/network-egress.md).**
@@ -238,7 +238,7 @@ production server, and use a single account locally for functional checks.
 Chat2API enforces this automatically once a verdict appears. A `bxpunish` /
 `RGV587` verdict is decided by the egress path, not by one payload, so the
 per-request risk circuit is joined by a **process-wide egress circuit**: after
-`CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` distinct payloads (default 3) are
+`CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` distinct payloads (default 12) are
 rejected inside `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` (default 5 min), all
 new Qwen AI traffic is refused with `503 qwen_ai_risk_circuit_open` and a
 `Retry-After` header *before* another account is consumed. One accepted upstream
@@ -247,9 +247,14 @@ waiting out the cooldown.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `3` | Distinct payloads that must be rejected before the egress is parked; `0` parks on the first verdict |
-| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `600000` | How long the egress stays parked |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `12` | Distinct payloads that must be rejected before the egress is parked; `0` parks on the first verdict |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `180000` | How long the egress stays parked |
 | `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` | `300000` | Window in which verdicts are counted |
+
+A verdict is not always about the egress. If one request fingerprint is
+rejected on every account while other requests succeed, the upstream is judging
+that transcript; changing accounts or IPs will not help. See `AGENTS.md`
+("A content verdict is not always an egress or account problem").
 
 ## Set the storage encryption key (required)
 
@@ -325,7 +330,7 @@ same account pool needs a little care.
 | Never do | Drive the production pool, or run a load test from here | — |
 
 - **Do not** point a local instance and the production container at the same
-  `accounts.json`/`/data` volume while both are running. They will overwrite each
+  `data.json`/`/data` volume while both are running. They will overwrite each
   other's `status`/`errorMessage` fields and each one's repair queue will fight
   the other's verdicts.
 - **Do not** run load or soak tests from a workstation. Upstream rate limiting
@@ -340,9 +345,8 @@ same account pool needs a little care.
 - The desktop app applies the direct-egress policy automatically. If you run the
   Docker image on a host that also has a proxy configured, the headless server
   applies the same policy; set `CHAT2API_EGRESS_DIRECT=off` only if you
-  deliberately want the proxy in that path. See
-  [docs/network-egress.md](docs/network-egress.md) for the Clash rules a Docker
-  host still needs.
+  deliberately want the proxy in that path. For a Docker Desktop host, fix the
+  VM-level proxy as described above; Clash rules do not reach container traffic.
 
 Two failure modes that look identical but are unrelated — see
 [docs/network-egress.md](docs/network-egress.md#9-symptom--cause):
@@ -375,10 +379,11 @@ Desktop data is stored in `~/.chat2api/`; Docker data is stored in the mounted `
 
 | Path | Contents |
 | --- | --- |
-| `config.json` | Proxy, UI, and application settings |
-| `providers.json` | Provider definitions and model mappings |
-| `accounts.json` | Account credentials and account state |
-| `logs/` | Request logs |
+| `data.json` | Everything: providers, accounts (credentials encrypted), config, sessions, statistics |
+| `qwen-ai-file-cache.json`, `compression-archive.json` | Provider upload cache and context-compression archive |
+| `logs/`, `request-logs/`, `responses/` | App logs, request logs, stored Responses state |
+
+The server uses `CHAT2API_DATA_DIR` when set.
 
 The server supports environment variables for host/port, management API, API keys, storage encryption, load balancing, request deadlines, and provider-specific controls. Start with the examples in [docs/docker.md](docs/docker.md).
 
@@ -389,8 +394,12 @@ Issues, provider updates, tests, and documentation improvements are welcome. Ple
 ```bash
 npm install
 npm run build
-npm run test:server-compat
+npm run build:server
 ```
+
+The test suite (`tests/`) is kept out of the repository and exists only in
+maintainers' working copies, so `npm run test:*` scripts need a local `tests/`
+directory.
 
 ## License
 

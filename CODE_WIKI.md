@@ -2,15 +2,17 @@
 
 ## 1. 项目概述
 
-Chat2API 是一个多平台 AI 服务统一管理工具，通过利用官方 Web UI 实现零成本访问领先的 AI 模型。它支持 DeepSeek、GLM、Kimi、MiniMax、Qwen、Z.ai 等提供商，并与 openlcaw、Cline、Roo-Code 等工具无缝集成，使任何 OpenAI 兼容客户端都能开箱即用。
+Chat2API 是一个桌面应用（Electron）加无头服务端（Koa，Docker），把网页版 AI 服务账号统一成 OpenAI 兼容接口。支持的提供商见 7.3 节。
+
+> 本文是概览。开发与排障规则以 `AGENTS.md` 为准；两者冲突时改正本文。
 
 ### 核心功能
-- OpenAI 兼容 API：提供标准的 OpenAI 兼容 API 端点，实现无缝集成
-- 多提供商支持：连接 DeepSeek、GLM、Kimi、MiniMax、Perplexity、Qwen、Z.ai 等
+- OpenAI 兼容 API：`/v1/chat/completions`、`/v1/responses`（Codex）、`/v1/completions`，另有 Anthropic Messages 和 Gemini 兼容路由
+- 多提供商支持：见 7.3 节
 - 上下文管理：智能对话上下文管理，支持滑动窗口、令牌限制和摘要策略
 - 函数调用支持：通过提示工程实现所有模型的通用工具调用能力，兼容 Cherry Studio、Kilo Code 等客户端
 - 模型映射：灵活的模型名称映射，支持通配符和首选提供商/账户选择
-- 自定义参数：支持自定义 HTTP 头，启用网络搜索、思考模式和深度研究功能
+- 网络搜索 / 思考模式：由各适配器根据请求字段（`web_search`、`reasoning_effort`）或模型名开启，没有专用 HTTP 头
 - 仪表板监控：实时请求流量、令牌使用和成功率
 - API 密钥管理：为本地代理生成和管理密钥
 - 模型管理：查看和管理所有提供商的可用模型
@@ -37,7 +39,8 @@ Chat2API/
 │   │   ├── store/              # 数据存储
 │   │   ├── oauth/              # OAuth 认证
 │   │   ├── providers/          # 提供商管理
-│   │   └── utils/              # 工具函数
+│   │   └── runtime/            # Electron / Node 运行时适配（数据目录、加密）
+│   ├── server/                 # 无头服务端入口（Docker），打包到 out-server/
 │   ├── preload/                # 上下文桥接
 │   └── renderer/               # React 前端
 │       ├── components/         # UI 组件
@@ -113,17 +116,17 @@ Chat2API/
 - **主要方法**：
   - `start(port, host)`：启动代理服务器
   - `stop()`：停止代理服务器
-  - `restart(port, host)`：重启代理服务器
   - `isRunning()`：检查服务器是否运行
   - `getStatistics()`：获取服务器统计信息
 
 #### 4.1.2 LoadBalancer (src/main/proxy/loadbalancer.ts)
 - **职责**：实现负载均衡策略
 - **主要方法**：
-  - `selectAccount(model, strategy, preferredProviderId, preferredAccountId)`：选择合适的账户
+  - `selectAccount(model, strategy, preferredProviderId, preferredAccountId, excludedAccountIds, constraints)`：选择合适的账户
   - `markAccountFailed(accountId)`：标记账户失败
   - `clearAccountFailure(accountId)`：清除账户失败状态
-  - `getAvailableAccounts(model, preferredProviderId, excludeFailed)`：获取可用账户列表
+  - `getAvailableAccounts(model, preferredProviderId, excludeFailed, excludedAccountIds)`：获取可用账户列表
+  - Qwen AI 会优先选择有完整 Web 会话（`token=` cookie）的账号；该 cookie 优先于 Bearer JWT 生效
 
 #### 4.1.3 ModelMapper (src/main/proxy/modelMapper.ts)
 - **职责**：支持请求模型到实际模型的映射
@@ -230,11 +233,10 @@ npm run start:sandbox
 
 ### 7.1 配置文件
 
-应用数据存储在 `~/.chat2api/` 目录：
-- `config.json` - 应用配置
-- `providers.json` - 提供商设置
-- `accounts.json` - 账户凭证（加密）
-- `logs/` - 请求日志
+应用数据存储在 `~/.chat2api/`（服务端：`CHAT2API_DATA_DIR`，生产环境默认 `/data`）：
+- `data.json` - 全部数据（服务商、账号凭证（加密）、配置、会话、统计），单一 electron-store 文件
+- `qwen-ai-file-cache.json`、`compression-archive.json` - 上传缓存、压缩归档
+- `logs/`、`request-logs/`、`responses/` - 日志与 Responses 状态
 
 ### 7.2 代理配置
 
@@ -244,17 +246,10 @@ npm run start:sandbox
 
 ### 7.3 提供商配置
 
-支持的提供商：
-- DeepSeek
-- GLM
-- Kimi
-- MiniMax
-- Perplexity
-- Qwen (CN)
-- Qwen AI (Global)
-- Z.ai
+支持的提供商以 `src/main/providers/builtin/index.ts` 的 `builtinProviders` 为准（唯一来源，`store/types.ts` 的 `BUILTIN_PROVIDERS` 只是重导出）：
+DeepSeek、GLM、Kimi、MiniMax、Mimo、Microsoft 365 Copilot、Perplexity、Qwen (CN)、Qwen AI (Global)、Z.ai。
 
-每个提供商需要配置相应的认证信息，如令牌或凭证。
+每个提供商需要配置相应的认证信息，如令牌或凭证。排障规则（风控、出口、加密密钥、账号池身份）见 `AGENTS.md`。
 
 ## 8. 开发指南
 
@@ -267,10 +262,12 @@ npm run start:sandbox
 ### 8.2 扩展提供商
 
 要添加新的提供商支持，需要：
-1. 在 `src/main/providers/builtin/` 目录添加提供商实现
+1. 在 `src/main/providers/builtin/` 目录添加提供商配置，并在 `builtin/index.ts` 注册
 2. 在 `src/main/oauth/adapters/` 目录添加 OAuth 适配器
-3. 在 `src/main/proxy/adapters/` 目录添加代理适配器
-4. 在渲染进程中添加提供商图标和配置界面
+3. 在 `src/main/proxy/adapters/` 目录添加代理适配器，并在 `forwarder.ts` 的 `providerForwarders` 表中注册
+4. 在渲染进程中添加提供商图标（`src/renderer/src/assets/providers/`）和配置界面
+
+完整清单见 `AGENTS.md` 的 "Adding a New Provider"。
 
 ### 8.3 调试技巧
 

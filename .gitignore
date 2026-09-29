@@ -59,6 +59,10 @@ coverage/
 
 # Test suite. Local verification only; nothing in the shipped bundle reads it.
 tests/
+# Test files anywhere else in the tree (co-located specs, ad-hoc checks).
+*.test.ts
+*.test.mjs
+*.test.js
 
 # Manual live test scripts (local debugging only)
 tests/manual/*-live.mjs

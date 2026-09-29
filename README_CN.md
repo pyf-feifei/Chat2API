@@ -190,9 +190,8 @@ prepend:
 `%APPDATA%/io.github.clash-verge-rev.clash-verge-rev/profiles/<uid>.yaml`。
 改完后需在 UI 里重载订阅；核心以服务方式运行，无管理员权限的 shell 无法重启它。
 
-> **Docker 注意**：Docker Desktop 的网络层会继承 Windows 系统代理，所以即使容器内
-> **没有** `HTTP_PROXY`，流量照样被本地代理接管。在容器内设 `NO_PROXY` 无效。对
-> Docker 部署而言，**上面这些 Clash 规则才是真正的修复**，而不是应用层策略。
+> **Docker 注意**：即使容器内**没有** `HTTP_PROXY`，Docker Desktop 也可能把容器流量
+> 走 Windows 系统代理。容器内设 `NO_PROXY` 和上面的 Clash 规则都解决不了，见下一节。
 
 **完整配置、验证与排障：[docs/network-egress.md](docs/network-egress.md)。**
 
@@ -224,16 +223,20 @@ IP）上驱动约 340 个账号，本身就是一个异常形态。请把完整�
 一旦出现风控判定，Chat2API 会自动兜底。`bxpunish` / `RGV587` 判定由出口路径决定，
 而非某个特定请求体，所以除了按请求指纹的熔断之外，还有一个**进程级出口熔断**：
 当 `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS`（默认 5 分钟）窗口内有
-`CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD`（默认 3）个**不同请求体**被判风控时，
+`CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD`（默认 12）个**不同请求体**被判风控时，
 所有新的 Qwen AI 流量会直接以 `503 qwen_ai_risk_circuit_open` 和 `Retry-After`
 拒绝，**在消耗下一个账号之前**就停住。只要有一次上游成功响应即自动关闭，因此修好路由
 后能立即恢复，而不必等完整个冷却期。
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `3` | 多少个不同请求体被拒后停住整个出口；设为 `0` 则首次判定即停 |
-| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `600000` | 出口停住的时长 |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `12` | 多少个不同请求体被拒后停住整个出口；设为 `0` 则首次判定即停 |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `180000` | 出口停住的时长 |
 | `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` | `300000` | 统计风控判定的时间窗口 |
+
+风控判定不一定和出口有关。如果同一个请求指纹在所有账号上都被拒、而其他请求正常，说明
+上游判的是这段对话内容，换账号或换 IP 都没用。详见 `AGENTS.md`（"A content verdict is
+not always an egress or account problem"）。
 
 ## 必须配置存储加密密钥
 
@@ -299,7 +302,7 @@ docker compose up -d --force-recreate
 | 出口 | 家宽 IP，不走代理 | 固定服务器 IP，不走代理 |
 | 禁止 | 驱动生产账号池，或从本机做压测 | — |
 
-- **不要**让本地实例和生产容器在同时运行时指向同一个 `accounts.json`/`/data` 卷。
+- **不要**让本地实例和生产容器在同时运行时指向同一个 `data.json`/`/data` 卷。
   双方会互相覆盖 `status`/`errorMessage` 字段，且各自的修复队列会与对方的判定相互
   干扰。
 - **不要**在工作机上做压测或长时间浸泡测试。上游限流是按出口 IP 计的，本机压测损害的
@@ -311,8 +314,8 @@ docker compose up -d --force-recreate
   ```
 - 桌面端会自动应用直连策略；若你在同样配置了代理的主机上跑 Docker 镜像，无头服务端会
   应用同一策略。只有当你**确实希望**该路径经过代理时，才设置
-  `CHAT2API_EGRESS_DIRECT=off`。但 Docker 主机仍需配置 Clash 规则，详见
-  [docs/network-egress.md](docs/network-egress.md)。
+  `CHAT2API_EGRESS_DIRECT=off`。Docker Desktop 主机请按上文修正 VM 级代理；Clash 规则
+  管不到容器流量。
 
 两种长得一样但根因无关的故障，详见
 [docs/network-egress.md](docs/network-egress.md#9-symptom--cause)：
@@ -345,10 +348,11 @@ docker compose up -d --force-recreate
 
 | 路径 | 内容 |
 | --- | --- |
-| `config.json` | 代理、界面和应用设置 |
-| `providers.json` | 服务商定义和模型映射 |
-| `accounts.json` | 账户凭证和状态 |
-| `logs/` | 请求日志 |
+| `data.json` | 全部数据：服务商、账号（凭证加密）、配置、会话、统计 |
+| `qwen-ai-file-cache.json`、`compression-archive.json` | 上传文件缓存和上下文压缩归档 |
+| `logs/`、`request-logs/`、`responses/` | 应用日志、请求日志、Responses 状态 |
+
+服务端设置了 `CHAT2API_DATA_DIR` 时以它为准。
 
 服务端支持主机/端口、管理 API、API Key、存储加密、负载均衡、请求超时和服务商专属参数。可从 [docs/docker.md](docs/docker.md) 中的示例开始配置。
 
@@ -359,8 +363,11 @@ docker compose up -d --force-recreate
 ```bash
 npm install
 npm run build
-npm run test:server-compat
+npm run build:server
 ```
+
+测试套件（`tests/`）不在仓库里，只存在于维护者的本地工作副本中，所以 `npm run test:*`
+脚本需要本地有 `tests/` 目录才能运行。
 
 ## 许可证
 

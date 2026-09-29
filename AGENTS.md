@@ -1,10 +1,13 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to coding agents working in this repository.
+
+**Every claim here is checked against the code. If you find one that no longer
+matches, fix or delete it in the same change — a stale rule is worse than none.**
 
 ## Project Overview
 
-Chat2API Manager is an Electron desktop application that provides an OpenAI-compatible API proxy for multiple AI service providers (DeepSeek, GLM, Kimi, MiniMax, Qwen, Z.ai, Perplexity). It enables using any OpenAI-compatible client with these providers across macOS, Windows, and Linux.
+Chat2API is an Electron desktop application and a headless Koa server (Docker) that expose an OpenAI-compatible API proxy for web AI providers (DeepSeek, GLM, Kimi, MiniMax, Mimo, Microsoft 365 Copilot, Perplexity, Qwen, Qwen AI, Z.ai).
 
 ## Build Commands
 
@@ -22,7 +25,25 @@ npm run build:all        # Build for all platforms
 
 # Preview production build
 npm run preview
+
+# Headless server bundle (what Docker runs) -> out-server/
+npm run build:server
+
+# Server test suite (node --test over tests/server/*.test.{mjs,ts})
+node tests/server/run-server-tests.mjs
+npm run test:server-compat      # build:server + the suite
 ```
+
+The test suite is **not in the repository**. `tests/` and `*.test.{ts,mjs,js}`
+are in `.gitignore` and were untracked on 2026-09-29, so a fresh clone has no
+tests and `test:server-compat`, `test:compression`, `test:imageslim` and
+`corpus:verify` fail there. Tests live in the local working copy only. Keep
+writing them for every fix, and do not `git add -f` them. Test paths named in
+this file refer to that local copy.
+
+Type-check has a pre-existing error baseline. Compare
+`npx tsc --noEmit -p tsconfig.json` before and after your change and report new
+errors only; do not claim a clean tree.
 
 ## Architecture
 
@@ -35,8 +56,8 @@ src/
 │   │   ├── server.ts       # HTTP server with middleware
 │   │   ├── forwarder.ts    # Request forwarding logic & auth
 │   │   ├── adapters/       # Provider-specific adapters
-│   │   ├── routes.ts       # Proxy routes registration
-│   │   ├── sessionManager.ts # Multi-turn conversation management
+│   │   ├── routes/         # chat, responses, anthropic, gemini, management, ...
+│   │   ├── sessionManager.ts # Session records (chat | agent)
 │   │   └── services/       # Prompt injection & prompt generation
 │   ├── oauth/              # OAuth authentication
 │   │   ├── manager.ts      # OAuth flow orchestration
@@ -68,38 +89,35 @@ Each AI provider has a dedicated adapter in `src/main/proxy/adapters/` that hand
 - Stream response parsing
 - Multi-turn conversation context
 
-To add a new provider:
-1. Create config in `src/main/providers/builtin/<provider>.ts`
-2. Create OAuth adapter in `src/main/oauth/adapters/<provider>.ts`
-3. Create proxy adapter in `src/main/proxy/adapters/<provider>.ts`
-4. Create stream handler in `src/main/proxy/adapters/<provider>-stream.ts`
-5. Register in `src/main/providers/builtin/index.ts` and `src/main/proxy/adapters/index.ts`
+See [Adding a New Provider](#adding-a-new-provider) for the full checklist.
 
 ### IPC Communication
 All main-renderer communication uses IPC channels defined in `src/main/ipc/channels.ts`. The naming convention is `domain:action` (e.g., `proxy:start`, `accounts:add`).
 
-### Session Management
-Multi-turn conversations are managed by `sessionManager.ts`:
-- `single` mode: Session deleted after each chat
-- `multi` mode: Session persists with parent message IDs for context
+### Sessions
+`sessionManager.ts` keeps session records (`sessionType: 'chat' | 'agent'`)
+governed by `SessionConfig` (timeout, max messages, max sessions per account).
+There is no `single`/`multi` mode. Qwen AI has its own chat-reuse policy,
+`QwenAiSessionMode` = `legacy | tool-call-binding | sticky` (default
+`tool-call-binding`, `src/main/store/types.ts`).
 
 ### Tool Prompt Injection
 For models without native function calling, prompts are injected via `promptInjectionService.ts`. This enables function calling compatibility with clients like Cherry Studio and Kilo Code.
 
-### Session Management Flow
-1. Client sends request with `sessionId`
-2. `sessionManager.ts` retrieves session or creates new one
-3. For `multi` mode: parentMessageId is used to fetch conversation history
-4. Adapter creates/uses provider-specific session
-5. Response is returned with new parentMessageId for context continuation
-
 ## Data Storage
 
-Application data is stored in `~/.chat2api/`:
-- `config.json` - Application configuration
-- `providers.json` - Provider settings
-- `accounts.json` - Account credentials (encrypted)
-- `logs/` - Request logs
+Everything lives in **one** electron-store file, `data.json` (providers,
+accounts, config, logs, sessions, statistics). There is no `config.json`,
+`providers.json` or `accounts.json`.
+
+| Runtime | Directory |
+| --- | --- |
+| Desktop (Electron) | `~/.chat2api/` |
+| Server | `CHAT2API_DATA_DIR`, else `/data` when `NODE_ENV=production`, else `~/.chat2api/` |
+
+Next to it: `qwen-ai-file-cache.json`, `compression-archive.json`, `logs/`,
+`request-logs/`, `responses/`. Credential values are stored as `c2a:v1:…`
+ciphertext when `CHAT2API_STORAGE_ENCRYPTION_KEY` is set.
 
 ## Tech Stack
 
@@ -154,8 +172,7 @@ Adding a new provider requires modifications across 4 layers: Provider Config, O
 | File | Purpose |
 |------|---------|
 | `src/main/providers/builtin/<provider>.ts` | Provider configuration definition |
-| `src/main/providers/builtin/index.ts` | Register provider in `builtinProviders` array |
-| `src/main/store/types.ts` | Sync to `BUILTIN_PROVIDERS` array |
+| `src/main/providers/builtin/index.ts` | Register provider in `builtinProviders` array (single source; `BUILTIN_PROVIDERS` in `store/types.ts` is a re-export) |
 
 #### 2. OAuth Authentication Layer (Required)
 
@@ -170,9 +187,9 @@ Adding a new provider requires modifications across 4 layers: Provider Config, O
 | File | Purpose |
 |------|---------|
 | `src/main/proxy/adapters/<provider>.ts` | Proxy adapter implementation |
-| `src/main/proxy/adapters/<provider>-stream.ts` | Stream handler implementation |
+| `src/main/proxy/adapters/<provider>-stream.ts` | Stream handler (optional; only DeepSeek and Perplexity have a separate file) |
 | `src/main/proxy/adapters/index.ts` | Export adapter |
-| `src/main/proxy/forwarder.ts` | Add `forward<Provider>()` method |
+| `src/main/proxy/forwarder.ts` | Add an entry to `providerForwarders` plus a `forward<Provider>()` method |
 
 #### 4. UI Layer (Required)
 
@@ -180,8 +197,8 @@ Adding a new provider requires modifications across 4 layers: Provider Config, O
 |------|---------|
 | `src/renderer/src/i18n/locales/zh-CN.json` | Chinese translations |
 | `src/renderer/src/i18n/locales/en-US.json` | English translations |
-| `src/renderer/src/components/providers/ProviderCard.tsx` | Add icon mapping |
-| `src/assets/providers/<provider>.svg` | Provider icon file |
+| `src/renderer/src/components/providers/ProviderCard.tsx` | Add icon mapping (also `AddProviderDialog.tsx`, `LoginGuideDialog.tsx`, `models/ModelList.tsx`) |
+| `src/renderer/src/assets/providers/<provider>.svg` | Provider icon file (`@/` resolves to `src/renderer/src`) |
 
 ### Step-by-Step Implementation
 
@@ -247,7 +264,8 @@ export const builtinProviderMap: Record<string, BuiltinProviderConfig> = {
 export { providerConfig }
 ```
 
-**CRITICAL**: Must also update `src/main/store/types.ts` `BUILTIN_PROVIDERS` array with identical configuration.
+This is the only registration. `BUILTIN_PROVIDERS` in `src/main/store/types.ts`
+re-exports `builtinProviders`; do not copy the config there.
 
 #### Step 3: OAuth Adapter
 
@@ -449,12 +467,14 @@ export { ProviderAdapter, ProviderStreamHandler, providerAdapter } from './provi
 ```typescript
 // src/main/proxy/forwarder.ts
 import { ProviderAdapter } from './adapters/provider'
-import { ProviderStreamHandler } from './adapters/provider-stream'
 
-// In doForward method, add check:
-if (ProviderAdapter.isProviderProvider(provider)) {
-  return this.forwardProvider(request, account, provider, actualModel, startTime, sessionContext)
-}
+// Dispatch is table-driven: add an entry to `providerForwarders`.
+{
+  profileKey: 'provider-id',
+  matches: ProviderAdapter.isProviderProvider,
+  forward: (request, account, provider, actualModel, startTime, context) =>
+    this.forwardProvider(request, account, provider, actualModel, startTime, context),
+},
 
 // Add forward method:
 private async forwardProvider(
@@ -522,61 +542,20 @@ const providerIcons: Record<string, string> = {
 | `userToken` | User Token | DeepSeek | `token` |
 | `jwt` | JWT Token | Kimi, MiniMax, Qwen AI, Z.ai | `token` |
 | `refresh_token` | Refresh Token | GLM | `refresh_token` |
-| `cookie` | Cookie Auth | Perplexity | `sessionToken` |
+| `cookie` | Cookie Auth | Perplexity, Mimo | `sessionToken` / `service_token` |
 | `tongyi_sso_ticket` | SSO Ticket | Qwen | `ticket` |
-| `token` | Generic Token | Z.ai | `token` |
+| `oauth` | OAuth (in-app login) | Microsoft 365 Copilot | refresh token |
 
-### Web Search Mode Implementation
+The full union also has `token` and `realUserID_token`; check
+`AuthType` in `src/main/store/types.ts` before relying on this table.
 
-Three ways to enable web search:
+### Web Search and Thinking Modes
 
-1. **Model Mapping**: Auto-enable via model name
-```typescript
-const modelLower = request.model.toLowerCase()
-if (modelLower.includes('search')) {
-  searchEnabled = true
-}
-```
-
-2. **Custom Parameter**: Via `web_search` parameter
-```typescript
-if (request.web_search) {
-  searchEnabled = true
-}
-```
-
-3. **Custom Header**: Via request header
-```typescript
-if (headers['X-Enable-Search']) {
-  searchEnabled = true
-}
-```
-
-### Thinking Mode Implementation
-
-Three ways to enable thinking mode:
-
-1. **Model Mapping**: Auto-enable via model name
-```typescript
-const modelLower = request.model.toLowerCase()
-if (modelLower.includes('r1') || modelLower.includes('think')) {
-  thinkingEnabled = true
-}
-```
-
-2. **Custom Parameter**: Via `reasoning_effort` parameter
-```typescript
-if (request.reasoning_effort) {
-  thinkingEnabled = true
-}
-```
-
-3. **Custom Header**: Via request header
-```typescript
-if (headers['X-Enable-Thinking']) {
-  thinkingEnabled = true
-}
-```
+Each adapter decides this itself; read the adapter you are changing. The
+patterns in use are the request field (`web_search`, `reasoning_effort`) and,
+in some adapters, the model name (DeepSeek: `search`; Kimi: `think`/`r1`).
+There are no `X-Enable-Search` / `X-Enable-Thinking` headers. Qwen AI maps
+effort tiers through `src/main/providers/qwen-ai-model-mode.ts`.
 
 ### Thinking Content Handling
 
@@ -589,15 +568,6 @@ if (path === 'thinking') {
   delta.content = processedContent
 }
 ```
-
-### Model List Synchronization
-
-**CRITICAL**: Model list must be defined in TWO locations:
-
-1. `src/main/providers/builtin/<provider>.ts` - `supportedModels` array
-2. `src/main/store/types.ts` - `BUILTIN_PROVIDERS` array
-
-Both must be identical, otherwise configuration won't take effect.
 
 ### Testing Checklist
 
@@ -614,23 +584,12 @@ Both must be identical, otherwise configuration won't take effect.
 
 ## Updating Provider Configuration
 
-When updating provider configuration (e.g., model list, description, help text), you MUST update **both** locations:
+Edit **only** `src/main/providers/builtin/<provider>.ts` (model list,
+description, help text). `BUILTIN_PROVIDERS` in `src/main/store/types.ts` is a
+re-export of `builtinProviders`, so there is nothing to keep in sync by hand.
 
-1. **`src/main/providers/builtin/<provider>.ts`** - Provider config module
-2. **`src/main/store/types.ts`** - `BUILTIN_PROVIDERS` array
-
-The `initializeDefaultProviders()` method in `store.ts` syncs configuration from `BUILTIN_PROVIDERS` to persistent storage on app startup. If only one location is updated, the changes will not be reflected in the UI.
-
-Example: When updating Z.ai model list:
-```typescript
-// 1. src/main/providers/builtin/zai.ts
-supportedModels: ['GLM-5-Turbo', 'GLM-5', 'GLM-4.7', ...]
-
-// 2. src/main/store/types.ts (BUILTIN_PROVIDERS array)
-supportedModels: ['GLM-5-Turbo', 'GLM-5', 'GLM-4.7', ...]
-```
-
-**Important**: Users must restart the app after configuration updates to see the changes.
+`initializeDefaultProviders()` in `store.ts` copies the built-in config into the
+persisted store at startup, so restart the app/server to see the change.
 
 ## Network Egress: Never Diagnose "Home IP Banned" Without Checking the Proxy
 
@@ -712,10 +671,75 @@ When adding a provider whose risk control is IP-sensitive, add its domain to
 Two independent circuits exist in `src/main/proxy/qwenAiRiskCircuit.ts`:
 
 - **Per-fingerprint** — blocks a repeat of the exact payload already judged.
-- **Egress-level (process-wide)** — a `bxpunish`/`RGV587` verdict is decided by
-  the egress path, not by one payload, so N *distinct* payloads rejected inside a
-  window parks all new Qwen AI traffic before another account is consumed. One
-  accepted response clears it.
+- **Egress-level (process-wide)** — N *distinct* payloads rejected inside a
+  window park all new Qwen AI traffic before another account is consumed. One
+  accepted response clears it. Defaults (code and compose): threshold 12,
+  cooldown 180 s, window 300 s.
+
+### A content verdict is not always an egress or account problem
+
+`bxpunish` / `RGV587` verdicts come in three shapes. Classify before fixing:
+
+| Shape | Evidence | Meaning |
+| --- | --- | --- |
+| One fingerprint, every account | `risk circuit recorded for request fingerprint` repeats one `fingerprint` across accounts; other requests succeed | The **payload** is judged. Which part triggers it is not observable. Rotating accounts or IPs does nothing; a changed transcript (new user message, `/compact`) or waiting it out does. |
+| Many fingerprints, one exit | distinct fingerprints, rising egress-circuit count | Egress is flagged. See the network sections. |
+| Every account is the same user | distinct `token` cookie count ≠ account count | Pool identity corruption, see below. |
+
+The per-request circuit is keyed on the Codex session **plus the newest user
+message** (`userTurnAnchor` in `qwenAiRiskCircuit.ts`), so it follows one turn
+through its tool loop but never blocks the user's next message. Keyed on the
+session alone, one verdict refused "继续" for the full cooldown (2026-09-29).
+
+Verdicts are transient: the same payload has passed about an hour later. The
+forwarder therefore paces same-request retries instead of failing over:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES` | `2` | Same-request retries after a verdict (`0` = old fail-fast) |
+| `CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_DELAY_MS` | `60000` | First wait; doubles per retry |
+| `CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_MAX_DELAY_MS` | `240000` | Cap per wait; never waits past the request deadline |
+
+### Codex only backs off on a rate-limit-shaped failure
+
+Measured on Codex 0.158 with a mock upstream:
+
+- in-stream `response.failed` with code `rate_limit_exceeded` and text
+  `try again in Ns` makes Codex wait N seconds;
+- **any other code** is retried after 0.2 s and 0.4 s, so the budget burns in
+  under a second and the user sees `stream disconnected before completion`;
+- HTTP 503 with `Retry-After` is honoured; HTTP 429 is not retried.
+
+`src/main/proxy/responses/stream.ts` therefore rewrites retryable Responses
+failures to `code: rate_limit_exceeded` + `try again in Ns` and keeps the real
+code in `upstream_code`. `CHAT2API_RESPONSES_PACED_FAILURE_CODE=off` restores
+the provider code. Do not "fix" the rewrite back to provider codes, and do not
+return 429 to Codex.
+
+### Risk refresh must never copy identity between accounts
+
+`qwen-risk-refresh.ts` harvests a browser cookie jar and shares risk cookies
+with the pool. On 2026-09-29 it copied the **whole** jar, including `token`,
+`refresh_token`, `aui` and `cnaui`, onto 339 accounts. A `token` cookie takes
+priority over the Bearer JWT (`resolveQwenAiAuthHeaders`), so all 340 accounts
+ran as one user and drew verdicts continuously.
+
+- Peers only receive cookies the refresh itself changed **and** that carry no
+  identity (`src/main/proxy/adapters/qwen-ai-cookie-identity.ts`). Identity is
+  decided from the value: a signed JWT, or a value equal to a user id from
+  one. Do not replace this with a list of cookie names.
+- Health check for the pool: the number of distinct `token` cookies must equal
+  the number of accounts, and each must equal that account's own JWT.
+- Tests: `tests/server/qwen-ai-cookie-identity.test.ts`.
+
+### Quota notices arrive as successful answers
+
+"今日对话次数已达上限" / "You've reached today's chat limit" comes back as HTTP
+200 content. It must be classified (`qwen_ai_daily_quota_exhausted`, account
+parked until reset) **before** the dangling-answer rule. Otherwise the short
+answer is treated as `qwen_ai_semantic_incomplete` and replayed on other
+accounts. Both response paths in `qwen-ai.ts` keep that order; a source-order
+test guards it (`tests/server/qwen-ai-daily-quota-notice.test.mjs`).
 
 When mocking `./qwenAiRiskCircuit` in tests, provide **all** of:
 `createQwenAiRiskFingerprint`, `getQwenAiRiskCircuitEntry`,
@@ -730,7 +754,7 @@ Upstream rate limiting is per egress IP. A ~340-account pool on one IP — above
 all a shared datacenter one — is an anomaly shape no matter how the accounts
 were obtained. Keep the full pool on the production server; use one account
 locally for functional checks. Never point a local instance and the production
-container at the same `accounts.json`/`/data` volume while both run: they
+container at the same `data.json`/`/data` volume while both run: they
 overwrite each other's `status`/`errorMessage` and their repair queues fight.
 
 See the "Network egress" and "Local versus production deployment" sections in
@@ -799,9 +823,18 @@ inside a container can reach it.
    docker exec <c> node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
    ```
 
-Clash rules alone are **not** a fix for the container path: `DOMAIN-SUFFIX,...,DIRECT`
-in mihomo only affects traffic that traverses the proxy, and the container's
-direct traffic never reaches mihomo.
+Clash rules are **not** a fix for the container path: `DOMAIN-SUFFIX,...,DIRECT`
+in mihomo only affects traffic that traverses the proxy. Some older docs said
+"for Docker, Clash rules are the real fix"; that is wrong and has been removed.
+
+With the Docker VM proxy active, the container **does** go through Clash, and
+Clash's rules then decide per domain. Measured 2026-09-29 with Clash rules
+`DOMAIN-SUFFIX,qwen.ai,DIRECT` in place: container → `ipinfo.io` exits via the
+node (`195.242.178.82`, falls to `MATCH,PROXY`), container → a DIRECT-ruled
+domestic domain exits via the residential IP. So `ipinfo.io` from the
+container only proves where *ipinfo.io* goes. To judge Qwen's egress, look at
+the rule Clash applied to `chat.qwen.ai` (Clash Verge → Connections), not a
+generic IP echo.
 
 Consequences when reasoning about Docker deployments:
 
@@ -911,7 +944,7 @@ line between the two environments first.**
 2. **After editing `.env`, recreate the container.** Environment variables are
    read once at process start; `docker restart` is not enough.
 3. **The key must match the one the data was written with.** The desktop and
-   Docker deployments share `accounts.json`; a divergent key produces exactly
+   Docker deployments can share one `data.json`; a divergent key produces exactly
    this failure.
 4. **Never edit a data volume by hand while the container is running.** Stop it
    first, otherwise the in-memory state overwrites the file on the next save.
@@ -940,7 +973,7 @@ line between the two environments first.**
 - Tests: `tests/server/credential-self-check.test.mjs` (9 cases, includes the
   false-positive guard).
 
-### Diagnosing the two risk-control-shaped failures
+### Diagnosing risk-control-shaped failures
 
 They are independent. Do not conflate them.
 
@@ -948,6 +981,11 @@ They are independent. Do not conflate them.
 |---|---|---|
 | Egress is a datacenter AS | Local proxy (Clash) inherited by Docker Desktop | `curl ipinfo.io` from inside the container |
 | Every request 403, accounts "frozen" | Missing/unmatched encryption key | `ready=0 pending=N` + `docker exec ... printenv CHAT2API_STORAGE_ENCRYPTION_KEY` |
+| Verdicts on every account, residential egress, key fine | Accounts share one identity | distinct `token` cookie count vs account count |
+| One request verdicted everywhere, others succeed | That transcript is judged | one repeating `fingerprint` in `risk circuit recorded` |
+
+Work down this table in order. Each row takes seconds and rules out the one
+above it.
 
 ## Never Mutate User Data Without Explicit Confirmation
 
@@ -957,7 +995,7 @@ a few accounts to the pool" as "cut the pool down to a few". The user needed all
 should never have happened without asking.
 
 - **Ask before deleting, truncating, rewriting, or bulk-updating any store file**
-  (`data.json`, `accounts.json`, volumes, `/opt/chat2api/data`).
+  (`data.json`, volumes, `/opt/chat2api/data`).
 - When a request is ambiguous, prefer the **non-destructive** reading and say
   which one you chose. "Add a few accounts" most often means "import/keep a few
   extra", not "delete the rest".
@@ -965,6 +1003,14 @@ should never have happened without asking.
   removal.
 - If a bulk edit is genuinely wanted, restate the exact before/after counts and
   wait for confirmation.
+- For a **running** container, change accounts through the management API
+  (`PUT /v0/management/accounts/:id`, secret from
+  `docker exec <c> printenv CHAT2API_MANAGEMENT_SECRET`) instead of editing
+  `data.json`. It writes through `storeManager`, so encryption and in-memory
+  state stay consistent. Take `cp -p /data/data.json /data/data.json.bak.<reason>-<ts>`
+  first, dry-run with counts only, and re-verify afterwards.
+- Never print credential values while investigating. Hash them, or print
+  counts and booleans (for example "distinct `token` cookies: 340").
 
 ## Controlled Comparisons Before Concluding
 
@@ -1010,3 +1056,20 @@ Corollary for shared infrastructure: a log is not a private scratch space.
 Correlate the lines you read back to the requests you sent (by `requestId`, or
 any per-request marker) before summing. Summing every line produced a total
 larger than the corpus, because another agent was writing to the same container.
+
+## Local Deploy And Verification Loop
+
+- Local `chat2api` (compose project `chat2api`, image `chat2api-local:latest`)
+  may run with `out-server/` bind-mounted read-only at `/app/out-server`
+  (`docker inspect chat2api --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'`).
+  If so, `npm run build:server` + `docker restart chat2api` deploys a change.
+  Without that mount the container runs the code baked into the image.
+- Production is image-only: build locally, push, and let the server pull
+  (`scripts/deploy/build-push.ps1`, `docs/docker.md` "Production Update
+  Flow"). Never build on the server, and ask before touching it.
+- A change is verified when the suite passes **and** one real request through
+  the container succeeds, e.g. `POST /v1/responses` with
+  `{"model":"Qwen3.8-Max","input":"reply with just: ok"}` → `status: completed`.
+- Read outcomes from `[Responses] stream-delivery {…"outcome":…}` lines and
+  join them to accounts by `requestId`. Another client may share the container,
+  so never sum log lines you did not correlate.

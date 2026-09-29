@@ -273,6 +273,30 @@ function retryAfterSecondsFromError(error: Error): number | undefined {
   return undefined
 }
 
+const DEFAULT_PACED_FAILURE_CODE = 'rate_limit_exceeded'
+// The wording OpenAI uses for a rate limit. Clients read the wait out of the
+// message text, not from a structured field.
+const PACED_FAILURE_DELAY_PATTERN = /try again in\s*\d+(?:\.\d+)?\s*(?:s|ms|seconds?)\b/i
+
+/**
+ * Error code for a failure that carries a backoff hint.
+ *
+ * The Responses protocol has exactly one failure shape that clients pace: a
+ * rate limit, whose wait is stated in the message. Any other code reads as
+ * "retry now". Measured 2026-09-29 against Codex 0.158: a `response.failed`
+ * with code `rate_limit_exceeded` and "try again in 7s" was retried 7s later,
+ * while the same event under a provider-specific code was retried after 0.2s
+ * and 0.4s, so a 594s risk-circuit wait spent the client's whole retry budget
+ * in six seconds and the turn failed. Blank keeps the default; `off` keeps the
+ * provider code.
+ */
+export function responsesPacedFailureCodeFromEnv(): string | undefined {
+  const raw = process.env.CHAT2API_RESPONSES_PACED_FAILURE_CODE
+  if (raw === undefined || raw.trim() === '') return DEFAULT_PACED_FAILURE_CODE
+  const value = raw.trim()
+  return value.toLowerCase() === 'off' ? undefined : value
+}
+
 export class ChatCompletionsToResponsesStream extends Transform {
   private readonly parser = new IncrementalSseParser()
   private readonly request: ResponseCreateRequest
@@ -353,6 +377,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
       message: string
       retryable?: boolean
       retry_after_seconds?: number
+      upstream_code?: string
     } = {
       code: typeof (error as Error & { code?: unknown }).code === 'string'
         ? (error as Error & { code: string }).code
@@ -362,10 +387,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
     // Surface an explicit non-retryable classification so SDK-side retry
     // policies can stop instead of treating every stream failure as
     // transport-level "reconnect and replay" work.
-    const retryable = (error as Error & { retryable?: unknown }).retryable
-    if (typeof retryable === 'boolean') {
-      responseError.retryable = retryable
-    }
+    let retryable = (error as Error & { retryable?: unknown }).retryable
     // A failure raised after the response started has already spent the status
     // line, so a Retry-After header is unreachable by the client - the only
     // remaining channel is the payload of the terminal event. Without it a
@@ -376,6 +398,22 @@ export class ChatCompletionsToResponsesStream extends Transform {
     const retryAfterSeconds = retryAfterSecondsFromError(error)
     if (retryAfterSeconds !== undefined) {
       responseError.retry_after_seconds = retryAfterSeconds
+      // A structured field alone is not enough: clients only pace the
+      // protocol's rate-limit shape. Present the wait in that shape, keep the
+      // provider code for diagnosis, and state that the request may be
+      // retried, since that is exactly what the hint invites.
+      const pacedCode = responsesPacedFailureCodeFromEnv()
+      if (pacedCode && responseError.code !== pacedCode) {
+        responseError.upstream_code = responseError.code
+        responseError.code = pacedCode
+        if (!PACED_FAILURE_DELAY_PATTERN.test(responseError.message)) {
+          responseError.message = `${responseError.message.trimEnd()} Please try again in ${retryAfterSeconds}s.`
+        }
+        retryable = true
+      }
+    }
+    if (typeof retryable === 'boolean') {
+      responseError.retryable = retryable
     }
     this.enqueueEvent('error', {
       code: responseError.code,
@@ -383,6 +421,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
       param: null,
       ...(typeof retryable === 'boolean' ? { retryable } : {}),
       ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
+      ...(responseError.upstream_code ? { upstream_code: responseError.upstream_code } : {}),
     })
     const response = createResponseObject(this.request, {
       id: this.responseId,
@@ -446,8 +485,14 @@ export class ChatCompletionsToResponsesStream extends Transform {
         const message = typeof chunk.error.message === 'string'
           ? chunk.error.message
           : 'Upstream stream returned an error.'
-        const error = new Error(message) as Error & { code?: string }
+        const error = new Error(message) as Error & { code?: string; retryAfterSeconds?: number }
         if (typeof chunk.error.code === 'string') error.code = chunk.error.code
+        // An upstream error frame is the only carrier of a backoff hint once
+        // the stream has started; keep it so fail() can pace the client.
+        const hintedSeconds = Number(chunk.error.retry_after_seconds)
+        if (Number.isSafeInteger(hintedSeconds) && hintedSeconds > 0) {
+          error.retryAfterSeconds = hintedSeconds
+        }
         this.fail(error)
         continue
       }

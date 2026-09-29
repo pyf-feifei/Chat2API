@@ -65,6 +65,21 @@ function prune(now: number): void {
   }
 }
 
+/**
+ * Position and content hash of the newest message a person wrote. Tool results
+ * and assistant output appended inside the turn leave it unchanged; a new user
+ * message moves it.
+ */
+function userTurnAnchor(messages: ChatCompletionRequest['messages'] | undefined): string {
+  const list = Array.isArray(messages) ? messages : []
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index]
+    if (message?.role !== 'user') continue
+    return `${index}:${createQwenAiTranscriptHash([message])}`
+  }
+  return 'none'
+}
+
 export function createQwenAiRiskFingerprint(
   request: Pick<ChatCompletionRequest, 'model' | 'messages' | 'tools' | 'tool_choice' | 'parallel_tool_calls' | 'response_format' | 'reasoning_effort' | 'enable_thinking' | 'thinking_budget' | 'image_generation' | 'stream'>,
   actualModel?: string,
@@ -73,8 +88,13 @@ export function createQwenAiRiskFingerprint(
   const contract = createQwenAiSessionRequestFingerprint(request)
   const actual = actualModel ?? request.model
   if (stableKey) {
+    // A stable client key lets the circuit follow one turn while its tool loop
+    // grows the transcript. It must not outlive the turn: keyed on the session
+    // alone, a verdict on one turn blocked the user's next message for the
+    // whole cooldown (observed 2026-09-29, "继续" refused for 457 s). The turn
+    // is identified by the newest user-authored message and its position.
     return createHash('sha256')
-      .update(JSON.stringify({ contract, stableKey, actualModel: actual }))
+      .update(JSON.stringify({ contract, stableKey, turn: userTurnAnchor(request.messages), actualModel: actual }))
       .digest('hex')
   }
   const transcript = createQwenAiTranscriptHash(request.messages)

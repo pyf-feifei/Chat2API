@@ -7343,25 +7343,33 @@ export class QwenAiStreamHandler {
         return
       }
 
-      if (
-        !emittedToolCall
-        && isDanglingManagedToolAnswer(this.content, this.toolCallingPlan)
-      ) {
-        recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
-        return
-      }
-
       // Streamed daily-quota refusal. The notice arrives in the content channel
       // with an empty reasoning channel, so it is only checked once the notice
       // itself is visible; failStream marks the account so the governor
       // rotates instead of re-selecting it.
-      if (isQwenAiDailyQuotaNotice(this.content, this.reasoning)) {
+      //
+      // Checked BEFORE the dangling-answer rule: the notice is a short
+      // marker-less answer, so over a live tool workflow that rule claims it
+      // first and replays the same spent account through every same-chat and
+      // fresh-chat recovery. Observed 2026-09-29: five consecutive Codex turns
+      // each burned six replays of the notice on one account and surfaced as
+      // qwen_ai_semantic_incomplete, while the rotation this error drives was
+      // never reached.
+      if (!emittedToolCall && isQwenAiDailyQuotaNotice(this.content, this.reasoning)) {
         console.warn('[QwenAI] stream returned a daily-quota refusal; parking the account', JSON.stringify({
           requestId: this.toolCallingPlan?.diagnostics?.requestId,
           accountId: this.account?.id,
           notice: String(this.content).trim().slice(0, 80),
         }))
         failStream(createQwenAiDailyQuotaError())
+        return
+      }
+
+      if (
+        !emittedToolCall
+        && isDanglingManagedToolAnswer(this.content, this.toolCallingPlan)
+      ) {
+        recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
         return
       }
 
@@ -8073,14 +8081,11 @@ export class QwenAiStreamHandler {
           }
         }
 
-        if (isDanglingManagedToolAnswer(answerText, this.toolCallingPlan)) {
-          recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
-          return
-        }
-
         // An exhausted daily quota arrives as HTTP 200 with the notice in
         // `content`. Returning that verbatim would present the notice as the
         // model's answer and the account would keep being selected all day.
+        // Checked before the dangling-answer rule for the same reason as the
+        // stream path: the notice is short, and that rule would replay it.
         if (isQwenAiDailyQuotaNotice(answerText, finalReasoning)) {
           console.warn('[QwenAI] upstream returned a daily-quota refusal; parking the account', JSON.stringify({
             requestId: this.toolCallingPlan?.diagnostics?.requestId,
@@ -8090,6 +8095,11 @@ export class QwenAiStreamHandler {
           // Non-streaming path: rejectOnce is the local settlement hook here.
           // failStream only exists in the streaming closure.
           rejectOnce(createQwenAiDailyQuotaError())
+          return
+        }
+
+        if (isDanglingManagedToolAnswer(answerText, this.toolCallingPlan)) {
+          recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
           return
         }
 

@@ -57,3 +57,30 @@ selected model can produce one.
 Codex-specific server-side namespace tools are not representable in a generic
 Chat Completions upstream and are omitted from that provider request. Ordinary
 Codex coding tools are function or custom tools and pass through the bridge.
+
+## Retries and failures
+
+Codex (measured on 0.158) waits only for an in-stream `response.failed` whose
+code is `rate_limit_exceeded` and whose message contains `try again in Ns`. Any
+other code is retried after 0.2 s and 0.4 s and then surfaces as
+`stream disconnected before completion`. An HTTP 429 is not retried at all.
+
+Chat2API therefore reports retryable Responses failures in that shape and
+keeps the provider's code in `upstream_code`:
+
+```json
+{"code": "rate_limit_exceeded", "upstream_code": "qwen_ai_content_verdict",
+ "message": "... Please try again in 60s.", "retry_after_seconds": 60}
+```
+
+Set `CHAT2API_RESPONSES_PACED_FAILURE_CODE=off` to keep provider codes.
+
+For Qwen AI content verdicts the proxy first retries the same request in place
+(`CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES`, default 2, 60 s then 120 s). A single
+request can therefore take several minutes before Codex shows
+`Reconnecting... n/5`; that is expected, not a hang.
+
+If one request keeps failing with `qwen_ai_content_verdict` after every retry
+while other requests succeed, the upstream is judging that transcript. Retrying
+cannot pass it; send a different message (or start a new session) so the
+payload changes.

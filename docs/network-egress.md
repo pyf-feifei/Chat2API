@@ -148,8 +148,10 @@ Docker Desktop's network layer honours the Windows system proxy
 container* cannot help, because the container never has an `HTTP_PROXY` to
 bypass — the interception happens below the container's network stack.
 
-Therefore: **for Docker deployments, the Clash/mihomo rules in §4.2 are the only
-real fix.** Layer 1 is a no-op there.
+Layer 1 is a no-op there, and so are the Clash/mihomo rules in §4.2: container
+traffic never enters mihomo. The fix is Docker Desktop's proxy mode (§8.5).
+(An earlier version of this guide called the Clash rules "the only real fix";
+that was measured wrong on 2026-09-26.)
 
 ### 4.2 Clash Verge / mihomo rules
 
@@ -310,8 +312,8 @@ recovers immediately instead of waiting out the cooldown.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `3` | Distinct payloads rejected before the egress is parked; `0` parks on the first verdict |
-| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `600000` | How long the egress stays parked |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_THRESHOLD` | `12` | Distinct payloads rejected before the egress is parked; `0` parks on the first verdict |
+| `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_COOLDOWN_MS` | `180000` | How long the egress stays parked |
 | `CHAT2API_QWEN_AI_EGRESS_CIRCUIT_WINDOW_MS` | `300000` | Window in which verdicts are counted |
 
 Counting *distinct fingerprints* rather than raw verdicts is deliberate: one
@@ -344,7 +346,7 @@ regardless of how the accounts were obtained.
 | Never | Drive the production pool, or load-test from here | — |
 
 - Do **not** point a local instance and the production container at the same
-  `accounts.json` / `/data` volume while both run. They overwrite each other's
+  `data.json` / `/data` volume while both run. They overwrite each other's
   `status` / `errorMessage`, and each one's repair queue fights the other's
   verdicts.
 - Do **not** run load or soak tests from a workstation. Per-IP limiting means a
