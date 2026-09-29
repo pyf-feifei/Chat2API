@@ -732,6 +732,35 @@ ran as one user and drew verdicts continuously.
   the number of accounts, and each must equal that account's own JWT.
 - Tests: `tests/server/qwen-ai-cookie-identity.test.ts`.
 
+### Qwen issues two kinds of login token
+
+Older accounts hold a long-lived JWT with no `type` claim, and most carry it as
+a `token=` cookie. Accounts logged in through the current web app
+(2026-09-29 and later) hold an `access_token` (`type: access_token`, **15
+minutes**) and a `refresh_token` cookie (30 days). Measured facts:
+
+- The access token is only accepted as `Authorization: Bearer`. Sent as a
+  `token=` cookie it answers `Unauthorized`, so never write it into the jar.
+- Renewal is `GET https://auth.qwen.ai/api/v2/auths/refresh` with
+  `Cookie: refresh_token=…`. `chat.qwen.ai` answers that path with Not Found.
+  `Timezone` and `x-request-origin` are required (`Invalid request header` /
+  `Missing origin` without them). `CHAT2API_QWEN_AI_AUTH_BASE` overrides the host.
+- The refresh token was not rotated in testing, but a rotated one in the
+  response is kept. Exchanges are serialized per account.
+- An account whose import has neither a `refresh_token` nor a working
+  email/password is dead once its access token lapses. Signin answering
+  `INVALID_CRED` for such accounts is the login itself, not our hashing: the
+  same request signs older accounts in.
+- A refused login on a non-active account is recorded as
+  `credentialsRejectedAt` + `credentialsRejectedFor` (a fingerprint, never the
+  password). Session repair waits
+  `CHAT2API_QWEN_AI_SESSION_REPAIR_REJECTED_LOGIN_RETRY_MS` (default 24h)
+  before trying that same login again, and retries at once when it changes.
+  Without this the refusals kept opening the pool-wide rejection-storm gate.
+- Code: `usableQwenAiRefreshToken`, `hasQwenAiWebSession`,
+  `canRefreshQwenAiAccount` in `qwen-ai-token-refresh.ts`. Tests:
+  `tests/server/qwen-ai-refresh-token.test.mjs`.
+
 ### Quota notices arrive as successful answers
 
 "今日对话次数已达上限" / "You've reached today's chat limit" comes back as HTTP
@@ -1060,10 +1089,13 @@ larger than the corpus, because another agent was writing to the same container.
 ## Local Deploy And Verification Loop
 
 - Local `chat2api` (compose project `chat2api`, image `chat2api-local:latest`)
-  may run with `out-server/` bind-mounted read-only at `/app/out-server`
-  (`docker inspect chat2api --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'`).
-  If so, `npm run build:server` + `docker restart chat2api` deploys a change.
-  Without that mount the container runs the code baked into the image.
+  may or may not have `out-server/` bind-mounted at `/app/out-server`; it has
+  been recreated both ways. Check before assuming a restart deploys anything:
+  `docker inspect chat2api --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'`.
+  With the mount, `npm run build:server` + `docker restart chat2api` deploys.
+  Without it the container runs the code baked into the image, and a restart
+  changes nothing; confirm by grepping `/app/out-server/server/index.js` for a
+  string your change added.
 - Production is image-only: build locally, push, and let the server pull
   (`scripts/deploy/build-push.ps1`, `docs/docker.md` "Production Update
   Flow"). Never build on the server, and ask before touching it.

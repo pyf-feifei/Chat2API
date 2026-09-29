@@ -355,6 +355,13 @@ export interface Account {
   /** Timestamp of the most recent verdict in the current strike window */
   lastUnregisteredAt?: number
   /**
+   * When the upstream last refused this account's saved login (INVALID_CRED),
+   * and a fingerprint of the email/password it refused. Session repair waits
+   * before signing that same login in again; a changed login is retried at once.
+   */
+  credentialsRejectedAt?: number
+  credentialsRejectedFor?: string
+  /**
    * End of the daily-quota exhaustion window (epoch ms), set when the upstream
    * answers a request with a quota notice in the message body.
    *

@@ -7,7 +7,7 @@ import { Account, Provider, LoadBalanceStrategy } from '../store/types'
 import { AccountSelection } from './types'
 import { storeManager } from '../store/store'
 import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
-import { hasQwenAiSessionCookie } from './adapters/qwen-ai-token-refresh'
+import { hasQwenAiWebSession } from './adapters/qwen-ai-token-refresh'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 import { qwenAiStickyRegistry } from './qwenAiStickyRegistry'
 
@@ -368,7 +368,7 @@ export class LoadBalancer {
 
     const credentials = candidate.account.credentials || {}
     const cookies = String(credentials.cookies || credentials.cookie || '').trim()
-    return hasQwenAiSessionCookie(cookies)
+    return hasQwenAiWebSession(cookies)
   }
 
   private hasIncompleteQwenAiWebSession(candidate: AccountSelection): boolean {
@@ -376,7 +376,7 @@ export class LoadBalancer {
 
     const credentials = candidate.account.credentials || {}
     const cookies = String(credentials.cookies || credentials.cookie || '').trim()
-    return Boolean(cookies && !hasQwenAiSessionCookie(cookies))
+    return Boolean(cookies && !hasQwenAiWebSession(cookies))
   }
 
   /**

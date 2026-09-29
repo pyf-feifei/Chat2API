@@ -1,9 +1,12 @@
 import type { Account, Provider } from '../store/types'
 import { storeManager } from '../store/store'
 import {
+  canRefreshQwenAiAccount,
   hasQwenAiSessionCookie,
+  qwenAiLoginFingerprint,
   qwenAiRefreshRiskGateRemainingMs,
   qwenAiTokenRefresher,
+  usableQwenAiRefreshToken,
 } from './adapters/qwen-ai-token-refresh'
 
 const DEFAULT_REPAIR_INTERVAL_MS = 25_000
@@ -12,6 +15,7 @@ const DEFAULT_FAILURE_RETRY_MS = 5 * 60_000
 const DEFAULT_CREDENTIAL_RETRY_MS = 6 * 60 * 60_000
 const DEFAULT_RISK_COOLDOWN_MS = 180_000
 const DEFAULT_PROBE_INTERVAL_MS = 6 * 60 * 60_000
+const DEFAULT_REJECTED_LOGIN_RETRY_MS = 24 * 60 * 60_000
 
 export type QwenAiSessionRepairState =
   | 'ready'
@@ -57,13 +61,45 @@ function isQwenAiProvider(provider: Provider): boolean {
   return provider.id === 'qwen-ai' || provider.apiEndpoint.includes('chat.qwen.ai')
 }
 
+/**
+ * Ready means a request can authenticate now: the jar carries the session
+ * cookie, or it carries a refresh token and the access token minted from it has
+ * not reached its renewal point. Such an access token lives for minutes, so this
+ * sweep, not the next request, is what keeps it current.
+ */
 export function isQwenAiWebSessionReady(account: Account): boolean {
   const cookies = String(account.credentials.cookies || account.credentials.cookie || '')
-  return hasQwenAiSessionCookie(cookies)
+  if (hasQwenAiSessionCookie(cookies)) return true
+  return Boolean(usableQwenAiRefreshToken(cookies))
+    && !qwenAiTokenRefresher.isTokenExpiringSoon(String(account.credentials.token || ''))
 }
 
 export function isQwenAiWebSessionRepairable(account: Account): boolean {
-  return Boolean(account.credentials.email && account.credentials.password)
+  return canRefreshQwenAiAccount(account)
+}
+
+function credentialRejectionRetryMs(): number {
+  return envDuration(
+    'CHAT2API_QWEN_AI_SESSION_REPAIR_REJECTED_LOGIN_RETRY_MS',
+    DEFAULT_REJECTED_LOGIN_RETRY_MS,
+    60 * 60_000,
+  )
+}
+
+/**
+ * When a frozen account whose saved login was already refused may be probed
+ * again. Keyed to the login it refused: saving a different email or password
+ * makes the account probe-able at once, and an unchanged one waits a long
+ * interval instead of spending a signin every sweep. It never parks the
+ * account for good: on 2026-09-22 an egress storm produced credential verdicts
+ * for healthy accounts, and a permanent park would have kept them down.
+ */
+export function qwenAiRejectedLoginDeadline(account: Account): number {
+  const rejectedAt = Number(account.credentialsRejectedAt)
+  if (!Number.isFinite(rejectedAt) || rejectedAt <= 0) return 0
+  const fingerprint = qwenAiLoginFingerprint(account)
+  if (!fingerprint || fingerprint !== account.credentialsRejectedFor) return 0
+  return rejectedAt + credentialRejectionRetryMs()
 }
 
 function probeIntervalMs(): number {
@@ -156,6 +192,10 @@ export class QwenAiSessionRepairService {
 
       const nextAttemptAt = Math.max(
         qwenAiSessionRepairProbeDeadline(account, now),
+        // A live refresh token renews without the refused login.
+        usableQwenAiRefreshToken(String(account.credentials.cookies || account.credentials.cookie || ''))
+          ? 0
+          : qwenAiRejectedLoginDeadline(account),
         this.retryAfterByAccount.get(account.id) || 0,
         this.globalPauseUntil,
       )
