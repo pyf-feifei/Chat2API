@@ -39,12 +39,14 @@ Practical consequences:
 |---|---|
 | Electron desktop app, host has `HTTPS_PROXY` | Layer 1 forces direct ✅ |
 | `npm run dev` / `dev:win` | Layer 1 forces direct ✅ |
-| Docker container, **no** proxy env in container | **Layer 3 still applies** ⚠️ |
+| Docker container, **no** proxy env in container | **Layer 3 still applies** ⚠️ (Docker Desktop VM proxy → Clash) |
 | Docker container, Clash rules contain the provider domain | Layer 3 routes direct ✅ |
 | Docker container, Clash rules missing it | Layer 3 proxies the container ⚠️ |
+| Docker Desktop proxy mode set to manual/none | Container bypasses Clash entirely ✅ |
 
-The Docker row is the one that bit us, and it surprised everyone involved. See
-§4.
+The Docker rows are the ones that bit us, and they surprised everyone involved.
+Layers 1–2 cannot help inside the container, but Layer 3 rules still decide
+each domain. See §4.
 
 ---
 
@@ -133,14 +135,14 @@ export NO_PROXY="127.0.0.1,localhost,.qwen.ai,.qianwen.com,.aliyuncs.com,.alibab
 ### 4.1 Docker Desktop inherits the system proxy
 
 **This is the key finding.** A container with no proxy environment variables at
-all still egressed through the local Clash node:
+all still has its traffic sent to the local Clash:
 
 ```bash
 $ docker exec chat2api sh -c "env | grep -i proxy"
 (nothing)
 
-$ docker exec chat2api node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
-195.242.178.82      # the Clash node, not the residential IP
+$ docker info --format '{{.HTTPProxy}} | {{.HTTPSProxy}}'
+http.docker.internal:3128 | http.docker.internal:3128   # VM-level proxy → host system proxy → Clash
 ```
 
 Docker Desktop's network layer honours the Windows system proxy
@@ -148,10 +150,31 @@ Docker Desktop's network layer honours the Windows system proxy
 container* cannot help, because the container never has an `HTTP_PROXY` to
 bypass — the interception happens below the container's network stack.
 
-Layer 1 is a no-op there, and so are the Clash/mihomo rules in §4.2: container
-traffic never enters mihomo. The fix is Docker Desktop's proxy mode (§8.5).
-(An earlier version of this guide called the Clash rules "the only real fix";
-that was measured wrong on 2026-09-26.)
+Layer 1 is a no-op there. The traffic **does** enter mihomo, so the Clash rules
+in §4.2 decide each domain. Measured 2026-09-30 from inside the container with
+the system proxy on (Clash TUN off):
+
+| Probe | Rule hit | Egress |
+|---|---|---|
+| `chat.qwen.ai` | `DOMAIN-SUFFIX,qwen.ai,DIRECT` | residential |
+| `chat.z.ai` | `RULE-SET,direct` (`+.z.ai`) | residential |
+| `sdata.chatglm.cn`, `z-cdn.chatglm.cn` | `RULE-SET,direct` | residential |
+| `myip.ipip.net` | `RULE-SET,direct` | residential |
+| `ipinfo.io` | `MATCH,PROXY` | proxy node |
+| `api.ipify.org` | `RULE-SET,proxy` | proxy node |
+
+(Rules read from the running core's `/connections` while the container made
+the requests; see §5 Layer 3 for the named-pipe query.)
+
+So a container needs a DIRECT rule for every domain the provider touches, or
+Docker Desktop's proxy mode must take it off the system proxy (§8.5). (An
+earlier revision said container traffic never enters mihomo; that came from
+reading `ipinfo.io`, which itself matches `MATCH,PROXY`, and it was wrong.)
+
+> **Egress probes lie under rule-based proxies.** An IP echo service only
+> reports the path *to that service*. Judge a provider's egress by the rule its
+> domain hits (Clash Verge → Connections) or by an echo service on the same rule
+> path, never by `ipinfo.io`/`ipify` alone.
 
 ### 4.2 Clash Verge / mihomo rules
 
@@ -230,10 +253,17 @@ node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https:/
 ### Layer 2 / 3 — what the host actually uses
 
 ```bash
-curl -s https://ipinfo.io/ip
+curl -s --noproxy '*' https://myip.ipip.net   # raw line egress, all proxies bypassed
+curl -s https://myip.ipip.net                 # via the proxy; DIRECT like domestic providers
 ```
 
-Judge by the AS number:
+An echo service only reports the path to *itself*. `ipinfo.io`/`ipify` match
+`MATCH,PROXY` under a rule-based proxy and show the node even when every
+provider domain is DIRECT, so do not use them to judge provider egress. For a
+specific provider domain, the rule table below (or Clash Verge → Connections) is
+authoritative.
+
+Judge the raw line by the AS number:
 
 | AS / org | Meaning |
 | --- | --- |
@@ -380,8 +410,8 @@ to catch.
 node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https://chat.qwen.ai/api/v1/chat')||'DIRECT')"
 #    -> DIRECT
 
-# 2. confirm the real egress is residential
-curl -s https://ipinfo.io/ip
+# 2. confirm the raw line egress is residential
+curl -s --noproxy '*' https://myip.ipip.net
 #    -> an AS4837-style carrier, not AS7488
 
 # 3. start the app
@@ -426,16 +456,23 @@ $ docker info | grep -A2 "^ *Proxy"
  HTTP Proxy:  http.docker.internal:3128
  HTTPS Proxy: http.docker.internal:3128
 
-$ curl -s --noproxy '*' https://ipinfo.io/ip
-221.213.36.92                                            # host, real egress
-$ docker exec chat2api node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
-195.242.178.82                                            # NOT the same
+$ curl -s --noproxy '*' https://myip.ipip.net
+221.213.x.x  (AS4837)                                    # host, raw line egress
 ```
 
-Different addresses mean Docker Desktop routes all container traffic through its
-VM proxy. The WAF verdict is about that egress, not about the request.
+A VM proxy means Docker Desktop sends all container traffic into the host proxy
+(Clash). Each provider domain then exits according to the Clash rule it hits:
+DIRECT keeps it residential, and anything falling to `MATCH,PROXY` exits via
+the node. The WAF verdict is about that egress, not about the request. Check the
+domain's rule in Clash Verge → Connections. Do not compare `ipinfo.io` output:
+`ipinfo.io` itself hits `MATCH,PROXY`, so it shows the node even when every
+provider domain is DIRECT (this misled the 2026-09-26 analysis).
 
 ### Fix
+
+Either make sure every domain the provider touches hits a Clash DIRECT rule
+(§4.2; for Z.ai that includes `chatglm.cn`), or take the container off Clash
+entirely:
 
 1. Windows system proxy off (`ProxyEnable=0`) - otherwise Docker re-applies it
    on every start.
@@ -454,8 +491,10 @@ layer, below the container's own stack and above its filesystem.
 
 ### After the fix
 
-Clash rules are no longer what rescues the container, because traffic never
-enters mihomo. One clean residential egress is more predictable than rotating a
+With Docker off the system proxy the container bypasses mihomo, so Clash rules
+no longer matter for it. (While Docker stays on the system proxy they do: the
+traffic enters mihomo and DIRECT rules keep each listed domain residential.)
+One clean residential egress is more predictable than rotating a
 proxy pool. Webshare stays useful as a fallback - the forwarder engages it only
 after a verdict - not as the primary path.
 
@@ -518,10 +557,11 @@ was wrong; 20 were usable. State the usable count and which subset was tested.
 | Every Webshare key returns `401` simultaneously | `proxy.webshare.io` is DNS-poisoned, so no request reaches Webshare | `nslookup proxy.webshare.io`; pin real IPs via `extra_hosts` |
 | **Every** request `403 qwen_ai_token_refresh_gated`, accounts look frozen, `401 email not found` | **Missing or mismatched `CHAT2API_STORAGE_ENCRYPTION_KEY`** | `[Session Repair] started ready=0 pending=339`; `docker exec <c> printenv CHAT2API_STORAGE_ENCRYPTION_KEY`. See §10 |
 | `ready=339 pending=0` on one host but `ready=0 pending=339` on another | Same store, different key (or one host never got the variable) | Compare the two startup lines; compare key length and value |
-| `qwen_ai_content_verdict`, `RGV587`, `bxpunish` | Egress IP flagged, **or** genuine content match | `ipinfo.io/ip`; compare against the [2026-09-22 diagnosis](diag-2026-09-22-codex-bxpunish.md) |
+| `qwen_ai_content_verdict`, `RGV587`, `bxpunish` | Egress IP flagged, **or** genuine content match | Clash rule hit for the provider domain (Connections), plus `curl --noproxy '*' myip.ipip.net`; compare against the [2026-09-22 diagnosis](diag-2026-09-22-codex-bxpunish.md) |
 | `qwen_ai_risk_circuit_open` | Egress parked after repeated verdicts | Wait, or fix the route; do not retry harder |
 | WAF slider / `aliyun_waf_aa` HTML instead of JSON | Request reached an endpoint that needs a session (`/api/v2/*`) without one, or an expired `acw_tc` | Re-login to refresh cookies; **not** necessarily an IP ban |
 | Works in the browser, fails in the app | Browser and app on different egresses, or the app's cookie jar is incomplete | §4.2 — align the Clash rules |
+| Client on `http://127.0.0.1:8080` gets `401 Invalid API key`, or `/health` shows another instance's uptime/counters | Client proxied loopback: `HTTP(S)_PROXY` set but `NO_PROXY` lacks `127.0.0.1`/`localhost` (a user-level `NO_PROXY` without them does not help once another tool overrides it). Clash has no loopback rule, so `127.0.0.1:8080` falls to `MATCH,PROXY` and is served by the **node's** own loopback | Clash Connections shows `127.0.0.1:8080 Match → PROXY`; compare `curl --noproxy '*' 127.0.0.1:8080/health` uptime with the client's. Keep `127.0.0.1,localhost` in `NO_PROXY` (measured 2026-09-30) |
 | Worked yesterday, fails after a Clash change | Subscription update overwrote the rules | Re-apply the enhancement (§4.2) |
 | `docker compose up` reports the name is already in use | The container was created with `docker run` and has no compose label | `docker inspect <c> --format '{{index .Config.Labels "com.docker.compose.project"}}'` — remove it and recreate via compose |
 | `no_available_account`, many accounts `inactive` | Repair-queue deadlock | `qwenAiSessionRepair.ts`, `qwen-ai-token-refresh.ts` |

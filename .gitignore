@@ -1,21 +1,22 @@
 # Dependencies
 node_modules/
 
-# Build outputs
+# Build outputs (out-server-shadow and similar side builds included)
 out/
-out-server/
-out-admin/
+out-*/
 dist/
 build/entitlements.mac.plist
 
 # TypeScript
 *.tsbuildinfo
+# Stray tsc emit next to its source. Hand-written declarations (vite-env.d.ts,
+# src/types/*.d.ts, ...) have no .ts sibling; they are tracked source, and
+# scripts/check-source-artifacts.js is what catches real emit before a build.
 src/**/*.js
-src/**/*.d.ts
 electron.vite.config.js
 electron.vite.config.d.ts
-vite.config.js
-vite.config.d.ts
+vite*.config.js
+vite*.config.d.ts
 
 # Vite temp files
 *.mjs.tmp
@@ -33,7 +34,7 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE / agent tooling (local config, worktrees, session scratch)
 .idea/
 .vscode/
 .workbuddy/
@@ -42,6 +43,9 @@ Thumbs.db
 *.swo
 .codex/
 .playwright-mcp/
+.devin/
+.kilo/
+.kilocode/
 CLAUDE.md
 
 # Environment
@@ -53,6 +57,12 @@ CLAUDE.md
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+.pytest_cache/
+
+# Tool caches
+.cache/
+.eslintcache
 
 # Test
 coverage/
@@ -63,9 +73,6 @@ tests/
 *.test.ts
 *.test.mjs
 *.test.js
-
-# Manual live test scripts (local debugging only)
-tests/manual/*-live.mjs
 
 # Misc
 *.pem
@@ -84,10 +91,8 @@ backup/
 # Local live debug logs
 .tmp-live-*.ndjson
 
-# Codex local test runtime state and GitHub research scratch files
+# Codex local test runtime state
 .codex-local-test/
-/gh_*.py
-/gh_*.txt
 
 # local temp / test artifacts
 .tmp-*
@@ -158,6 +163,12 @@ scripts/zai-captcha/__pycache__/
 scripts/mimo-login/artifacts/
 scripts/mimo-login/__pycache__/
 
+# Qwen captcha solver debug screenshots (when run with the artifact dir in-tree)
+scripts/qwen-captcha/*.png
+
+# Working-tree snapshot written by ad-hoc concurrent-edit monitors
+.watch-tree-state.json
+
 # Pre-deploy data snapshots. These are full store exports containing every
 # account's `credentials` blob (encrypted, but still the live account pool).
 # Never commit them; keep them out of the repo entirely.
@@ -189,8 +200,8 @@ scripts/compress/tmp/
 # Stray diagnostics that kept landing in the repo root. All of these are
 # reproducible artefacts, and a few of them (gh_*.py scraped account data,
 # tmp-wskeys) carried live credentials, so they must never be committed.
-electron.vite.config.*.mjs
-replay-*.mjs
+# Root-anchored: skills/*/scripts/replay-client-fixture.mjs is tracked source.
+/replay-*.mjs
 tmp-wskeys*
 tmp-ws-group.cjs
 tmp-codex-*.log

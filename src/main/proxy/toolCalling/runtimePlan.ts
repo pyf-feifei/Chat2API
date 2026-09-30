@@ -93,6 +93,7 @@ export function buildToolCallingRuntimePlan(input: {
     allowedUpstreamToolNames,
     workflowContinuation: false,
     failedToolResultPending: false,
+    ...(profile.workflowCompletionMarker ? { completionMarkerMode: profile.workflowCompletionMarker } : {}),
     forcedToolName: forcedName,
     diagnostics: {
       requestId: input.requestId,

@@ -23,12 +23,15 @@ import { isColonTerminatedShortAnswer, isProgressStyleManagedAnswer, isToolDenia
 import { isClientCancellationError } from '../utils/errors'
 import {
   hasManagedWorkflowCompletionMarker,
+  isOptionalManagedWorkflowCompletionMarker,
   requiresManagedWorkflowCompletionMarker,
+  stripStrayManagedWorkflowCompletionMarkers,
 } from '../toolCalling/workflowCompletion'
+import { managedMarkerConfabulationVerdict } from '../toolCalling/managedMarkerConfabulation'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { ZaiFileUploader, ZaiFileReference, ZaiUploadedFile, extractFileFromContent, collectFileParts } from './zai-files'
 import { zaiTranscriptTail } from './zaiTranscript'
-import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError } from './zai-captcha-solver'
+import { solveCaptchaAndUpdateAccount, isCaptchaRequiredError, isZaiCaptchaBreakerOpen } from './zai-captcha-solver'
 import { checkoutWebshareProxyAgent, webshareProxyUrlForLog } from '../webshareProxy'
 
 const TOKEN_EXPIRY_WARNING_MS = 5 * 60 * 1000 // 5 minutes
@@ -234,6 +237,30 @@ function zaiBooleanEnv(name: string, fallback: boolean): boolean {
   if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true
   if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false
   return fallback
+}
+
+/**
+ * How many times an admission-time captcha challenge is solved before the
+ * request gives up. Every fresh z.ai chat request is challenged (F019) and a
+ * geometrically correct slider drag is still rejected by the risk scorer about
+ * half the time (measured 2026-09-29), so a single solve leaves a large share
+ * of requests failing on a coin flip.
+ */
+export function zaiCaptchaSolveAttemptsFromEnv(): number {
+  const raw = Number(process.env.CHAT2API_ZAI_CAPTCHA_SOLVE_ATTEMPTS)
+  if (!Number.isFinite(raw) || raw < 1) return 2
+  return Math.min(5, Math.floor(raw))
+}
+
+async function solveZaiCaptchaWithRetries(accountId: string, token: string, label: string): Promise<boolean> {
+  const attempts = zaiCaptchaSolveAttemptsFromEnv()
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (await solveCaptchaAndUpdateAccount(accountId, token)) return true
+    console.warn(`[Z.ai] ${label} captcha solve attempt ${attempt}/${attempts} failed`)
+    // An open breaker refuses every further solve; retrying only burns time.
+    if (isZaiCaptchaBreakerOpen()) break
+  }
+  return false
 }
 
 export function zaiTranscriptUploadEnabled(): boolean {
@@ -1013,8 +1040,7 @@ ${tailExcerpt}`,
             console.log('[Z.ai] Captcha error detected, solving and retrying with fresh context...')
             // Destroy the failed stream
             try { response.data.destroy() } catch {}
-            const { solveCaptchaAndUpdateAccount } = await import('./zai-captcha-solver')
-            const solved = await solveCaptchaAndUpdateAccount(this.account.id, token)
+            const solved = await solveZaiCaptchaWithRetries(this.account.id, token, 'Admission')
             if (solved) {
               this.captchaRetryAttempted = true
               // Redo entire chatCompletion with fresh chat, signature, timestamp, requestId
@@ -1120,8 +1146,7 @@ ${tailExcerpt}`,
           if (firstChunk.toString('utf8').includes('FRONTEND_CAPTCHA_REQUIRED')) {
             console.log('[Z.ai] Continuation captcha error detected, solving and retrying...')
             try { response.data.destroy() } catch {}
-            const { solveCaptchaAndUpdateAccount } = await import('./zai-captcha-solver')
-            const solved = await solveCaptchaAndUpdateAccount(this.account.id, token)
+            const solved = await solveZaiCaptchaWithRetries(this.account.id, token, 'Continuation')
             if (solved) {
               const freshParam = this.getCaptchaVerifyParam()
               if (freshParam) requestBody.captcha_verify_param = freshParam
@@ -1435,10 +1460,20 @@ function zaiManagedAnswerIdle(reason: string): ZaiManagedAnswerVerdict {
  * substantive answer would append a near-duplicate of text already delivered
  * to the client; that family is reported via `reason` but delivered as-is.
  */
-function classifyZaiManagedAnswer(
-  content: string,
+/**
+ * Should a marker-bearing, tool-less answer be re-examined for confabulation
+ * instead of short-circuiting on the completion marker? The judgment lives in
+ * `managedMarkerConfabulation` (a leaf module) so it is node --test reachable;
+ * see that file for why the marker is not proof of work.
+ */
+function classifyZaiManagedAnswer(  content: string,
   plan: ToolCallingPlan | undefined,
-  options: { isRecoveryBranch?: boolean; trailingAssistantText?: string } = {},
+  options: {
+    isRecoveryBranch?: boolean
+    /** Whether the nudge that produced this recovery branch demanded a tool call. Unknown → treated as demanded. */
+    recoveryDemandedToolCall?: boolean
+    trailingAssistantText?: string
+  } = {},
 ): ZaiManagedAnswerVerdict {
   if (!plan?.shouldParseResponse) return zaiManagedAnswerIdle('parse_disabled')
   let parsed: { toolCalls?: unknown[]; rawMatches?: unknown[]; malformedReason?: string }
@@ -1452,7 +1487,42 @@ function classifyZaiManagedAnswer(
     parsed = { toolCalls: [], rawMatches: [], malformedReason: 'classification_parse_error' }
   }
   if (parsed.toolCalls && parsed.toolCalls.length > 0) return zaiManagedAnswerIdle('tool_call_present')
-  if (hasManagedWorkflowCompletionMarker(content, plan)) return zaiManagedAnswerIdle('completion_marker_present')
+  const markerPresent = hasManagedWorkflowCompletionMarker(content, plan)
+  /** Marker-stripped text when the marker gate decided to scrutinize, else ''. */
+  let markerScrutinyText = ''
+  // The completion marker attests that the WORK is finished. A capability
+  // denial ("I don't have access to your filesystem") or a colon-terminated
+  // promise ("The file contains:") both CONTRADICT that attestation — the
+  // model appends the marker to a confabulation it could not execute, which
+  // was delivered verbatim and ended the agent turn (observed live 2026-09-29
+  // on m365 gpt-5.6-sol: "The file `/etc/hostname` contains:
+  // <chat2api_workflow_complete/>"). That early return used to run ahead of
+  // every confabulation check below, so those never got a chance.
+  //
+  // Scoped to m365_fenced: a marker-bearing answer over declared tools, with
+  // no live workflow to have actually run anything, and short enough to be a
+  // confabulation rather than a substantive final answer, falls through to the
+  // denial/colon/progress checks. A long marker-bearing final answer is
+  // unaffected (it still short-circuits here), and every other provider keeps
+  // the previous ordering untouched.
+  if (markerPresent) {
+    const markerScrutiny = managedMarkerConfabulationVerdict(content, plan)
+    // Optional-marker plans: a marked PROMISE ("我来查看…<marker>") is not a
+    // completion proof even over a live workflow — the marker contradicts the
+    // announced pending action, so it keeps the progress-style tool demand.
+    const markedPromise = isOptionalManagedWorkflowCompletionMarker(plan)
+      && isProgressStyleManagedAnswer(markerScrutiny.text)
+    if (markerScrutiny.verdict === 'deliver' && !markedPromise) {
+      return zaiManagedAnswerIdle('completion_marker_present')
+    }
+    // Fall through, and run every confabulation check below on the
+    // marker-stripped text: the marker is transport text, so the promise
+    // "The file contains: <chat2api_workflow_complete/>" does not end in a
+    // colon until the marker is removed. Checking the raw text here passes
+    // every check and delivers the denial anyway (that is exactly what the
+    // first attempt at this fix did).
+    markerScrutinyText = markerScrutiny.text
+  }
   if (/<chat2api_workflow_complete(?:\/|>)[\s\S]*\S/.test(content)) {
     return {
       continuation: true,
@@ -1461,7 +1531,7 @@ function classifyZaiManagedAnswer(
       reason: 'completion_marker_followed_by_prose',
     }
   }
-  const trimmed = content.trim()
+  const trimmed = (markerPresent ? markerScrutinyText : content).trim()
   if (!trimmed) return zaiManagedAnswerIdle('empty_answer')
   if (plan.failedToolResultPending === true) return zaiManagedAnswerIdle('failed_tool_result_pending')
   // A protocol-shaped block that yielded no valid tool call is a REJECTED tool
@@ -1498,7 +1568,29 @@ function classifyZaiManagedAnswer(
   // opener list had never seen and the turn stalled a second time). Long
   // marker-less branches keep the live-workflow divergence: they are delivered
   // as-is because re-prompting would duplicate delivered text.
-  if (options.isRecoveryBranch && [...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS) {
+  // Optional completion marker (provider-profile opt-in): the model can PROVE
+  // that a short answer is final by ending it with the marker, so a short
+  // marker-less answer is asked for that proof (or the next tool call) instead
+  // of being forced into another tool call. Without this, a correct short
+  // final answer after a tool result ("README.md has 412 lines") was demanded
+  // a tool call twice and the turn failed with recovery exhausted (observed
+  // live 2026-09-29, GLM-5.3-Flash). Promise prose keeps the tool demand.
+  const optionalMarker = isOptionalManagedWorkflowCompletionMarker(plan)
+  const shortAnswer = [...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS
+  const proofMissing = (reason: string): ZaiManagedAnswerVerdict => ({
+    continuation: true,
+    completionProofMissing: true,
+    requireManagedToolCall: false,
+    reason,
+  })
+  if (options.isRecoveryBranch && shortAnswer) {
+    // The recovery-branch rule exists because a branch that was DEMANDED a
+    // tool call and answered with prose is narration by construction. A
+    // branch that was only asked for the completion proof is not that case.
+    if (optionalMarker && options.recoveryDemandedToolCall === false && !isProgressStyleManagedAnswer(trimmed)) {
+      console.info('[Z.ai] Short marker-less recovery branch after a completion-proof nudge; asking for the proof again')
+      return proofMissing('recovery_branch_completion_proof_missing')
+    }
     console.info('[Z.ai] Short marker-less answer over a recovery branch triggers continuation')
     return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'recovery_branch_markerless_answer' }
   }
@@ -1524,7 +1616,11 @@ function classifyZaiManagedAnswer(
       console.info('[Z.ai] Progress-style answer over live workflow triggers continuation')
       return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'progress_style_answer_over_live_workflow' }
     }
-    if ([...trimmed].length <= MANAGED_SHORT_ANSWER_CODE_POINTS) {
+    if (shortAnswer) {
+      if (optionalMarker) {
+        console.info('[Z.ai] Short marker-less answer over live workflow; asking for the completion proof or the next tool call')
+        return proofMissing('completion_proof_missing_over_live_workflow')
+      }
       console.info('[Z.ai] Short marker-less answer over live workflow triggers continuation')
       return { continuation: true, completionProofMissing: false, requireManagedToolCall: true, reason: 'short_markerless_answer_over_live_workflow' }
     }
@@ -1625,6 +1721,7 @@ export class ZaiStreamHandler {
   private accountToken: string = ''
   private continuation?: ZaiWorkflowContinuationHandle
   private trailingAssistantText?: string
+  private upstreamUsage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
@@ -1743,6 +1840,9 @@ export class ZaiStreamHandler {
     let branchFinished = false
     let continuationInFlight = false
     let continuationSeq = 0
+    // Whether the nudge behind the current recovery branch demanded a tool
+    // call (vs. only the completion proof); feeds the recovery-branch rule.
+    let lastContinuationDemandedToolCall: boolean | undefined
     let idleTimer: NodeJS.Timeout | undefined
     // Degenerate-output guards: a repetition loop streams continuously (the
     // idle watchdog cannot fire) and grows far past any stall classifier's
@@ -1891,6 +1991,7 @@ export class ZaiStreamHandler {
           return false
         }
         continuationSeq += 1
+        lastContinuationDemandedToolCall = verdict.requireManagedToolCall
         console.warn('[Z.ai] Managed workflow continuation branch attached', JSON.stringify({
           reason: verdict.reason,
           attempt: continuationSeq,
@@ -2016,6 +2117,7 @@ export class ZaiStreamHandler {
       const branchContent = this.content.slice(branchContentStart)
       const verdict = classifyZaiManagedAnswer(branchContent, this.toolCallingPlan, {
         isRecoveryBranch: continuationSeq > 0,
+        recoveryDemandedToolCall: lastContinuationDemandedToolCall,
         trailingAssistantText: this.trailingAssistantText,
       })
       const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
@@ -2096,16 +2198,31 @@ export class ZaiStreamHandler {
         safeEnd('data: [DONE]\n\n')
         notifyEnd()
       } else {
+        // Any other upstream error frame (INTERNAL_ERROR on an oversized
+        // context, measured 2026-09-10) used to be written as answer text with
+        // finish_reason=stop: the client saw "Error: Oops…" as a completed
+        // reply and an agent turn ended on a fake success. Fail the stream
+        // with a structured error chunk instead so Responses/Anthropic
+        // translators surface a failure and the client can retry.
+        const upstreamCode = typeof error?.code === 'string' && error.code
+          ? error.code
+          : (typeof error?.error_code === 'string' && error.error_code ? error.error_code : 'unknown')
+        writeVisibleNotice(`\n\n[Z.ai] Upstream error (${upstreamCode}); failing this turn so the request can be retried.`)
         transStream.write(
           `data: ${JSON.stringify({
             id: this.chatId,
             model: this.model,
             object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: { content: `\nError: ${error.detail || JSON.stringify(error)}` }, finish_reason: 'stop' }],
-            created: this.created,
+            error: {
+              code: `zai_upstream_${upstreamCode.toLowerCase()}`,
+              message: `upstream error ${upstreamCode}: ${error?.detail || error?.message || JSON.stringify(error)}`,
+              param: null,
+              type: 'upstream_error',
+            },
           })}\n\n`
         )
         safeEnd('data: [DONE]\n\n')
+        notifyEnd()
       }
     }
 
@@ -2115,7 +2232,13 @@ export class ZaiStreamHandler {
 
         // First frames show the delta shape; done frames show where the
         // upstream puts the assistant message id and usage.
-        const debugWorthy = zaiDebugFrameCounter < 8 || /"done"\s*:\s*true/.test(event.data)
+        // Any frame that is not a plain {delta_content, phase} append is also
+        // worth logging: snapshot/edit frames, usage and error frames change
+        // the accumulated answer in ways a delta log would never show.
+        const debugWorthy = zaiDebugFrameCounter < 8
+          || /"done"\s*:\s*true/.test(event.data)
+          || /"(?:edit_content|edit_index|content|usage|error)"\s*:/.test(event.data)
+          || !/"phase"\s*:\s*"(?:thinking|answer)"/.test(event.data)
         if (zaiDebugStreamFromEnv() && debugWorthy) {
           zaiDebugFrameCounter += 1
           console.log('[Z.ai] DEBUG upstream frame', zaiDebugFrameCounter, ':', event.data.slice(0, 800))
@@ -2202,7 +2325,12 @@ export class ZaiStreamHandler {
 
           if (outputChunks.length > 0) this.sentRole = true
         } else if (result.phase === 'done' && result.done) {
-          handleDone(result)
+          // The real token usage arrives in a separate `phase:"other"` frame
+          // just before `done` (captured live 2026-09-29, 14/14 streams); the
+          // done frame itself never carries it.
+          handleDone(result.usage ? result : { ...result, usage: this.upstreamUsage })
+        } else if (result.usage && !result.error && !data.error) {
+          this.upstreamUsage = result.usage
         } else if (result.error || data.error) {
           handleUpstreamError(result, data)
         }
@@ -2327,6 +2455,9 @@ export class ZaiStreamHandler {
                   data.usage = result.usage
                 }
                 resolveOnce(data)
+              } else if (result.usage && !result.error && !eventData.error) {
+                // Real usage rides a `phase:"other"` frame before `done`.
+                data.usage = result.usage
               } else if (result.error || eventData.error) {
                 const error = result.error || eventData.error
                 console.error('[Z.ai] Non-stream error event (full):', JSON.stringify(eventData))
@@ -2351,8 +2482,12 @@ export class ZaiStreamHandler {
                   })()
                   return
                 }
-                data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
-                resolveOnce(data)
+                // Same contract as the streaming path: an upstream error is a
+                // failed response, never appended answer text.
+                const upstreamCode = typeof error?.code === 'string' && error.code
+                  ? error.code
+                  : (typeof error?.error_code === 'string' && error.error_code ? error.error_code : 'unknown')
+                rejectOnce(new Error(`zai_upstream_${upstreamCode.toLowerCase()}: ${error?.detail || error?.message || JSON.stringify(error)}`))
               }
             } catch (err) {
               console.error('[Z.ai] Non-stream parse error:', err)
@@ -2430,20 +2565,23 @@ export class ZaiStreamHandler {
 
     const result = await this.collectNonStreamResponse(response)
     if (!this.toolCallingPlan?.shouldParseResponse || !this.continuation) {
-      return result
+      return this.stripOptionalCompletionMarker(result)
     }
 
     // Managed workflow continuation for the buffered path: a classified
     // dangling answer is recovered with a replacement branch whose text is
     // appended to the collected content; the forwarder parses the final text
     // for tool calls afterwards (applyToolCallsToResponse).
+    let lastDemandedToolCall: boolean | undefined
     for (let guard = 0; guard < 3; guard += 1) {
       const content: string = result.choices?.[0]?.message?.content || ''
       const verdict = classifyZaiManagedAnswer(content, this.toolCallingPlan, {
         isRecoveryBranch: guard > 0,
+        recoveryDemandedToolCall: lastDemandedToolCall,
         trailingAssistantText: this.trailingAssistantText,
       })
       if (!verdict.continuation) break
+      lastDemandedToolCall = verdict.requireManagedToolCall
 
       console.warn('[Z.ai] Non-stream managed answer classified as dangling stall; starting managed workflow continuation', JSON.stringify({
         reason: verdict.reason,
@@ -2469,6 +2607,19 @@ export class ZaiStreamHandler {
       if (next.usage) {
         result.usage = next.usage
       }
+    }
+    return this.stripOptionalCompletionMarker(result)
+  }
+
+  /**
+   * The optional completion marker is transport text: the stream path holds it
+   * back in ToolStreamParser, the buffered path strips it here.
+   */
+  private stripOptionalCompletionMarker(result: any): any {
+    if (!isOptionalManagedWorkflowCompletionMarker(this.toolCallingPlan)) return result
+    const message = result?.choices?.[0]?.message
+    if (message && typeof message.content === 'string') {
+      message.content = stripStrayManagedWorkflowCompletionMarkers(message.content).trimEnd()
     }
     return result
   }

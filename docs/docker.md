@@ -213,9 +213,10 @@ CHAT2API_QWEN_AI_VERDICT_PACED_RETRY_MAX_DELAY_MS=240000
 CHAT2API_RESPONSES_PACED_FAILURE_CODE=rate_limit_exceeded
 # Keep provider traffic off any host-level HTTP proxy. "on" (default) appends
 # the provider domains to NO_PROXY. NOTE: on Docker Desktop the container's
-# network layer can inherit the Windows system proxy, which neither this nor
-# Clash rules reach — fix Docker Desktop's proxy mode. See
-# docs/network-egress.md §8.5.
+# network layer inherits the Windows system proxy, which this setting cannot
+# bypass. That traffic does enter Clash, so per-domain Clash DIRECT rules decide
+# the egress; alternatively take Docker off the system proxy. See
+# docs/network-egress.md §4 and §8.5.
 CHAT2API_EGRESS_DIRECT=on
 QWEN_AI_REQUEST_TIMEOUT_MS=840000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0

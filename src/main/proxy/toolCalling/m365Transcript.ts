@@ -2,11 +2,13 @@
  * M365 Copilot managed-tool transcript flattener.
  *
  * The Chathub consumer invocation carries exactly one free-text field
- * (`message.text`) and has no native tool channel (verified against
- * winnstorm/m365-copilot-api, cramt/m365-copilot-proxy and
- * edlaver/m365-copilot-bun-proxy), so the ToolCallingEngine output — injected
- * protocol prompt plus role-labelled history including textualized tool
- * calls/results — is serialized into that single field here.
+ * (`message.text`), and no caller-defined tool channel has been verified on
+ * this wire: the ToolCallingEngine output — injected protocol prompt plus
+ * role-labelled history including textualized tool calls/results — is
+ * serialized into that single field here. Other projects do send caller
+ * tools as `plugins: [{Id, Source: "API"}]` and parse native calls out of
+ * the frames; see docs/providers/m365-copilot.md before assuming the two are
+ * equivalent.
  */
 import { getProviderToolProfile } from './providerProfiles.ts'
 import { MANAGED_WORKFLOW_COMPLETE_MARKER } from './workflowCompletion.ts'
@@ -58,6 +60,8 @@ export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[
   // Map tool_call_id -> tool name from assistant tool_calls so tool results
   // can be labelled with the correct name in the fenced protocol.
   const toolNameById: Record<string, string> = {}
+  // The same calls' arguments, so a result can name the call that produced it.
+  const toolArgsById: Record<string, string> = {}
   for (const msg of messages) {
     if (msg.role === 'system') {
       const text = messageContentToText(msg.content)
@@ -68,6 +72,9 @@ export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[
       for (const tc of msg.tool_calls) {
         if (tc.id && tc.function?.name) {
           toolNameById[tc.id] = tc.function.name
+          if (typeof tc.function?.arguments === 'string' && tc.function.arguments) {
+            toolArgsById[tc.id] = tc.function.arguments
+          }
         }
       }
     }
@@ -92,6 +99,7 @@ export function flattenManagedTranscript(messages: ManagedToolTranscriptMessage[
         name: toolNameById[toolCallId],
         content: messageContentToText(msg.content),
         isError: msg.is_error === true,
+        summary: toolArgsById[toolCallId],
       })
       blocks.push(`[tool]\n${formatted}`)
       continue

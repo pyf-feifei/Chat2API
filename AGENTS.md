@@ -625,8 +625,9 @@ A recurring and expensive mistake is concluding that the operator's "residential
 IP got flagged". On 2026-09-25 this produced a wrong root cause and a wrong fix
 for a full Qwen pool outage. The rules:
 
-1. **Measure the app's egress, not the browser's.** `curl https://ipinfo.io` only
-   proves the shell's path. Ask what axios will actually do:
+1. **Measure the app's egress, not the browser's.** An IP echo (`ipinfo.io`,
+   `ipify`) only proves the path to *that echo service*; under a rule-based proxy
+   it can differ from the provider domain's path. Ask what axios will actually do:
    ```bash
    node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https://chat.qwen.ai/api/v1/chat')||'DIRECT')"
    ```
@@ -795,13 +796,14 @@ troubleshooting guide. The post-mortem is
 ## Docker Inherits the Host System Proxy
 
 Measured 2026-09-25 on Docker Desktop for Windows. A container with **no** proxy
-environment variables still egresses through the local proxy node:
+environment variables still has its traffic sent into the local proxy (Clash),
+which then routes each domain by its rules:
 
 ```bash
 $ docker exec chat2api sh -c "env | grep -i proxy"
 (nothing)
-$ docker exec chat2api node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
-195.242.178.82      # the Clash node, not the residential IP
+$ docker info --format '{{.HTTPProxy}}'
+http.docker.internal:3128   # VM-level proxy → Windows system proxy → Clash
 ```
 
 ### Find it in one command
@@ -815,13 +817,10 @@ $ docker info | grep -A2 "^ *Proxy"
  HTTPS Proxy: http.docker.internal:3128
 ```
 
-Compare that address against the host's real egress. They differing is the
-diagnosis:
-
-```bash
-curl -s --noproxy '*' https://ipinfo.io/ip        # host, real egress
-docker exec <c> node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
-```
+That alone does not mean the provider egress is wrong: Clash still applies its
+rules. The diagnosis is the rule each provider domain hits (Clash Verge →
+Connections). A domain without a DIRECT rule that falls to `MATCH,PROXY` is the
+problem.
 
 ### What does NOT work
 
@@ -849,21 +848,35 @@ inside a container can reach it.
 3. Verify:
    ```bash
    docker info | grep -A2 "^ *Proxy"          # expect nothing
-   docker exec <c> node -e "fetch('https://ipinfo.io/ip').then(r=>r.text()).then(console.log)"
+   docker exec <c> node -e "fetch('https://ifconfig.me/ip').then(r=>r.text()).then(console.log)"
+   # now a MATCH,PROXY-class echo also returns the residential IP
    ```
 
-Clash rules are **not** a fix for the container path: `DOMAIN-SUFFIX,...,DIRECT`
-in mihomo only affects traffic that traverses the proxy. Some older docs said
-"for Docker, Clash rules are the real fix"; that is wrong and has been removed.
+Alternatively keep the VM proxy and rely on Clash rules. With the Docker VM
+proxy active, the container **does** go through Clash, and Clash's rules decide
+per domain. Measured 2026-09-29/30 with system proxy on, TUN off:
 
-With the Docker VM proxy active, the container **does** go through Clash, and
-Clash's rules then decide per domain. Measured 2026-09-29 with Clash rules
-`DOMAIN-SUFFIX,qwen.ai,DIRECT` in place: container → `ipinfo.io` exits via the
-node (`195.242.178.82`, falls to `MATCH,PROXY`), container → a DIRECT-ruled
-domestic domain exits via the residential IP. So `ipinfo.io` from the
-container only proves where *ipinfo.io* goes. To judge Qwen's egress, look at
-the rule Clash applied to `chat.qwen.ai` (Clash Verge → Connections), not a
-generic IP echo.
+| Container → | Rule hit | Egress |
+| --- | --- | --- |
+| `chat.qwen.ai` | `DOMAIN-SUFFIX,qwen.ai,DIRECT` | residential |
+| `chat.z.ai` | `RULE-SET,direct` (`+.z.ai`) | residential |
+| `sdata.chatglm.cn`, `z-cdn.chatglm.cn` | `RULE-SET,direct` | residential |
+| `myip.ipip.net` | `RULE-SET,direct` | residential |
+| `ipinfo.io` | `MATCH,PROXY` | node `195.242.178.82` |
+| `api.ipify.org` | `RULE-SET,proxy` | node `195.242.178.82` |
+
+Rules read from the running core's `/connections` (named pipe) while the
+container issued the requests; every connection showed `src=127.0.0.1`, i.e.
+it arrived via the system-proxy port. So a DIRECT rule is a real fix for every
+domain it lists, and only for those. Z.ai's `chatglm.cn` asset hosts are
+covered by the subscription's `direct` rule set, not by an explicit rule; if the
+subscription drops them they would fall through to later rules.
+
+**Never judge provider egress with a generic IP echo.** `ipinfo.io` from the
+container only proves where *ipinfo.io* goes; that reading produced the wrong
+"container traffic never enters Clash" conclusion on 2026-09-26. Look at the
+rule Clash applied to the provider domain (Clash Verge → Connections), or use an
+echo service on the same rule path (`myip.ipip.net` for domestic providers).
 
 Consequences when reasoning about Docker deployments:
 
@@ -1008,7 +1021,8 @@ They are independent. Do not conflate them.
 
 | Symptom | Root cause | Where to look |
 |---|---|---|
-| Egress is a datacenter AS | Local proxy (Clash) inherited by Docker Desktop | `curl ipinfo.io` from inside the container |
+| Egress is a datacenter AS | Local proxy (Clash) inherited by Docker Desktop | `docker info` proxy line, then the Clash rule hit for the provider domain (Connections) |
+| Codex on `127.0.0.1:8080` gets `401 Invalid API key`; works with Clash off | Codex proxies loopback when `NO_PROXY` lacks `127.0.0.1,localhost` (it also honours the Windows system proxy with no env set). Clash has no loopback rule, so it hits `MATCH,PROXY` and reaches the node's own `:8080` (a different Chat2API) | Clash Connections `127.0.0.1:8080 Match → PROXY`; `/health` uptime differs from `curl --noproxy '*'` |
 | Every request 403, accounts "frozen" | Missing/unmatched encryption key | `ready=0 pending=N` + `docker exec ... printenv CHAT2API_STORAGE_ENCRYPTION_KEY` |
 | Verdicts on every account, residential egress, key fine | Accounts share one identity | distinct `token` cookie count vs account count |
 | One request verdicted everywhere, others succeed | That transcript is judged | one repeating `fingerprint` in `risk circuit recorded` |

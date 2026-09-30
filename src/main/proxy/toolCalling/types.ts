@@ -35,6 +35,12 @@ export interface NormalizedToolResult {
   name?: string
   content: string
   isError?: boolean
+  /**
+   * The raw JSON arguments of the call this result answers, when the history
+   * still carries them. Protocols that label a result with the call that
+   * produced it use this; protocols with a fixed result envelope ignore it.
+   */
+  summary?: string
 }
 
 export interface ToolCallDiagnostics {
@@ -110,6 +116,13 @@ export interface ToolCallingPlan {
    * contract.
    */
   hasLiveToolWorkflow?: boolean
+  /**
+   * Provider-profile opt-in to the managed completion marker for protocols
+   * that do not require it. 'optional' teaches the marker and accepts it as a
+   * completion proof, but never rejects a marker-less answer on that ground
+   * alone. Unset keeps the protocol default (see workflowCompletion.ts).
+   */
+  completionMarkerMode?: 'optional'
   forcedToolName?: string
   /**
    * Upstream-wire renames for client tools whose names collide with Qwen's

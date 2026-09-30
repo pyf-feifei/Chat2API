@@ -20,6 +20,21 @@ export interface ChatRequest {
   toolChoice?: unknown
   mcpServerUrl?: string
   customInstructions?: string
+  /**
+   * True when the CLIENT declared tools for this request, including the
+   * managed path where the fenced protocol replaces the wire `tools` array
+   * with an empty one. M365 must not be allowed to answer a tool-bearing
+   * request from its own code-interpreter sandbox, so the transport uses
+   * this (not `tools.length`) to decide which option sets to send.
+   */
+  callerToolsActive?: boolean
+  /**
+   * Copilot Studio agent id for this turn. When present the invocation routes
+   * through the agent, whose tool contract lives in its SERVER-SIDE system
+   * prompt — the only placement this backend actually honours. The agent wire
+   * fields REPLACE `plugins`; sending both is not the measured shape.
+   */
+  studioAgentId?: string
 }
 
 export interface ChatResult {

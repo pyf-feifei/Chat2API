@@ -25,7 +25,7 @@ import { KimiAdapter, KimiStreamHandler } from './adapters/kimi'
 import { M365Adapter, m365DebugStreamEnabled, m365WorkflowContinuationAttemptsFromEnv, m365WorkflowContinuationTimeoutMsFromEnv } from './adapters/m365'
 import { isM365AuthIssue, isM365QuotaWall, m365FailureClassification } from './m365FailoverClassification'
 import { appendManagedReplayTurns } from './toolCalling/m365Transcript.ts'
-import { findManagedToolDenialClaim } from './adapters/qwenAiProgressIntent'
+import { findM365ToolDenialClaim } from './adapters/m365ToolDenial'
 import {
   MimoAdapter,
   MimoStreamHandler,
@@ -57,6 +57,7 @@ import type {
   QwenAiTransportProbe,
 } from './adapters/qwen-ai-files'
 import { ZaiAdapter, ZaiStreamHandler, classifyZaiManagedAnswer, zaiWorkflowContinuationAttemptsFromEnv, zaiWorkflowContinuationTimeoutMsFromEnv } from './adapters/zai'
+import { hasClaimedPayload, looksLikeActionRequest, looksLikeManagedConfabulation } from './toolCalling/managedMarkerConfabulation'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
@@ -1073,6 +1074,33 @@ export function calculateQwenAiCompactionDispatchCapacity(
     maxConcurrent - Math.max(0, Math.floor(input.activeRequests)),
     compactionMaxConcurrent - activeCompactionRequests,
   ))
+}
+
+/**
+ * Drop the prose a managed branch emitted around a real tool call, keeping the
+ * tool-call chunks (and the `role` delta the client needs to open the turn).
+ *
+ * The branch is fully buffered before it reaches the wire, so the invented
+ * narration ("Let me check…", "All done!") is still retractable here: it was
+ * written before the call's result existed, and a client that receives it acts
+ * on work nobody verified. M365-only: the other managed providers keep their
+ * mixed-output behaviour unchanged.
+ */
+function dropBranchProse(branchOuts: any[], flushed: any[]): any[] {
+  const hasToolCalls = (chunk: any): boolean =>
+    Array.isArray(chunk?.choices?.[0]?.delta?.tool_calls)
+    && chunk.choices[0].delta.tool_calls.length > 0
+  const survivors = [...branchOuts, ...flushed].filter(
+    (chunk) => hasToolCalls(chunk) || !chunk?.choices?.[0]?.delta?.content,
+  )
+  const roleSource = [...branchOuts, ...flushed].find((chunk) => chunk?.choices?.[0]?.delta?.role)
+  if (roleSource && !survivors.some((chunk) => chunk?.choices?.[0]?.delta?.role)) {
+    survivors.unshift({
+      ...roleSource,
+      choices: [{ index: 0, delta: { role: roleSource.choices[0].delta.role }, finish_reason: null }],
+    })
+  }
+  return survivors
 }
 
 function qwenAiCompactionMessageText(message: ChatMessage): string {
@@ -3315,6 +3343,42 @@ export class RequestForwarder {
   /**
    * M365 Copilot Forward (ChatHub WebSocket protocol)
    */
+  /**
+   * Resolve the Copilot Studio agent id for a tool-bearing M365 turn.
+   *
+   * Returns null in every "not available" case — deployment off, no consent to
+   * the two Power Platform scopes, provisioning failed, a non-tool turn — and
+   * the request then proceeds on the fenced protocol. It must never throw: an
+   * agent that cannot be created is a degraded tool-compliance rate, not a
+   * broken provider.
+   *
+   * Per-account so the agent is provisioned from an account that actually holds
+   * the consent, and the request is never delayed by a second provisioning
+   * round inside the same turn.
+   */
+  private async resolveM365StudioAgentId(
+    toolBearing: boolean,
+    account: Account,
+  ): Promise<string | undefined> {
+    if (!toolBearing) return undefined
+    try {
+      const { getOrCreateStudioAgent, studioAgentCachePath, studioAgentEnabled } =
+        await import('../providers/builtin/m365/agent/agentProvisioner.ts')
+      if (!studioAgentEnabled()) return undefined
+      return (await getOrCreateStudioAgent({
+        enabled: true,
+        getRefreshToken: () => account.credentials?.refreshToken,
+        cachePath: studioAgentCachePath(getRuntime().getDataDir()),
+        timeoutMs: 30000,
+      })) ?? undefined
+    } catch (error) {
+      console.warn('[M365Copilot] Studio agent resolution failed; using the fenced protocol', JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      return undefined
+    }
+  }
+
   private async forwardM365Copilot(
     request: ChatCompletionRequest,
     account: Account,
@@ -3361,9 +3425,30 @@ export class RequestForwarder {
         attachments: transformedRequest.attachments || [],
         tools: transformedRequest.tools || [],
         toolChoice: transformedRequest.toolChoice,
+        // Managed mode ships an empty wire `tools` array (the fenced protocol
+        // rides the text channel), so the transport needs this explicit flag
+        // to drop the code-interpreter option sets that would otherwise let
+        // M365 answer a tool request from its own sandbox.
+        callerToolsActive: transformed.plan.shouldParseResponse === true,
+        // Tool contract via a Copilot Studio agent whose instructions live
+        // server-side — the only placement this backend honours. Resolved ONLY
+        // for tool-bearing turns: the agent overrides the tone and forces GPT-5,
+        // so plain chat must keep the tone-selected model. Null (off, no
+        // consent, provisioning failed) leaves the fenced protocol in place.
+        studioAgentId: await this.resolveM365StudioAgentId(
+          transformed.plan.shouldParseResponse === true,
+          account,
+        ),
       }
       const toolStreamParser = transformed.plan.shouldParseResponse
-        ? new ToolStreamParser(transformed.plan)
+        // M365 chat models routinely write the fence and then continue, inventing
+        // the <tool_response> they expect and then acting on that fiction
+        // (cramt/m365-copilot-proxy #31: 38 of 80 Sonnet 4.6 turns, and with
+        // several fences the invented tail made the turn look like a document,
+        // so the real action at the head was discarded). Failing the request on
+        // that leak throws away a correct call; strip the invented block and
+        // keep the head, which is what the reference implementation does.
+        ? new ToolStreamParser(transformed.plan, undefined, { stripOnlyToolResultWrappers: true })
         : undefined
       const { ChatHubClient } = await import(
         '../providers/builtin/m365/chathub/client.ts'
@@ -3397,7 +3482,9 @@ export class RequestForwarder {
         let branchOuts: any[] = []
         let branchRoleSent = false
         const startBranch = (): void => {
-          branchParser = toolStreamParser ? new ToolStreamParser(transformed.plan) : undefined
+          branchParser = toolStreamParser
+            ? new ToolStreamParser(transformed.plan, undefined, { stripOnlyToolResultWrappers: true })
+            : undefined
           branchOuts = []
           branchRoleSent = false
           branchText = ''
@@ -3463,11 +3550,20 @@ export class RequestForwarder {
               return
             }
             streamWritten = true
-            for (const chunk of branchOuts) {
-              passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
-            }
-            for (const chunk of branchParser.flush(skeletonChunk)) {
-              passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+            // A branch that produced a real call also produced the prose around
+            // it, and that prose was written before the call's result existed
+            // ("Let me check…" before the fence, "All done!" after it). Drop it
+            // rather than shipping a turn that narrates work nobody verified;
+            // the tool call is the whole answer (cramt "Mixed output"). The role
+            // delta moves onto the first surviving chunk.
+            const flushed = branchParser.flush(skeletonChunk)
+            const emitted = branchParser.hasEmittedToolCall()
+              ? dropBranchProse(branchOuts, flushed)
+              : [...branchOuts, ...flushed]
+            if (emitted.length > 0) {
+              for (const chunk of emitted) {
+                passThrough.write(`data: ${JSON.stringify(chunk)}\n\n`)
+              }
             }
           }
           const finalChunk = {
@@ -3477,6 +3573,19 @@ export class RequestForwarder {
               delta: {},
               finish_reason: branchParser?.hasEmittedToolCall() ? 'tool_calls' : 'stop',
             }],
+          }
+          // An empty 200 is the worst outcome for an agentic client: it reads a
+          // successful turn that produced nothing and ends its loop with the
+          // work silently unfinished. A branch that delivered neither content
+          // nor a tool call therefore fails loudly with a typed, retryable
+          // error, so the client discards the turn and retries on another
+          // account instead of accepting silence.
+          if (!streamWritten && !branchParser?.hasEmittedToolCall()) {
+            failClientStream(
+              'm365_empty_answer',
+              'M365 returned no content and no tool call for this turn; retry the request',
+            )
+            return
           }
           passThrough.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
           passThrough.write('data: [DONE]\n\n')
@@ -3572,7 +3681,7 @@ export class RequestForwarder {
                 // satisfy by restating the denial with the marker appended.
                 // Deployment-tunable / disable via
                 // CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS=off.
-                const denial = Boolean(findManagedToolDenialClaim(branchText.trim()))
+                const denial = Boolean(findM365ToolDenialClaim(branchText.trim()))
                 // The daily-quota wall arrives as ordinary answer text and can
                 // land on ANY branch (observed 2026-09-14: it replaced the
                 // final continuation replay). It is terminal for this account
@@ -3756,6 +3865,79 @@ export class RequestForwarder {
       }
       if (transformed.plan.shouldParseResponse) {
         this.applyToolCallsToResponse(body, transformed)
+      }
+      // Same contract as the streaming path: never hand back a successful turn
+      // that carries neither content nor a tool call. An empty 200 reads as a
+      // finished turn to an agentic client, so the work disappears silently.
+      const deliveredMessage = body?.choices?.[0]?.message
+      const deliveredContent = typeof deliveredMessage?.content === 'string'
+        ? deliveredMessage.content.trim()
+        : ''
+      const deliveredCalls = Array.isArray(deliveredMessage?.tool_calls)
+        ? deliveredMessage.tool_calls
+        : []
+      // The streaming path recovers from a non-compliant turn by re-prompting
+      // and then failing with a typed retryable error. Non-stream has no
+      // re-prompt loop, so without this guard it delivered the fabrication
+      // outright ("`uname -a` returned: Kernel version: 6.1.158.2", observed
+      // 2026-09-29). A client that asked for a tool must not be handed an
+      // invented result, so the same judgment applies and the turn fails
+      // retryably instead.
+      //
+      // Two independent reasons, because wording alone keeps leaking new
+      // phrasings (measured: "contains: Note that …" and "reported by
+      // `uname -a`: The kernel version is …" both slipped a wording-only
+      // filter):
+      //  1. an outright confabulation signal (denial / claimed result);
+      //  2. the USER asked for an action and the answer claims a payload, with
+      //     no tool call anywhere. "What is the capital of France?" needs no
+      //     tool, so its prose answer is correct and stays deliverable.
+      const userAskedForAction = looksLikeActionRequest(
+        String(extractLatestActiveUserRequest(request.messages as any) ?? ''),
+      )
+      if (
+        transformed.plan.shouldParseResponse
+        && deliveredCalls.length === 0
+        && deliveredContent.length > 0
+        && (
+          looksLikeManagedConfabulation(deliveredContent)
+          || (userAskedForAction && hasClaimedPayload(deliveredContent))
+        )
+      ) {
+        console.error('[M365Copilot] non-stream answer is a confabulation; failing instead of delivering it', JSON.stringify({
+          accountId: account.id,
+          chars: deliveredContent.length,
+          head: deliveredContent.slice(0, 160),
+        }))
+        // NOT an account fault. Measured 2026-09-29: every account in the pool
+        // answers the same request the same way, so rotating walks all 25 and
+        // turns one refusal into a four-minute hang (observed: 259s before the
+        // pool was exhausted). No account rotation, no retry: fail fast so the
+        // client decides what to do with a clear error.
+        return {
+          success: false,
+          status: 502,
+          error: 'M365 produced a non-compliant managed-tool answer (capability denial or fabricated result); the request needs a model that honours the tool contract',
+          retryable: false,
+          accountFault: false,
+          latency: Date.now() - startTime,
+        }
+      }
+      if (deliveredContent.length === 0 && deliveredCalls.length === 0) {
+        console.error('[M365Copilot] empty non-stream answer; failing instead of returning an empty success', JSON.stringify({
+          accountId: account.id,
+          upstreamChars: (result.text || '').length,
+        }))
+        // Same reasoning as the confabulation guard: an empty answer is not
+        // account-specific, so rotating the pool would just burn the budget.
+        return {
+          success: false,
+          status: 502,
+          error: 'M365 returned an empty answer for this turn',
+          retryable: false,
+          accountFault: false,
+          latency: Date.now() - startTime,
+        }
       }
       return {
         success: true,

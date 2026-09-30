@@ -16,11 +16,38 @@ export interface ProviderToolProfile {
   // search) that can intercept a managed-tool turn instead of the declared
   // client tools, so undeclared-capability exclusion rules apply.
   excludesUndeclaredProviderCapabilities: boolean
+  /**
+   * True when the platform's chat models routinely keep writing after their
+   * own tool call — inventing the tool-result envelope they expect and then
+   * acting on that fiction. The invented block is stripped and the real call
+   * at the head is kept, instead of failing the request on a wrapper leak
+   * that costs a correct call (cramt/m365-copilot-proxy #31).
+   */
+  stripsInventedToolResultWrappers?: boolean
+  /**
+   * Opt a protocol that does not require the completion marker into teaching
+   * it as an OPTIONAL proof. Lets a short final answer after a tool result be
+   * told apart from stall narration without any wording heuristics.
+   */
+  workflowCompletionMarker?: 'optional'
   formatAssistantToolCalls(calls: Array<{ id: string; name: string; arguments: string }>): string
   formatToolResult(result: NormalizedToolResult): string
 }
 
 let warnedUnknownQwenAiManagedProtocol = false
+
+/**
+ * Z.ai optional completion marker (default on). Without a proof channel a
+ * short correct final answer after a tool result ("README.md has 412 lines")
+ * is structurally indistinguishable from stall narration, and the recovery
+ * nudge demanded another tool call until the turn failed (observed live
+ * 2026-09-29, GLM-5.3-Flash). Set CHAT2API_ZAI_COMPLETION_MARKER=off to
+ * restore the marker-less contract.
+ */
+export function zaiCompletionMarkerFromEnv(): boolean {
+  const raw = String(process.env.CHAT2API_ZAI_COMPLETION_MARKER ?? '').trim().toLowerCase()
+  return !['0', 'false', 'no', 'off', 'disabled'].includes(raw)
+}
 
 /**
  * Managed tool protocol for the qwen-ai provider. Defaults to the
@@ -89,6 +116,7 @@ const m365FencedHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   preferredManagedProtocol: 'm365_fenced',
   usesTranscriptDocumentTransport: false,
   excludesUndeclaredProviderCapabilities: false,
+  stripsInventedToolResultWrappers: true,
   formatAssistantToolCalls(calls) {
     return m365FencedProtocol.formatAssistantToolCalls(calls)
   },
@@ -126,10 +154,14 @@ const profiles: Record<string, ProviderToolProfile> = {
   // protocol env knob (CHAT2API_QWEN_AI_MANAGED_PROTOCOL) cannot desync the
   // history formatters from the teaching protocol across env changes.
   // Explicit so protocol choice for the Copilot transport is intentional
-  // instead of riding the unknown-provider fallback. The consumer Chathub has
-  // no native tool channel (verified against winnstorm/m365-copilot-api,
-  // cramt/m365-copilot-proxy, edlaver/m365-copilot-bun-proxy), so managed
-  // XML prompt injection is the only path here.
+  // instead of riding the unknown-provider fallback. No caller-defined tool
+  // channel has been VERIFIED on the consumer Chathub: the fenced protocol is
+  // what this repo teaches and enforces. Two higher-starred projects
+  // (HEXUXIU/M365-Copilot2API, shenping1200/m365-copilot-bridge) do send
+  // caller tools as `plugins: [{Id, Source: "API"}]` and read real calls back
+  // out of the stream frames — and then skip the prompt injection entirely when
+  // plugins are present. That is a DIFFERENT transport, not evidence that the
+  // fenced one is wrong; see docs/providers/m365-copilot.md before switching.
   'm365-copilot': {
     providerId: 'm365-copilot',
     ...m365FencedHistoryProfile,
@@ -147,6 +179,12 @@ export function getProviderToolProfile(providerId: string): ProviderToolProfile 
         ? qwenAiNativeHistoryProfile
         : qwenAiHermesHistoryProfile),
     }
+  }
+  if (providerId === 'zai') {
+    // Resolved per call so the env switch applies without a rebuild.
+    return zaiCompletionMarkerFromEnv()
+      ? { ...profiles.zai, workflowCompletionMarker: 'optional' }
+      : profiles.zai
   }
   return profiles[providerId] ?? {
     providerId,

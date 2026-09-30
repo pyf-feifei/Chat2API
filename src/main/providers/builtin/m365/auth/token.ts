@@ -9,7 +9,7 @@ import {
   getDeviceTokenEndpoint,
   getTokenOriginCandidates,
   requestToken,
-} from './config'
+} from './config.ts'
 
 export async function refresh(
   refreshToken: string,

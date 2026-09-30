@@ -187,10 +187,23 @@ function tokenSubject(payload: Record<string, any> | null): string {
  * the access token is dead a quarter of an hour later, so the refresh token is
  * what actually keeps it alive.
  */
-export function usableQwenAiRefreshToken(cookieHeader: string, now: number = Date.now()): string {
+export function usableQwenAiRefreshToken(
+  cookieHeader: string,
+  ownToken: string = '',
+  now: number = Date.now(),
+): string {
   const value = cookieValue(cookieHeader, 'refresh_token').trim()
   const payload = value ? decodeJwtPayload(value) : null
   if (!payload || typeof payload.exp !== 'number' || payload.exp * 1000 <= now) return ''
+  // A refresh token belongs to one user. Observed 2026-09-30: three accounts
+  // were written with another pool account's refresh_token beside their own
+  // session. Exchanging it would mint that other user's access token, and the
+  // "issued to a different user" check cannot catch it because the token does
+  // match the refresh token. Compare against the account's own identity.
+  const own = tokenSubject(decodeJwtPayload(String(ownToken || '').trim()))
+  const ownFromJar = tokenSubject(decodeJwtPayload(cookieValue(cookieHeader, 'token').trim()))
+  const holder = own || ownFromJar
+  if (holder && tokenSubject(payload) !== holder) return ''
   return value
 }
 
@@ -201,9 +214,15 @@ export function usableQwenAiRefreshToken(cookieHeader: string, now: number = Dat
  * resolveQwenAiAuthHeaders): a minted access token is only accepted as a Bearer
  * header, and as a `token=` cookie it answers Unauthorized.
  */
-export function hasQwenAiWebSession(cookieHeader: string): boolean {
+export function hasQwenAiWebSession(cookieHeader: string, ownToken: string = ''): boolean {
   const cookies = String(cookieHeader || '')
-  return hasQwenAiSessionCookie(cookies) || Boolean(usableQwenAiRefreshToken(cookies))
+  return hasQwenAiSessionCookie(cookies) || Boolean(usableQwenAiRefreshToken(cookies, ownToken))
+}
+
+/** hasQwenAiWebSession for an account's stored credentials. */
+export function accountHasQwenAiWebSession(credentials: Record<string, string> | undefined): boolean {
+  const stored = credentials || {}
+  return hasQwenAiWebSession(String(stored.cookies || stored.cookie || '').trim(), stored.token)
 }
 
 /** Fingerprint of the saved login, so a rejection is tied to the credential it judged. */
@@ -218,7 +237,7 @@ export function qwenAiLoginFingerprint(account: Account): string {
 export function canRefreshQwenAiAccount(account: Account): boolean {
   const credentials = account.credentials || {}
   return Boolean(credentials.email && credentials.password)
-    || Boolean(usableQwenAiRefreshToken(String(credentials.cookies || credentials.cookie || '')))
+    || Boolean(usableQwenAiRefreshToken(String(credentials.cookies || credentials.cookie || ''), credentials.token))
 }
 
 export function resolveQwenAiAuthHeaders(token: string, cookieHeader: string): Record<string, string> {
@@ -804,7 +823,7 @@ export class QwenAiTokenRefresher {
     lastFailure?: string,
   ): Promise<Account> {
     const cookies = String(account.credentials.cookies || account.credentials.cookie || '').trim()
-    const incompleteWebSession = Boolean(cookies) && !hasQwenAiWebSession(cookies)
+    const incompleteWebSession = Boolean(cookies) && !hasQwenAiWebSession(cookies, account.credentials.token)
     const challenged = this.isSessionFinishedBy(lastFailure ?? pendingChallenge(account.id))
     const expiring = this.isTokenExpiringSoon(account.credentials.token || '')
     const refreshable = this.canRefresh(account)
@@ -838,7 +857,10 @@ export class QwenAiTokenRefresher {
     }
     // A refresh-token session is only as good as its access token, which lives
     // for minutes; renew it while it is expiring rather than on every sweep.
-    if (usableQwenAiRefreshToken(cookies) && !this.isTokenExpiringSoon(account.credentials.token || '')) {
+    if (
+      usableQwenAiRefreshToken(cookies, account.credentials.token)
+      && !this.isTokenExpiringSoon(account.credentials.token || '')
+    ) {
       return account
     }
 
@@ -865,7 +887,7 @@ export class QwenAiTokenRefresher {
    */
   private async refresh(account: Account, signal?: AbortSignal): Promise<Account> {
     const cookies = String(account.credentials.cookies || account.credentials.cookie || '')
-    if (usableQwenAiRefreshToken(cookies)) {
+    if (usableQwenAiRefreshToken(cookies, account.credentials.token)) {
       try {
         return await this.exchangeRefreshToken(account, signal)
       } catch (error) {
@@ -906,7 +928,7 @@ export class QwenAiTokenRefresher {
     }
 
     const cookies = String(account.credentials.cookies || account.credentials.cookie || '')
-    const refreshToken = usableQwenAiRefreshToken(cookies)
+    const refreshToken = usableQwenAiRefreshToken(cookies, account.credentials.token)
     const owner = tokenSubject(decodeJwtPayload(refreshToken))
 
     let response: QwenAiSignInResponse

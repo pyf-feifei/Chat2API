@@ -25,6 +25,7 @@ import {
 } from './workflowHeuristics.ts'
 import {
   MANAGED_WORKFLOW_COMPLETE_MARKER,
+  isOptionalManagedWorkflowCompletionMarker,
   requiresManagedWorkflowCompletionMarker,
 } from './workflowCompletion.ts'
 import { getToolStreamValidationFailure } from './streamValidationPolicy.ts'
@@ -41,6 +42,25 @@ const MANAGED_WORKFLOW_COMPLETION_PROMPT = [
   'Append this transport marker after the final answer even when the active user requests exact output or no extra prose; the proxy removes it before delivery.',
   'Never emit the completion marker in a progress update or alongside a tool call.',
   'If you are unsure whether the request is complete, call the next appropriate tool rather than returning a final answer without the marker.',
+].join(' ')
+
+// Optional-marker contract (provider-profile opt-in, see
+// isOptionalManagedWorkflowCompletionMarker): the marker is the model's way to
+// PROVE that a short answer after tool results is the final answer rather than
+// narration. It is taught, never demanded for every answer.
+const OPTIONAL_MANAGED_WORKFLOW_COMPLETION_PROMPT = [
+  'Completion proof: when your answer is the final answer that completes the request — including a short answer that only reports what a tool returned — end it with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + ' as the final characters; the proxy removes it before delivery.',
+  'Never emit the marker in a progress update, a plan, or alongside a tool call.',
+  'After tool results, a short answer without the marker is treated as unfinished and you will be asked to continue.',
+].join(' ')
+
+// Missing-proof nudge for the optional-marker contract. The stream bridge has
+// already delivered the dangling answer, so asking for the answer again would
+// duplicate it on the client; the bare marker closes the workflow instead.
+const OPTIONAL_MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT = [
+  'Your preceding answer has already been delivered to the user, but it did not end with the completion marker, so the workflow could not be closed.',
+  'If that answer fully completes the active request, your entire output on this turn must be ONLY the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + ' — do not repeat or rephrase the answer; for this turn the marker alone satisfies option (b).',
+  'If work remains, respond with the next appropriate declared tool call instead.',
 ].join(' ')
 
 // Deployment-tunable runtime rules. Defaults below; a non-empty env value
@@ -161,6 +181,7 @@ export function createToolWorkflowContinuationMessage(options: {
     | 'allowedToolNames'
     | 'workflowContinuation'
     | 'failedToolResultPending'
+    | 'completionMarkerMode'
   >
 } = {}): ChatMessage {
   // Every prompt rendered from the plan's tool list must carry the UPSTREAM
@@ -186,9 +207,10 @@ export function createToolWorkflowContinuationMessage(options: {
     && options.plan.tools.length > 0
     ? getToolProtocol(options.plan.protocol).renderContinuationReminder?.(promptTools)
     : undefined
+  const optionalMarker = isOptionalManagedWorkflowCompletionMarker(options.plan)
   const completionPrompt = options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
     ? MANAGED_WORKFLOW_COMPLETION_PROMPT
-    : undefined
+    : optionalMarker ? OPTIONAL_MANAGED_WORKFLOW_COMPLETION_PROMPT : undefined
   const activeUserRequestPrompt = options.activeUserRequest?.trim()
     ? [
         ACTIVE_USER_REQUEST_CONTINUATION_PROMPT[0],
@@ -202,15 +224,22 @@ export function createToolWorkflowContinuationMessage(options: {
     content: [
       TOOL_WORKFLOW_CONTINUATION_PROMPT,
       activeUserRequestPrompt,
-      options.completionProofMissing ? MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT : undefined,
+      options.completionProofMissing
+        ? optionalMarker
+          ? OPTIONAL_MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT
+          : MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT
+        : undefined,
       options.rejectedNativeToolCall ? REJECTED_NATIVE_TOOL_CONTINUATION_PROMPT : undefined,
-      options.plan?.workflowContinuation
+      // The optional-marker proof nudge replaces the "return the final answer"
+      // tail: the answer is already on the client, and restating it there
+      // would invite a duplicate.
+      options.plan?.workflowContinuation && !(optionalMarker && options.completionProofMissing)
         ? options.failedToolResultPending
           ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT
           : SUCCESSFUL_TOOL_RESULT_CONTINUATION_PROMPT_TAIL + (
             options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
               ? ' with the required completion marker.'
-              : '.'
+              : optionalMarker ? ' ending with the completion marker.' : '.'
           )
         : undefined,
       recoveryPrompt,
@@ -232,6 +261,12 @@ export function extractTrailingAssistantText(messages: ChatMessage[]): string | 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
     if (message.role !== 'assistant') continue
+    // A tool-call carrier is tool activity even when it also carries a short
+    // preamble ("Running wc now."): the consecutive-short-prose stall rule
+    // must not read that preamble as narration and demand another tool call
+    // over the tool results that follow it.
+    const toolCalls = (message as ChatMessage & { tool_calls?: unknown }).tool_calls
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) return undefined
     if (typeof message.content === 'string') {
       return message.content.trim() ? message.content : undefined
     }
@@ -401,6 +436,11 @@ export class ToolCallingEngine {
     const message = choices[0]?.message
     if (!message) return
 
+    // A platform whose chat models keep writing past their own call gets the
+    // invented result envelope stripped instead of a failed request: the real
+    // call sits at the head of the text and is still worth delivering.
+    const stripInventedWrappers = plan.shouldParseResponse
+      && getProviderToolProfile(plan.providerId).stripsInventedToolResultWrappers === true
     let guardedContent: string | undefined
     for (let choiceIndex = 0; choiceIndex < choices.length; choiceIndex += 1) {
       const choiceMessage = choices[choiceIndex]?.message
@@ -434,6 +474,13 @@ export class ToolCallingEngine {
         const guarded = stripManagedToolResultWrappers(
           candidate.value,
           candidate.protectedProtocol,
+          {
+            stripOnly: stripInventedWrappers,
+            // m365_fenced renders the attributed result block, so the guard
+            // must recognize that shape to catch an invented copy. Tied to the
+            // same M365-only profile flag.
+            attributedResultOpeners: stripInventedWrappers,
+          },
         )
         if (guarded.wrapperLeakDetected) {
           console.warn('[ToolCalling] Blocked leaked managed tool-result wrapper', JSON.stringify({
@@ -759,7 +806,7 @@ function renderPrompt(
   const policyPrompt = renderToolChoicePolicyPrompt(plan)
   const completionPrompt = requiresManagedWorkflowCompletionMarker(plan)
     ? MANAGED_WORKFLOW_COMPLETION_PROMPT
-    : ''
+    : isOptionalManagedWorkflowCompletionMarker(plan) ? OPTIONAL_MANAGED_WORKFLOW_COMPLETION_PROMPT : ''
   const customPromptTemplate = config.diagnosticsEnabled
     ? config.advanced.customPromptTemplate
     : undefined

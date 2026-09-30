@@ -70,7 +70,7 @@ function isQwenAiProvider(provider: Provider): boolean {
 export function isQwenAiWebSessionReady(account: Account): boolean {
   const cookies = String(account.credentials.cookies || account.credentials.cookie || '')
   if (hasQwenAiSessionCookie(cookies)) return true
-  return Boolean(usableQwenAiRefreshToken(cookies))
+  return Boolean(usableQwenAiRefreshToken(cookies, account.credentials.token))
     && !qwenAiTokenRefresher.isTokenExpiringSoon(String(account.credentials.token || ''))
 }
 
@@ -193,7 +193,10 @@ export class QwenAiSessionRepairService {
       const nextAttemptAt = Math.max(
         qwenAiSessionRepairProbeDeadline(account, now),
         // A live refresh token renews without the refused login.
-        usableQwenAiRefreshToken(String(account.credentials.cookies || account.credentials.cookie || ''))
+        usableQwenAiRefreshToken(
+          String(account.credentials.cookies || account.credentials.cookie || ''),
+          account.credentials.token,
+        )
           ? 0
           : qwenAiRejectedLoginDeadline(account),
         this.retryAfterByAccount.get(account.id) || 0,

@@ -13,7 +13,7 @@ type ManagedWorkflowCompletionPlan = Pick<
   | 'allowedToolNames'
   | 'workflowContinuation'
   | 'failedToolResultPending'
->
+> & Partial<Pick<ToolCallingPlan, 'completionMarkerMode'>>
 
 export interface ManagedWorkflowCompletionProof {
   complete: boolean
@@ -69,6 +69,7 @@ export function stripManagedWorkflowCompletionMarker(
 export function requiresManagedWorkflowCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
   return Boolean(
     supportsManagedWorkflowCompletionMarker(plan)
+    && protocolRequiresCompletionMarker(plan)
     // A successful continuation must terminate with either a parsed tool call
     // or an explicit completion proof. A failed tool result is different: the
     // structured failure state permits a final explanation without inventing
@@ -87,18 +88,33 @@ export function supportsManagedWorkflowCompletionMarker(
 ): boolean {
   return Boolean(
     plan?.shouldParseResponse
-    && (plan.protocol === 'qwen_hermes'
-      || plan.protocol === 'qwen_native'
-      // m365_fenced teaches natural-language finals ("respond with no
-      // fence"), which is indistinguishable from a capability-denial
-      // confabulation at classification time. Observed live 2026-09-13
-      // (gpt-5.6-luna first turn via codex): a 331-char denial escaped every
-      // capped prose detector and the first-turn fall-through delivered it,
-      // ending the agent turn. With marker support the m365 branch classifies
-      // proof-less finals the same way the qwen protocols do.
-      || plan.protocol === 'm365_fenced')
+    && (protocolRequiresCompletionMarker(plan)
+      // Provider-profile opt-in (zai): the marker is taught and accepted as a
+      // completion proof without becoming mandatory for every answer.
+      || plan.completionMarkerMode === 'optional')
     && plan.allowedToolNames.size > 0
   )
+}
+
+/**
+ * The marker is OPTIONAL for this plan: supported as a completion proof, but a
+ * marker-less answer is never rejected for that reason alone.
+ */
+export function isOptionalManagedWorkflowCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
+  return supportsManagedWorkflowCompletionMarker(plan) && !protocolRequiresCompletionMarker(plan)
+}
+
+function protocolRequiresCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
+  return plan?.protocol === 'qwen_hermes'
+    || plan?.protocol === 'qwen_native'
+    // m365_fenced teaches natural-language finals ("respond with no
+    // fence"), which is indistinguishable from a capability-denial
+    // confabulation at classification time. Observed live 2026-09-13
+    // (gpt-5.6-luna first turn via codex): a 331-char denial escaped every
+    // capped prose detector and the first-turn fall-through delivered it,
+    // ending the agent turn. With marker support the m365 branch classifies
+    // proof-less finals the same way the qwen protocols do.
+    || plan?.protocol === 'm365_fenced'
 }
 
 const COMPLETION_MARKER_PREFIX = '<chat2api_workflow_complete'

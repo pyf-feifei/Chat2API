@@ -480,6 +480,11 @@ services:
       CHAT2API_VALIDATED_SSE_MAX_HOLD_MS: ${CHAT2API_VALIDATED_SSE_MAX_HOLD_MS:-60000}
     volumes:
       - chat2api-data:/data
+      # Local dev loop: serve the headless bundle from the working tree so
+      # `npm run build:server` + `docker restart chat2api` deploys a change
+      # without rebuilding the image. Production is image-only and does not
+      # use this. Read-only so the container can never write the bundle.
+      - ./out-server:/app/out-server:ro
 
 volumes:
   chat2api-data:

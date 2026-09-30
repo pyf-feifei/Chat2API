@@ -126,6 +126,13 @@
       {
         "from": "sha3_wasm_bg.7b9ca65ddd.wasm",
         "to": "sha3_wasm_bg.7b9ca65ddd.wasm"
+      },
+      {
+        "from": "scripts/zai-captcha",
+        "to": "scripts/zai-captcha",
+        "filter": [
+          "*.py"
+        ]
       }
     ],
     "asar": true,

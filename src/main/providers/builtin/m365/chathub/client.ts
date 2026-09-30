@@ -10,13 +10,17 @@
  *   and every account opens its own socket (load-balancer friendly).
  */
 import { randomUUID } from 'crypto'
-import { MSA_CONSUMER_TID } from '../auth/config'
+// Explicit .ts specifiers: the repo builds with allowImportingTsExtensions,
+// and this is what lets the option-set policy below be covered by a plain
+// node --test run (extensionless specifiers do not resolve under ESM).
+import { MSA_CONSUMER_TID } from '../auth/config.ts'
+import { buildAgentChatFields } from '../agent/agentIdentity.ts'
 import type {
   ChatHubAccount,
   ChatRequest,
   ChatResult,
   StreamHandler,
-} from './types'
+} from './types.ts'
 
 const WS_BASE = 'wss://substrate.office.com/m365Copilot/Chathub'
 const DEFAULT_TONE = 'magic'
@@ -191,6 +195,46 @@ const CONSUMER_OPTIONS_SETS = [
   'web_search_citations_answer_cards',
 ]
 
+/**
+ * Option sets that hand file/code work to M365's OWN code-interpreter
+ * sandbox. With them present the model answers a file or command request by
+ * running its sandbox, so no caller-declared tool call is ever produced —
+ * the managed fenced protocol is then silently ignored (M365Bridge
+ * TOOL-CALLING.md, "Why simulation is required": stripping these sets
+ * "is essential", not an optimisation).
+ */
+const CALLER_TOOL_CONFLICTING_OPTION_SETS = new Set([
+  'cwc_code_interpreter',
+  'cwc_code_interpreter_amsfix',
+  'cwc_code_interpreter_citation_fix',
+  'cwc_code_interpreter_citation_sourceannotations',
+  'code_interpreter_interactive_charts',
+  'cwc_code_interpreter_interactive_charts_inline_image',
+  'code_interpreter_matplotlib_patching',
+  'cdxcwc_code_interpreter_hallucinated_url_filter',
+])
+
+/**
+ * Whether a caller-declared-tools request drops the code-interpreter option
+ * sets. Deployment knob so a tenant that NEEDS the built-in sandbox for some
+ * client can keep the capture-and-strip behaviour off:
+ * CHAT2API_M365_TOOL_OPTION_SET_STRIP=off
+ */
+export function m365ToolOptionSetStripEnabled(): boolean {
+  const raw = String(process.env.CHAT2API_M365_TOOL_OPTION_SET_STRIP ?? '').trim().toLowerCase()
+  return raw !== 'off' && raw !== '0' && raw !== 'false' && raw !== 'no'
+}
+
+/**
+ * Option sets for one invocation. A request that declares caller tools keeps
+ * the wire shape otherwise byte-identical, so a mismatch in the remaining sets
+ * cannot appear on non-tool turns.
+ */
+export function consumerOptionsSets(hasCallerTools: boolean): string[] {
+  if (!hasCallerTools || !m365ToolOptionSetStripEnabled()) return CONSUMER_OPTIONS_SETS
+  return CONSUMER_OPTIONS_SETS.filter((set) => !CALLER_TOOL_CONFLICTING_OPTION_SETS.has(set))
+}
+
 const CONSUMER_ALLOWED_MESSAGE_TYPES = [
   'Chat', 'Suggestion', 'InternalSearchQuery', 'Disengaged',
   'InternalLoaderMessage', 'Progress', 'GeneratedCode', 'RenderCardRequest',
@@ -301,13 +345,22 @@ function buildChatPayload(
   return JSON.stringify(payload)
 }
 
-function buildConsumerChatPayload(
+/**
+ * The consumer invocation payload. Exported so the agent wire fields can be
+ * asserted in a plain node --test run: getting this shape wrong is silent at
+ * runtime (ChatHub ignores an invocation whose shape drifts), and "did the
+ * agent actually get referenced" is the single most important thing to pin
+ * about this route.
+ */
+export function buildConsumerChatPayload(
     text: string,
     sessionId: string,
     requestId: string,
     firstTurn: boolean,
     customInstructions?: string,
     tone?: string,
+    hasCallerTools = false,
+    studioAgentId?: string,
   ): string {
   // Mirrored from the m365.cloud.microsoft officeweb consumer client; the
   // ChatHub silently ignores invocations whose shape drifts too far.
@@ -329,7 +382,7 @@ function buildConsumerChatPayload(
         source: 'officeweb',
         clientCorrelationId: requestId,
         sessionId,
-        optionsSets: CONSUMER_OPTIONS_SETS,
+        optionsSets: consumerOptionsSets(hasCallerTools),
         streamingMode: 'ConciseWithPadding',
         options: customInstructions ? { customInstructions: { text: customInstructions } } : {},
         extraExtensionParameters: {},
@@ -355,6 +408,13 @@ function buildConsumerChatPayload(
           clientInfo,
         },
         plugins: [{ Id: 'BingWebSearch', Source: 'BuiltIn' }],
+        // A Copilot Studio agent carries the tool contract in its SERVER-SIDE
+        // system prompt, which is the only placement this backend honours: with
+        // per-request injection alone it answers tool requests in prose or
+        // hallucinates tool results (measured 0/N on this repo's pool,
+        // 2026-09-29). These fields REPLACE `plugins` rather than joining them —
+        // that is the shape compliance was measured with.
+        ...(studioAgentId ? buildAgentChatFields(studioAgentId) : {}),
         isSbsSupported: true,
         // Magic confabulates instead of following prompt-injected tool
         // protocols; Assist complies (validated 2026-08-28).
@@ -400,6 +460,12 @@ export class ChatHubClient {
     const requestId = randomUUID()
     const tone = request.tone || DEFAULT_TONE
     const firstTurn = request.started !== false
+    // Managed tool calling has no native channel: the fenced protocol rides
+    // `message.text`, so `tools` stays empty on the wire there. The caller
+    // flag is therefore the only reliable tool signal for this transport.
+    const hasCallerTools =
+      request.callerToolsActive === true
+      || (Array.isArray(request.tools) && request.tools.length > 0)
     const wsUrl = buildWsUrl(account, sessionId, conversationId, requestId, variant)
 
     return new Promise<ChatResult>((resolve, reject) => {
@@ -445,7 +511,16 @@ export class ChatHubClient {
               // frame; without it the hub silently drops the invocation.
               const payload =
                 (variant === 'consumer'
-                  ? buildConsumerChatPayload(request.text, sessionId, requestId, firstTurn, request.customInstructions, tone)
+                  ? buildConsumerChatPayload(
+                      request.text,
+                      sessionId,
+                      requestId,
+                      firstTurn,
+                      request.customInstructions,
+                      tone,
+                      hasCallerTools,
+                      request.studioAgentId,
+                    )
                   : buildChatPayload(
                       request.text,
                       sessionId,

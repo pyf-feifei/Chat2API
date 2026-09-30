@@ -164,12 +164,17 @@ WAF 随之返回 `bxpunish` / `RGV587` 风控判定（`qwen_ai_content_verdict`�
 # 策略生效后应用会走的路径
 node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https://chat.qwen.ai/api/v1/chat')||'DIRECT')"
 
-# 真实网络出口
-curl -s https://ipinfo.io/ip
+# 绕过所有代理后的真实网络出口
+curl -s --noproxy '*' https://myip.ipip.net
 ```
 
-第一个命令输出 `DIRECT` 是预期结果。如果第二个命令返回的是机房 AS（如 `AS7488`），
-说明 Chat2API 上游仍有东西在代理。（`AS4837` 属于正常家宽运营商。）
+第一个命令输出 `DIRECT` 是预期结果。注意：IP 回显服务只能说明**访问它自己**走的是哪条路。
+在 Clash 这类按规则分流的代理下，`ipinfo.io`（`MATCH,PROXY`）、`api.ipify.org`（代理规则集）
+显示的是节点 IP，即使服务商域名全部直连也一样。这个读数已经不止一次把诊断带偏。
+要判断某个服务商域名的出口，请看 Clash 对该域名命中的规则（Clash Verge → 连接），
+或者用和服务商同一条规则路径的回显服务对比（国内服务商用 `myip.ipip.net`，走
+DIRECT）。如果 `--noproxy` 那条命令返回机房 AS（如 `AS7488`），说明 Chat2API
+之下还有东西在代理全部流量。（`AS4837` 属于正常家宽运营商。）
 
 ### Clash Verge / Mihomo
 
@@ -190,8 +195,12 @@ prepend:
 `%APPDATA%/io.github.clash-verge-rev.clash-verge-rev/profiles/<uid>.yaml`。
 改完后需在 UI 里重载订阅；核心以服务方式运行，无管理员权限的 shell 无法重启它。
 
-> **Docker 注意**：即使容器内**没有** `HTTP_PROXY`，Docker Desktop 也可能把容器流量
-> 走 Windows 系统代理。容器内设 `NO_PROXY` 和上面的 Clash 规则都解决不了，见下一节。
+> **Docker 注意**：即使容器内**没有** `HTTP_PROXY`，Docker Desktop 也会把容器流量
+> 走 Windows 系统代理（`http.docker.internal:3128`），所以容器内设 `NO_PROXY` 没用。
+> 但这些流量**确实会进入 Clash**，由上面的规则按域名分流。2026-09-30 在系统代理开启时
+> 从容器内实测：上面这些服务商域名走 DIRECT，出口是家宽 IP；国外域名命中
+> 代理规则，走节点。规则只管它列出的域名，所以要确认服务商页面会访问的域名都被覆盖
+> （例如 Z.ai 还会访问 `chatglm.cn`，可在“连接”里确认）。如果想让容器完全不经过 Clash，见下一节。
 
 **完整配置、验证与排障：[docs/network-egress.md](docs/network-egress.md)。**
 
@@ -204,8 +213,10 @@ prepend:
 docker info | grep -A2 "^ *Proxy"     # 会打印 http.docker.internal:3128 吗？
 ```
 
-如果打印了，说明 Docker 把所有容器流量都走了这个代理，容器的出口就成了代理的地址
-而不是你自己的。修法：关掉 Windows 系统代理，并把 Docker Desktop 的代理模式改为
+如果打印了，说明 Docker 把所有容器流量都送进了这个代理，也就是 Clash。之后每个域名
+走哪里由它命中的 Clash 规则决定：DIRECT 规则保持家宽 IP，落到 `MATCH,PROXY` 的走节点。
+所以先确认每个服务商域名都有 DIRECT 规则（见上文）。如果想让容器完全不经过 Clash：
+关掉 Windows 系统代理，并把 Docker Desktop 的代理模式改为
 manual 且不填地址（存于 `%APPDATA%\Docker\marlin.dat`，把
 `"proxyHTTPMode":{...,"Value":"system"}` 改为 `"manual"`），然后重启 Docker Desktop。
 

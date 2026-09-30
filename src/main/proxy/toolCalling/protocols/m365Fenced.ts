@@ -4,6 +4,41 @@ import type { ToolCall } from '../../types.ts'
 
 const FENCE = '```'
 
+/**
+ * How many fenced calls one M365 turn may yield.
+ *
+ * This backend does not stop at a call: it writes its whole plan into one
+ * reply and then narrates the results of the steps it never ran
+ * (cramt/m365-copilot-proxy, "One call per turn" — later steps then run on
+ * guessed state, and the invented narration reads as a finished task). One
+ * real action per turn is what turns a single reply into a working loop, so
+ * the default is 1. `CHAT2API_M365_MAX_TOOL_CALLS_PER_TURN` raises it for
+ * clients that need parallel calls on a tenant whose model does stop at the
+ * call.
+ */
+export function m365MaxToolCallsPerTurn(): number {
+  const raw = process.env.CHAT2API_M365_MAX_TOOL_CALLS_PER_TURN
+  if (raw === undefined || raw.trim() === '') return 1
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 1) return 1
+  return value
+}
+
+/**
+ * The caller's host platform, stated explicitly.
+ *
+ * Every framing variant in this prompt teaches POSIX idioms by name
+ * (heredocs, `sed -i`, `ls`/`grep`), so on a Windows caller the model emits
+ * commands the host cannot run every turn — a fence that never routes reads
+ * to the user exactly like "the model ignored my tools"
+ * (cramt/m365-copilot-proxy #7). The platform is injectable so the Windows
+ * branch stays testable from a POSIX box.
+ */
+export function m365HostPlatformNote(platform: string = process.platform): string {
+  if (platform !== 'win32') return ''
+  return "\nThe caller runs Windows. That shell tool is Windows PowerShell 5.1, not bash: Windows paths like D:\\ and \\\\ are directly reachable. Use PowerShell to create a file (Set-Content, Out-File, here-strings), to edit one ((Get-Content -Raw) -replace ... | Set-Content), and to inspect one (Get-ChildItem, Get-Content, Select-String) — never heredocs, `sed -i`, `ls`, `cat` or `grep`, which do not exist there. Do not fall back to a Linux container, a /mnt/data path, or any cloud sandbox, and do not claim the environment changed.\n"
+}
+
 function renderToolList(tools: NormalizedToolDefinition[]): string {
   return tools
     .map((tool) => {
@@ -34,10 +69,12 @@ export const m365FencedProtocol: ToolProtocolAdapter = {
 
     return `## Tool Execution Environment
 
-You are running inside a managed tool-calling harness. The tools listed below are REAL capabilities wired into your runtime by the operator — they are part of your own execution environment, not suggestions, not user-described pretend tools, and not a capability you must disclaim. When you emit a fenced call, the harness executes it and returns a <tool_response>. Denying these tools exist or claiming you "cannot access" them is a contract violation.
+Performing this task with the tools below is your PRIMARY JOB. Answering the user in prose is, and always will be, SECONDARY: prose is the right output only once the work is actually finished, which you can know only because a <tool_response> for it already appears above.
+
+You are running inside a managed tool-calling harness. The tools listed below are REAL capabilities wired into your runtime by the operator — they are part of your own execution environment, not suggestions, not user-described pretend tools, and not a capability you must disclaim. A fenced block is an ACTION the harness executes for you, never an example, an illustration, or a code sample you are writing for the user. When you emit a fenced call, the harness executes it and returns a <tool_response>. Denying these tools exist or claiming you "cannot access" them is a contract violation.
 
 The tool calls run in the CALLER's environment — the machine/workspace of the program making this request — not in any sandbox you control. Paths, working directories, and available commands belong to that caller's environment; do not assume your own filesystem layout or OS. If a tool result reports a missing file or a different OS/path style, trust the result and adapt to the caller's environment rather than your own.
-
+${m365HostPlatformNote()}
 ${renderToolList(tools)}
 ${shellFraming}
 ## How to call a tool
@@ -54,18 +91,20 @@ ${FENCE}
 For tools whose arguments are JSON-like, put a single valid JSON object inside the fence instead of header lines.
 
 Rules:
-- Emit exactly ONE fenced tool call per turn, then stop and wait for the tool result. Nothing else in the reply.
+- Emit exactly ONE fenced tool call per turn, then stop and wait for the tool result. Nothing else in the reply. Keep the rest of your plan to yourself: the state those later steps depend on does not exist yet.
 - The info-string and argument keys must match the provided tool definitions exactly.
-- Never claim success, never describe a result, never write "the command returned X" — you have not run anything yet. Only a <tool_response> block that already appears above counts as a result.
+- Never claim success and never write "Done", "SUCCESS" or a checkmark unless a <tool_response> proving it already appears above — this backend's chat model declares victory before the call has even been sent.
+- Never describe a result, never write "the command returned X" — you have not run anything yet. Only a <tool_response> block that already appears above counts as a result.
+- Never write a <tool_response> block yourself; only the harness sends those. If you catch yourself predicting one, stop after the fence instead.
 - If you write anything that is not the fence itself, the call is invalid and will be rejected.
 
 Tool results will be returned in a block like:
 
-<tool_response name="tool_name" call_id="call_id">
+<tool_response name="tool_name" call_id="call_id" call="the arguments that produced this">
 result text
 </tool_response>
 
-Treat the tool_response block as ground truth and use it to decide the next step. When you have the final answer, respond in natural language with no fence, ending with the required completion marker. If the request needs no tool at all, answer directly and still end with the marker.`
+Each result names the tool and the exact call that produced it, so read it as the output of THAT call rather than guessing which step it belongs to. Treat the tool_response block as ground truth and use it to decide the next step; if it reports a failure, fix the cause and call the tool again instead of reporting the failure as the answer. When you have the final answer, respond in natural language with no fence and no preamble or sign-off, ending with the required completion marker. If the request needs no tool at all, answer directly and still end with the marker.`
   },
 
   renderRecoveryPrompt(tools) {
@@ -96,12 +135,14 @@ Treat the tool_response block as ground truth and use it to decide the next step
     const rawMatches: string[] = []
     const invalidToolNames: string[] = []
     const allowedSet = new Set(context.tools.map((t) => t.name))
+    const maxCalls = m365MaxToolCallsPerTurn()
     // Tool names may carry a namespace separator (e.g. `default_api:read_file`),
     // so the info-string class must accept ':' as well as the plain identifier
     // characters — otherwise namespaced managed tools can never match.
     const regex = /\`\`\`([a-zA-Z0-9_:.\/-]+)\r?\n([\s\S]*?)\`\`\`/g
     let match: RegExpExecArray | null
     let callIndex = 0
+    let droppedCalls = 0
 
     while ((match = regex.exec(content)) !== null) {
       const rawBlock = match[0]
@@ -111,6 +152,16 @@ Treat the tool_response block as ground truth and use it to decide the next step
 
       if (!allowedSet.has(toolName)) {
         invalidToolNames.push(toolName)
+        continue
+      }
+
+      // The model plans in one breath: fence, then the results of the steps it
+      // never ran. Everything past the first real call is either a duplicate
+      // or that invented narration, so it is dropped instead of executed on
+      // guessed state. The dropped text is not delivered to the client either
+      // way — the tail was written before the first call's result existed.
+      if (toolCalls.length >= maxCalls) {
+        droppedCalls += 1
         continue
       }
 
@@ -128,10 +179,23 @@ Treat the tool_response block as ground truth and use it to decide the next step
       callIndex++
     }
 
+    if (droppedCalls > 0) {
+      console.warn('[M365Copilot] dropped batched tool calls beyond the first in one turn', JSON.stringify({
+        droppedCalls,
+        keptCalls: toolCalls.length,
+        maxCalls,
+      }))
+    }
+
     const cleanContent = content.replace(/\`\`\`[a-zA-Z0-9_.-]+\r?\n[\s\S]*?\`\`\`/g, '').trim()
 
     return {
-      content: cleanContent,
+      // Mixed output: this backend narrates a turn it has not finished — a
+      // greeting before the fence, a "done!" after it. That prose was written
+      // before any result existed, so it is dropped and the client receives
+      // the tool call alone (cramt/m365-copilot-proxy, "Mixed output"). The
+      // streaming path never reads this field; it releases prose itself.
+      content: toolCalls.length > 0 ? '' : cleanContent,
       toolCalls,
       protocol: 'm365_fenced',
       rawMatches,
@@ -164,8 +228,38 @@ Treat the tool_response block as ground truth and use it to decide the next step
   },
 
   formatToolResult(result) {
-    return `<tool_response name="${result.name || 'tool'}" call_id="${result.toolCallId}">\n${result.content}\n</tool_response>`
+    // The model reads an unlabelled result as "whatever step this was" and
+    // misattributes it — observed live: it ran a directory listing, saw the
+    // target file in it, and concluded the FILE was empty
+    // (cramt/m365-copilot-proxy F16). Naming the originating call keeps the
+    // output in context. The attribute is omitted when the transcript has no
+    // arguments for the call (older histories), never invented.
+    const call = summarizeToolCall(result.summary)
+    const attributes = call
+      ? ` name="${escapeAttribute(result.name || 'tool')}" call_id="${escapeAttribute(result.toolCallId)}" call="${escapeAttribute(call)}"`
+      : ` name="${escapeAttribute(result.name || 'tool')}" call_id="${escapeAttribute(result.toolCallId)}"`
+    return `<tool_response${attributes}>\n${result.content}\n</tool_response>`
   },
+}
+
+/**
+ * One-line rendering of the arguments that produced a tool result, collapsed
+ * to a single line and bounded so a multi-kilobyte write does not bloat every
+ * later turn's transcript.
+ */
+const TOOL_CALL_SUMMARY_MAX_CHARS = 120
+
+function summarizeToolCall(rawArguments: string | undefined): string {
+  if (!rawArguments) return ''
+  const collapsed = rawArguments.replace(/\s+/g, ' ').trim()
+  if (!collapsed) return ''
+  return collapsed.length > TOOL_CALL_SUMMARY_MAX_CHARS
+    ? `${collapsed.slice(0, TOOL_CALL_SUMMARY_MAX_CHARS)}…`
+    : collapsed
+}
+
+function escapeAttribute(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
 }
 
 function parseFenceArguments(body: string, tool?: NormalizedToolDefinition): Record<string, unknown> {

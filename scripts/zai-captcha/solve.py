@@ -25,6 +25,124 @@ if not CHROME_PATH:
         CHROME_PATH = "chromium"
 ARTIFACT_DIR = Path(os.environ.get("ZAI_CAPTCHA_ARTIFACT_DIR", r"C:\my\Chat2API\scripts\zai-captcha"))
 
+# The slider handle. Declared with the other module constants because both drag
+# paths reach for it, and a slider that renders below the fold is the single
+# most misread failure in this file: the mouse events land off-screen, the piece
+# never moves, and the closed loop looks like a bad target estimate.
+SLIDER_SELECTOR = "#aliyunCaptcha-sliding-slider"
+CAPTCHA_VIEWPORT_MARGIN = 180
+
+# Login page labels, oldest spelling first. Verified live 2026-09-29: the page
+# is English now, and reaching the email form takes two clicks ("Email Login"
+# then "Continue with Email") rather than one tab.
+EMAIL_ENTRY_SELECTORS = (
+    "text=邮箱",
+    "button:has-text('邮箱')",
+    "text=Email Login",
+    "button:has-text('Email Login')",
+    "text=Continue with Email",
+    "button:has-text('Continue with Email')",
+)
+
+# The submit button was '登录' and is 'Sign in' now. button[type=submit] is
+# tried as well because the label is the part that keeps moving.
+LOGIN_SUBMIT_SELECTORS = (
+    "button:has-text('登录')",
+    "button[type=submit]",
+    "button:has-text('Sign in')",
+    "button:has-text('Log in')",
+)
+
+
+_VIRTUAL_DISPLAY = {"proc": None, "display": None}
+
+
+def _virtual_display_mode() -> str:
+    value = (os.environ.get("ZAI_CAPTCHA_VIRTUAL_DISPLAY", "") or "auto").strip().lower()
+    return "off" if value in ("0", "off", "false", "no", "disabled") else "auto"
+
+
+def _start_virtual_display():
+    """Start a private Xvfb server and export DISPLAY; returns the display or None.
+
+    Each solver process owns its server, so concurrent solves never share an X
+    display; a number whose lock file exists (or whose server exits at once)
+    is skipped instead of reused."""
+    import atexit
+    import shutil
+    import subprocess
+
+    if _VIRTUAL_DISPLAY["display"]:
+        return _VIRTUAL_DISPLAY["display"]
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        return None
+    size = (os.environ.get("ZAI_CAPTCHA_VIRTUAL_DISPLAY_SIZE", "") or "1920x1080x24").strip()
+    for number in range(99, 160):
+        if os.path.exists(f"/tmp/.X{number}-lock"):
+            continue
+        proc = subprocess.Popen(
+            [xvfb, f":{number}", "-screen", "0", size, "-nolisten", "tcp", "-ac"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        socket = f"/tmp/.X11-unix/X{number}"
+        deadline = time.time() + 5
+        while time.time() < deadline and proc.poll() is None and not os.path.exists(socket):
+            time.sleep(0.05)
+        if proc.poll() is not None or not os.path.exists(socket):
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+            continue
+        _VIRTUAL_DISPLAY.update(proc=proc, display=f":{number}")
+        os.environ["DISPLAY"] = f":{number}"
+
+        def _stop(p=proc):
+            try:
+                p.terminate()
+                p.wait(timeout=3)
+            except Exception:
+                pass
+
+        atexit.register(_stop)
+        # The Node caller's execFile timeout sends SIGTERM, which skips atexit
+        # and would orphan the X server; turn it into a normal exit instead.
+        try:
+            import signal
+
+            if signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, None):
+                signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        except Exception:
+            pass
+        return _VIRTUAL_DISPLAY["display"]
+    return None
+
+
+def effective_headless(requested_headless: bool) -> bool:
+    """Run the 'headless' solve as a headed browser on a private virtual display.
+
+    Measured live 2026-09-30 in the Linux container, same account and egress:
+    headless chromium got aliyun's invisible first verify F001 ("suspected
+    attack, blocked by the risk control policy") on every challenge, and its
+    correct drags were then rejected about half the time (F015/F001); the
+    identical browser headed on Xvfb got T001 on the invisible verify 11/11,
+    never even showing the slider. The headless signal - not the drag, not the
+    exit IP - was the verdict. Linux only, and only when no real display is
+    present, so a desktop solve never pops a window. ZAI_CAPTCHA_VIRTUAL_DISPLAY
+    =off restores true headless."""
+    if not requested_headless or _virtual_display_mode() == "off":
+        return requested_headless
+    if not sys.platform.startswith("linux") or os.environ.get("DISPLAY"):
+        return requested_headless
+    display = _start_virtual_display()
+    if not display:
+        print("  Virtual display unavailable (Xvfb not installed); staying headless")
+        return True
+    print(f"  Headed browser on virtual display {display}")
+    return False
+
 
 def launch_stealth(pw, headless: bool):
     """Launch the real Chrome channel via patchright with a consistent fingerprint.
@@ -39,7 +157,12 @@ def launch_stealth(pw, headless: bool):
     chrome_channel = os.path.isfile(r"C:\Program Files\Google\Chrome\Application\chrome.exe") or \
         os.path.isfile(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") or \
         (bool(CHROME_PATH) and "chrome" in os.path.basename(CHROME_PATH).lower() and "chromium" not in os.path.basename(CHROME_PATH).lower())
+    headless = effective_headless(headless)
     launch_args = {"headless": headless, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+    if not headless and _VIRTUAL_DISPLAY["display"]:
+        # The playwright driver process was spawned before DISPLAY was
+        # exported, so the browser must receive it explicitly.
+        launch_args["env"] = {**os.environ, "DISPLAY": _VIRTUAL_DISPLAY["display"]}
     if chrome_channel:
         launch_args["channel"] = "chrome"
     elif CHROME_PATH and os.path.isfile(CHROME_PATH):
@@ -176,6 +299,74 @@ def _template_match_target(bg_rgb: np.ndarray, pz_rgba: np.ndarray):
     return float(max_loc[0]), float(max_val), True
 
 
+def _grow_mask(mask: np.ndarray, radius: int, grow: bool) -> np.ndarray:
+    """Disk dilation (grow=True) or erosion (grow=False) with numpy shifts only,
+    so the detector needs no OpenCV (the published image does not ship cv2)."""
+    out = mask.copy()
+    h, w = mask.shape
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy > radius * radius:
+                continue
+            shifted = np.zeros_like(mask)
+            shifted[max(0, dy):h + min(0, dy), max(0, dx):w + min(0, dx)] = \
+                mask[max(0, -dy):h + min(0, -dy), max(0, -dx):w + min(0, -dx)]
+            out = (out | shifted) if grow else (out & shifted)
+    return out
+
+
+def _overlay_outline_target(bg_rgb: np.ndarray, pz_rgba: np.ndarray):
+    """Locate the hole by the brightness/saturation step along the piece outline.
+
+    The widget now marks the hole with a pale, desaturated overlay in the
+    piece's exact shape (measured 2026-09-29 on live captchas: the older
+    'inpainted, perfectly smooth patch' signature is gone, and the flatness
+    scan below picked the wrong window with confidence 0.22-0.46). A band just
+    inside the outline is therefore brighter and greyer than a band just
+    outside it at the true position, and nowhere else does that step follow
+    the whole outline. Returns (target_x, score, margin) where margin is the
+    lead over the best candidate more than 10px away, or (None, 0, 0)."""
+    mask = pz_rgba[:, :, 3] > 24
+    if mask.sum() < 100:
+        return None, 0.0, 0.0
+    ys, xs = np.where(mask)
+    r0, r1 = int(ys.min()), int(ys.max()) + 1
+    c0, c1 = int(xs.min()), int(xs.max()) + 1
+    pad = 5
+    shape = np.pad(mask[r0:r1, c0:c1], pad)
+    inner = shape & ~_grow_mask(shape, 2, grow=False)
+    outer = _grow_mask(shape, 4, grow=True) & ~_grow_mask(shape, 1, grow=True)
+    hi = bg_rgb.max(axis=2)
+    lo = bg_rgb.min(axis=2)
+    sat = (hi - lo) / np.maximum(hi, 1.0)
+    lum = (0.299 * bg_rgb[:, :, 0] + 0.587 * bg_rgb[:, :, 1] + 0.114 * bg_rgb[:, :, 2]) / 255.0
+    h, w = lum.shape
+    ph, pw = shape.shape
+    scored = []
+    for cx in range(c0 + 8, w - (c1 - c0) + 1):
+        y0, x0 = r0 - pad, cx - pad
+        a0, a1 = max(0, y0), min(h, y0 + ph)
+        b0, b1 = max(0, x0), min(w, x0 + pw)
+        valid = np.zeros((ph, pw), dtype=bool)
+        valid[a0 - y0:a1 - y0, b0 - x0:b1 - x0] = True
+        win_l = np.zeros((ph, pw), dtype=np.float32)
+        win_s = np.zeros((ph, pw), dtype=np.float32)
+        win_l[a0 - y0:a1 - y0, b0 - x0:b1 - x0] = lum[a0:a1, b0:b1]
+        win_s[a0 - y0:a1 - y0, b0 - x0:b1 - x0] = sat[a0:a1, b0:b1]
+        i, o = inner & valid, outer & valid
+        if i.sum() < 40 or o.sum() < 40:
+            continue
+        score = (float(win_l[i].mean()) - float(win_l[o].mean())) \
+            + (float(win_s[o].mean()) - float(win_s[i].mean()))
+        scored.append((score, cx))
+    if not scored:
+        return None, 0.0, 0.0
+    scored.sort(reverse=True)
+    best_score, best_x = scored[0]
+    runner = next((s for s, x in scored if abs(x - best_x) > 10), 0.0)
+    return best_x, best_score, best_score - runner
+
+
 def captcha_target_geometry(page) -> dict:
     bg_loc = page.locator("#aliyunCaptcha-img")
     pz_loc = page.locator("#aliyunCaptcha-puzzle")
@@ -251,7 +442,16 @@ def captcha_target_geometry(page) -> dict:
     # far better than anywhere else - which beats 'find the flattest strip',
     # especially on pictures with big flat areas (cabinets, balloons).
     tm_x, tm_score, tm_used = _template_match_target(bg, pz)
-    if tm_used and tm_x is not None:
+    ov_x, ov_score, ov_margin = _overlay_outline_target(bg, pz)
+    ov_min_margin = float(os.environ.get("ZAI_CAPTCHA_OVERLAY_MIN_MARGIN", "0.05") or 0.05)
+    if ov_x is not None and ov_margin >= ov_min_margin:
+        target_x = int(ov_x)
+        score = ov_score
+        # Map the lead over the runner-up onto 0..1: a 0.2 lead (luminance +
+        # saturation units) is an unambiguous outline.
+        confidence = float(np.clip(ov_margin / 0.2, 0.0, 1.0))
+        print(f"  overlay-outline x={target_x} score={ov_score:.3f} margin={ov_margin:.3f}")
+    elif tm_used and tm_x is not None:
         target_x = int(round(tm_x))
         confidence = float(np.clip(tm_score, 0.0, 1.0))
         score = tm_score
@@ -366,18 +566,51 @@ def slider_visible(page) -> bool:
     except Exception:
         return False
 
-def solve_slider(page, max_attempts=3) -> bool:
+def slider_attempts_from_env(default: int = 5) -> int:
+    """Per-widget drag budget. Measured 2026-09-29 on 13 labelled live chat
+    captchas: the overlay detector located the hole every time, yet a correct
+    drag was accepted only about half the time (aliyun scores the gesture),
+    so 3 attempts left ~1 in 6 solves failing outright."""
+    try:
+        value = int(os.environ.get("ZAI_CAPTCHA_SLIDER_ATTEMPTS", "") or default)
+    except ValueError:
+        return default
+    return max(1, min(12, value))
+
+def drag_style_from_env() -> str:
+    """Chat-captcha drag trajectory: 'fast' (ease-out sweep, ~2s) or 'human'
+    (the login path's closed-loop gesture). ZAI_CAPTCHA_DRAG_STYLE selects."""
+    value = (os.environ.get("ZAI_CAPTCHA_DRAG_STYLE", "") or "fast").strip().lower()
+    return value if value in ("fast", "human") else "fast"
+
+def solve_slider(page, max_attempts=None) -> bool:
+    if max_attempts is None:
+        max_attempts = slider_attempts_from_env()
     for attempt in range(max_attempts):
         print(f"  Slider solve attempt {attempt+1}...")
         try:
+            # Same layout precondition as the login path: a rail below the fold
+            # swallows the drag and is indistinguishable from a bad target.
+            geo_view = ensure_captcha_in_view(page)
+            if not geo_view.get("in_view"):
+                print(f"  Slider below the fold (bottom={geo_view.get('slider_bottom')}, "
+                      f"viewport_h={geo_view.get('viewport_height')}); drag may be ignored")
             geo = captcha_target_geometry(page)
-            slider = page.locator("#aliyunCaptcha-sliding-slider")
-            drag_slider(page, slider, geo["target_puzzle_left"], geo["max_travel"])
+            slider = page.locator(SLIDER_SELECTOR)
+            if drag_style_from_env() == "human":
+                # Hover-then-press, irregular cadence, hesitation and an
+                # overshoot-and-settle; the chat widget moves the piece 1:1
+                # with the handle, and the closed loop absorbs any residue.
+                drag_slider_closed_loop(page, geo["target_puzzle_left"], geo["max_travel"], 1.0)
+            else:
+                drag_slider(page, slider, geo["target_puzzle_left"], geo["max_travel"])
             time.sleep(2.5)
             if not slider_visible(page):
                 print("  Slider disappeared -> likely success")
                 return True
-            print("  Slider still visible -> likely failed, retrying")
+            verdict = captcha_verdict(page)
+            print("  Slider still visible -> likely failed, retrying"
+                  + (f" (widget says: {verdict})" if verdict else ""))
             time.sleep(1.5)
         except Exception as e:
             print(f"  Attempt {attempt+1} error: {e}")
@@ -734,6 +967,137 @@ def expand_captcha(page) -> bool:
     return slider_visible(page)
 
 
+def click_first_visible(page, selectors, timeout: int = 6000) -> str:
+    """Click the first selector that is actually there, and report which one.
+
+    Returns the selector that fired, or "" when none matched. A login page that
+    moved its controls must fail with the list it tried, not with a bare
+    Playwright timeout - the two look identical in the logs and only one of them
+    is a UI change.
+    """
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible(timeout=2000):
+                loc.click(timeout=timeout)
+                return sel
+        except Exception:
+            continue
+    return ""
+
+
+def measured_viewport(page) -> dict:
+    """The real on-screen viewport, in CSS pixels.
+
+    `page.viewport_size` is the wrong source here: the context is created with
+    `no_viewport=True` (so the window size is whatever the host gave us) and it
+    reports an empty dict. Trusting a hardcoded fallback in that state is how a
+    rail 100px below the edge gets reported as "in view" and the drag silently
+    does nothing.
+    """
+    try:
+        size = page.evaluate("() => ({width: window.innerWidth, height: window.innerHeight})")
+        if size and size.get("height"):
+            return {"width": int(size["width"]), "height": int(size["height"])}
+    except Exception:
+        pass
+    fallback = page.viewport_size or {}
+    return {"width": int(fallback.get("width") or 1280), "height": int(fallback.get("height") or 720)}
+
+
+def ensure_captcha_in_view(page, margin: int = CAPTCHA_VIEWPORT_MARGIN) -> dict:
+    """Scroll and, if need be, grow the viewport so the slider is on screen.
+
+    Returns a measurement dict rather than a bare bool: the caller logs it, and a
+    drag that lands within 2px and is still refused must be distinguishable in
+    the log from a drag that never happened because the rail was off-screen.
+    """
+    report = {"in_view": False, "resized": False, "slider_bottom": None, "viewport_height": None}
+    try:
+        slider = page.locator(SLIDER_SELECTOR).first
+        # The widget re-renders a fresh puzzle after a refusal, so wait for it
+        # instead of reporting "no slider" for a frame.
+        try:
+            slider.wait_for(state="visible", timeout=6000)
+        except Exception:
+            return report
+    except Exception:
+        return report
+
+    for _ in range(6):
+        try:
+            slider.scroll_into_view_if_needed(timeout=3000)
+            page.wait_for_timeout(150)
+            box = slider.bounding_box()
+            viewport = measured_viewport(page)
+            report["viewport_height"] = viewport["height"]
+            if not box:
+                return report
+            bottom = box["y"] + box["height"]
+            report["slider_bottom"] = round(bottom)
+            if bottom <= viewport["height"]:
+                report["in_view"] = True
+                return report
+            # Not enough room. set_viewport_size pins an explicit viewport, which
+            # is what stops the rail from sitting under the fold.
+            page.set_viewport_size({
+                "width": max(viewport["width"], 1280),
+                "height": int(bottom + margin),
+            })
+            report["resized"] = True
+            page.wait_for_timeout(400)
+            grown = measured_viewport(page)["height"]
+            if grown <= viewport["height"]:
+                # The window stopped growing; stop asking for more.
+                break
+        except Exception:
+            return report
+
+    # One last look with whatever layout we ended up with.
+    try:
+        box = slider.bounding_box()
+        viewport = measured_viewport(page)
+        if box:
+            report["slider_bottom"] = round(box["y"] + box["height"])
+            report["viewport_height"] = viewport["height"]
+            report["in_view"] = report["slider_bottom"] <= viewport["height"]
+    except Exception:
+        pass
+    return report
+
+
+
+# The widget states its verdict in the page. Surfacing it beats inferring the
+# outcome from "the slider is still on screen": a refusal means the drag was
+# understood and rejected, which is a different failure from a missed drag.
+CAPTCHA_RESULT_SELECTORS = (
+    ".aliyunCaptcha-toast",
+    "[class*=aliyunCaptcha][class*=toast]",
+    "[class*=aliyunCaptcha][class*=error]",
+    "[class*=aliyunCaptcha][class*=message]",
+)
+
+
+def captcha_verdict(page) -> str:
+    """Read the widget's own failure/success banner, if it is showing one."""
+    for sel in CAPTCHA_RESULT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible(timeout=800):
+                text = (loc.inner_text() or "").strip()
+                if text:
+                    return text[:120]
+        except Exception:
+            continue
+    return ""
+
+
+def captcha_was_refused(page) -> bool:
+    verdict = captcha_verdict(page).lower()
+    return any(word in verdict for word in ("fail", "try again", "incorrect", "wrong", "验证失败"))
+
+
+
 def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float, gain: float = 1.0) -> float:
     """Drag with continuous closed-loop control.
 
@@ -892,14 +1256,40 @@ def solve_slider_login(page, max_attempts: int = 3) -> bool:
         print(f"  Login captcha attempt {attempt+1}/{max_attempts}...")
         before = captcha_image_signature(page)
         try:
+            # Layout first: target detection and the drag both read page
+            # coordinates, so both are wrong while the rail sits below the fold.
+            geo_view = ensure_captcha_in_view(page)
+            if not geo_view.get("in_view"):
+                print(f"  Slider below the fold (bottom={geo_view.get('slider_bottom')}, "
+                      f"viewport_h={geo_view.get('viewport_height')}); drag may be ignored")
             target_left, max_travel, gain = resolve_target(page)
+            # A target the rail cannot physically reach is a detection error by
+            # construction. Dragging to it anyway submits a guaranteed-wrong
+            # verify (F015, measured live 2026-09-30), and every failed verify
+            # raises the egress's risk score - swap the puzzle instead, which
+            # submits nothing.
+            base_left = read_puzzle_left(page)
+            if base_left is not None and gain > 0:
+                needed_handle = (target_left - base_left) / gain
+                if needed_handle > max_travel + 2 or needed_handle < 0:
+                    print(f"  target unreachable (handle {needed_handle:.1f} vs rail {max_travel:.1f}); "
+                          "refreshing the puzzle instead of submitting a wrong drag")
+                    if refresh_captcha_for_human(page):
+                        continue
             err = drag_slider_closed_loop(page, target_left, max_travel, gain)
             print(f"  residual error={err:.2f}px")
             page.screenshot(path=str(ARTIFACT_DIR / f"login-captcha-attempt{attempt+1}.png"))
             if not slider_visible(page):
                 print("  Slider dismissed -> captcha passed")
                 return True
-            print("  Slider still visible, waiting for a fresh captcha")
+            verdict = captcha_verdict(page)
+            if verdict:
+                # The widget understood the drag and refused it. That is a
+                # different failure from a drag that never landed, and the
+                # human fallback below is the only reliable way through it.
+                print(f"  Slider still visible; widget verdict: {verdict}")
+            else:
+                print("  Slider still visible, waiting for a fresh captcha")
         except Exception as e:
             print(f"  Attempt {attempt+1} error: {e}")
             try:
@@ -1008,21 +1398,36 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
         page.goto(ZAI_OAUTH_URL, wait_until="domcontentloaded", timeout=60000)
         time.sleep(6)
 
-        # The authorize page defaults to phone+SMS; switch to the email tab.
-        for sel in ["text=邮箱", "button:has-text('邮箱')"]:
-            try:
-                loc = page.locator(sel).first
-                if loc.is_visible(timeout=2500):
-                    loc.click(timeout=4000)
-                    break
-            except Exception:
-                continue
-        time.sleep(3)
+        # The authorize page is a chooser, not a form: it offers phone+SMS and an
+        # "Email Login" button, which in turn opens a "Continue with Email"
+        # chooser (Google / Phone / Email / GitHub). Both hops are label-drift
+        # prone - the page has shipped as Chinese ('邮箱') and as English
+        # ('Email Login', 'Continue with Email') - so every spelling that has
+        # ever been live is tried and the DOM is re-checked after each click.
+        for _ in range(4):
+            if page.locator("input[type=email]").count():
+                break
+            clicked = click_first_visible(page, EMAIL_ENTRY_SELECTORS)
+            if not clicked:
+                break
+            print(f"  Clicked '{clicked}'")
+            time.sleep(3)
+
+        if not page.locator("input[type=email]").count():
+            raise RuntimeError(
+                "No email field on the z.ai login page after trying "
+                f"{EMAIL_ENTRY_SELECTORS}; the login UI changed"
+            )
 
         page.fill("input[type=email]", email, timeout=10000)
         page.fill("input[type=password]", password, timeout=10000)
         time.sleep(0.8)
-        page.click("button:has-text('登录')", timeout=10000)
+        submit = click_first_visible(page, LOGIN_SUBMIT_SELECTORS)
+        if not submit:
+            raise RuntimeError(
+                f"No login submit button found among {LOGIN_SUBMIT_SELECTORS}; the login UI changed"
+            )
+        print(f"  Submitted via '{submit}'")
         print("Credentials submitted, waiting for captcha...")
         time.sleep(4)
 
@@ -1032,14 +1437,18 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
             if expand_captcha(page):
                 if solve_slider_login(page, max_attempts=max_captcha_attempts):
                     page.screenshot(path=str(ARTIFACT_DIR / "login-captcha-passed.png"))
-                    page.click("button:has-text('登录')", timeout=10000)
+                    click_first_visible(page, LOGIN_SUBMIT_SELECTORS)
                     page.screenshot(path=str(ARTIFACT_DIR / "login-after-submit.png"))
                     token = read_session_token(page, context, email=email)
                     if token:
                         break
                     detail = "captcha passed but no session token after login submission"
                     break
-                detail = "captcha verification failed"
+                # Carry the widget's own wording into the result: "verification
+                # failed" is what tells the Node side this is a captcha refusal
+                # (retryable, not a dead credential) instead of a bad password.
+                verdict = captcha_verdict(page)
+                detail = f"captcha verification failed{': ' + verdict if verdict else ''}"
                 if allow_human and not headless:
                     try:
                         page.bring_to_front()
@@ -1056,7 +1465,7 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
                     refresh_captcha_for_human(page)
                     if wait_for_login_captcha(page, human_timeout):
                         page.screenshot(path=str(ARTIFACT_DIR / "login-captcha-passed.png"))
-                        page.click("button:has-text('登录')", timeout=10000)
+                        click_first_visible(page, LOGIN_SUBMIT_SELECTORS)
                         page.screenshot(path=str(ARTIFACT_DIR / "login-after-submit.png"))
                         token = read_session_token(page, context, email=email)
                         detail = "" if token else "captcha passed but no session token after login submission"
@@ -1095,7 +1504,8 @@ def update_account(management_url, secret, account_id, captcha_param):
 def main():
     args = parse_args()
     print("Z.ai Captcha Solver v2")
-    print(f"Token prefix: {args.token[:30]}...")
+    # Length only: stdout is shipped straight into the app log.
+    print(f"Token provided: {len(args.token or '')} chars")
     if args.mode == "signin":
         if not args.email or not args.password:
             print(json.dumps({"error": "signin mode requires --email and --password"}))
@@ -1106,7 +1516,8 @@ def main():
             # Only works while some token still triggers the chat captcha - a
             # fully revoked token never reaches that point, so the login-form
             # path remains the fallback for a dead session.
-            signin = {"status": 0, "token": "", "cookies": "", "detail": ""}
+            signin = {"status": 0, "token": "", "cookies": "",
+                      "detail": "", "captcha_verify_param": ""}
             session = None
             try:
                 print("Harvesting captcha from a chat session...")
@@ -1119,6 +1530,9 @@ def main():
                 )
                 captcha_param, browser, context, page, pw = session
                 signin = signin_in_session(page, context, args.email, args.password, captcha_param)
+                # The chat param is single-use and was just spent on the signin,
+                # but the session that minted it is the one now signed in.
+                signin["captcha_verify_param"] = captcha_param
             except Exception as e:
                 signin["detail"] = f"captcha harvest failed: {e}"
             finally:
@@ -1146,6 +1560,7 @@ def main():
             "token": signin["token"],
             "cookies": signin["cookies"],
             "account_id": args.account_id,
+            "captcha_verify_param": signin.get("captcha_verify_param", ""),
             "detail": signin["detail"],
         }))
         return

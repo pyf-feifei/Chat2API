@@ -169,13 +169,19 @@ Domains kept direct by default: `.qwen.ai`, `.qianwen.com`, `.aliyuncs.com`,
 # What your app will use after the policy runs
 node -e "const p=require('proxy-from-env');console.log(p.getProxyForUrl('https://chat.qwen.ai/api/v1/chat')||'DIRECT')"
 
-# What the network really is
-curl -s https://ipinfo.io/ip
+# What the network really is, with every proxy bypassed
+curl -s --noproxy '*' https://myip.ipip.net
 ```
 
-`DIRECT` on the first command is expected. If the second command returns a
-datacenter AS (`AS7488`, `AS4837` is fine — that is a residential carrier),
-something upstream of Chat2API is still proxying.
+`DIRECT` on the first command is expected. An IP echo service only reports the
+path taken to **that service**: behind a rule-based proxy such as Clash,
+`ipinfo.io` (`MATCH,PROXY`) or `api.ipify.org` (a proxy rule set) show the proxy
+node even when every provider domain goes direct. That reading has sent
+diagnoses the wrong way more than once. To see what a provider domain uses,
+check which rule Clash applied to it (Clash Verge → Connections), or compare an
+echo service on the same rule path as the provider (for CN providers,
+`myip.ipip.net` goes DIRECT). A datacenter AS on the `--noproxy` command means something below
+Chat2API proxies everything (`AS4837` is fine — that is a residential carrier).
 
 ### Clash Verge / Mihomo
 
@@ -198,10 +204,17 @@ subscription body — the subscription is regenerated on every update and your
 edits are lost. The mihomo core runs as a Windows service and cannot be killed
 from an unprivileged shell, so reload the profile in the UI.
 
-> **Docker note:** Docker Desktop can route container traffic through the
-> Windows system proxy even when the container has no `HTTP_PROXY`. Neither
-> `NO_PROXY` inside the container nor these Clash rules fix that; see the next
-> section.
+> **Docker note:** Docker Desktop routes container traffic through the Windows
+> system proxy (`http.docker.internal:3128`) even when the container has no
+> `HTTP_PROXY`, so `NO_PROXY` inside the container does not help. The traffic
+> then **does** enter Clash, and these rules decide per domain. Measured
+> 2026-09-30 from inside the container with the system proxy on: the provider
+> domains above went DIRECT via the residential IP, while foreign domains
+> matched proxy rules and went through the node. Rules only apply to the
+> domains they list, so make sure every domain a provider page loads is covered
+> (Z.ai, for example, also loads `chatglm.cn`; confirm it in Connections).
+> See the next section for the alternative
+> of taking Docker off the system proxy entirely.
 
 **Full setup, verification and troubleshooting:
 [docs/network-egress.md](docs/network-egress.md).**
@@ -216,9 +229,12 @@ almost always Docker Desktop's proxy, not the provider:
 docker info | grep -A2 "^ *Proxy"     # prints http.docker.internal:3128 ?
 ```
 
-If it does, Docker routes all container traffic through that proxy, so the
-container egress is the proxy's address rather than yours. Fix it by turning the
-Windows system proxy off and setting Docker Desktop's proxy mode to manual with
+If it does, Docker routes all container traffic through that proxy, i.e. into
+Clash. Each domain then exits wherever its Clash rule sends it: DIRECT rules
+keep the residential IP, anything that falls to `MATCH,PROXY` exits via the
+node. So first make sure every provider domain has a DIRECT rule (see above).
+To take Clash out of the container path entirely, turn the
+Windows system proxy off and set Docker Desktop's proxy mode to manual with
 no address (stored in `%APPDATA%\Docker\marlin.dat` as
 `"proxyHTTPMode":{...,"Value":"system"}` → `"manual"`), then restarting Docker
 Desktop. Nothing set inside the container can override it — not `HTTP_PROXY`,
@@ -345,8 +361,10 @@ same account pool needs a little care.
 - The desktop app applies the direct-egress policy automatically. If you run the
   Docker image on a host that also has a proxy configured, the headless server
   applies the same policy; set `CHAT2API_EGRESS_DIRECT=off` only if you
-  deliberately want the proxy in that path. For a Docker Desktop host, fix the
-  VM-level proxy as described above; Clash rules do not reach container traffic.
+  deliberately want the proxy in that path. On a Docker Desktop host the
+  container reaches Clash through the VM-level proxy, so either keep the
+  provider domains in Clash `DIRECT` rules or take Docker off the system proxy
+  as described above.
 
 Two failure modes that look identical but are unrelated — see
 [docs/network-egress.md](docs/network-egress.md#9-symptom--cause):

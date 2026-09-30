@@ -21,6 +21,12 @@ const TOOL_RESULT_ENDS = [
   '</tool_result>',
   '</tool_response>',
 ] as const
+// Bare tag names of the result openers above, without the closing bracket, so
+// a partially streamed attributed opener (`<tool_response name="bash"…`) is
+// retained as pending instead of being released as visible prose.
+const TOOL_RESULT_TAG_PREFIXES: readonly string[] = TOOL_RESULT_STARTS
+  .filter((marker) => marker.endsWith('>'))
+  .map((marker) => marker.slice(0, -1))
 // Some clients render a tool result as a function-result envelope and close
 // the outer block with this legacy parameter-results tag.
 const LEGACY_TOOL_RESULT_ENDS = ['</parameter_results>'] as const
@@ -148,6 +154,16 @@ export interface ManagedToolResultGuardOptions {
    * while summarizing history; failing the whole request is never correct.
    */
   stripOnly?: boolean
+  /**
+   * Also recognize ATTRIBUTED result openers
+   * (`<tool_response name="bash" call_id="c1">`).
+   *
+   * Off by default so the shared guard's behaviour is unchanged for every
+   * other provider: only the protocols that actually EMIT that shape opt in
+   * (currently m365_fenced). Without it, an invented attributed block from a
+   * provider whose protocol never writes one is ordinary prose.
+   */
+  attributedResultOpeners?: boolean
 }
 
 export interface ManagedToolResultStripResult extends ManagedToolResultGuardOutput {
@@ -194,6 +210,7 @@ export class ManagedToolResultGuard {
   private readonly rejectMalformedProtectedToolCalls: boolean
   private readonly bufferUntilFlush: boolean
   private readonly stripOnly: boolean
+  private readonly attributedResultOpeners: boolean
 
   constructor(
     protectedToolCallProtocol: ToolProtocolId | null = 'managed_xml',
@@ -211,6 +228,7 @@ export class ManagedToolResultGuard {
     // wrapper inside `arguments` is not mistaken for top-level assistant text.
     this.bufferUntilFlush = protectedToolCallProtocol === 'codex_responses'
     this.stripOnly = options.stripOnly === true
+    this.attributedResultOpeners = options.attributedResultOpeners === true
   }
 
   private markWrapperLeak(): void {
@@ -250,7 +268,7 @@ export class ManagedToolResultGuard {
     let suppressed = false
 
     if (this.rejectUnprotectedToolCalls) {
-      const resultCandidate = findToolResultStart(this.buffer, final)
+      const resultCandidate = findToolResultStart(this.buffer, final, this.attributedResultOpeners)
       if (resultCandidate) {
         if (this.stripOnly) {
           content += this.buffer.slice(0, resultCandidate.index)
@@ -333,7 +351,7 @@ export class ManagedToolResultGuard {
 
       if (this.state === 'fenced') {
         const fenceIndex = this.buffer.indexOf(MARKDOWN_FENCE)
-        const toolResultIndex = findToolResultStart(this.buffer, final)
+        const toolResultIndex = findToolResultStart(this.buffer, final, this.attributedResultOpeners)
         if (toolResultIndex !== undefined && (fenceIndex === -1 || toolResultIndex.index < fenceIndex)) {
           content += this.buffer.slice(0, toolResultIndex.index)
           this.buffer = this.buffer.slice(toolResultIndex.index + toolResultIndex.marker.length)
@@ -366,10 +384,14 @@ export class ManagedToolResultGuard {
           break
         }
 
-        const retained = longestSuffixPrefixLength(this.buffer, [
-          MARKDOWN_FENCE,
-          ...TOOL_RESULT_STARTS,
-        ])
+        const retained = Math.max(
+          longestSuffixPrefixLength(this.buffer, [
+            MARKDOWN_FENCE,
+            ...TOOL_RESULT_STARTS,
+            ...TOOL_RESULT_TAG_PREFIXES,
+          ]),
+          this.attributedResultOpeners ? pendingAttributedOpenerLength(this.buffer) : 0,
+        )
         const visibleLength = this.buffer.length - retained
         content += this.buffer.slice(0, visibleLength)
         this.buffer = this.buffer.slice(visibleLength)
@@ -404,6 +426,7 @@ export class ManagedToolResultGuard {
         this.buffer,
         final,
         this.toolCallStarts,
+        this.attributedResultOpeners,
       )
       if (start) {
         content += this.buffer.slice(0, start.index)
@@ -438,16 +461,20 @@ export class ManagedToolResultGuard {
         break
       }
 
-      const retained = longestSuffixPrefixLength(this.buffer, [
-        ...this.toolCallStarts,
-        ...(this.rejectUnprotectedToolCalls
-          ? UNPROTECTED_TOOL_MARKUP_PREFIXES
-          : this.rejectMalformedProtectedToolCalls
-            ? MALFORMED_QWEN_TOOL_MARKUP_PREFIXES
-            : []),
-        MARKDOWN_FENCE,
-        ...TOOL_RESULT_STARTS,
-      ])
+      const retained = Math.max(
+        longestSuffixPrefixLength(this.buffer, [
+          ...this.toolCallStarts,
+          ...(this.rejectUnprotectedToolCalls
+            ? UNPROTECTED_TOOL_MARKUP_PREFIXES
+            : this.rejectMalformedProtectedToolCalls
+              ? MALFORMED_QWEN_TOOL_MARKUP_PREFIXES
+              : []),
+          MARKDOWN_FENCE,
+          ...TOOL_RESULT_STARTS,
+          ...TOOL_RESULT_TAG_PREFIXES,
+        ]),
+        this.attributedResultOpeners ? pendingAttributedOpenerLength(this.buffer) : 0,
+      )
       const visibleLength = this.buffer.length - retained
       content += this.buffer.slice(0, visibleLength)
       this.buffer = this.buffer.slice(visibleLength)
@@ -482,9 +509,10 @@ function findNextTopLevelStart(
   content: string,
   final: boolean,
   toolCallStarts: readonly string[],
+  attributedResultOpeners = false,
 ): { index: number; marker: string; kind: 'fence' | 'tool_call' | 'tool_result'; end?: string } | undefined {
   const toolCall = findEarliestMarker(content, toolCallStarts)
-  const toolResult = findToolResultStart(content, final)
+  const toolResult = findToolResultStart(content, final, attributedResultOpeners)
   const fenceIndex = content.indexOf(MARKDOWN_FENCE)
 
   if (
@@ -540,6 +568,7 @@ function findEarliestMalformedQwenMarkup(
 function findToolResultStart(
   content: string,
   final: boolean,
+  attributedResultOpeners = false,
 ): { index: number; marker: string; end: string } | undefined {
   let selected: { index: number; marker: string; end: string } | undefined
   for (let markerIndex = 0; markerIndex < TOOL_RESULT_STARTS.length; markerIndex += 1) {
@@ -561,8 +590,71 @@ function findToolResultStart(
       }
       searchIndex = boundaryIndex
     }
+
+    // Attributed openers (`<tool_response name="bash" call_id="c1">`) are what
+    // the fenced managed protocols actually emit, and what a model reproduces
+    // when it invents its own result. The literal marker above only matches
+    // the bare form, so an invented attributed block used to reach the client
+    // as ordinary prose — the model then acted on its own fiction. Match the
+    // tag name and consume the attribute run; attribute values are escaped by
+    // the protocols, so the first `>` always closes the tag.
+    if (!attributedResultOpeners) continue
+    const tagName = marker.endsWith('>') ? marker.slice(0, -1) : undefined
+    if (!tagName) continue
+    let tagIndex = content.indexOf(tagName, 0)
+    while (tagIndex !== -1) {
+      const afterTag = tagIndex + tagName.length
+      const next = content[afterTag]
+      let opener: string | undefined
+      if (next === '>') {
+        opener = content.slice(tagIndex, afterTag + 1)
+      } else if (next !== undefined && /\s/.test(next)) {
+        const close = content.indexOf('>', afterTag)
+        if (close !== -1) {
+          opener = content.slice(tagIndex, close + 1)
+        } else if (final) {
+          // End of stream with an unterminated attributed opener: still an
+          // invented result envelope, so the remainder goes instead of being
+          // delivered to the client as prose.
+          opener = content.slice(tagIndex)
+        }
+      }
+      if (opener !== undefined) {
+        if (!selected || tagIndex < selected.index) {
+          selected = { index: tagIndex, marker: opener, end: TOOL_RESULT_ENDS[markerIndex] }
+        }
+        break
+      }
+      tagIndex = content.indexOf(tagName, afterTag)
+    }
   }
   return selected
+}
+
+/**
+ * Index of a trailing, still-incomplete attributed result opener
+ * (`<tool_response name="ba`), or -1.
+ *
+ * Plain suffix-prefix retention only covers the tag name itself, so an opener
+ * split inside its attribute run was released as visible prose and then never
+ * recognised once the rest arrived — a fabricated result leaking into the
+ * answer one delta at a time.
+ */
+function partialAttributedResultOpenerIndex(content: string): number {
+  const tagIndex = content.lastIndexOf('<')
+  if (tagIndex === -1) return -1
+  const tail = content.slice(tagIndex)
+  if (tail.includes('>')) return -1
+  const isResultTag = TOOL_RESULT_TAG_PREFIXES.some(
+    (tag) => tail === tag || tail.startsWith(`${tag} `) || tail.startsWith(`${tag}\t`),
+  )
+  return isResultTag ? tagIndex : -1
+}
+
+/** Length of the trailing partial attributed opener, or 0. */
+function pendingAttributedOpenerLength(content: string): number {
+  const index = partialAttributedResultOpenerIndex(content)
+  return index === -1 ? 0 : content.length - index
 }
 
 function findEarliestMarker(

@@ -58,12 +58,22 @@ export class ToolStreamParser {
   constructor(
     plan: ToolCallingPlan,
     callIdPrefix?: string,
-    options: { inputAlreadyGuarded?: boolean } = {},
+    options: { inputAlreadyGuarded?: boolean; stripOnlyToolResultWrappers?: boolean } = {},
   ) {
     this.plan = plan
     this.callIdPrefix = callIdPrefix ?? `call_${randomUUID().replace(/-/g, '')}`
     this.diagnostics = { ...plan.diagnostics }
-    this.toolResultGuard = new ManagedToolResultGuard(plan.protocol)
+    this.toolResultGuard = new ManagedToolResultGuard(plan.protocol, {
+      // A provider that keeps writing the tool-result envelope after its own
+      // call is not a protocol violation worth failing a request over: the
+      // invented block is stripped and the real call at the head still runs.
+      // Off by default; M365 opts in (cramt #31).
+      stripOnly: options.stripOnlyToolResultWrappers === true,
+      // The m365_fenced result block is the ATTRIBUTED form
+      // (`<tool_response name=… call_id=…>`), so the guard has to recognize it
+      // to see an invented copy at all. M365-only opt-in.
+      attributedResultOpeners: options.stripOnlyToolResultWrappers === true,
+    })
     this.inputAlreadyGuarded = options.inputAlreadyGuarded === true
   }
 

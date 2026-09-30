@@ -1,10 +1,21 @@
-import { execFile, spawnSync } from 'child_process'
-import { existsSync, readdirSync } from 'fs'
-import { platform } from 'os'
+import { execFile } from 'child_process'
+import { existsSync } from 'fs'
+import {
+  pythonCandidates,
+  resolveEnvInt,
+  resolvePythonBin,
+  resetSolverRuntimeForTests,
+  solverScriptPath,
+} from './zai-solver-runtime.ts'
 // Explicit .ts extensions keep this module loadable by `node --test`, which
 // resolves imports natively instead of through the bundler.
 import type { Account } from '../../store/types.ts'
 import { storeManager } from '../../store/store.ts'
+import { zaiCaptchaBreaker } from './zai-captcha-breaker.ts'
+
+// Interpreter discovery moved next to the other solver launch paths; re-exported
+// here because the refresh module is what the docs and tests point at.
+export { pythonCandidates, resolveEnvInt }
 
 /**
  * Z.ai has no refresh_token endpoint: login JWTs are issued without `exp` and
@@ -19,80 +30,6 @@ import { storeManager } from '../../store/store.ts'
  * one browser session because the captcha is bound to that session's
  * fingerprint, so a bare axios call from Node is always rejected.
  */
-
-// Read configuration lazily so it can be changed at runtime and overridden in
-// tests, instead of being frozen at module load.
-function solverScriptPath(): string {
-  return process.env.ZAI_CAPTCHA_SOLVER_PATH || '/app/scripts/zai-captcha/solve.py'
-}
-
-/**
- * Interpreters installed under the usual Windows per-user location. The Python
- * that owns PATH is often a different install from the one that has the solver
- * dependencies, so these are worth trying before giving up.
- */
-function windowsPythonInstalls(): string[] {
-  const roots = [
-    process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Programs\\Python` : '',
-    'C:\\Python',
-  ].filter(Boolean)
-  const found: string[] = []
-  for (const root of roots) {
-    try {
-      for (const entry of readdirSync(root)) {
-        if (!/^Python3\d*$/i.test(entry)) continue
-        const exe = `${root}\\${entry}\\python.exe`
-        if (existsSync(exe)) found.push(exe)
-      }
-    } catch {
-      // Directory missing or unreadable - nothing to add from here.
-    }
-  }
-  return found
-}
-
-/**
- * Candidate interpreters, most likely first. `ZAI_PYTHON_PATH` is trusted
- * outright - if the operator named one, they know what they are doing.
- */
-export function pythonCandidates(plat: NodeJS.Platform = platform()): string[] {
-  const explicit = process.env.ZAI_PYTHON_PATH?.trim()
-  if (explicit) return [explicit]
-  if (plat === 'win32') return ['python', 'python3', 'py', ...windowsPythonInstalls()]
-  return ['python3', 'python']
-}
-
-// The solver needs patchright (browser), numpy and Pillow (image maths). The
-// first `python` on PATH is frequently some other install that has none of
-// them, and a refresh that dies on ModuleNotFoundError looks identical to a
-// dead account. Probe once, then remember the answer.
-let resolvedPythonBin: string | null = null
-
-function pythonBin(): string {
-  if (resolvedPythonBin) return resolvedPythonBin
-  const explicit = process.env.ZAI_PYTHON_PATH?.trim()
-  const candidates = explicit ? [explicit] : pythonCandidates()
-  let chosen = candidates[0]
-  if (!explicit) {
-    for (const bin of candidates) {
-      try {
-        const probe = spawnSync(bin, ['-c', 'import patchright, numpy, PIL'], {
-          timeout: 15000,
-          windowsHide: true,
-          encoding: 'utf8',
-        })
-        if (!probe.error && probe.status === 0) {
-          chosen = bin
-          break
-        }
-      } catch {
-        // Not a usable interpreter - try the next one.
-      }
-    }
-  }
-  resolvedPythonBin = chosen
-  return chosen
-}
 
 /**
  * Vision-model settings for the captcha solver. The UI value wins when it is
@@ -140,11 +77,28 @@ function visionSolverEnv(): Record<string, string> {
 }
 
 function refreshTimeoutMs(): number {
-  return Number(process.env.ZAI_REFRESH_TIMEOUT_MS || 180000)
+  return resolveEnvInt(process.env.ZAI_REFRESH_TIMEOUT_MS, 180000, { min: 1000 })
 }
 
 function solverWaitSeconds(): number {
-  return Number(process.env.ZAI_REFRESH_WAIT_SECONDS || 60)
+  return resolveEnvInt(process.env.ZAI_REFRESH_WAIT_SECONDS, 60, { min: 5, max: 3600 })
+}
+
+/**
+ * How the JWT is minted:
+ *  - `login-form` drives the real email+password page (default; works with no
+ *    live token at all).
+ *  - `chat-captcha` harvests a captcha_verify_param from a chat session and
+ *    POSTs /auths/signin inside that same session. It only works while some
+ *    token still triggers the chat captcha, so it is the operator's escape hatch
+ *    when the login page changes but the chat surface does not.
+ */
+export function resolveZaiSigninMethod(
+  env: Record<string, string | undefined> = process.env
+): 'login-form' | 'chat-captcha' {
+  const raw = (env.ZAI_REFRESH_SIGNIN_METHOD || '').trim().toLowerCase().replace(/_/g, '-')
+  if (raw === 'chat-captcha') return 'chat-captcha'
+  return 'login-form'
 }
 
 /**
@@ -184,7 +138,7 @@ function allowHumanFallback(): boolean {
 }
 
 function humanTimeoutSeconds(): number {
-  return Number(process.env.ZAI_REFRESH_HUMAN_TIMEOUT || 180)
+  return resolveEnvInt(process.env.ZAI_REFRESH_HUMAN_TIMEOUT, 180, { min: 10, max: 3600 })
 }
 
 /**
@@ -203,8 +157,21 @@ function effectiveTimeoutMs(): number {
  * Cap how many refreshes run at once and queue the rest.
  */
 function maxConcurrentRefreshes(): number {
-  const configured = Number(process.env.ZAI_REFRESH_MAX_CONCURRENCY)
-  return Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : 1
+  return resolveEnvInt(process.env.ZAI_REFRESH_MAX_CONCURRENCY, 1, { min: 1, max: 8 })
+}
+
+/**
+ * Total signin attempts for one account. A captcha param that was rejected
+ * server-side is routinely fixed by a fresh harvest, and the solver already
+ * retries the slider internally, so the default of 2 (one retry) turns a
+ * transient rejection into a recovered account instead of a dead one.
+ */
+function maxRefreshAttempts(): number {
+  return resolveEnvInt(process.env.ZAI_REFRESH_MAX_ATTEMPTS, 2, { min: 1, max: 5 })
+}
+
+function retryDelayMs(): number {
+  return resolveEnvInt(process.env.ZAI_REFRESH_RETRY_DELAY_MS, 2000, { min: 0, max: 60000 })
 }
 
 /**
@@ -213,8 +180,7 @@ function maxConcurrentRefreshes(): number {
  * request. Set to 0 to disable.
  */
 function failureCooldownMs(): number {
-  const configured = Number(process.env.ZAI_REFRESH_COOLDOWN_MS)
-  return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 5 * 60 * 1000
+  return resolveEnvInt(process.env.ZAI_REFRESH_COOLDOWN_MS, 5 * 60 * 1000, { min: 0 })
 }
 
 // Shared across all refresher instances: adapter instances are per-request, but
@@ -249,6 +215,10 @@ export function resetZaiRefreshStateForTests(): void {
   lastFailureAt.clear()
   waitingForSlot.length = 0
   activeRefreshes = 0
+  // The interpreter cache is process-wide too; leaving it behind makes the next
+  // case depend on which interpreter an earlier one happened to resolve.
+  resetSolverRuntimeForTests()
+  zaiCaptchaBreaker.recordSuccess()
 }
 
 export type ZaiRefreshError = Error & {
@@ -308,14 +278,16 @@ export function parseSolverOutput(stdout: string): ParsedSolverOutput {
     if (!isObjectValue(parsed)) continue
 
     if (parsed.mode === 'signin') {
+      // Empty means "the solver had none" (the login-form path never has one);
+      // normalise to undefined so it cannot be mistaken for a usable param.
+      const captchaParam = typeof parsed.captcha_verify_param === 'string' ? parsed.captcha_verify_param.trim() : ''
       return {
         kind: 'signin',
         result: {
           status: Number(parsed.status) || 0,
           token: String(parsed.token || ''),
           cookies: String(parsed.cookies || ''),
-          captcha_verify_param:
-            typeof parsed.captcha_verify_param === 'string' ? parsed.captcha_verify_param : undefined,
+          captcha_verify_param: captchaParam || undefined,
           detail: String(parsed.detail || ''),
         },
       }
@@ -333,7 +305,14 @@ function isObjectValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
-function sanitizeDetail(value: unknown): string | undefined {
+/**
+ * Strip secrets out of anything headed for a log line or an error message.
+ *
+ * The `--password <value>` argv form matters as much as the `key=value` form:
+ * Node's execFile error message embeds the whole command line, so an unsanitized
+ * failure log printed the account password in clear text.
+ */
+export function sanitizeDetail(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const compact = value.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim()
   if (!compact) return undefined
@@ -341,7 +320,8 @@ function sanitizeDetail(value: unknown): string | undefined {
   return compact
     .replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED]')
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]')
-    .replace(/((?:token|cookie|password|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    // `=`/`:` covers json/headers, whitespace covers the `--password x` argv.
+    .replace(/((?:token|cookie|password|passwd|secret|authorization)\s*[=:\s]\s*)[^\s,;]+/gi, '$1[REDACTED]')
     .slice(0, 300)
 }
 
@@ -400,9 +380,12 @@ function createRefreshError(options: {
  * which is not evidence that the credential is bad.
  */
 export function classifyZaiSigninFailure(result: ZaiSigninResult): ZaiRefreshError {
-  const detail = sanitizeDetail(result.detail)
+  const rawDetail = String(result.detail || '')
+  const detail = sanitizeDetail(rawDetail)
   const suffix = detail ? `: ${detail}` : ''
-  const haystack = `${detail || ''} ${result.status}`
+  // Match on the raw detail: the redacted copy is for humans, and a secret
+  // scrubbed out of it must not change which branch we take.
+  const haystack = `${rawDetail} ${result.status}`
 
   if (/captcha|verification|滑块|验证/i.test(haystack)) {
     return createRefreshError({
@@ -462,26 +445,37 @@ export function classifyZaiSigninFailure(result: ZaiSigninResult): ZaiRefreshErr
   })
 }
 
+/**
+ * A signin that failed on the captcha (the branch classifyZaiSigninFailure
+ * tags "captcha rejected"), as opposed to bad credentials or transport. Only
+ * captcha failures feed the shared solve breaker.
+ */
+function isCaptchaSigninFailure(error: ZaiRefreshError): boolean {
+  return error.status === 403 && /captcha rejected/.test(error.message)
+}
+
 function createTransportError(error: unknown): ZaiRefreshError {
   const record = isObjectValue(error) ? error : undefined
   const code = typeof record?.code === 'string' ? record.code : ''
   const message = error instanceof Error ? error.message : ''
   const killed = code === 'ETIMEDOUT' || (error as { killed?: boolean })?.killed
   const timedOut = killed || code === 'ECONNABORTED' || /timed?\s*out|timeout/i.test(message)
+  // `message` here is the execFile failure, which contains the full argv.
+  const detail = sanitizeDetail(message)
 
   return createRefreshError({
-    message: timedOut ? 'Z.ai token refresh timed out' : 'Z.ai token refresh solver failed',
+    message: `${timedOut ? 'Z.ai token refresh timed out' : 'Z.ai token refresh solver failed'}${detail ? `: ${detail}` : ''}`,
     status: timedOut ? 504 : 502,
     retryable: true,
     accountFault: false,
   })
 }
 
-function persistInactiveAccount(account: Account, error: ZaiRefreshError): void {
+function persistInactiveAccount(account: Account, error: ZaiRefreshError, deps: ZaiRefreshDeps): void {
   if (error.accountStatus !== 'inactive') return
 
   try {
-    storeManager.updateAccount(account.id, {
+    deps.updateAccount(account.id, {
       status: 'inactive',
       errorMessage: error.message,
     })
@@ -504,12 +498,14 @@ export function buildSolverSigninArgv(opts: {
   waitSeconds: number
   human: boolean
   humanTimeout: number
+  signinMethod?: 'login-form' | 'chat-captcha'
 }): string[] {
   return [
     opts.scriptPath,
     '--token', opts.token,
     '--account-id', opts.accountId,
     '--mode', 'signin',
+    ...(opts.signinMethod ? ['--signin-method', opts.signinMethod] : []),
     '--email', opts.email,
     '--password', opts.password,
     '--wait-seconds', String(opts.waitSeconds),
@@ -536,10 +532,11 @@ function runSolverSignin(args: {
       waitSeconds: solverWaitSeconds(),
       human: allowHumanFallback(),
       humanTimeout: humanTimeoutSeconds(),
+      signinMethod: resolveZaiSigninMethod(),
     })
 
     const child = execFile(
-      pythonBin(),
+      resolvePythonBin(),
       argv,
       {
         timeout: effectiveTimeoutMs(),
@@ -564,9 +561,11 @@ function runSolverSignin(args: {
         const detail = solverFailureDetail(String(stdout || ''), String(stderr || ''))
 
         if (error) {
-          console.error('[Z.ai] Signin solver failed:', error.message)
+          // error.message embeds the full argv, password included.
+          const safeMessage = sanitizeDetail(error.message) || 'Command failed'
+          console.error('[Z.ai] Signin solver failed:', safeMessage)
           if (detail) console.error('[Z.ai] Solver output:', detail)
-          reject(new Error(`Z.ai signin solver failed: ${error.message}${detail ? ` (${detail})` : ''}`))
+          reject(new Error(`Z.ai signin solver failed: ${safeMessage}${detail ? ` (${detail})` : ''}`))
           return
         }
 
@@ -576,7 +575,7 @@ function runSolverSignin(args: {
           const missing = /No module named '([^']+)'/.exec(combined)?.[1] || 'dependencies'
           reject(
             new Error(
-              `Z.ai signin solver is missing Python package "${missing}". Install it for ${pythonBin()} ` +
+              `Z.ai signin solver is missing Python package "${missing}". Install it for ${resolvePythonBin()} ` +
                 `(pip install patchright numpy pillow) or point ZAI_PYTHON_PATH at an interpreter that has it.`
             )
           )
@@ -594,7 +593,64 @@ function runSolverSignin(args: {
   })
 }
 
+export type ZaiSigninRunner = (args: {
+  token: string
+  email: string
+  password: string
+  accountId: string
+}) => Promise<ZaiSigninResult>
+
+export type ZaiRefreshDeps = {
+  /** Launches the solver and returns its signin result. */
+  runSignin: ZaiSigninRunner
+  /** Re-reads an account with decrypted credentials, if it still exists. */
+  loadAccount: (id: string) => Account | undefined
+  updateAccount: (id: string, updates: Partial<Account>) => Account | null
+}
+
+/**
+ * Production wiring. Resolved per call rather than captured at construction so
+ * the store is never touched at import time (which `node --test` does not
+ * initialize), and so tests can inject fakes for all three.
+ */
+function defaultDeps(): ZaiRefreshDeps {
+  return {
+    runSignin: runSolverSignin,
+    loadAccount: (id) => storeManager.getAccountById(id, true),
+    updateAccount: (id, updates) => storeManager.updateAccount(id, updates),
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+type SigninOutcome =
+  | { ok: true; token: string }
+  | { ok: false; error: ZaiRefreshError }
+
 export class ZaiTokenRefresher {
+  // Declared field rather than a parameter property: `node --test` loads this
+  // module with type stripping, which does not support them.
+  private readonly deps: Partial<ZaiRefreshDeps>
+
+  constructor(deps: Partial<ZaiRefreshDeps> = {}) {
+    this.deps = deps
+  }
+
+  private runSignin(): ZaiSigninRunner {
+    return this.deps.runSignin || defaultDeps().runSignin
+  }
+
+  private loadAccount(id: string): Account | undefined {
+    return (this.deps.loadAccount || defaultDeps().loadAccount)(id)
+  }
+
+  private updateAccount(id: string, updates: Partial<Account>): Account | null {
+    return (this.deps.updateAccount || defaultDeps().updateAccount)(id, updates)
+  }
+
   canRefresh(account: Account): boolean {
     const { email, password } = resolveZaiCredentials(account)
     return Boolean(email && password)
@@ -658,51 +714,148 @@ export class ZaiTokenRefresher {
     return this.refresh(account)
   }
 
+  /**
+   * A captcha param rejected server-side is routinely fixed by harvesting a
+   * fresh one, and the solver already retries the slider internally - so a
+   * retryable failure gets another full attempt before the account is parked
+   * for the cooldown. A rejected credential is not retried: the second browser
+   * launch would only draw another risk-control verdict.
+   */
   private async doRefresh(
     account: Account,
     email: string,
     password: string,
     derived: boolean,
   ): Promise<string | null> {
+    const attempts = maxRefreshAttempts()
+    let lastError: ZaiRefreshError | null = null
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (attempt > 1) {
+        const delay = retryDelayMs()
+        if (delay > 0) await sleep(delay)
+        console.log(`[Z.ai] Retrying token refresh for ${email} (attempt ${attempt}/${attempts})`)
+      }
+
+      const outcome = await this.attemptSignin(account, email, password, derived)
+      if (outcome.ok) {
+        // The account is healthy again; a stale cooldown entry must not keep it
+        // parked for the rest of the window.
+        lastFailureAt.delete(account.id)
+        return outcome.token
+      }
+
+      lastError = outcome.error
+      if (!outcome.error.retryable) break
+    }
+
+    throw lastError || createRefreshError({
+      message: 'Z.ai token refresh produced no result',
+      status: 502,
+      retryable: true,
+      accountFault: false,
+    })
+  }
+
+  private async attemptSignin(
+    account: Account,
+    email: string,
+    password: string,
+    derived: boolean,
+  ): Promise<SigninOutcome> {
+    // The signin form is captcha-gated on the same egress as the chat
+    // captcha, so it shares the solve breaker: a failed login drag raises the
+    // exit's risk score exactly like a failed chat drag does.
+    const gate = zaiCaptchaBreaker.tryAcquire()
+    if (!gate.allowed) {
+      console.warn('[Z.ai] Captcha circuit breaker open; skipping credential re-login', JSON.stringify({
+        accountId: account.id,
+        retryInS: Math.ceil(gate.retryInMs / 1000),
+      }))
+      return {
+        ok: false,
+        error: createRefreshError({
+          message: 'Z.ai captcha circuit breaker open; credential re-login deferred',
+          status: 503,
+          retryable: false,
+          accountFault: false,
+        }),
+      }
+    }
+    const outcome = await this.attemptSigninUngated(account, email, password, derived)
+    if (outcome.ok) {
+      zaiCaptchaBreaker.recordSuccess()
+    } else if (isCaptchaSigninFailure(outcome.error)) {
+      zaiCaptchaBreaker.recordFailure()
+    } else {
+      zaiCaptchaBreaker.releaseProbe()
+    }
+    return outcome
+  }
+
+  private async attemptSigninUngated(
+    account: Account,
+    email: string,
+    password: string,
+    derived: boolean,
+  ): Promise<SigninOutcome> {
     console.log(
       `[Z.ai] Refreshing token via /api/v1/auths/signin for ${email}` +
         `${derived ? ' (password derived from email convention)' : ''}`,
     )
 
+    // The adapter hands over an account that may predate the last refresh.
+    const current = this.loadAccount(account.id) || account
+    const credentials: Record<string, string> = current.credentials || {}
+
     let result: ZaiSigninResult
     try {
-      result = await runSolverSignin({
-        token: String(account.credentials.token || ''),
+      result = await this.runSignin()({
+        token: String(credentials.token || ''),
         email,
         password,
         accountId: account.id,
       })
     } catch (error) {
-      throw createTransportError(error)
+      return { ok: false, error: createTransportError(error) }
     }
 
     if (!result.token) {
       const refreshError = classifyZaiSigninFailure(result)
-      persistInactiveAccount(account, refreshError)
-      throw refreshError
+      persistInactiveAccount(account, refreshError, this.resolvedDeps())
+      return { ok: false, error: refreshError }
     }
 
-    const credentials: Record<string, string> = {
-      ...account.credentials,
-      token: result.token,
-    }
-    if (result.cookies) credentials.cookies = result.cookies
-    if (result.captcha_verify_param) credentials.captcha_verify_param = result.captcha_verify_param
+    // Only the fields this run actually learned: `updateAccount` merges them
+    // over the decrypted store, so re-sending the caller's credential bag would
+    // write back whatever form it held (ciphertext included).
+    const updates: Record<string, string> = { token: result.token }
+    if (result.cookies) updates.cookies = result.cookies
+    // The login consumed the captcha budget, so a fresh param is worth keeping -
+    // otherwise the next request has to harvest one from scratch.
+    if (result.captcha_verify_param) updates.captcha_verify_param = result.captcha_verify_param
+    // Backfill the login this run just proved works, so the account stops
+    // depending on the display name / derivation convention staying put.
+    if (!credentials.email) updates.email = email
+    if (derived && password) updates.password = password
 
-    const updated = storeManager.updateAccount(account.id, {
+    this.updateAccount(account.id, {
       email,
-      credentials,
+      credentials: updates,
       status: 'active',
       errorMessage: undefined,
     })
 
     console.log(`[Z.ai] Token refreshed successfully for ${email}`)
-    return result.token || updated?.credentials?.token || null
+    return { ok: true, token: result.token }
+  }
+
+  private resolvedDeps(): ZaiRefreshDeps {
+    return {
+      runSignin: this.runSignin(),
+      loadAccount: (id) => this.loadAccount(id),
+      updateAccount: (id, updates) => this.updateAccount(id, updates),
+    }
   }
 }
 

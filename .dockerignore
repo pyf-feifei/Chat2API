@@ -47,3 +47,15 @@ docker-export.json
 /*.py
 /*.txt
 
+# The runtime stage copies scripts/{zai-captcha,qwen-captcha,mimo-login} whole,
+# so their local debug screenshots and bytecode would otherwise ship in the image.
+**/__pycache__
+**/*.pyc
+scripts/zai-captcha/*.png
+scripts/qwen-captcha/*.png
+scripts/mimo-login/artifacts
+scripts/compress/tmp
+tests
+.playwright-mcp
+out-*
+

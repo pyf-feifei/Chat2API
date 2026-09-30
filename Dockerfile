@@ -182,10 +182,13 @@ ENV QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 ENV QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS=2000
 ENV QWEN_AI_FILE_PARSE_TIMEOUT_MS=180000
 ENV QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
-# Install Chromium and Python deps for Z.ai captcha solver
+# Install Chromium and Python deps for Z.ai captcha solver. xvfb: the solver runs
+# its browser headed on a private virtual display, because aliyun's invisible
+# verify blocks headless chromium outright (F001, measured 2026-09-30).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
+    xvfb \
     python3-pip \
     python3-numpy \
     python3-pil \
