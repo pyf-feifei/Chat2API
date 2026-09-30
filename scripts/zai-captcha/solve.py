@@ -204,6 +204,15 @@ def decode_data_image(source: str) -> bytes:
 
 def image_bytes_from_locator(page, locator) -> bytes:
     result = locator.evaluate("""async image => {
+        // Right after a puzzle swap the <img> already carries the new src but
+        // has not decoded it: naturalWidth is 0, the canvas is 0x0 and
+        // toDataURL() returns the empty "data:," (measured 2026-09-30 as
+        // "Not base64" on every attempt after a refresh). Wait for the decode.
+        const deadline = Date.now() + 8000;
+        while (!(image.complete && image.naturalWidth > 0) && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        try { await image.decode(); } catch (e) {}
         const width = image.naturalWidth || image.width;
         const height = image.naturalHeight || image.height;
         const src = image.currentSrc || image.src || '';
@@ -211,10 +220,13 @@ def image_bytes_from_locator(page, locator) -> bytes:
         const encode = drawable => {
             const canvas = document.createElement('canvas');
             canvas.width = width; canvas.height = height;
+            if (!width || !height) throw new Error('image not decoded (0x0)');
             const context = canvas.getContext('2d', {willReadFrequently: true});
             if (!context) throw new Error('no canvas');
             context.drawImage(drawable, 0, 0, width, height);
-            return canvas.toDataURL('image/png');
+            const url = canvas.toDataURL('image/png');
+            if (!url.includes(';base64,')) throw new Error('empty canvas export');
+            return url;
         };
         try { return {dataUrl: encode(image), src, width, height, errors}; }
         catch (error) { errors.push('canvas: ' + String(error)); }
@@ -315,6 +327,93 @@ def _grow_mask(mask: np.ndarray, radius: int, grow: bool) -> np.ndarray:
     return out
 
 
+def _box_mean(arr: np.ndarray, r: int) -> np.ndarray:
+    """(2r+1)^2 box mean over the first two axes via an integral image (numpy only)."""
+    pad = [(r + 1, r)] + [(r + 1, r)] + [(0, 0)] * (arr.ndim - 2)
+    c = np.pad(arr, pad, mode="edge").cumsum(0).cumsum(1)
+    k = 2 * r + 1
+    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+    return s / float(k * k)
+
+
+def _zscore(values: np.ndarray) -> np.ndarray:
+    sd = float(values.std()) or 1.0
+    return (values - float(values.mean())) / sd
+
+
+def _fringe_target(bg_rgb: np.ndarray, pz_rgba: np.ndarray):
+    """Locate the hole of the LOGIN captcha (object cut out, spot inpainted).
+
+    The login widget cuts a whole object out of the picture and repaints the
+    spot, so neither a pale overlay nor a flat patch marks the hole (measured
+    2026-09-30 on 9 hand-labelled live puzzles: the overlay and flatness
+    detectors got 0/9). What survives is the piece's anti-aliased rim: its
+    semi-transparent pixels were composited over the ORIGINAL background, so
+    they still carry a trace of the picture at the true cut point. Scores:
+      - rim colour vs background (the rim pixels as-is),
+      - rim unmixed with alpha: alpha*object + (1-alpha)*background,
+      - piece/background correlation, and a small low-detail bonus for the
+        repainted interior.
+    Returns (target_x, margin, runner_x) or (None, 0, None) when the piece has
+    no soft rim (then the caller falls back to the older detectors)."""
+    a = pz_rgba[:, :, 3].astype(np.float32)
+    solid = a > 242
+    rim = (a > 8) & (a < 200)
+    if rim.sum() < 10 or solid.sum() < 30:
+        return None, 0.0, None
+    ys, xs = np.where(a > 8)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    span = int(xs.max()) + 1
+    bg = bg_rgb.astype(np.float32)
+    width = bg.shape[1]
+    if width - span < 1:
+        return None, 0.0, None
+    rgb = pz_rgba[:, :, :3].astype(np.float32)
+    # Object colour behind each rim pixel = mean of nearby fully opaque pixels.
+    solid_f = solid.astype(np.float32)
+    obj = _box_mean(rgb * solid_f[:, :, None], 2) / np.maximum(_box_mean(solid_f, 2)[:, :, None], 1e-3)
+    ry, rx = np.where(rim)
+    alpha = (a[ry, rx] / 255.0)[:, None]
+    comp = rgb[ry, rx]
+    obj_r = obj[ry, rx]
+    weight = 1.0 - alpha[:, 0]
+
+    body = a[y0:y1, :span] > 128
+    gray_bg = 0.299 * bg[:, :, 0] + 0.587 * bg[:, :, 1] + 0.114 * bg[:, :, 2]
+    gray_pz = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+    p = gray_pz[y0:y1, :span][body]
+    p = p - p.mean()
+    pn = float(np.sqrt((p * p).sum())) or 1.0
+    detail = np.abs(gray_bg - _box_mean(gray_bg, 1))
+    pad = 6
+    body_p = np.pad(body, pad)
+    ring = _grow_mask(body_p, 5, grow=True) & ~body_p
+    detail_p = np.pad(detail, pad, mode="edge")
+
+    n = width - span + 1
+    s_rim = np.empty(n, np.float32)
+    s_mix = np.empty(n, np.float32)
+    s_ncc = np.empty(n, np.float32)
+    s_det = np.empty(n, np.float32)
+    for cx in range(n):
+        under = bg[ry, rx + cx]
+        s_rim[cx] = -float(np.abs(under - comp).mean())
+        pred = alpha * obj_r + (1.0 - alpha) * under
+        s_mix[cx] = -float((np.abs(pred - comp).sum(1) * weight).sum() / (weight.sum() + 1e-6))
+        b = gray_bg[y0:y1, cx:cx + span][body]
+        b = b - b.mean()
+        s_ncc[cx] = float((p * b).sum() / (pn * (float(np.sqrt((b * b).sum())) or 1.0)))
+        win = detail_p[y0:y1 + 2 * pad, cx:cx + span + 2 * pad]
+        s_det[cx] = -float(win[pad:-pad, pad:-pad][body].mean() / (win[ring].mean() + 1e-3))
+    # Weights fitted on the labelled set (6/9 top-1, truth inside top-2 9/9).
+    score = _zscore(s_rim) + _zscore(s_mix) + 0.5 * _zscore(s_ncc) + 0.3 * _zscore(s_det)
+    best = int(np.argmax(score))
+    far = np.abs(np.arange(n) - best) >= 8
+    runner = int(np.argmax(np.where(far, score, -np.inf))) if far.any() else None
+    margin = float(score[best] - score[runner]) if runner is not None else 0.0
+    return best, margin, runner
+
+
 def _overlay_outline_target(bg_rgb: np.ndarray, pz_rgba: np.ndarray):
     """Locate the hole by the brightness/saturation step along the piece outline.
 
@@ -367,7 +466,25 @@ def _overlay_outline_target(bg_rgb: np.ndarray, pz_rgba: np.ndarray):
     return best_x, best_score, best_score - runner
 
 
-def captcha_target_geometry(page) -> dict:
+def fringe_min_margin_from_env(default: float = 0.15) -> float:
+    """Lead the fringe detector needs over its runner-up before we drag.
+    ZAI_CAPTCHA_FRINGE_MIN_MARGIN tunes it; 0 always drags."""
+    try:
+        value = float(os.environ.get("ZAI_CAPTCHA_FRINGE_MIN_MARGIN", "") or default)
+    except ValueError:
+        return default
+    return max(0.0, value)
+
+
+def login_detector_from_env() -> str:
+    """Hole detector for the LOGIN slider: 'fringe' (default; object-cutout
+    puzzles, see _fringe_target) or 'legacy' (overlay/template/flatness, the
+    chat-captcha detectors). ZAI_CAPTCHA_LOGIN_DETECTOR selects."""
+    value = (os.environ.get("ZAI_CAPTCHA_LOGIN_DETECTOR", "") or "fringe").strip().lower()
+    return value if value in ("fringe", "legacy") else "fringe"
+
+
+def captcha_target_geometry(page, detector: str = "legacy") -> dict:
     bg_loc = page.locator("#aliyunCaptcha-img")
     pz_loc = page.locator("#aliyunCaptcha-puzzle")
     bg_bytes = image_bytes_from_locator(page, bg_loc)
@@ -444,7 +561,26 @@ def captcha_target_geometry(page) -> dict:
     tm_x, tm_score, tm_used = _template_match_target(bg, pz)
     ov_x, ov_score, ov_margin = _overlay_outline_target(bg, pz)
     ov_min_margin = float(os.environ.get("ZAI_CAPTCHA_OVERLAY_MIN_MARGIN", "0.05") or 0.05)
-    if ov_x is not None and ov_margin >= ov_min_margin:
+    fr_x, fr_margin, fr_runner = (None, 0.0, None)
+    ambiguous = False
+    if detector == "fringe":
+        fr_x, fr_margin, fr_runner = _fringe_target(bg, pz)
+    if fr_x is not None:
+        # fr_x is where the piece image's own column 0 lands; target_x is
+        # expressed in the piece's alpha-left convention used below.
+        target_x = int(fr_x) + piece_left
+        score = fr_margin
+        # The rim score is a z-score sum; a 1.0 lead over the runner-up is a
+        # clear winner. Kept below the vision threshold on purpose only when
+        # the lead is tiny.
+        confidence = float(np.clip(0.55 + fr_margin / 2.0, 0.0, 1.0))
+        print(f"  fringe x={target_x} margin={fr_margin:.2f} runner={fr_runner}")
+        if fr_margin < fringe_min_margin_from_env():
+            # A near-tie means the winner is a coin flip between two spots
+            # (both mislabels in the labelled set had leads of 0.01/0.06).
+            # A wrong verify costs risk score; a puzzle swap costs nothing.
+            ambiguous = True
+    elif ov_x is not None and ov_margin >= ov_min_margin:
         target_x = int(ov_x)
         score = ov_score
         # Map the lead over the runner-up onto 0..1: a 0.2 lead (luminance +
@@ -508,7 +644,8 @@ def captcha_target_geometry(page) -> dict:
     gain = float(np.clip(piece_span / max_travel, 0.4, 1.2))
     print(f"  target_x={target_x} piece_left={piece_left} display_x={target_display_x:.1f} "
           f"max_travel={max_travel:.1f} gain={gain:.2f} score={score:.2f} confidence={confidence:.2f}")
-    return {"target_display_x": float(target_display_x), "target_puzzle_left": float(target_puzzle_left),
+    return {"ambiguous": ambiguous,
+            "target_display_x": float(target_display_x), "target_puzzle_left": float(target_puzzle_left),
             "max_travel": float(max_travel), "gain": gain, "confidence": confidence}
 
 def drag_slider(page, slider, target_puzzle_left, max_travel, bias=0):
@@ -576,6 +713,25 @@ def slider_attempts_from_env(default: int = 5) -> int:
     except ValueError:
         return default
     return max(1, min(12, value))
+
+def min_target_travel_from_env(default: float = 24.0) -> float:
+    """Smallest handle travel accepted as a real gap. The piece is ~30px wide at
+    its origin, so a detected target closer than that is the piece's own
+    outline. ZAI_CAPTCHA_MIN_TARGET_TRAVEL tunes it; 0 disables the guard."""
+    try:
+        value = float(os.environ.get("ZAI_CAPTCHA_MIN_TARGET_TRAVEL", "") or default)
+    except ValueError:
+        return default
+    return max(0.0, value)
+
+def signin_token_wait_from_env(default: int = 45) -> int:
+    """Seconds to wait for the signed-in JWT after the login captcha passes.
+    ZAI_SIGNIN_TOKEN_WAIT_SECONDS tunes it."""
+    try:
+        value = int(os.environ.get("ZAI_SIGNIN_TOKEN_WAIT_SECONDS", "") or default)
+    except ValueError:
+        return default
+    return max(5, min(180, value))
 
 def drag_style_from_env() -> str:
     """Chat-captcha drag trajectory: 'fast' (ease-out sweep, ~2s) or 'human'
@@ -924,7 +1080,7 @@ def vision_target_x(bg: Image.Image):
         return None
 
 
-def resolve_target(page):
+def resolve_target(page, detector: str = "legacy"):
     """Target x in page coordinates.
 
     The local smoothness matcher leads: it is deterministic, costs nothing, and
@@ -932,7 +1088,12 @@ def resolve_target(page):
     only consulted when the image is so uniformly smooth that the local matcher
     cannot tell the hole apart from the rest.
     """
-    geo = captcha_target_geometry(page)
+    geo = captcha_target_geometry(page, detector)
+    if geo.get("ambiguous"):
+        # Signal "do not drag": the login loop turns a negative target into a
+        # puzzle swap, which submits nothing.
+        print("  detector ambiguous (runner-up too close); swapping the puzzle instead of guessing")
+        return -1.0, geo["max_travel"], geo["gain"]
     if geo.get("confidence", 0.0) >= 0.55:
         return geo["target_puzzle_left"], geo["max_travel"], geo["gain"]
     print(f"  local matcher unsure (confidence={geo.get('confidence', 0):.2f}), asking vision")
@@ -1194,6 +1355,8 @@ def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float, 
     # cursor, so this closes whatever gap the first pass left. With the gain
     # applied above this should converge in 1-2 nudges, not the old dozen.
     best_err = None
+    prev_err = None
+    damping = 1.0
     for i in range(6):
         cur = read_puzzle_left(page)
         if cur is None:
@@ -1203,9 +1366,16 @@ def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float, 
             best_err = err
         if abs(err) <= 1.5:
             break
+        # The piece moves in coarser steps than the handle near the end of the
+        # rail, so a full correction can hop over the target and ping-pong
+        # (+5.0/-5.8 for six rounds, measured 2026-09-30). Halve the nudge each
+        # time the error changes sign so the loop converges instead.
+        if prev_err is not None and (err > 0) != (prev_err > 0):
+            damping *= 0.5
+        prev_err = err
         remain = max_travel - mouse
         # Convert the piece-space error into a handle nudge via the gain.
-        step = err / gain
+        step = err / gain * damping
         step = max(-12, min(12, step))
         if step > remain:
             print(f"  drag: cannot close err={err:.1f} (remain={remain:.1f})")
@@ -1217,9 +1387,34 @@ def drag_slider_closed_loop(page, target_puzzle_left: float, max_travel: float, 
         print(f"  drag fix i={i} mouse={mouse:6.1f} pos={cur:7.1f} err={err:6.1f}")
 
     page.wait_for_timeout(random.randint(120, 260))
+    # With ZAI_CAPTCHA_DEBUG set, photograph the picture while the button is
+    # still held (the piece sits exactly where the verify will judge it) and
+    # again after release, so a refused drag can be checked by eye: piece on
+    # the gap = gesture/risk refusal, piece off the gap = detection error.
+    stamp = _capture_drag_frame(page, "held") if os.environ.get("ZAI_CAPTCHA_DEBUG") else None
     page.mouse.up()
     page.wait_for_timeout(2500)
+    if stamp:
+        _capture_drag_frame(page, "released", stamp)
+        print(f"  [debug] drag frames saved stamp={stamp} target={target_puzzle_left:.1f} "
+              f"final={read_puzzle_left(page) or 0:.1f} best_err={best_err}")
     return abs(best_err) if best_err is not None else 999.0
+
+
+def _capture_drag_frame(page, label: str, stamp=None):
+    stamp = stamp or int(time.time() * 1000) % 1000000
+    try:
+        # A passed captcha closes the widget; a short timeout keeps the debug
+        # frame from stalling the signin for Playwright's default 30s.
+        box = (page.locator("#aliyunCaptcha-img-box").bounding_box(timeout=1500)
+               or page.locator("#aliyunCaptcha-img").bounding_box(timeout=1500))
+        if box:
+            # Include the rail below the picture so handle position is visible too.
+            clip = {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"] + 60}
+            page.screenshot(path=str(ARTIFACT_DIR / f"drag-{stamp}-{label}.png"), clip=clip)
+    except Exception as e:
+        print(f"  [debug] drag frame '{label}' failed: {str(e)[:80]}")
+    return stamp
 
 
 def captcha_image_signature(page) -> str:
@@ -1262,7 +1457,7 @@ def solve_slider_login(page, max_attempts: int = 3) -> bool:
             if not geo_view.get("in_view"):
                 print(f"  Slider below the fold (bottom={geo_view.get('slider_bottom')}, "
                       f"viewport_h={geo_view.get('viewport_height')}); drag may be ignored")
-            target_left, max_travel, gain = resolve_target(page)
+            target_left, max_travel, gain = resolve_target(page, login_detector_from_env())
             # A target the rail cannot physically reach is a detection error by
             # construction. Dragging to it anyway submits a guaranteed-wrong
             # verify (F015, measured live 2026-09-30), and every failed verify
@@ -1271,6 +1466,13 @@ def solve_slider_login(page, max_attempts: int = 3) -> bool:
             base_left = read_puzzle_left(page)
             if base_left is not None and gain > 0:
                 needed_handle = (target_left - base_left) / gain
+                # The gap is never cut where the piece already sits: a target
+                # within about one piece-width of the origin means the matcher
+                # locked onto the piece itself (x=8/x=17, all refused, measured
+                # 2026-09-30). Treated like an unreachable target.
+                if 0 <= needed_handle < min_target_travel_from_env():
+                    print(f"  target too close to origin (handle {needed_handle:.1f}); matcher likely hit the piece")
+                    needed_handle = -1
                 if needed_handle > max_travel + 2 or needed_handle < 0:
                     print(f"  target unreachable (handle {needed_handle:.1f} vs rail {max_travel:.1f}); "
                           "refreshing the puzzle instead of submitting a wrong drag")
@@ -1297,7 +1499,14 @@ def solve_slider_login(page, max_attempts: int = 3) -> bool:
             except Exception:
                 pass
         if not wait_for_new_captcha(page, before, 12.0):
-            time.sleep(1.5)
+            # The login widget does not always swap the picture after a refused
+            # verify; it keeps the spent puzzle, whose piece image is then
+            # empty, so every later attempt dies on "alpha mask empty"
+            # (measured 2026-09-30). Ask for a fresh one explicitly.
+            if slider_visible(page) and refresh_captcha_for_human(page):
+                wait_for_new_captcha(page, before, 6.0)
+            else:
+                time.sleep(1.5)
     return False
 
 
@@ -1314,6 +1523,10 @@ def wait_for_login_captcha(page, timeout: int) -> bool:
 # fresh puzzle. Aliyun renames this between widget builds, so we try several and
 # simply carry on when none match - a human can click it by hand.
 CAPTCHA_REFRESH_SELECTORS = (
+    # Live id as of 2026-09-30 (DOM dump of the login widget). The generic
+    # id pattern below keeps matching if the prefix/suffix is renamed again.
+    "#aliyunCaptcha-btn-refresh",
+    "[id^='aliyunCaptcha'][id*='refresh']",
     "#aliyunCaptcha-refresh",
     "#aliyunCaptcha-refresh-btn",
     "#aliyunCaptcha-refresh-button",
@@ -1381,7 +1594,7 @@ def read_session_token(page, context, max_seconds: int = 20, email: str = "") ->
 
 
 def email_login(email: str, password: str, headless: bool, wait_seconds: int,
-                max_captcha_attempts: int = 3, allow_human: bool = False,
+                max_captcha_attempts: int = 0, allow_human: bool = False,
                 human_timeout: int = 180) -> dict:
     """Log in with email+password and return the freshly minted JWT.
 
@@ -1435,13 +1648,19 @@ def email_login(email: str, password: str, headless: bool, wait_seconds: int,
         token = ""
         while time.time() < deadline:
             if expand_captcha(page):
-                if solve_slider_login(page, max_attempts=max_captcha_attempts):
+                attempts = max_captcha_attempts or slider_attempts_from_env()
+                if solve_slider_login(page, max_attempts=attempts):
                     page.screenshot(path=str(ARTIFACT_DIR / "login-captcha-passed.png"))
                     click_first_visible(page, LOGIN_SUBMIT_SELECTORS)
                     page.screenshot(path=str(ARTIFACT_DIR / "login-after-submit.png"))
-                    token = read_session_token(page, context, email=email)
+                    # After "Verification Passed" the button can sit on
+                    # "Signing in..." well past 20s before the SPA stores the
+                    # JWT (measured 2026-09-30), so the read window is longer
+                    # and tunable.
+                    token = read_session_token(page, context, max_seconds=signin_token_wait_from_env(), email=email)
                     if token:
                         break
+                    page.screenshot(path=str(ARTIFACT_DIR / "login-no-token.png"))
                     detail = "captcha passed but no session token after login submission"
                     break
                 # Carry the widget's own wording into the result: "verification

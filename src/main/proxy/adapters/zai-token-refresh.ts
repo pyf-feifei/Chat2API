@@ -76,8 +76,11 @@ function visionSolverEnv(): Record<string, string> {
   return resolveCaptchaVisionEnv(cfg, process.env)
 }
 
+// A login-form signin runs up to ZAI_CAPTCHA_SLIDER_ATTEMPTS drags (~25s each)
+// plus the post-captcha token wait; measured 2026-09-30 at up to ~125s for 5
+// attempts. 180s left too little headroom once the token wait grew.
 function refreshTimeoutMs(): number {
-  return resolveEnvInt(process.env.ZAI_REFRESH_TIMEOUT_MS, 180000, { min: 1000 })
+  return resolveEnvInt(process.env.ZAI_REFRESH_TIMEOUT_MS, 300000, { min: 1000 })
 }
 
 function solverWaitSeconds(): number {
