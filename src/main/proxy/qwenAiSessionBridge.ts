@@ -168,15 +168,25 @@ export function createQwenAiDeltaHash(messages: readonly ChatMessage[]): string 
  * instructions (system prompt) and the first K conversation messages are
  * stable across a codex task's turns — they form a natural session key that
  * does not require any client cooperation.
+ *
+ * Content alone is not unique across clients: two codex threads started in
+ * the same directory share the instructions and the AGENTS.md first message,
+ * so they would share one chain — the second thread is refused with
+ * CHAT_IN_PROGRESS while the first is in flight, and sequential turns append
+ * one thread's transcript into the other's upstream chat (observed
+ * 2026-10-01). `clientScope` is the client's own thread identity; when present
+ * it partitions the chain so only one linear transcript ever owns it.
  */
 export function createQwenAiChainKey(
   instructions: string | undefined,
   headMessages: readonly ChatMessage[],
+  clientScope?: string,
 ): string {
   return createHash('sha256')
     .update(JSON.stringify({
       instructions: instructions ?? null,
       head: canonicalize(headMessages),
+      ...(clientScope ? { scope: clientScope } : {}),
     }))
     .digest('hex')
 }

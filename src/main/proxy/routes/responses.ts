@@ -155,6 +155,53 @@ function codexSessionRiskKey(ctx: Context, request: unknown): string | undefined
     : undefined
 }
 
+/**
+ * The client's own identity for one linear transcript, used to partition the
+ * store:false sticky chain. Without it, two threads with the same
+ * instructions and first message collide on one content-derived chain.
+ *
+ * Codex sends `thread-id` (mirrored in `x-codex-turn-metadata.thread_id`) on
+ * every request; it is unique per thread, including spawned sub-agents and
+ * forks, and survives compaction and resume. `session-id` and
+ * `prompt_cache_key` are shared by a whole codex agent tree, so they are only
+ * fallbacks for clients that omit a thread id. The scope is hashed together
+ * with the content key, so any value can only split chains, never merge them.
+ * `CHAT2API_QWEN_AI_STICKY_CHAIN_CLIENT_SCOPE=off` restores the content-only key.
+ */
+function stickyChainClientScope(
+  ctx: Context,
+  request: unknown,
+): { source: string; value: string } | undefined {
+  const toggle = String(process.env.CHAT2API_QWEN_AI_STICKY_CHAIN_CLIENT_SCOPE ?? '').trim()
+  if (/^(?:0|false|off|no)$/i.test(toggle)) return undefined
+
+  const threadId = headerValue(ctx, ['thread-id'])
+  if (threadId) return { source: 'thread-id', value: threadId }
+
+  // Read the raw header: headerValue truncates, which would break the JSON.
+  const rawMetadata = ctx.headers['x-codex-turn-metadata']
+  const metadata = Array.isArray(rawMetadata) ? rawMetadata[0] : rawMetadata
+  if (typeof metadata === 'string' && metadata.trim()) {
+    try {
+      const parsed = JSON.parse(metadata) as Record<string, unknown>
+      const value = typeof parsed.thread_id === 'string' ? parsed.thread_id.trim() : ''
+      if (value) return { source: 'x-codex-turn-metadata.thread_id', value: value.slice(0, 256) }
+    } catch {
+      // Ignore malformed optional client metadata; later fallbacks still apply.
+    }
+  }
+
+  const sessionId = headerValue(ctx, ['session-id'])
+  if (sessionId) return { source: 'session-id', value: sessionId }
+
+  const promptCacheKey = request && typeof request === 'object'
+    ? (request as Record<string, unknown>).prompt_cache_key
+    : undefined
+  return typeof promptCacheKey === 'string' && promptCacheKey.trim()
+    ? { source: 'prompt_cache_key', value: promptCacheKey.trim().slice(0, 256) }
+    : undefined
+}
+
 function writeInvalidRequest(
   ctx: Context,
   message: string,
@@ -784,10 +831,18 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     const instructions = typeof request.instructions === 'string'
       ? request.instructions
       : undefined
-    const chainKey = createQwenAiChainKey(instructions, headMessages)
+    const clientScope = stickyChainClientScope(ctx, request)
+    const chainKey = createQwenAiChainKey(instructions, headMessages, clientScope?.value)
     const claimResult = qwenAiStickyRegistry.claimByChainKey(chainKey)
 
     if (claimResult.status === 'busy') {
+      // This 429 never reaches the forwarder or governor, so log it here.
+      console.info('[Responses] Qwen sticky chain busy', JSON.stringify({
+        requestId: responseId,
+        chainKey: chainKey.slice(0, 16),
+        clientScopeSource: clientScope?.source ?? 'none',
+        retryAfterMs: claimResult.retryAfterMs,
+      }))
       abort.cleanup()
       ctx.set('Retry-After', String(Math.max(1, Math.ceil(claimResult.retryAfterMs / 1000))))
       ctx.status = 429
