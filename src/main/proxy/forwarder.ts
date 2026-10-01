@@ -866,6 +866,27 @@ const DAILY_QUOTA_PARK_MS = 20 * 60 * 60 * 1000
  *
  * Advisory: the pool keeps working, this only stops the wasted selections.
  */
+/**
+ * Has the Studio agent route already been found unusable?
+ *
+ * A cached record carrying an explicit negative answer (no agent id) means
+ * provisioning was attempted and failed, so the token request is skipped. On a
+ * consumer MSA pool that is the permanent state: `api.bap.microsoft.com/.default`
+ * is not a valid scope for the consumer app (AADSTS70011, measured 2026-09-30),
+ * so re-attempting per turn buys nothing but a round trip and a log line.
+ */
+async function studioAgentKnownUnavailable(cachePath: string): Promise<boolean> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { readFileSync } = await import('fs') as typeof import('fs')
+    const parsed = JSON.parse(readFileSync(cachePath, 'utf8')) as { agentId?: unknown }
+    return typeof parsed?.agentId !== 'string' || parsed.agentId === ''
+  } catch {
+    // No cache file: nothing has been attempted yet, so try once.
+    return false
+  }
+}
+
 function markAccountDailyQuotaExhausted(accountId: string | undefined): void {
   if (!accountId) return
   const until = Date.now() + DAILY_QUOTA_PARK_MS
@@ -3365,10 +3386,17 @@ export class RequestForwarder {
       const { getOrCreateStudioAgent, studioAgentCachePath, studioAgentEnabled } =
         await import('../providers/builtin/m365/agent/agentProvisioner.ts')
       if (!studioAgentEnabled()) return undefined
+      const cachePath = studioAgentCachePath(getRuntime().getDataDir())
+      // A known-useless route must not cost a token request per tool turn. On a
+      // consumer account the BAP scope does not exist at all (AADSTS70011), so
+      // with no cached agent every turn would re-attempt and fail identically.
+      // The negative result is cached, so a tenant that gains a work/school
+      // account can clear one file rather than waiting out a backoff.
+      if (await studioAgentKnownUnavailable(cachePath)) return undefined
       return (await getOrCreateStudioAgent({
         enabled: true,
         getRefreshToken: () => account.credentials?.refreshToken,
-        cachePath: studioAgentCachePath(getRuntime().getDataDir()),
+        cachePath,
         timeoutMs: 30000,
       })) ?? undefined
     } catch (error) {

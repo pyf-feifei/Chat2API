@@ -52,22 +52,43 @@ export function studioAgentCachePath(dataDir: string): string {
 }
 
 export interface CachedAgentRecord {
+  /** Empty when provisioning was attempted and failed; the route stays off. */
   agentId: string
   botId: string
   instructionsHash: string
   createdAt: string
   /** Tenant this record belongs to; a tenant switch must not reuse it. */
   tenantId?: string
+  /** Why agentId is empty, for the operator-facing log. */
+  unavailableReason?: string
 }
 
 function parseCache(raw: string | undefined): CachedAgentRecord | null {
   if (!raw) return null
   try {
     const parsed = JSON.parse(raw) as CachedAgentRecord
-    return typeof parsed?.agentId === 'string' ? parsed : null
+    // A record with no instructionsHash is an explicit NEGATIVE result
+    // (provisioning attempted and failed). It must survive the parse, or the
+    // caller would re-attempt the known-useless route on every tool turn.
+    if (typeof parsed !== 'object' || parsed === null) return null
+    return parsed
   } catch {
     return null
   }
+}
+
+/**
+ * Remember that the route is unusable, so the token request is not repeated on
+ * every tool turn. Overwritten as soon as a real agent is provisioned.
+ */
+function writeUnavailableCache(path: string, reason: string): void {
+  writeCache(path, {
+    agentId: '',
+    botId: '',
+    instructionsHash: agentInstructionsHash(),
+    createdAt: new Date().toISOString(),
+    unavailableReason: reason,
+  })
 }
 
 function readCache(path: string): CachedAgentRecord | null {
@@ -179,7 +200,11 @@ function botIconBase64(): string {
   }
   const crc32 = (buf: Buffer): number => {
     let c = 0xffffffff
-    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8)
+    // Index loop, not `for..of`: iterating a Buffer needs downlevelIteration,
+    // which tsconfig.node.json does not enable.
+    for (let index = 0; index < buf.length; index += 1) {
+      c = crcTable[(c ^ buf[index]) & 0xff] ^ (c >>> 8)
+    }
     return (c ^ 0xffffffff) >>> 0
   }
   const chunk = (type: string, data: Buffer): Buffer => {
@@ -310,11 +335,20 @@ export async function getOrCreateStudioAgent(config: StudioAgentConfig): Promise
   }
 
   const bapToken = await tokenFor(refreshToken, BAP_SCOPE, config.timeoutMs)
-  if (!bapToken) return null
+  if (!bapToken) {
+    writeUnavailableCache(config.cachePath, 'no token for the BAP scope (tenant has not consented, or the account type does not offer it)')
+    return null
+  }
   const envUrl = await discoverEnvironmentUrl(bapToken, config.timeoutMs)
-  if (!envUrl) return null
+  if (!envUrl) {
+    writeUnavailableCache(config.cachePath, 'BAP environment discovery failed')
+    return null
+  }
   const ppToken = await tokenFor(refreshToken, POWER_PLATFORM_SCOPE, config.timeoutMs)
-  if (!ppToken) return null
+  if (!ppToken) {
+    writeUnavailableCache(config.cachePath, 'no token for the Power Platform scope')
+    return null
+  }
 
   try {
     const wantName = agentName()
@@ -336,9 +370,9 @@ export async function getOrCreateStudioAgent(config: StudioAgentConfig): Promise
     console.log('[M365Copilot] Studio agent ready', JSON.stringify({ agentId, reused: Boolean(existing) }))
     return agentId
   } catch (error) {
-    console.warn('[M365Copilot] Studio agent provisioning failed; staying on the fenced protocol', JSON.stringify({
-      error: error instanceof Error ? error.message : String(error),
-    }))
+    const reason = error instanceof Error ? error.message : String(error)
+    console.warn('[M365Copilot] Studio agent provisioning failed; staying on the fenced protocol', JSON.stringify({ error: reason }))
+    writeUnavailableCache(config.cachePath, reason.slice(0, 300))
     return null
   }
 }

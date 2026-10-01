@@ -411,9 +411,9 @@ export function buildConsumerChatPayload(
         // A Copilot Studio agent carries the tool contract in its SERVER-SIDE
         // system prompt, which is the only placement this backend honours: with
         // per-request injection alone it answers tool requests in prose or
-        // hallucinates tool results (measured 0/N on this repo's pool,
-        // 2026-09-29). These fields REPLACE `plugins` rather than joining them —
-        // that is the shape compliance was measured with.
+        // hallucinates tool results (measured ~1 compliant turn in ~40 on this
+        // repo's pool, 2026-09-29/30). These fields REPLACE `plugins` rather
+        // than joining them — that is the shape compliance was measured with.
         ...(studioAgentId ? buildAgentChatFields(studioAgentId) : {}),
         isSbsSupported: true,
         // Magic confabulates instead of following prompt-injected tool

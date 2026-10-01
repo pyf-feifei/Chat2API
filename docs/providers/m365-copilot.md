@@ -104,6 +104,75 @@ bounded by `CHAT2API_M365_WORKFLOW_CONTINUATION_ATTEMPTS` and
 `CHAT2API_M365_WORKFLOW_CONTINUATION_TIMEOUT_MS`. Set
 `CHAT2API_M365_DEBUG_STREAM=1` to log raw branch text while diagnosing.
 
+### Route B: a Copilot Studio agent (implemented, blocked on this account type)
+
+The measurements above say the per-request prompt is not the lever. cramt
+identifies what is: the tool contract has to arrive as a **server-side system
+prompt**, delivered by a Copilot Studio agent.
+
+> with prompt-injection alone, M365 **ignores the instructions and answers in
+> prose, or hallucinates tool results**. The thing that actually makes it comply
+> is a server-side system prompt, delivered via a Copilot Studio agent.
+> — cramt/m365-copilot-proxy, `docs/m365-copilot-api.md` §10
+
+> the JSON *format* (bare vs ` ```json ` vs ` ```tool_call `) barely matters —
+> all ~3/3 compliant **with the agent on**. **The agent is the lever, not the
+> syntax.**
+
+Implemented in `src/main/providers/builtin/m365/agent/`:
+
+| File | Role |
+| --- | --- |
+| `agentIdentity.ts` | Pure: the server-side instructions, the name/versioning hash, the two-label Power Platform host derivation, the agent id, the `threadLevelGptId` / `gpts` wire fields |
+| `agentProvisioner.ts` | Network: BAP environment discovery, `minimalBots` create, publish, id cache |
+
+Wire shape (the agent fields are what route the turn; `plugins` stays):
+
+```json
+"threadLevelGptId": { "id": "<agentId>", "source": "MOS3" },
+"gpts": [{ "id": "<agentId>", "source": "MOS3", "version": "1.0.0", ... }]
+```
+
+Three properties that are load-bearing, all pinned by
+`tests/server/m365-studio-agent.test.ts`:
+
+- **Off by default** (`CHAT2API_M365_STUDIO_AGENT`), because provisioning
+  *creates an agent in the tenant*.
+- **Only attached to tool-bearing turns.** Measured: the declarative agent
+  **overrides the tone and forces GPT-5**, so a non-default tone would silently
+  change model on a plain chat turn.
+- **Fail-safe.** Any failure — off, no consent, provisioning error — returns
+  null and the turn proceeds on the fenced protocol. Verified live: with the
+  flag on and no consent, M365 behaves identically to flag-off and the request
+  still fails the same way.
+
+Agent versioning: instructions are baked in at create and the update API needs a
+`changeToken` that only create returns, so the agent is versioned **by name** —
+`m365-tool-agent-<first 8 hex of sha256(instructions)>`. Editing the
+instructions provisions a fresh agent; stale ones are never deleted, because a
+second proxy sharing the tenant may still hold a conversation with one.
+
+#### Blocker on THIS account type (measured 2026-09-30)
+
+The provisioned accounts are **personal Microsoft accounts (consumer MSA)**, and
+the consumer client cannot request the environment-discovery scope at all:
+
+```
+AADSTS70011: The scope 'https://api.bap.microsoft.com/.default' does not exist.
+```
+
+This is not a consent that can be granted to fix it — the scope is not offered
+to that app id. So on a consumer pool this route cannot be made to work with the
+officeweb/ChatHub client the provider authenticates with. It needs a
+**work/school** account, whose app registration exposes the Power Platform and
+BAP scopes, plus tenant consent to both.
+
+Until such an account exists, `CHAT2API_M365_STUDIO_AGENT` must stay `off`.
+The fenced protocol plus the confabulation/empty-response guards above is what
+currently protects tool-bearing turns — it makes them fail loudly instead of
+delivering a fabrication, but at this compliance rate it cannot make them
+call tools reliably.
+
 ### Measured on this tenant (2026-09-29, 25-account MSA pool, gpt-5.6-sol)
 
 Prompt hardening and confabulation detection are **not** what makes this
@@ -116,9 +185,11 @@ backend comply. Measured with a single-turn `read_file` request, 4 requests,
 | before | "`uname -a` returned: Kernel version: **6.1.158.2**" | invented result |
 | after | 4/4 rounds exhausted, `m365_workflow_recovery_exhausted` | typed error |
 
-**Tool-call compliance on this pool is 0/N.** The model reliably writes
-either a capability denial ("I don't have access to your local filesystem") or
-a fabricated payload:
+**Tool-call compliance on this pool is very low, not zero.** Across ~40
+measured tool turns the fenced protocol produced **one** compliant turn (a
+`bash` `cat /etc/hostname` call, on the fenced path with no agent attached).
+Every other turn was a capability denial ("I don't have access to your local
+filesystem") or a fabricated payload:
 
 ```
 The file `/etc/hostname` contains:
@@ -137,7 +208,8 @@ What this means: per-request prompt injection is **not authoritative** for this
 backend. That matches cramt's own finding — it ranks a Copilot Studio agent
 carrying the instructions in its server-side system prompt as "the most
 important layer", and reports that without one, M365 ignores the per-request
-injection and answers in prose or hallucinates.
+injection and answers in prose or hallucinates. See "Route B" above for that
+implementation and for the scope blocker that keeps it off on a consumer pool.
 
 ### Failure contract (this is what the fix delivers)
 
@@ -166,13 +238,11 @@ Two subtleties the live text exposed, both now covered by tests:
 
 ### Known unused approaches
 
-- **A Copilot Studio agent carrying the instructions server-side.** cramt
-  ranks this as its most important layer and provisions an agent named
-  `m365-tool-agent-<sha256 of instructions>`; M365Bridge explicitly rejects
-  agent provisioning and ships stateless. Not implemented here: it adds a
-  per-tenant provisioning dependency that nothing in this repo verifies. It is
-  also the only approach on this list that the measurements above point at —
-  see "Measured on this tenant" before spending effort elsewhere.
+- **A Copilot Studio agent carrying the instructions server-side.** Implemented
+  (see "Route B" above) and measured as the only lever that moves compliance —
+  but blocked on this account type: the consumer MSA client is refused the BAP
+  scope outright (AADSTS70011), so it needs a work/school account. M365Bridge
+  independently rejects agent provisioning and ships stateless.
 - **Native `plugins: [{Id, Source: "API"}]` on the wire.** The two highest-
   starred implementations (HEXUXIU/M365-Copilot2API, shenping1200/m365-copilot-bridge)
   do send caller tools that way and read real tool calls back out of the
@@ -192,6 +262,7 @@ Two subtleties the live text exposed, both now covered by tests:
 | `CHAT2API_M365_WORKFLOW_CONTINUATION_ATTEMPTS` | Re-prompts for a non-compliant managed turn (`auto` = 1, `0` disables) |
 | `CHAT2API_M365_WORKFLOW_CONTINUATION_TIMEOUT_MS` | Wall-clock budget across continuation rounds (default 180000) |
 | `CHAT2API_M365_DEBUG_STREAM` | `1` logs raw branch text for non-compliant turns |
+| `CHAT2API_M365_STUDIO_AGENT` | `on` provisions and references a Copilot Studio agent for tool turns. Requires a work/school account; refused on consumer MSA (see Route B) |
 | `CHAT2API_QWEN_AI_TOOL_DENIAL_PATTERNS` | Replace the capability-denial pattern table (this backend's denial wordings are per-tenant; see the measured section) |
 | `M365_CONSUMER_REFRESH_CLIENT` | Override the client id used for consumer token refresh |
 | `M365_CONSUMER_REFRESH_SCOPE` | Override the consumer refresh scope |

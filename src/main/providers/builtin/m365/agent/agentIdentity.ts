@@ -3,10 +3,10 @@
  *
  * Why this exists at all: M365 ignores per-request prompt injection for tool
  * calling — it answers in prose or hallucinates tool results. Measured on this
- * repo's own 25-account pool (2026-09-29): 0 tool calls in N attempts, only
- * denials ("I don't have access to your local filesystem") and fabrications
- * ("The file contains: `SandboxHost-639262996218002518`"), with the full
- * fenced-protocol prompt already in place. cramt/m365-copilot-proxy measures
+ * repo's own 25-account pool (2026-09-29/30): across ~40 tool turns the
+ * fenced protocol yielded ONE compliant call, everything else being a denial
+ * or a fabrication, with the full fenced-protocol prompt already in place.
+ * cramt/m365-copilot-proxy measures
  * the same thing and identifies the fix: the tool contract has to arrive as a
  * SERVER-SIDE system prompt, delivered by a Copilot Studio agent. The syntax
  * barely matters; "the agent is the lever, not the syntax".

@@ -259,6 +259,18 @@ services:
       # Debug: log the raw managed-branch text whenever a branch classifies
       # non-compliant (re-prompt or exhausted), for wire-format diagnosis.
       CHAT2API_M365_DEBUG_STREAM: ${CHAT2API_M365_DEBUG_STREAM:-false}
+      # Copilot Studio tool-calling agent. The per-request fenced prompt is NOT
+      # authoritative on this backend (measured 0 tool calls in N attempts on a
+      # 25-account pool); a Copilot Studio agent carries the tool contract in a
+      # SERVER-SIDE system prompt, which is the only placement observed to work.
+      # OFF by default: provisioning CREATES an agent in the tenant, and it needs
+      # the tenant to have consented to
+      #   https://api.powerplatform.com/.default
+      #   https://api.bap.microsoft.com/.default
+      # Without that consent every attempt logs and falls back to the fenced
+      # protocol, so leaving it on costs one log line per tool turn and nothing
+      # else. See docs/providers/m365-copilot.md.
+      CHAT2API_M365_STUDIO_AGENT: ${CHAT2API_M365_STUDIO_AGENT:-off}
       # Inline tail (bytes) of the archived transcript kept on the active turn
       # when complete managed document transport archives the pending user
       # message, so the operative task stays visible without a file read.

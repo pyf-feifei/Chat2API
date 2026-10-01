@@ -88,14 +88,21 @@ export function isM365ToolDenialManagedAnswer(trimmedContent: string): boolean {
 /** Unanchored, cap-free locator used by the forwarder's continuation decision. */
 export function findM365ToolDenialClaim(text: string): ManagedToolDenialClaim | undefined {
   if (!text) return undefined
+  // Typographic apostrophes MUST be normalized here. M365's consumer tone emits
+  // "I don’t have access to …" (U+2019) far more often than the ASCII form, and
+  // no ASCII-spelled pattern can match it. The length-capped classifier already
+  // normalizes; this locator did not, so a curly-quote denial went undetected
+  // and was delivered as the answer (measured 2026-09-30: 1 leak in 8 turns,
+  // the only difference from the caught cases being the apostrophe).
+  const normalized = text.replace(/[‘’ʼ]/g, "'")
   const shared = managedToolDenialRegex()
   const own = m365ToolDenialRegex()
-  const sharedMatch = shared?.exec(text)
-  const ownMatch = own && own !== shared ? own.exec(text) : undefined
-  const index = Math.min(
-    ...[sharedMatch?.index, ownMatch?.index].filter((value): value is number => value !== undefined),
-  )
-  if (!Number.isFinite(index)) return undefined
+  const sharedMatch = shared?.exec(normalized)
+  const ownMatch = own && own !== shared ? own.exec(normalized) : undefined
+  const candidates = [sharedMatch?.index, ownMatch?.index]
+    .filter((value): value is number => value !== undefined)
+  if (candidates.length === 0) return undefined
+  const index = Math.min(...candidates)
   const match = ownMatch && ownMatch.index === index ? ownMatch : sharedMatch
   if (!match) return undefined
   return { index, end: index + match[0].length }
