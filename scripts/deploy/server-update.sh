@@ -226,8 +226,8 @@ const UPSTREAM_CODES = [
   "qwen_ai_daily_quota_exhausted",
   "no_available_account",
   "CHAT_IN_PROGRESS",
-  // The probe's request is fixed and well-formed, so this 502 shape means the
-  // upstream answered the chat call with a non-stream body — the aliyun
+  // The probe sends one fixed and well-formed ping, so this 502 shape means
+  // the upstream answered the chat call with a non-stream body — the aliyun
   // IP-flag pattern (2026-10-14: every exit punished, rollbacks of a good
   // image blocked the harvest fix that could clear the flag).
   "Bad_Request",
