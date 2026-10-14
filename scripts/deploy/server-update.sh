@@ -231,6 +231,8 @@ const UPSTREAM_CODES = [
   // IP-flag pattern (2026-10-14: every exit punished, rollbacks of a good
   // image blocked the harvest fix that could clear the flag).
   "Bad_Request",
+  "qwen_ai_egress_waf_block",
+  "qwen_ai_upstream_http_rejection",
 ]
 
 const body = JSON.stringify({ model: "Qwen3.8-Max", messages: [{ role: "user", content: "ping" }], stream: false })
