@@ -67,6 +67,7 @@ def parse_args():
     p.add_argument("--account-id", default="")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--wait-seconds", type=int, default=75)
+    p.add_argument("--punish-url", default="", help="Optional aliyun punish URL to enter the captcha deliberately")
     return p.parse_args()
 
 
@@ -258,7 +259,7 @@ def parse_cookie_string(raw: str):
     return cookies
 
 
-def solve_challenge(token: str, cookie_string: str, headless: bool, wait_seconds: int) -> dict:
+def solve_challenge(token: str, cookie_string: str, headless: bool, wait_seconds: int, punish_url: str = "") -> dict:
     with sync_playwright() as pw:
         launch_args = {
             "headless": headless,
@@ -283,6 +284,21 @@ def solve_challenge(token: str, cookie_string: str, headless: bool, wait_seconds
         page.evaluate("(t) => { try { localStorage.setItem('token', t); } catch (e) {} }", token)
         page.reload(wait_until="domcontentloaded", timeout=60000)
         time.sleep(5)
+
+        # When the egress IP carries an aliyun risk flag, the API-shaped requests
+        # are punished while a real browser passes invisibly — so the organic
+        # login flow never encounters a slider and no x5sec is ever issued. A
+        # punish URL captured from a punished request drops this same browser
+        # straight into the baxia challenge, where solving it yields the x5sec
+        # the cookie-less API path needs (community/official-doc verified: a
+        # passed slider whitelists the client for ~30 minutes).
+        if punish_url:
+            print(f"Navigating to punish URL: {punish_url[:90]}...")
+            try:
+                page.goto(punish_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(3)
+            except Exception as error:
+                print(f"  punish navigation failed (continuing): {str(error)[:160]}")
 
         solved = False
         deadline = time.time() + wait_seconds
@@ -340,7 +356,13 @@ def main():
     args = parse_args()
     print("Qwen Risk Session Refresher")
     print(f"Token prefix: {args.token[:24]}...")
-    result = solve_challenge(args.token, args.cookies, headless=args.headless, wait_seconds=args.wait_seconds)
+    result = solve_challenge(
+        args.token,
+        args.cookies,
+        headless=args.headless,
+        wait_seconds=args.wait_seconds,
+        punish_url=(args.punish_url or "").strip(),
+    )
     result["account_id"] = args.account_id
     print("SUCCESS: risk session harvested")
     print(json.dumps(result, ensure_ascii=False))

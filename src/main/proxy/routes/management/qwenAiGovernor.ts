@@ -6,7 +6,7 @@ import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import { loadBalancer } from '../../loadbalancer'
 import { qwenAiRequestGovernor } from '../../qwenAiRequestGovernor'
 import { qwenAiSessionRepairService } from '../../qwenAiSessionRepair'
-import { refreshQwenAiRiskSession } from '../../adapters/qwen-risk-refresh'
+import { normalizeQwenAiPunishUrl, refreshQwenAiRiskSession } from '../../adapters/qwen-risk-refresh'
 import { getQwenAiRefreshFaultStatus } from '../../adapters/qwen-ai-token-refresh'
 import type {
   ManagementApiResponse,
@@ -132,7 +132,20 @@ router.post('/accounts/:accountId/refresh-risk-session', async (ctx: Context) =>
     } as ManagementApiResponse
     return
   }
-  const updated = await refreshQwenAiRiskSession(account)
+  // Optional punish URL: drops the solver straight into the baxia challenge.
+  // Without it a browser-shaped session usually passes invisibly and the
+  // harvest returns no x5sec, which cannot clear an exit-level IP flag.
+  const body = (ctx.request.body || {}) as { punishUrl?: unknown }
+  const punishUrl = normalizeQwenAiPunishUrl(body.punishUrl ?? ctx.query.punishUrl)
+  if ((body.punishUrl ?? ctx.query.punishUrl) && !punishUrl) {
+    ctx.status = 400
+    ctx.body = {
+      success: false,
+      error: { code: 'validation_error', message: 'punishUrl must be an https://chat.qwen.ai/ URL' },
+    } as ManagementApiResponse
+    return
+  }
+  const updated = await refreshQwenAiRiskSession(account, { punishUrl })
   if (!updated) {
     ctx.status = 502
     ctx.body = {

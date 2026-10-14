@@ -112,13 +112,40 @@ export function noteQwenAiRiskChallenge(account: Account, evidence?: string): vo
 }
 
 /**
+ * A punish URL the refresher should enter deliberately.
+ *
+ * When the egress IP carries an aliyun risk flag, API-shaped requests are
+ * punished while a real browser passes invisibly — the organic login flow then
+ * never sees a slider and the harvest returns `solved_slider:false` with no
+ * x5sec (observed 2026-10-14: all three exits flagged, harvests useless).
+ * Feeding a punish URL captured from an actually-punished request drops the
+ * solver straight into the baxia challenge, where a pass re-issues the x5sec
+ * the API path needs. Structural validation only: the URL must point at the
+ * Qwen host; anything else is rejected before it reaches the browser.
+ */
+export function normalizeQwenAiPunishUrl(raw: unknown): string | undefined {
+  const value = String(raw ?? '').trim()
+  if (!value) return undefined
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'chat.qwen.ai') return undefined
+    return parsed.toString()
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Run the browser-based refresher for one account and persist the harvested
  * cookies (x5sec family) plus token back into the store.
  */
-export async function refreshQwenAiRiskSession(account: Account): Promise<Account | null> {
+export async function refreshQwenAiRiskSession(
+  account: Account,
+  options: { punishUrl?: string } = {},
+): Promise<Account | null> {
   const existing = inFlight.get(account.id)
   if (existing) return existing
-  const operation = doRefresh(account)
+  const operation = doRefresh(account, options.punishUrl)
   inFlight.set(account.id, operation)
   try {
     return await operation
@@ -127,7 +154,7 @@ export async function refreshQwenAiRiskSession(account: Account): Promise<Accoun
   }
 }
 
-async function doRefresh(account: Account): Promise<Account | null> {
+async function doRefresh(account: Account, punishUrl?: string): Promise<Account | null> {
   const token = String(account.credentials.token || '').trim()
   if (!token) {
     console.error('[QwenAI Risk Refresh] account has no token:', account.id)
@@ -142,6 +169,9 @@ async function doRefresh(account: Account): Promise<Account | null> {
     '--headless',
     '--wait-seconds', '75',
   ]
+  if (punishUrl) {
+    args.push('--punish-url', punishUrl)
+  }
   return new Promise(resolve => {
     const pythonCmd = platform() === 'win32' ? 'python' : 'python3'
     execFile(pythonCmd, args, {
