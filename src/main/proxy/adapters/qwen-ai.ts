@@ -4439,6 +4439,28 @@ export class QwenAiAdapter {
       error.headers = sanitizeForwardedErrorHeaders(response.headers)
       return error
     }
+    // The WAF's second shape (measured 2026-10-14 on every flagged egress):
+    // the chat call is answered HTTP 200 with a JSON "Internal error" body
+    // while chat creation on a different endpoint succeeded. Fresh accounts
+    // and 16-byte payloads failed identically, so the shape tracks the
+    // egress, not the account or the content — classified here so the
+    // forwarder can park the egress instead of feeding the block more calls.
+    if (
+      response.status === 200
+      && contentType.includes('application/json')
+      && /internal error/i.test(body)
+    ) {
+      const error = new Error(
+        `Qwen AI upstream ${reason} (HTTP 200, application/json "Internal error"): `
+        + 'the egress WAF answered the chat call instead of the generation service.',
+      ) as QwenAiUpstreamError
+      error.status = 200
+      error.code = 'qwen_ai_egress_waf_block'
+      error.retryable = false
+      error.accountFault = false
+      error.headers = sanitizeForwardedErrorHeaders(response.headers)
+      return error
+    }
     const upstreamMessage = this.extractUpstreamErrorMessage(body)
     const detail = upstreamMessage ? `: ${upstreamMessage}` : ''
 

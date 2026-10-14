@@ -121,10 +121,12 @@ import {
   countQwenAiRiskCircuitFailures,
   createQwenAiRiskFingerprint,
   getQwenAiEgressCircuitEntry,
+  getQwenAiEgressWafBlock,
   getQwenAiRiskCircuitEntry,
   openQwenAiRiskCircuit,
   qwenAiRiskCircuitThreshold,
   recordQwenAiEgressRiskVerdict,
+  recordQwenAiEgressWafBlock,
 } from './qwenAiRiskCircuit'
 import {
   isWebshareProxyEnabled,
@@ -943,6 +945,20 @@ function createQwenAiRiskCircuitResult(
   }
 }
 
+function noteQwenAiEgressWafSignal(requestId: string, errorCode: string): void {
+  const entry = recordQwenAiEgressWafBlock(
+    errorCode === 'qwen_ai_upstream_http_rejection' ? 'http405' : 'internal_error_json',
+  )
+  if (entry) {
+    console.warn('[QwenAI] egress WAF block parked; pausing upstream traffic', JSON.stringify({
+      requestId,
+      until: new Date(entry.until).toISOString(),
+      cooldownMinutes: Math.round(entry.cooldownMs / 60000),
+      trips: entry.trips,
+    }))
+  }
+}
+
 function createQwenAiSharedRiskVerdictResult(startTime: number): ForwardResult {
   return {
     success: false,
@@ -951,6 +967,26 @@ function createQwenAiSharedRiskVerdictResult(startTime: number): ForwardResult {
     error: 'Qwen AI risk-control verdict was already terminal for this request.',
     retryable: false,
     accountFault: false,
+    latency: Math.max(0, Date.now() - startTime),
+  }
+}
+
+function createQwenAiEgressWafBlockResult(
+  entry: { until: number; cooldownMs: number },
+  startTime: number,
+): ForwardResult {
+  const retryAfterSeconds = Math.max(1, Math.ceil((entry.until - Date.now()) / 1000))
+  return {
+    success: false,
+    status: 503,
+    errorCode: 'qwen_ai_egress_waf_block',
+    error: `Qwen AI egress is WAF-blocked: the chat endpoint is answering this IP with a `
+      + `block page, so all accounts fail identically. Upstream traffic is paused for `
+      + `${Math.ceil(entry.cooldownMs / 60000)} minutes to let the flag decay; `
+      + `retry after ${retryAfterSeconds}s.`,
+    retryable: false,
+    accountFault: false,
+    headers: { 'Retry-After': String(retryAfterSeconds) },
     latency: Math.max(0, Date.now() - startTime),
   }
 }
@@ -1823,6 +1859,15 @@ export class RequestForwarder {
         }))
         return createQwenAiRiskCircuitResult(egressEntry, startTime)
       }
+      const wafBlock = getQwenAiEgressWafBlock()
+      if (wafBlock) {
+        console.warn('[QwenAI] egress WAF block active; request refused before pool dispatch', JSON.stringify({
+          requestId: context.requestId,
+          until: new Date(wafBlock.until).toISOString(),
+          cooldownMinutes: Math.round(wafBlock.cooldownMs / 60000),
+        }))
+        return createQwenAiEgressWafBlockResult(wafBlock, startTime)
+      }
     }
     const defaultManagedToolRecoveryOnly = recoverManagedToolStream
     const maxRetries = QwenAiAdapter.isQwenAiProvider(provider)
@@ -2605,6 +2650,12 @@ export class RequestForwarder {
         lastRetryScope = result.retryScope
         previousRecoveryHint = result.recoveryHint
 
+        if (isQwenAiProvider
+          && (lastErrorCode === 'qwen_ai_upstream_http_rejection'
+            || lastErrorCode === 'qwen_ai_egress_waf_block')) {
+          noteQwenAiEgressWafSignal(context.requestId, lastErrorCode)
+        }
+
         if (
           isQwenAiProvider
           && result.errorCode === 'qwen_ai_webshare_bandwidth_exhausted'
@@ -2828,6 +2879,11 @@ export class RequestForwarder {
         lastStatus = statusFromError(error)
         lastHeaders = headersFromError(error)
         lastErrorCode = errorCodeFromError(error)
+        if (isQwenAiProvider
+          && (lastErrorCode === 'qwen_ai_upstream_http_rejection'
+            || lastErrorCode === 'qwen_ai_egress_waf_block')) {
+          noteQwenAiEgressWafSignal(context.requestId, lastErrorCode)
+        }
         // Exception-path proxy accounting: a thrown adapter error still used
         // a proxy exit when the attempt was proxy-routed (observed 2026-09-09:
         // a dead pool endpoint surfaced as a thrown ECONNREFUSED from chat
@@ -3040,6 +3096,29 @@ export class RequestForwarder {
       // keeps route-level risk benches and the governor on the short
       // account-neutral path instead of the escalating risk ladder.
       lastAccountFault = false
+    } else if (
+      isQwenAiProvider
+      && (lastErrorCode === 'qwen_ai_upstream_http_rejection'
+        || lastErrorCode === 'qwen_ai_egress_waf_block')
+    ) {
+      const wafEntry = getQwenAiEgressWafBlock()
+      lastStatus = 503
+      lastErrorCode = 'qwen_ai_egress_waf_block'
+      const minutesLeft = wafEntry ? Math.max(1, Math.ceil((wafEntry.until - Date.now()) / 60000)) : 60
+      lastError = 'Qwen AI egress is WAF-blocked: the chat endpoint answers this IP with a '
+        + 'block page, so every account fails identically — the block tracks the IP, not '
+        + `the credentials or the content. Upstream traffic is paused for ~${minutesLeft} more `
+        + 'minutes to let the flag decay; retrying sooner re-arms it. New accounts, account '
+        + 'rotation, and proxy exits do not bypass this block.'
+      lastRetryable = false
+      lastRetryScope = undefined
+      lastAccountFault = false
+      if (wafEntry) {
+        lastHeaders = {
+          ...(lastHeaders || {}),
+          'Retry-After': String(Math.max(1, Math.ceil((wafEntry.until - Date.now()) / 1000))),
+        }
+      }
     } else if (
       isQwenAiProvider
       && lastErrorCode === 'qwen_ai_webshare_bandwidth_exhausted'

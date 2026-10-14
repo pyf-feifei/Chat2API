@@ -301,4 +301,101 @@ export function resetQwenAiRiskCircuit(): void {
   egressEntry = undefined
   egressVerdictTimestamps = []
   egressVerdictFingerprints.length = 0
+  resetQwenAiEgressWafBlock()
+}
+
+/* ------------------------------------------------------------------ *
+ * Egress WAF-block ledger
+ *
+ * The 2026-10-14 outage ran undetected for ~8 hours because the proxy had
+ * no idea the egress was WAF-blocked: the chat endpoint answered proxied
+ * calls with HTTP 200 + a JSON "Internal error" body (and bare probes with
+ * a 405 page), every account — including freshly registered ones — failed
+ * identically, and each failed call kept re-confirming the flag. This
+ * ledger parks the whole egress the moment the block shape is recognized,
+ * refusing requests at the door until the cooldown lapses, so the IP gets
+ * the quiet it needs to decay instead of more traffic that re-arms it.
+ * ------------------------------------------------------------------ */
+
+const DEFAULT_WAF_COOLDOWN_MS = 60 * 60 * 1000
+const DEFAULT_WAF_MAX_COOLDOWN_MS = 6 * 60 * 60 * 1000
+const WAF_STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000
+// An HTTP 405 block page is unambiguous (weight 2 parks at once); the 200
+// JSON "Internal error" shape alone needs a confirming second strike so a
+// genuine upstream glitch cannot park a healthy egress by itself.
+const WAF_PARK_THRESHOLD = 2
+
+export interface QwenAiEgressWafBlockEntry {
+  until: number
+  openedAt: number
+  cooldownMs: number
+  strikes: number
+  trips: number
+}
+
+let wafEntry: QwenAiEgressWafBlockEntry | undefined
+let wafStrikes: Array<{ at: number; weight: number }> = []
+
+export function qwenAiWafBlockCooldownMs(): number {
+  return boundedEnvNumber(
+    'CHAT2API_QWEN_AI_WAF_BLOCK_COOLDOWN_MS',
+    DEFAULT_WAF_COOLDOWN_MS,
+    60_000,
+    24 * 60 * 60 * 1000,
+  )
+}
+
+export function qwenAiWafBlockMaxCooldownMs(): number {
+  return boundedEnvNumber(
+    'CHAT2API_QWEN_AI_WAF_BLOCK_MAX_COOLDOWN_MS',
+    DEFAULT_WAF_MAX_COOLDOWN_MS,
+    60_000,
+    24 * 60 * 60 * 1000,
+  )
+}
+
+export type QwenAiEgressWafBlockKind = 'http405' | 'internal_error_json'
+
+/**
+ * Record one WAF-class chat failure. Returns the active block entry once
+ * enough strike weight accumulated, undefined while the egress is still
+ * considered healthy.
+ */
+export function recordQwenAiEgressWafBlock(
+  kind: QwenAiEgressWafBlockKind,
+  now = Date.now(),
+): QwenAiEgressWafBlockEntry | undefined {
+  wafStrikes = wafStrikes.filter((strike) => now - strike.at <= WAF_STRIKE_WINDOW_MS)
+  wafStrikes.push({ at: now, weight: kind === 'http405' ? 2 : 1 })
+  const weight = wafStrikes.reduce((sum, strike) => sum + strike.weight, 0)
+  if (weight < WAF_PARK_THRESHOLD) return undefined
+  const trips = (wafEntry?.trips ?? 0) + 1
+  const cooldownMs = Math.min(
+    qwenAiWafBlockMaxCooldownMs(),
+    qwenAiWafBlockCooldownMs() * 2 ** Math.min(8, trips - 1),
+  )
+  wafEntry = {
+    until: now + cooldownMs,
+    openedAt: now,
+    cooldownMs,
+    strikes: weight,
+    trips,
+  }
+  return { ...wafEntry }
+}
+
+/** Active WAF block, or undefined when the egress is considered healthy. */
+export function getQwenAiEgressWafBlock(now = Date.now()): QwenAiEgressWafBlockEntry | undefined {
+  if (!wafEntry) return undefined
+  if (wafEntry.until <= now) {
+    wafEntry = undefined
+    wafStrikes = []
+    return undefined
+  }
+  return { ...wafEntry }
+}
+
+export function resetQwenAiEgressWafBlock(): void {
+  wafEntry = undefined
+  wafStrikes = []
 }
