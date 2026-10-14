@@ -118,6 +118,7 @@ import {
 import {
   clearQwenAiEgressCircuit,
   clearQwenAiRiskCircuit,
+  countQwenAiRiskCircuitFailures,
   createQwenAiRiskFingerprint,
   getQwenAiEgressCircuitEntry,
   getQwenAiRiskCircuitEntry,
@@ -847,6 +848,30 @@ function qwenAiVerdictPacedRetryDelayMs(index: number): number {
     60 * 60 * 1000,
   )
   return Math.min(maxMs, baseMs * (2 ** Math.min(20, Math.max(0, index))))
+}
+
+/**
+ * Prior full-ladder failures on the same request fingerprint after which a
+ * repeat stops re-walking the ladder — no paced same-request retries, no
+ * Webshare exit escalation — and gives up on the first verdict.
+ *
+ * The full ladder is the right shape the first time a payload is judged: the
+ * verdict can be transient (a byte-identical replay succeeded about an hour
+ * later, measured 2026-09-29), and pacing one probe per window waits that out
+ * without dropping the client's turn. It is the wrong shape for a *repeat* of
+ * an already-judged payload: the client's reconnect loop then re-walks the
+ * whole ladder every time, and neither the paced waits nor the Webshare exits
+ * have ever produced a success the first ladder had not already tried.
+ * Observed 2026-10-14: a reconnect loop round-robined over three backends kept
+ * each process below the blocking threshold, and every reconnect spent ~9
+ * minutes plus five Webshare exits re-proving a verdict that was already
+ * on record. One quick probe per repeat still rotates to a fresh account, so
+ * per-account alternation keeps its chance; only the burst is removed.
+ *
+ * 0 restores the full ladder on every repeat.
+ */
+function qwenAiVerdictRepeatFastFailFromEnv(): number {
+  return boundedIntegerFromEnv('CHAT2API_QWEN_AI_VERDICT_REPEAT_FAST_FAIL', 1, 0, 10_000)
 }
 
 /**
@@ -1777,6 +1802,14 @@ export class RequestForwarder {
         return createQwenAiRiskCircuitResult(circuitEntry, startTime)
       }
     }
+    // Verdicts already on record for this exact payload, even below the
+    // blocking threshold. Captured before any upstream work so this request's
+    // own verdict cannot inflate the count mid-flight; the retry scheduler
+    // reads it to give a repeat one quick probe instead of the full ladder
+    // (see qwenAiVerdictRepeatFastFailFromEnv).
+    const qwenAiPriorVerdictFailures = qwenAiRiskFingerprint
+      ? countQwenAiRiskCircuitFailures(qwenAiRiskFingerprint)
+      : 0
     if (QwenAiAdapter.isQwenAiProvider(provider)) {
       // A bxpunish/RGV587 verdict is decided by the egress path, not by one
       // payload, so the per-fingerprint circuit above cannot protect the rest
@@ -1866,6 +1899,7 @@ export class RequestForwarder {
     let standardRetriesUsed = 0
     let qwenAiBusyRetries = 0
     let qwenAiVerdictPacedRetries = 0
+    let repeatVerdictLadderNoteLogged = false
     let qwenAiCapacityBackoffExceedsDeadline = false
     // Document-pipeline escape phases: parse/upload failure first downgrades
     // to locked inline on the same account; only if that inline retry is
@@ -2020,6 +2054,21 @@ export class RequestForwarder {
       // extra escalation beyond the exit budget so a different pool key can
       // retest before give-up.
       const verdictProxyExitMax = qwenAiVerdictProxyExitMaxFromEnv()
+      // A repeat of an already-judged payload gets one quick probe instead of
+      // the ladder: no Webshare exit escalation, no paced same-request retries.
+      // The first request still walks the full ladder — that walk is what puts
+      // the fingerprint on record (see qwenAiVerdictRepeatFastFailFromEnv).
+      const repeatFastFailThreshold = qwenAiVerdictRepeatFastFailFromEnv()
+      const repeatFastFailActive = repeatFastFailThreshold > 0
+        && qwenAiPriorVerdictFailures >= repeatFastFailThreshold
+      if (repeatFastFailActive && directExitRiskControlled && !repeatVerdictLadderNoteLogged) {
+        repeatVerdictLadderNoteLogged = true
+        console.warn('[QwenAI] repeat of an already-judged payload — skipping the verdict ladder', JSON.stringify({
+          requestId: context.requestId,
+          fingerprint: qwenAiRiskFingerprint?.slice(0, 12),
+          priorVerdictFailures: qwenAiPriorVerdictFailures,
+        }))
+      }
       if (directExitRiskControlled) {
         if (getQwenAiWebshareProxy() && qwenAiEgressRecoveryState) {
           const verdictExits = (qwenAiEgressRecoveryState.webshareVerdictExits ?? 0) + 1
@@ -2030,7 +2079,8 @@ export class RequestForwarder {
         }
         const bandwidthSpentOneExtra = qwenAiEgressRecoveryState?.webshareBandwidthExhausted === true
           && getQwenAiWebshareRetries() < verdictProxyExitMax + 1
-        const canEscalateVerdictToWebshare = isWebshareProxyEnabled()
+        const canEscalateVerdictToWebshare = !repeatFastFailActive
+          && isWebshareProxyEnabled()
           && !qwenAiEgressRecoveryState?.webshareVerdictSeen
           && (getQwenAiWebshareRetries() < verdictProxyExitMax || bandwidthSpentOneExtra)
           && !context.signal?.aborted
@@ -2039,7 +2089,9 @@ export class RequestForwarder {
           // No other egress can retest the verdict, but time still can: keep
           // the client's stream open and probe again after a spaced wait
           // instead of refusing the turn (see qwenAiVerdictPacedRetryCountFromEnv).
-          const pacedRetryLimit = qwenAiVerdictPacedRetryCountFromEnv()
+          const pacedRetryLimit = repeatFastFailActive
+            ? 0
+            : qwenAiVerdictPacedRetryCountFromEnv()
           const pacedDelayMs = qwenAiVerdictPacedRetryDelayMs(qwenAiVerdictPacedRetries)
           if (
             qwenAiVerdictPacedRetries < pacedRetryLimit
@@ -2974,8 +3026,12 @@ export class RequestForwarder {
         + webshareNote
         + 'The upstream did not say the egress is at fault: it judges the request '
         + 'payload, so the transcript contents are the first thing to check. '
-        + 'Repeating the identical request is blocked by a per-payload circuit; '
-        + 'rephrase the task, trim the transcript, or start a new session. '
+        + 'A repeat of this exact request gets one quick probe, and further '
+        + 'immediate replays are stopped by a per-payload circuit. The verdict '
+        + 'itself can be temporary (a byte-identical replay has succeeded about '
+        + 'an hour later), so a retry after a pause is reasonable; if it still '
+        + 'persists, rephrase the task, trim the transcript, or start a new '
+        + 'session. '
         + 'Before changing network settings, confirm the egress is actually '
         + 'involved by checking whether unrelated requests still succeed. '
       lastRetryable = false

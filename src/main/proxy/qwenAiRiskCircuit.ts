@@ -118,6 +118,26 @@ export function getQwenAiRiskCircuitEntry(
   return { ...entry }
 }
 
+/**
+ * Verdict failures already recorded for this fingerprint, including when the
+ * count is still below the blocking threshold.
+ *
+ * The blocking view above only fires once `threshold` requests have each walked
+ * the full verdict ladder. A client reconnect loop that spreads identical
+ * replays across restarts longer than the cooldown — or across several proxy
+ * processes behind one load balancer — keeps every process at one failure, so
+ * every replay re-walks the whole ladder. Callers use this count to shrink the
+ * ladder for a payload that has already been judged once, before the threshold
+ * ever trips. Observed 2026-10-14: one Codex session's reconnects were
+ * round-robined over three backends, and each reconnect spent ~9 minutes on
+ * paced retries plus five Webshare exits for a verdict that every one of them
+ * had already reproduced.
+ */
+export function countQwenAiRiskCircuitFailures(fingerprint: string, now = Date.now()): number {
+  prune(now)
+  return entries.get(fingerprint)?.failures ?? 0
+}
+
 export function openQwenAiRiskCircuit(
   fingerprint: string,
   details: { reason?: string; now?: number } = {},
