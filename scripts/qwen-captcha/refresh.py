@@ -28,9 +28,10 @@ import numpy as np
 from patchright.sync_api import sync_playwright
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter
 except ImportError:
     Image = None
+    ImageFilter = None
 
 CHROME_PATH = os.environ.get("CHROME_PATH", "")
 for candidate in [
@@ -58,6 +59,11 @@ ARTIFACT_DIR = os.environ.get("QWEN_CAPTCHA_ARTIFACT_DIR") or "/tmp/qwen-captcha
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 RISK_MARKERS = ("RGV587", "FAIL_SYS_USER_VALIDATE", "punish", "x5sec", "被挤爆", "请稍后重试")
+
+# Artifact dump tag, updated per solver attempt so late attempts cannot
+# overwrite a live captcha's diagnostics with post-crash states.
+CAPTURE_TAG = ["run"]
+RUN_COUNTER = [0]
 
 
 def parse_args():
@@ -232,6 +238,253 @@ def slider_locator(page):
     return None, None
 
 
+# ---------------------------------------------------------------- #
+# Icon-connect captcha ("Please connect them in order")
+#
+# The aliyun baxia widget renders the question strip as
+# #connect-question-canvas (355x48, four symbols) and the choices as
+# #connect-grid-0..#connect-grid-8 (nine 117x117 canvases). Everything is
+# same-origin canvas, so element screenshots give clean per-tile pixels.
+# The symbols are the same line drawings at different scales over a
+# speckle-texture wash: median-filter away the speckle, threshold the
+# stroke mass, crop, normalize, and match strip-to-grid by normalized
+# cross-correlation. Clicks go through the patchright-driven mouse with
+# human-ish pacing.
+# ---------------------------------------------------------------- #
+
+CONNECT_CONTAINER = ".connect-captcha-container"
+CONNECT_QUESTION = "#connect-question-canvas"
+CONNECT_GRID = "#connect-grid-{index}"
+CONNECT_REFRESH = "#connect-refresh"
+
+
+def connect_captcha_visible(page) -> bool:
+    try:
+        return page.locator(CONNECT_CONTAINER).count() > 0
+    except Exception:
+        return False
+
+
+def _glyph_mask(image):
+    """Unified stroke-mask pipeline shared by strip and grid glyphs.
+
+    Representing both sides identically (binary opened mask) matters more
+    than any per-side tuning: normalized cross-correlation degrades fast
+    when one side is binary and the other is continuous ink (measured
+    2026-10-14: same-glyph pairs scored 0.1-0.3 mixed with non-pairs).
+    """
+    smoothed = image.filter(ImageFilter.MedianFilter(3))
+    gray = np.asarray(smoothed, dtype=np.float32)
+    low = float(np.percentile(gray, 3))
+    high = float(np.percentile(gray, 97))
+    if high - low < 8:
+        return None
+    dark = (gray < low + (high - low) * 0.5).astype(np.uint8) * 255
+    opened = Image.fromarray(dark).filter(ImageFilter.MinFilter(3)).filter(
+        ImageFilter.MaxFilter(3))
+    mask = np.asarray(opened, dtype=np.float32) / 255.0
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 60:
+        return None
+    return mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
+def tile_png_mask(page, selector: str):
+    """Element screenshot -> (unified stroke mask, centroid in cell)."""
+    locator = page.locator(selector)
+    if locator.count() == 0:
+        return None
+    png = locator.screenshot()
+    image = Image.open(io.BytesIO(png)).convert("L")
+    mask = _glyph_mask(image)
+    if mask is None:
+        return None
+    ys, xs = np.where(mask > 0)
+    centroid = (float(xs.min() + xs.max()) / 2.0, float(ys.min() + ys.max()) / 2.0)
+    return mask, centroid
+
+
+def normalized(mask, size: int = 48) -> np.ndarray:
+    image = Image.fromarray((np.clip(mask, 0, 1) * 255).astype("uint8")).resize(
+        (size, size), Image.LANCZOS)
+    out = np.asarray(image.filter(ImageFilter.GaussianBlur(1.2)), dtype=np.float32) / 255.0
+    out -= out.mean()
+    norm = float(np.sqrt((out * out).sum()))
+    return out / norm if norm > 0 else out
+
+
+def similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float((a * b).sum())
+
+
+def _strip_ink_map(page):
+    """Unified glyph masks for the question strip, split by column gaps."""
+    locator = page.locator(CONNECT_QUESTION)
+    if locator.count() == 0:
+        return None
+    png = locator.screenshot()
+    image = Image.open(io.BytesIO(png)).convert("L")
+    smoothed = image.filter(ImageFilter.MedianFilter(3))
+    gray = np.asarray(smoothed, dtype=np.float32)
+    low = float(np.percentile(gray, 3))
+    high = float(np.percentile(gray, 97))
+    if high - low < 8:
+        return None
+    dark = (gray < low + (high - low) * 0.5).astype(np.uint8) * 255
+    opened = Image.fromarray(dark).filter(ImageFilter.MinFilter(3)).filter(
+        ImageFilter.MaxFilter(3))
+    mask = np.asarray(opened, dtype=np.float32) / 255.0
+    try:
+        tag = CAPTURE_TAG[0]
+        image.save(os.path.join(ARTIFACT_DIR, f"strip-native-{tag}.png"))
+        Image.fromarray(mask.astype("uint8")).save(
+            os.path.join(ARTIFACT_DIR, f"strip-mask-{tag}.png"))
+    except Exception:
+        pass
+    return mask
+
+
+def segment_strip(page) -> list:
+    """Split the question strip into per-symbol stroke masks by column gaps."""
+    ink = _strip_ink_map(page)
+    if ink is None:
+        return []
+    # The strip lays out 3-5 symbols of roughly even width; walk the column
+    # profile and keep runs where strokes exist, then require the run to look
+    # like a glyph (wide enough, enough stroke pixels) rather than residue.
+    height = float(ink.shape[0])
+    column_ink = ink.sum(axis=0) / height
+    profile = np.convolve(column_ink, np.ones(3) / 3.0, mode="same")
+    active = profile > 0.10
+    segments = []
+    start = None
+    for index, flag in enumerate(active):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            segments.append((start, index))
+            start = None
+    if start is not None:
+        segments.append((start, len(active)))
+    merged = []
+    for seg in segments:
+        if merged and seg[0] - merged[-1][1] < 5:
+            merged[-1] = (merged[-1][0], seg[1])
+        else:
+            merged.append(seg)
+    masks = []
+    for left, right in merged:
+        if right - left < 12:
+            continue
+        block = ink[:, left:right]
+        ys, xs = np.where(block > 0)
+        if len(xs) < 90:
+            continue
+        masks.append(block[ys.min():ys.max() + 1, xs.min():xs.max() + 1])
+    return masks
+
+
+def human_click(page, x: float, y: float) -> None:
+    page.mouse.move(
+        x - random.randint(24, 48), y - random.randint(30, 55),
+        steps=random.randint(6, 12),
+    )
+    time.sleep(random.uniform(0.08, 0.2))
+    page.mouse.move(x + random.randint(-2, 2), y + random.randint(-2, 2),
+                    steps=random.randint(8, 16))
+    time.sleep(random.uniform(0.15, 0.4))
+    page.mouse.down()
+    time.sleep(random.uniform(0.04, 0.12))
+    page.mouse.up()
+
+
+def solve_connect_captcha(page, max_attempts: int = 4, run_no: int = 1) -> bool:
+    """Match the strip symbols to grid cells and connect them in order."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # The strip paints progressively right after the widget renders;
+            # acting on a half-drawn strip yields garbage segments (measured:
+            # 9 fragment segments at t=0 vs 4 clean segments a second later).
+            stable = None
+            for _ in range(8):
+                masks_now = segment_strip(page)
+                signature = tuple(round(float(m.sum()), 1) for m in masks_now)
+                if 3 <= len(masks_now) <= 6 and signature == stable:
+                    strip_masks = [normalized(m) for m in masks_now]
+                    break
+                stable = signature
+                time.sleep(0.8)
+            else:
+                strip_masks = []
+            try:
+                page.locator(CONNECT_QUESTION).screenshot(
+                    path=os.path.join(ARTIFACT_DIR, f"strip-attempt-{attempt}.png"))
+            except Exception:
+                pass
+            if not strip_masks:
+                strip_masks = [normalized(m) for m in segment_strip(page)]
+            grid_tiles = []
+            for index in range(9):
+                selector = CONNECT_GRID.format(index=index)
+                tile = tile_png_mask(page, selector)
+                box = page.locator(selector).bounding_box()
+                if tile is None or box is None:
+                    continue
+                mask, centroid = tile
+                grid_tiles.append((index, normalized(mask), box, centroid))
+                try:
+                    page.locator(selector).screenshot(
+                        path=os.path.join(ARTIFACT_DIR,
+                                          f"grid-{CAPTURE_TAG[0]}-{index}.png"))
+                except Exception:
+                    pass
+            if not strip_masks or len(grid_tiles) < len(strip_masks):
+                print(f"  connect attempt {attempt}: strip={len(strip_masks)} grid={len(grid_tiles)}, too few tiles")
+                time.sleep(1.5)
+                continue
+            order = []
+            used = set()
+            for strip_mask in strip_masks:
+                best = None
+                for index, grid_mask, box, centroid in grid_tiles:
+                    if index in used:
+                        continue
+                    score = similarity(strip_mask, grid_mask)
+                    if best is None or score > best[0]:
+                        best = (score, index, box, centroid)
+                if best is None:
+                    break
+                used.add(best[1])
+                order.append(best)
+            print(f"  connect attempt {attempt}: strip={len(strip_masks)} matched "
+                  f"{[(round(s, 3), i) for s, i, _, _ in order]}")
+            if len(order) < len(strip_masks):
+                time.sleep(1.5)
+                continue
+            for _, _, box, centroid in order:
+                human_click(page, box["x"] + centroid[0], box["y"] + centroid[1])
+                time.sleep(random.uniform(0.25, 0.6))
+            time.sleep(2.5)
+            if not connect_captcha_visible(page):
+                print("  connect captcha accepted")
+                return True
+            print("  connect captcha still up after clicks")
+        except Exception as error:
+            print(f"  connect attempt {attempt} failed: {str(error)[:160]}")
+        refresh_box = None
+        try:
+            refresh_locator = page.locator(CONNECT_REFRESH)
+            if refresh_locator.count() > 0:
+                refresh_box = refresh_locator.bounding_box()
+        except Exception:
+            refresh_box = None
+        if refresh_box:
+            human_click(page, refresh_box["x"] + refresh_box["width"] / 2,
+                        refresh_box["y"] + refresh_box["height"] / 2)
+        time.sleep(2)
+    return False
+
+
 def page_looks_risky(page) -> bool:
     try:
         url = (page.url or "").lower()
@@ -319,7 +572,16 @@ def solve_challenge(token: str, cookie_string: str, headless: bool, wait_seconds
                     except Exception:
                         pass
                     time.sleep(2)
-            if solved and not slider_locator(page)[1]:
+            elif Image is not None and connect_captcha_visible(page):
+                print("Icon-connect captcha visible, solving...")
+                RUN_COUNTER[0] += 1
+                if solve_connect_captcha(page, run_no=RUN_COUNTER[0]):
+                    solved = True
+                try:
+                    page.screenshot(path=os.path.join(ARTIFACT_DIR, "connect-after.png"))
+                except Exception:
+                    pass
+            if solved and not slider_locator(page)[1] and not connect_captcha_visible(page):
                 break
             time.sleep(0.8)
 
