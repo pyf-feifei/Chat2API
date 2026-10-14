@@ -80,6 +80,28 @@ function nextCallId(): string {
 }
 
 /**
+ * Drop the internal `rawText` before a call reaches the client.
+ *
+ * `rawText` is the matched protocol block the parsers cut out of the delivered
+ * prose (`utils/toolParser.ts`, `utils/streamToolHandler.ts`); it has no place
+ * in the wire shape. OpenAI's tool-call schema has no such field, so leaving it
+ * in echoes model-generated protocol text back to the client and invites it to
+ * depend on a Chat2API-internal key. The streaming path already strips it in
+ * `ToolStreamParser.createToolCallChunk`; this is the non-streaming counterpart,
+ * and it is applied here because this module is the one place every
+ * client-facing call passes through (`ToolCallingEngine.applyNonStreamResponse`
+ * assigns these verbatim to `message.tool_calls`).
+ *
+ * The proxy-internal records in `local` keep their fields untouched: only what
+ * crosses the boundary is narrowed.
+ */
+function toClientFacingToolCall(call: NormalizedToolCall, id: string): NormalizedToolCall {
+  if (call.rawText === undefined) return { ...call, id }
+  const { rawText: _rawText, ...rest } = call
+  return { ...rest, id }
+}
+
+/**
  * Partition a parsed response's calls into client-owned and proxy-internal.
  *
  * With no active context this is a pass-through, which is what keeps every
@@ -94,7 +116,7 @@ export function partitionLocalToolCalls(input: LocalResolutionInput): LocalResol
     // No context, or nothing local: the existing id assignment applies unchanged.
     const prefix = nextCallId()
     return {
-      clientCalls: toolCalls.map((call, index) => ({ ...call, id: `${prefix}_${index}` })),
+      clientCalls: toolCalls.map((call, index) => toClientFacingToolCall(call, `${prefix}_${index}`)),
       local: [],
     }
   }
@@ -105,7 +127,7 @@ export function partitionLocalToolCalls(input: LocalResolutionInput): LocalResol
   for (const call of toolCalls) {
     const id = nextCallId()
     if (!isRetrievalToolName(call.name)) {
-      clientCalls.push({ ...call, id })
+      clientCalls.push(toClientFacingToolCall(call, id))
       continue
     }
 
@@ -121,7 +143,7 @@ export function partitionLocalToolCalls(input: LocalResolutionInput): LocalResol
       // Defensive and currently unreachable: `isRetrievalToolName` already
       // matched. Handing it to the client is the safe failure, because the
       // alternative is the call vanishing from a response the model produced.
-      clientCalls.push({ ...call, id })
+      clientCalls.push(toClientFacingToolCall(call, id))
       continue
     }
     context.used += 1
