@@ -170,6 +170,13 @@ const DEFAULT_HEADERS = {
   'Sec-Fetch-Site': 'same-origin',
   Version: '0.2.67',
   Origin: 'https://chat.qwen.ai',
+  // The webapp sends X-FE-Version on every API call. Without it the chat
+  // endpoint lands in a third response class — HTTP 200 + JSON "Internal
+  // error" — measured 2026-10-15: the exact same egress and account got the
+  // solvable RGV587 challenge envelope with this header present and the
+  // dead-end Internal-error body without it. Overridable because the value
+  // tracks the site's frontend deploy.
+  'X-FE-Version': process.env.CHAT2API_QWEN_AI_X_FE_VERSION || 'prod-fe-1.0.93',
 }
 
 /**
