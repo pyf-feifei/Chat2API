@@ -10,7 +10,11 @@
 
 ## 默认模型
 
-内置默认模型使用当前 Qwen AI 官方模型清单。`Qwen3.8-Max` 会映射到 `qwen3.8-max`，默认使用 Thinking 模式：`thinking_enabled: true`、`auto_thinking: false`；Preview 模型仅在客户端明确选择对应名称时使用。
+下表是内置离线兜底列表；实际列表还会合并官网 `/api/v2/models/` 返回的模型。桌面和服务端启动时同步，代理运行期间每 5 分钟自动刷新；失败保留上次成功结果，后台刷新不阻塞对话。`CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS` 可调整间隔（毫秒，`0` 关闭定时刷新）；供应商管理中的更新模型按钮仍可手动刷新。
+
+2026-11-11 实测接口已返回 `Qwen4-Max-Preview` → `qwen4.0-max-preview`，支持 1,000,000 上下文、131,072 摘要生成长度，`think_skip.enable=false`（思考不可跳过）。动态模型及能力会进入服务模型列表，无需手写内置模型；不会把已有 `Qwen3.8-Max` 请求擅自切到 Qwen4。
+
+`Qwen3.8-Max` 映射到 `qwen3.8-max`，无 effort 时默认 Auto；客户端明确选择 Preview 才使用该 Preview 模型。
 
 | 显示名称 | 实际模型 ID |
 | --- | --- |
@@ -21,11 +25,13 @@
 | Qwen3.7-Plus | qwen3.7-plus |
 | Qwen3.7-Max | qwen3.7-max |
 
-`Qwen3.8-Max` 模式名称会优先于客户端传入的 `reasoning_effort` / `enable_thinking`：
+所有 Qwen 模型（显示名称和上游 ID）均支持大小写不敏感的 `_Fast`、`_Think`、`_Thinking`、`_Auto` 后缀。例如 `qwen4.0-max-preview_FAST`、`Qwen4-Max-Preview_think`、`Qwen3.7-Plus_auto`。后缀在请求上游前移除，分别发送 `thinking_mode: Fast / Thinking / Auto` 及相应布尔开关；动态目录为每个模型生成模式别名。
+
+`_Fast` / `_Think` / `_Thinking` 固定模式并优先于客户端 effort，也不会被 `think_skip` 元数据静默覆盖；上游是否实际执行该模式仍由其响应决定，代理不隐藏或伪造思考输出。裸模型保留原有默认策略，`_Auto` 允许 `reasoning_effort` 决定模式。无 effort 时：
 
 | 模型名 | thinking_enabled | auto_thinking |
 | --- | --- | --- |
-| Qwen3.8-Max | true | false |
+| Qwen3.8-Max | true | true |
 | Qwen3.8-Max_Fast | false | false |
 | Qwen3.8-Max_Auto | true | true |
 | Qwen3.8-Max_Thinking | true | false |
@@ -56,6 +62,22 @@
 | Qwen3-VL-235B-A22B | qwen3-vl-plus | 多模态 |
 | Qwen3-Omni-Flash | qwen3-omni-flash-2025-12-01 | Omni |
 | Qwen2.5-Max | qwen-max-latest | 低版本 |
+
+## 浏览器验证条与风险会话恢复
+
+`scripts/qwen-captcha/refresh.py` 区分三种页面控件：Baxia 的整条右拖验证条（`nc_*` / `.btn_slide`，包含 iframe）、拼图滑块（`aliyunCaptcha-*` 和 `puzzle-captcha-*` 两种 DOM，后者的裁剪拼图需要 CSS 纵坐标偏移）、图标连线。验证交互最多尝试 3 轮。浏览器应复用该账号自己的凭据，隔离上下文；现代 `access_token` 不写入 `token=` Cookie。
+
+首次检测到验证信号即启动全局 single-flight 恢复；两次启动至少间隔 60 秒，冷却期内的新挑战会共享延迟恢复 Promise，等剩余冷却结束再认证，不再直接跳过恢复。当前请求重试前等待该恢复结束，并从 store 重新读取凭据，避免重放旧 Cookie。认证刷新被 WAF 暂停时先尝试同账号的浏览器恢复（有保存登录信息时可重新登录），失败才返回 HTTP 503 + `Retry-After`；已开始的 Responses 流将等待时间转换为 Codex 可识别的退避事件。密码重新登录会清除旧 `token=` Cookie，再合并本次登录响应，避免旧 Cookie 覆盖新 Bearer 凭据。创建会话在令牌刷新后仍返回 `Unauthorized` 时，会在同一请求内尝试浏览器重新认证再重试一次；认证仍未完成则返回 `qwen_ai_session_reauthentication_required` + HTTP 503 / `Retry-After`，而不是通用 `no chat ID returned`。
+
+恢复成功必须满足：验证控件消失，并且同一浏览器内的新探测消息收到带随机标记的真实回复。仅拖动完成、采集到 Cookie 或已有历史回复，都不视为成功；上游认证返回 `success:false` 时立即停止，保持原凭据不变。需要年龄确认时只尝试关闭遮罩，不填写出生年份或提交账号设置。也会关闭已知的 Qwen 新版本介绍弹窗（例如 `Qwen4-Max is now in preview`）；欢迎、年龄与版本介绍可能先后出现，最多关闭 3 次，未知弹窗不自动点击。探针失败会记录布尔状态与计数（是否发送、是否仍有遮罩、认证是否被拒等），不记录页面正文、凭据或原始子进程 stderr。如果页面既未发送探针、也无活动挑战，即使没有捕获到认证拒绝响应，仍允许用已保存登录信息重新登录一次；已发送但无回复或挑战仍在时不触发该兜底。
+
+- 桌面默认使用有窗口浏览器；Linux 无 `DISPLAY` 时请求 headless，但安装了 Xvfb 时优先启动独立虚拟显示、使用有窗口 Chromium，并在退出时回收显示进程。同账号对照中 headless 登录拼图连续被拒而 Xvfb 成功。`QWEN_CAPTCHA_XVFB=0` 可关闭该优先路径；`QWEN_CAPTCHA_HEADLESS=0` / `1` 控制基础浏览器模式。
+- `CHROME_PATH` 指定浏览器；Windows 也会查找已安装的 Chrome。
+- `QWEN_CAPTCHA_ARTIFACT_DIR` 指定诊断截图根目录，默认系统临时目录中的 `qwen-captcha`；服务为每次恢复创建独立 UUID 子目录，失败日志包含目录及白名单阶段名，异常关闭浏览器前保存 `failure.png`（截图可能包含会话内容，仅本地保留）。
+- 登录页可能自动重定向到已登录首页，包括填写邮箱后的异步跳转。恢复脚本识别可见聊天输入框与本地 token，不再等待不存在的密码按钮；该判断仅跳过重复登录，仍需全新的随机标记回复才写回凭据。默认浏览器探针使用网页当前模型，基础会话恢复成功不代表指定 Qwen4 Fast 长工具请求已通过。
+- 手动管理入口：`POST /v0/management/qwen-ai-governor/accounts/:accountId/refresh-risk-session`；可选 body `{ "punishUrl": "https://chat.qwen.ai/…" }`。只有验证成功才持久化凭据；此入口可能向其他账号传播新产生的非身份风险 Cookie，诊断时先用脚本单账号运行，不调用批量回写路径。
+
+本地回归：`python tests/server/qwen-captcha-slider.test.py`（真实 Chrome、本地页面，无上游请求）；`node --test tests/server/qwen-ai-risk-refresh-verdict.test.mjs`（结果判定与持久化门控）。测试文件位于本地工作副本，按仓库约定不强制加入 Git。
 
 ## 超长会话传输
 
@@ -145,7 +167,7 @@ WEBSHARE_PROXY_URL=http://user:pass@proxy.webshare.io:8080
 
 ## 同会话语义续写耗尽后的全新会话升级
 
-managed tool calling 中，模型偶尔会在工具循环进行到一半时输出"叙事性"文本（说明它打算做什么）而不是工具调用（dangling answer）。代理会先在同一会话里发送 workflow continuation 提示要求它给出真正的工具调用；若续写分支本身仍是 dangling answer（同会话预算 `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` 默认 1 次已耗尽），代理会升级为：
+managed tool calling 中，模型偶尔会在工具循环进行到一半时输出"叙事性"文本（说明它打算做什么）而不是工具调用（dangling answer）。代理会先在同一会话里发送 workflow continuation 提示要求它给出真正的工具调用；若续写分支本身仍是 dangling answer（同会话预算 `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` 默认 2 次已耗尽），或者续写遇到 `CHAT_IN_PROGRESS` 且恢复接口确认对应响应已结束／无数据帧，代理会升级为（死会话不再消耗剩余同会话续写次数）：
 
 - 在**同一账号的全新 chat** 里重放完整干净请求（不带被拒绝的叙事分支历史），给模型一次无污染上下文的机会；
 - 升级次数独立计数，每个逻辑请求默认 1 次，用环境变量调节：
@@ -155,6 +177,54 @@ CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
 ```
 
 取值为 `0`（禁用升级，同会话预算耗尽即按 422 `qwen_ai_semantic_incomplete` 快速失败）、`1`（默认）或 `2`（上限）；其他值回退为 `1`。升级分支若再次 dangling，则快速失败并把 `retryable` 标志透传给客户端。wrapper 泄漏不适用此升级（泄漏是确定性违规，已有更紧的独立预算）。
+
+## 浏览器恢复的验收范围
+
+`QWEN_RECOVERY_PROBE_MODEL` 和 `QWEN_RECOVERY_PROBE_MODE` 可指定恢复探针模型与模式，例如 `qwen4.0-max-preview`／`Fast`。脚本通过网页现有选择控件切换，并核对带本次唯一标记的实际生成请求；所选模型或模式不符、没有真实新回复时，不接受凭据写回。留空仍使用浏览器默认模型，日志标记 `probeScope: browser-default-model`，不能据此证明其他模型恢复。
+
+池内请求可能加入另一账号的浏览器 single-flight。该账号成功不代表当前账号成功；只有恢复结果 ID 与当前账号一致时，才取消本次退避和清除对应恢复冷却。状态 `active`、Cookie 收集成功、网页默认模型回复以及其他账号的成功，都不等于目标模型的当前请求可用。
+
+`RGV587`／`bxpunish` 不直接证明封号、IP 封禁或内容拒绝。先核对凭据和身份，再用同账号、同模型、相近时间的短请求对照网页与 HTTP 路径。正常完成网站要求的验证后仍应复测真实生成，遵守配额与 Retry-After，不以连续轮换账号作为诊断或修复。
+
+## 输入检查拒绝不是浏览器认证故障
+
+上游显式 `data_inspection_failed` 按 HTTP 422、`retryable:false`、`accountFault:false` 透传，保留白名单 `input`／`output` 阶段，不恢复该 response id、不轮换账号重放。该类拒绝不携带通用 Retry-After，也不被 Responses 层改写成可重试的限流错误。否则关闭后的分支只返回 `The request is ended!`，会掩盖原始输入检查错误。浏览器普通问答和基础随机标记探针成功，不证明另一份长工具转录能通过上游检查；具体触发片段通常不在上游错误里。排查时固定单账号、模型、网络路径，并用成功的最小请求前后夹住对照；分别比较中性长文本、工具协议、内联与文件传输。基线若已遇 RGV587，该轮不用于内容归因。原文或文件哈希变化与结果变化的相关性，不等于已证明存在上游哈希黑名单；不要靠随机改写、换文件名或轮换账号宣称修复内容检查。
+
+## Qwen4 Fast 工具通道兼容配置
+
+2026-11-11 本地 Codex CLI 实测：保持客户端系统提示在原生字段、将 managed 工具提示留在 inline，并使用 `qwen_native` 文本协议后，两次真实 PowerShell 调用和最终答复完成，未发生客户端重连。首次请求仍经过内部恢复，不能视作低延迟或长期稳定性保证。原生 `function_call` 和 `qwen_native` 文本 `<function_calls>` 是不同通道，后者由代理解析后交客户端执行。
+
+```env
+CHAT2API_QWEN_AI_MANAGED_PROTOCOL=qwen_native
+CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE=native
+CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL=inline
+```
+
+Compose 已暴露以上开关，修改 `.env` 后用 `docker compose up -d --no-build chat2api` 重建容器；普通 restart 不刷新环境。仓库默认保持 `qwen_hermes`／native／native，其他模型未据此统一迁移。此组合是请求通道兼容配置，不保证输入检查通过，也不通过更改正文绕过上游检查。
+
+### Qwen4 工具路由对照与可回滚协议
+
+`CHAT2API_QWEN_AI_MANAGED_PROTOCOL=qwen_bracket` 可选用 `[function_calls]`／`[call:name]{JSON}[/call]` 文本格式。保留工具别名、完整 schema 校验、完成标记和历史事实，仅改变代理到模型的工具序列化；未改变仓库默认协议。参数里的括号协议字样由 JSON 字符串边界隔离，坏调用批次不部分执行。
+
+2026-11-12 对照：固定账号和 Fast 模型、前后精确 `ok` 基线下，XML 风格请求出现云端工具误选，方括号格式多次返回有效客户端调用。相同 XML 请求也会成功，因此这不是确定的词语触发结论。后续真实 Codex：干净会话两次本机调用完成，原约 307KB 长会话三次本机调用完成（目录、移位/比较命令、inflate 回归 10/10），均正常结束、无云端误调用及客户端重连。原长会话首轮仍有一次叙述型内部纠正，模型请求耗时约 28–56s；干净会话起始还遇配额/风控，不能据此宣称长期稳定或消除风控。
+
+建议在实际客户端多步验收后选择此协议；回滚只需恢复 `.env` 中之前的协议值并重建本地容器。不要把生成出的工具文本当作已执行证据。
+
+## Codex 本机执行工具的验收
+
+当请求声明 `exec_command` 时，Qwen 的 `code_interpreter` 是云端沙箱，不是客户端本机：其结果不能证明本地文件操作已执行。代理将这种替代调用作为 `undeclared_native_tool_call` 走有界纠正；`web_extractor` 访问客户端 `file:` 或 loopback URL 也按同样规则处理，避免无效云端文件读取持续到 runaway 超时。普通计算／公网检索场景仍保留原来的上游内部工具处理。
+
+工具转录所需的声明列表与别名表必须由 forwarder 通过请求的 `toolCallingPlan` 显式交给 adapter（首次、delta continuation 与恢复重放均一致），不能读取仅存在于响应处理器上的字段。原生工具片段使用 Qwen 的 `function_id` 区分独立调用，缺失时才回退到索引；否则多次云端调用可能共享一个片段状态。生成循环已有明确的工具语义错误时，watchdog 保留它，不覆盖成通用传输 502。
+
+这类 executor 请求的纯文本最终答案必须附带协议 completion marker；口头计划不算执行完成。死会话 fresh-chat 重放会附上 tool-only 纠正指令，而非原样重复失败的请求。语义恢复只针对仍由流处理器保护的分支，不重复交付已执行工具。
+
+### 参数完整性与续接阶段超时
+
+`qwen_native` 参数以明确的 `</parameter>` 结束，不能在任意 `<` 处截断：命令可包含 `<<`、比较运算、HTML/XML。缺失关闭标签按 malformed 拒绝，不交付截断命令。历史格式化仍对 XML 做转义，解析后须保持原始参数值。
+
+续接请求与首轮共享绝对请求截止时间，覆盖令牌续期、附件处理和 POST。另有 `CHAT2API_QWEN_AI_CONTINUATION_HEADERS_TIMEOUT_MS`（默认 60000）只约束等响应头；已接受的 SSE 不受此短计时器截断。超时报 `503 qwen_ai_continuation_headers_timeout`、account-neutral、`Retry-After: 30`；POST 是否接受不明时不在本层自动重发。日志 `continuation headers received/failed` 含 requestId、耗时和状态，不含正文与凭据。
+
+语义纠正请求若遇每日配额、重新认证、输入检查或响应头超时，保留替代请求的真实错误并交给相应策略；不沿用之前的语义错误继续 fresh-chat 升级。
 
 ## 适配状态
 

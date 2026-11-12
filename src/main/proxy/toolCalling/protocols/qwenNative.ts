@@ -225,17 +225,20 @@ function parseFunctionCallsBlock(
       const paramValueStart = invokeBody.indexOf('>', paramNameEndQuote + 1)
       if (paramValueStart === -1) break
 
-      // Corrupted close tags (`</parameter name>`, `</parameter|`) end the
-      // value at the next tag-looking '<' instead of leaking into the value.
+      // Executable arguments can contain '<', '<<', HTML, and XML. Only
+      // the actual protocol closing tag terminates a parameter. Never turn
+      // a malformed envelope into a truncated but executable command.
       const paramValueEnd = findNativeParameterClose(invokeBody, paramValueStart + 1)
-      let paramValue: string
-      if (paramValueEnd !== -1) {
-        paramValue = invokeBody.slice(paramValueStart + 1, paramValueEnd).trim()
-        paramSearchIdx = paramValueEnd
-      } else {
-        paramValue = invokeBody.slice(paramValueStart + 1).trim()
-        paramSearchIdx = invokeBody.length
+      if (paramValueEnd === -1) {
+        return {
+          end,
+          rawText: content.slice(blockStart, end),
+          envelopes: [],
+          malformedReason: 'qwen_native_parameter_close_missing',
+        }
       }
+      const paramValue = invokeBody.slice(paramValueStart + 1, paramValueEnd).trim()
+      paramSearchIdx = paramValueEnd + PARAMETER_CLOSE_TAG.length
 
       // Schema-aware decode keeps string-typed values verbatim (a value like
       // 007 or {"a":1} stays a string) exactly like the Hermes parser.
@@ -266,22 +269,9 @@ function parseHistoryArgs(argumentsJson: string): unknown {
   }
 }
 
-/**
- * Find the closing boundary of a parameter value. Observed upstream drift
- * closes with corrupted tags (`</parameter name>`, `</parameter|`) — an
- * enumerated whitelist cannot keep up. Structural rule instead: a parameter
- * value never contains a raw '<' (payloads are XML-escaped), so the value
- * ends at the next '<' that starts any tag-looking run. Falls back to the
- * canonical close position for values that legitimately contain '<' as
- * escaped text followed by more value.
- */
+/** A raw less-than character in executable source is not an XML boundary. */
 function findNativeParameterClose(body: string, fromIndex: number): number {
-  const exact = body.indexOf(PARAMETER_CLOSE_TAG, fromIndex)
-  const nextTag = body.indexOf('<', fromIndex)
-  if (nextTag === -1) return exact
-  // A next '<' that is not part of the canonical close ends the value there.
-  if (exact === -1 || nextTag < exact) return nextTag
-  return exact
+  return body.indexOf(PARAMETER_CLOSE_TAG, fromIndex)
 }
 
 function nativeParameterSchema(

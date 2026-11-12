@@ -4,6 +4,7 @@ import { managedBracketProtocol } from './managedBracket.ts'
 import { managedXmlProtocol } from './managedXml.ts'
 import { qwenHermesProtocol } from './qwenHermes.ts'
 import { qwenNativeProtocol } from './qwenNative.ts'
+import { qwenBracketProtocol } from './qwenBracket.ts'
 import { anthropicToolUseProtocol } from './anthropicToolUse.ts'
 import { codexResponsesProtocol } from './codexResponses.ts'
 import { m365FencedProtocol } from './m365Fenced.ts'
@@ -16,6 +17,7 @@ const protocols: Record<ToolProtocolId, ToolProtocolAdapter> = {
   managed_xml: managedXmlProtocol,
   qwen_hermes: qwenHermesProtocol,
   qwen_native: qwenNativeProtocol,
+  qwen_bracket: qwenBracketProtocol,
   anthropic_tool_use: anthropicToolUseProtocol,
   codex_responses: codexResponsesProtocol,
   m365_fenced: m365FencedProtocol,
@@ -31,6 +33,7 @@ export function getManagedProtocols(): ToolProtocolAdapter[] {
     managedXmlProtocol,
     qwenHermesProtocol,
     qwenNativeProtocol,
+    qwenBracketProtocol,
     anthropicToolUseProtocol,
     codexResponsesProtocol,
     m365FencedProtocol,

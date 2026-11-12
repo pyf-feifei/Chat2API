@@ -168,15 +168,13 @@ const DEFAULT_HEADERS = {
   'Sec-Fetch-Dest': 'empty',
   'Sec-Fetch-Mode': 'cors',
   'Sec-Fetch-Site': 'same-origin',
-  Version: '0.2.67',
+  Version: process.env.CHAT2API_QWEN_AI_WEB_VERSION || '0.3.22',
   Origin: 'https://chat.qwen.ai',
-  // The webapp sends X-FE-Version on every API call. Without it the chat
-  // endpoint lands in a third response class — HTTP 200 + JSON "Internal
-  // error" — measured 2026-10-15: the exact same egress and account got the
-  // solvable RGV587 challenge envelope with this header present and the
-  // dead-end Internal-error body without it. Overridable because the value
-  // tracks the site's frontend deploy.
-  'X-FE-Version': process.env.CHAT2API_QWEN_AI_X_FE_VERSION || 'prod-fe-1.0.93',
+  // The current web client sends Version, not a hardcoded X-FE-Version.
+  // Keep an explicit override for deployments that still require that header.
+  ...(process.env.CHAT2API_QWEN_AI_X_FE_VERSION
+    ? { 'X-FE-Version': process.env.CHAT2API_QWEN_AI_X_FE_VERSION }
+    : {}),
 }
 
 /**
@@ -351,6 +349,8 @@ interface ChatCompletionRequest {
   temperature?: number
   enable_thinking?: boolean
   thinking_budget?: number
+  /** Request-scoped tool metadata used when rendering history and attachments. */
+  toolCallingPlan?: Pick<ToolCallingPlan, 'tools' | 'toolNameAliases'>
   /** Client-declared tools are encoded in Chat2API's managed text protocol. */
   managedToolCalling?: boolean
   /** Internal intent hint; 'context_compaction' switches tool history to plain prose rendering. */
@@ -401,6 +401,7 @@ interface QwenAiWorkflowContinuationRequest {
   parentId: string
   model: string
   originalModel?: string
+  requestId?: string
   /** Legacy text-only continuation payload. */
   content?: string
   /**
@@ -420,6 +421,7 @@ interface QwenAiWorkflowContinuationRequest {
   /** Client reasoning effort carried through to the thinking-mode mapping. */
   reasoning_effort?: string | null
   reasoningEffort?: string | null
+  toolCallingPlan?: Pick<ToolCallingPlan, 'tools' | 'toolNameAliases'>
   managedToolCalling?: boolean
   managedToolWorkflowContinuation?: boolean
   /** Internal intent hint; 'context_compaction' switches tool history to plain prose rendering. */
@@ -1659,6 +1661,18 @@ export function createQwenAiResumableStream(
             return false
           }
           lastError = error instanceof Error ? error : new Error(String(error))
+          // The replacement request has its own outcome. Quota/auth needs
+          // account policy; inspection is terminal; an ambiguous POST header
+          // timeout must not trigger another append/fresh replay here. Do not
+          // carry the original semantic eligibility across these failures.
+          const replacementCode = (lastError as QwenAiUpstreamError).code
+          if (
+            isQwenAiNextAccountFailureError(lastError)
+            || replacementCode === 'data_inspection_failed'
+            || replacementCode === 'qwen_ai_continuation_headers_timeout'
+          ) {
+            failRecovery(normalizeQwenAiStreamFailure(lastError))
+          }
           if (workflowRecoveryExpired) {
             failRecovery(effectiveWorkflowRecoveryTimeoutError())
           }
@@ -1672,17 +1686,18 @@ export function createQwenAiResumableStream(
       }
     }
 
-    // A same-chat continuation that itself ends in another dangling semantic
-    // answer leaves the chat history holding the rejected narration branch.
-    // Replaying the clean request once in a fresh chat gives the model a new
-    // branch without that poisoned context; this is an escalation of the
-    // same-chat budget above, bounded independently and env-configurable so a
-    // deployment can disable it. Unlike the wrapper-leak cap this remains open
-    // for behavioural (non-deterministic) semantic failures.
+    // A same-chat continuation that dangles again (or names a permanently
+    // ended in-flight response) cannot repair that branch. In the latter case
+    // the remaining continuation slots are unusable: replay the private
+    // request now instead of leaking CHAT_IN_PROGRESS to the client. Keep the
+    // same bounded, env-configurable fresh-chat escalation budget for both.
     if (
       !settled
       && semanticRecoveryEligible
-      && workflowContinuationAttempts >= workflowContinuationAttemptLimit
+      && (
+        workflowContinuationAttempts >= workflowContinuationAttemptLimit
+        || (lastError as QwenAiUpstreamError).deadInFlight === true
+      )
       && semanticFreshChatEscalations < semanticFreshChatEscalationLimit
       && options.restartFreshChat
     ) {
@@ -2371,6 +2386,7 @@ type QwenAiErrorEnvelopeMetadata = {
   code?: string
   retryable?: boolean
   responseId?: string
+  inspectionStage?: 'input' | 'output'
 }
 
 function markQwenAiNextAccountFailure(error: QwenAiUpstreamError): QwenAiUpstreamError {
@@ -2554,7 +2570,8 @@ function isQwenAiNextAccountFailureError(error: unknown): boolean {
   const code = typeof error.code === 'string' ? error.code : ''
   return status === 401
     || status === 403
-    || (status === 429 && code === 'qwen_ai_capacity_limit')
+    || (status === 429 && (code === 'qwen_ai_capacity_limit' || code === 'qwen_ai_daily_quota_exhausted'))
+    || (status === 503 && code === 'qwen_ai_session_reauthentication_required')
 }
 
 function createQwenAiStreamFailure(
@@ -2623,6 +2640,9 @@ const QWEN_AI_DAILY_QUOTA_NOTICES: readonly RegExp[] = [
   // match: the notice is a standalone sentence, not the start of a clause.
   /^\s*(?:请|你)?(?:可|能)?(?:在)?明日再(?:来|聊|使用)[。，,！!？?…\s]*$/,
   /(?:今日|今天)已(?:用完|达到上限)/,
+  // Current model-specific notice omits 次数 and shortens 达到 to 达.
+  // Captured 2026-11-10 with extra.update_member=true in a successful SSE.
+  /^\s*Qwen[\w.\-]*\s*(?:今日|今天)已达上限[，,。\s]*(?:请升级会员|请.*切换其他模型)/i,
   // English notices, observed 2026-09-26:
   //   "You've reached today's chat limit. Please try again tomorrow."
   // The English form carries no keyword the generic rate-limit regex catches,
@@ -2778,6 +2798,7 @@ type QwenAiRequestDeadlineScope = {
   wait<T>(operation: Promise<T>, disposeLateValue?: (value: T) => void): Promise<T>
   throwIfStopped(): void
   remainingTimeoutMs(configuredTimeoutMs: number): number
+  clearDeadlineTimer(): void
   dispose(): void
 }
 
@@ -2829,6 +2850,7 @@ function createQwenAiRequestDeadlineScope(
         () => stop('deadline'),
         Math.min(2_147_483_647, remainingMs),
       )
+      deadlineTimer.unref?.()
     }
   }
 
@@ -2903,6 +2925,10 @@ function createQwenAiRequestDeadlineScope(
       // deadline stop into an instant axios ECONNABORTED.
       return Math.min(safeConfigured, deadlineAt - Date.now())
     },
+    clearDeadlineTimer() {
+      if (deadlineTimer) clearTimeout(deadlineTimer)
+      deadlineTimer = undefined
+    },
     dispose() {
       if (deadlineTimer) {
         clearTimeout(deadlineTimer)
@@ -2912,6 +2938,20 @@ function createQwenAiRequestDeadlineScope(
       rejectStopped = undefined
     },
   }
+}
+
+function retainQwenAiScopeUntilStreamCloses(scope: QwenAiRequestDeadlineScope, stream: any): boolean {
+  if (!stream?.once || stream.destroyed || stream.readableEnded) return false
+  const cleanup = () => {
+    stream.removeListener('end', cleanup)
+    stream.removeListener('close', cleanup)
+    stream.removeListener('error', cleanup)
+    scope.dispose()
+  }
+  stream.once('end', cleanup)
+  stream.once('close', cleanup)
+  stream.once('error', cleanup)
+  return true
 }
 
 function createQwenAiWorkflowRecoveryTimeoutError(): QwenAiUpstreamError {
@@ -3055,6 +3095,12 @@ function isDanglingManagedToolAnswer(
   // here too — a user "continue" message after a stall does not restart the
   // contract.
   const midWorkflow = plan.workflowContinuation || plan.hasLiveToolWorkflow === true
+  // An agent executor cannot finish a local operation with a promise-only
+  // answer. Require the protocol's completion proof on Codex executor turns,
+  // including the first turn; the generic auto-chat contract stays unchanged.
+  if (plan.allowedToolNames.has('exec_command') && requiresManagedWorkflowCompletionMarker(plan)) {
+    return true
+  }
   if (!midWorkflow) {
     // A malformed managed block is a protocol failure even in auto mode. It
     // cannot be delivered as ordinary prose because doing so loses the tool
@@ -3610,6 +3656,9 @@ function extractQwenAiErrorEnvelopeMetadata(
         typeof value.retryable === 'boolean' ? value.retryable : undefined
       ),
       responseId: metadata.responseId ?? stringValue(value.response_id),
+      inspectionStage: metadata.inspectionStage ?? (
+        value.stage === 'input' || value.stage === 'output' ? value.stage : undefined
+      ),
     }
 
     queue.push(value.error, value.errors, value.data)
@@ -3752,6 +3801,19 @@ function createQwenAiStreamEnvelopeError(
   if (!isUpstreamBusy && !isRiskControl && !hasErrorSignal && !isRateLimited) return undefined
 
   const message = redactQwenAiErrorText(structuredMessage || raw)
+  if (envelopeMetadata.code?.toLowerCase() === 'data_inspection_failed') {
+    // A provider input/output inspection rejection is terminal for this
+    // payload, not a transport interruption. Resuming its response id only
+    // returns "request is ended" and hides the actual failure from clients.
+    const stage = envelopeMetadata.inspectionStage
+    return Object.assign(new Error(`Qwen AI upstream rejected the request${stage ? ` (${stage} inspection)` : ''}: ${message || 'data inspection failed'}`), {
+      status: 422,
+      code: 'data_inspection_failed',
+      ...(stage ? { param: stage } : {}),
+      retryable: false,
+      accountFault: false,
+    }) as QwenAiUpstreamError
+  }
   const error = new Error(`Qwen AI upstream stream rejected the request: ${message || 'unknown error'}`) as QwenAiUpstreamError
   error.status = isUpstreamBusy
     ? 503
@@ -4486,6 +4548,14 @@ export class QwenAiAdapter {
       envelopeError = createQwenAiStreamEnvelopeError(body, body, 'error')
     }
 
+    if (envelopeError?.code === 'data_inspection_failed') {
+      // A gateway may attach a generic Retry-After to this terminal verdict.
+      // Keeping it would turn a non-retryable inspection error into a paced
+      // rate-limit failure at the Responses boundary.
+      envelopeError.headers = undefined
+      return envelopeError
+    }
+
     // Qwen can attach generic validation/challenge headers to a structured
     // provider-congestion response. The body is more specific: an explicit
     // RGV587 busy envelope must remain request-scoped instead of cooling the
@@ -4796,6 +4866,19 @@ export class QwenAiAdapter {
         response = await this.postWithRefreshRetry(url, payload, createOptions)
       }
 
+      // Some credentials renew successfully but the chat endpoint still
+      // rejects them. Previously that second Unauthorized envelope became the
+      // generic 'no chat ID' error, spending Codex retries on different stale
+      // pool accounts. Reauthenticate in-place before any client reconnect.
+      if (this.isUnauthorizedPayload(response.data)) {
+        console.warn('[QwenAI] chat rejected renewed credentials; awaiting browser reauthentication', JSON.stringify({ accountId: this.account.id }))
+        this.account = await this.tokenRefresher.refreshAfterRejectedRenewal(this.account, signal)
+        response = await this.postWithRefreshRetry(url, payload, createOptions)
+        if (this.isUnauthorizedPayload(response.data)) {
+          throw this.tokenRefresher.rejectedRenewalError()
+        }
+      }
+
       if (response.status >= 400) {
         throw await this.createInvalidStreamError(response, `chat creation returned HTTP ${response.status}`)
       }
@@ -4970,13 +5053,13 @@ export class QwenAiAdapter {
           nativeSystemPromptMaxBytes,
           toolProtocolChannel,
           declaredToolNames: request.managedToolCalling
-            ? (this.toolCallingPlan?.tools ?? []).map(tool => tool.name)
+            ? (request.toolCallingPlan?.tools ?? []).map(tool => tool.name)
             : [],
           // History must show the same aliased names the managed prompt
           // teaches, or the model copies the platform-native client name out
           // of the transcript and routes the call through the platform's
           // native channel (422 rejected_native_tool_call).
-          toolNameAliases: this.toolCallingPlan?.toolNameAliases,
+          toolNameAliases: request.toolCallingPlan?.toolNameAliases,
           retryNonce: request.attemptNumber,
           signal: scope.signal,
           deadlineAt: request.deadlineAt,
@@ -5296,6 +5379,27 @@ export class QwenAiAdapter {
   async continueChatCompletion(
     request: QwenAiWorkflowContinuationRequest,
   ): Promise<AxiosResponse> {
+    const scope = createQwenAiRequestDeadlineScope(
+      request.signal,
+      request.deadlineAt ?? Date.now() + QWEN_AI_REQUEST_TIMEOUT_MS,
+    )
+    let retained = false
+    try {
+      const response = await scope.wait(
+        this.continueChatCompletionWithinDeadline({ ...request, signal: scope.signal }, scope),
+        response => destroyReadableStream(response.data),
+      )
+      retained = retainQwenAiScopeUntilStreamCloses(scope, response.data)
+      return response
+    } finally {
+      if (!retained) scope.dispose()
+    }
+  }
+
+  private async continueChatCompletionWithinDeadline(
+    request: QwenAiWorkflowContinuationRequest,
+    scope: QwenAiRequestDeadlineScope,
+  ): Promise<AxiosResponse> {
     const chatId = request.chatId.trim()
     const parentId = request.parentId.trim()
     const continuationMessages = Array.isArray(request.messages)
@@ -5309,7 +5413,8 @@ export class QwenAiAdapter {
     }
 
     this.useWebshareProxy = request.webshareProxy === true
-    await this.refreshTokenIfNeeded(request.signal)
+    await scope.wait(this.refreshTokenIfNeeded(scope.signal))
+    scope.throwIfStopped()
     if (!this.getToken() && !this.getCookies()) {
       const error = new Error('Qwen AI token/cookies not configured, please add credentials in account settings') as QwenAiUpstreamError
       error.status = 401
@@ -5349,7 +5454,7 @@ export class QwenAiAdapter {
         this.postWithRefreshRetry.bind(this),
         { providerId: this.provider.id, accountId: this.account.id },
       )
-      const preparedMessage = await prepareQwenAiMultimodalMessage(
+      const preparedMessage = await scope.wait(prepareQwenAiMultimodalMessage(
         continuationMessages,
         uploader,
         {
@@ -5361,18 +5466,18 @@ export class QwenAiAdapter {
             ?? qwenAiTranscriptTransportPolicyFromEnv(),
           managedToolCalling: request.managedToolCalling,
           workflowContinuation: request.managedToolWorkflowContinuation,
-          toolNameAliases: this.toolCallingPlan?.toolNameAliases,
+          toolNameAliases: request.toolCallingPlan?.toolNameAliases,
           requestMaxBytes: qwenAiRequestMaxBytesFromEnv(),
           systemPromptMode: qwenAiSystemPromptModeFromEnv(),
           nativeSystemPromptMaxBytes: qwenAiNativeSystemMaxBytesFromEnv(),
           toolProtocolChannel: qwenAiToolProtocolChannelFromEnv(),
           declaredToolNames: request.managedToolCalling
-            ? (this.toolCallingPlan?.tools ?? []).map(tool => tool.name)
+            ? (request.toolCallingPlan?.tools ?? []).map(tool => tool.name)
             : [],
           signal: request.signal,
           deadlineAt: request.deadlineAt,
         },
-      )
+      ))
       content = preparedMessage.content
       files = preparedMessage.files
       nativeSystemPrompt = preparedMessage.nativeSystemPrompt
@@ -5490,11 +5595,11 @@ export class QwenAiAdapter {
       // The deadline-derived cap keeps a stalled continuation from wedging
       // the whole recovery silently until the client gives up (observed
       // 2026-09-09): the attempt fails here and the outer layer rotates.
-      timeout: Math.min(
+      timeout: scope.remainingTimeoutMs(Math.min(
         QWEN_AI_REQUEST_TIMEOUT_MS,
         Math.max(120_000, continuationDeadline - Date.now()),
-      ),
-      signal: request.signal,
+      )),
+      signal: scope.signal,
       validateStatus: () => true,
     })
 
@@ -5519,6 +5624,20 @@ export class QwenAiAdapter {
       }
       return exhausted
     }
+
+    console.info('[QwenAI] continuation request shape', JSON.stringify({
+      requestId: request.requestId,
+      accountId: this.account.id,
+      model: modelId,
+      sourceMessageCount: continuationMessages.length,
+      payloadUtf8Bytes: Buffer.byteLength(JSON.stringify(payload), 'utf8'),
+      contentUtf8Bytes: Buffer.byteLength(content, 'utf8'),
+      nativeSystemPromptChars: nativeSystemPrompt?.length ?? 0,
+      fileCount: files.length,
+      managedToolCalling: request.managedToolCalling === true,
+      declaredToolCount: request.toolCallingPlan?.tools.length ?? 0,
+      thinkingEnabled: featureMode.thinkingEnabled,
+    }))
 
     // Anti-ban throttling: hammering ONE upstream chatId with rapid-fire
     // append→drain→replay calls is the exact bot fingerprint that got the
@@ -5548,7 +5667,53 @@ export class QwenAiAdapter {
       }
       lastAppendAt = Date.now()
 
-      const response = await this.postWithRefreshRetry(url, payload, createContinuationOptions)
+      scope.throwIfStopped()
+      const headerStartedAt = Date.now()
+      const headerTimeoutMs = positiveNumberFromEnv('CHAT2API_QWEN_AI_CONTINUATION_HEADERS_TIMEOUT_MS', 60_000)
+      const headerScope = createQwenAiRequestDeadlineScope(scope.signal, headerStartedAt + headerTimeoutMs)
+      let response: AxiosResponse
+      let headerScopeRetained = false
+      try {
+        response = await scope.wait(headerScope.wait(
+          this.postWithRefreshRetry(url, payload, () => ({
+            ...createContinuationOptions(),
+            signal: headerScope.signal,
+          })),
+          lateResponse => destroyReadableStream(lateResponse.data),
+        ), lateResponse => destroyReadableStream(lateResponse.data))
+        headerScope.clearDeadlineTimer()
+        headerScopeRetained = retainQwenAiScopeUntilStreamCloses(headerScope, response.data)
+        console.info('[QwenAI] continuation headers received', JSON.stringify({
+          requestId: request.requestId,
+          accountId: this.account.id,
+          elapsedMs: Date.now() - headerStartedAt,
+          status: response.status,
+        }))
+      } catch (error) {
+        // A POST with no returned headers may already have been accepted.
+        // Report its stage without retrying the append or blaming the account.
+        const headerDeadlineExpired = !scope.signal?.aborted
+          && headerScope.signal?.aborted
+          && (error as QwenAiUpstreamError)?.code === 'qwen_ai_request_timeout'
+        const failure = headerDeadlineExpired
+          ? Object.assign(new Error('Qwen AI continuation timed out waiting for upstream response headers; acceptance is unknown.'), {
+              status: 503,
+              code: 'qwen_ai_continuation_headers_timeout',
+              retryable: true,
+              accountFault: false,
+              headers: { 'Retry-After': '30' },
+            })
+          : error
+        console.warn('[QwenAI] continuation headers failed', JSON.stringify({
+          requestId: request.requestId,
+          accountId: this.account.id,
+          elapsedMs: Date.now() - headerStartedAt,
+          code: (failure as QwenAiUpstreamError)?.code,
+        }))
+        throw failure
+      } finally {
+        if (!headerScopeRetained) headerScope.dispose()
+      }
 
       if (QWEN_AI_DEBUG_REQUEST_LOGS) {
         console.log('[QwenAI] Workflow continuation response status:', response.status)
@@ -6343,13 +6508,49 @@ export class QwenAiStreamHandler {
     return [deltaName ?? match[1]]
   }
 
+  private isProviderLocalExecutorSubstitution(state: NativeToolCallState): boolean {
+    if (!this.toolCallingPlan?.allowedToolNames.has('exec_command')) return false
+    if (state.name === 'code_interpreter') return true
+    if (state.name !== 'web_extractor' || !isCompleteJsonText(state.arguments)) return false
+    // A cloud extractor cannot read the client's filesystem or loopback. Do
+    // not exempt these calls as ordinary web retrieval and let them spin until
+    // the runaway watchdog. Public web retrieval remains provider-internal.
+    const containsLocalUrl = (value: unknown): boolean => {
+      if (typeof value === 'string') {
+        try {
+          const url = new URL(value)
+          return url.protocol === 'file:'
+            || url.hostname === 'localhost'
+            || url.hostname.endsWith('.localhost')
+            || url.hostname.startsWith('127.')
+            || url.hostname === '[::1]'
+        } catch { return false }
+      }
+      if (Array.isArray(value)) return value.some(containsLocalUrl)
+      if (value && typeof value === 'object') return Object.values(value).some(containsLocalUrl)
+      return false
+    }
+    return containsLocalUrl(JSON.parse(state.arguments))
+  }
+
+  private hasCompleteProviderLocalExecutorSubstitution(): boolean {
+    return [...this.nativeToolCallStates.values()].some(state => (
+      !state.allowed
+      && isCompleteJsonText(state.arguments)
+      && this.isProviderLocalExecutorSubstitution(state)
+    ))
+  }
+
   private getCompleteUndeclaredNativeToolNames(): string[] {
     const names = new Set<string>()
     for (const state of this.nativeToolCallStates.values()) {
       if (
         state.name
         && !state.allowed
-        && !isQwenAiInternalNativeTool(state.name)
+        && (
+          !isQwenAiInternalNativeTool(state.name)
+          || this.isProviderLocalExecutorSubstitution(state)
+        )
         && isCompleteJsonText(state.arguments)
       ) {
         names.add(state.name)
@@ -6832,7 +7033,10 @@ export class QwenAiStreamHandler {
           downstreamFrameCount,
           bufferedManagedFrameCount: managedBranchFrames.length,
         }))
-        failStream(createQwenAiStreamFailure(
+        // An invalid tool branch may never reach a terminal marker. Preserve
+        // the already-known semantic cause instead of replacing it with a
+        // generic transport 502 that replays the same loop on another branch.
+        failStream(this.pendingSemanticRecoveryError ?? createQwenAiStreamFailure(
           `Qwen AI produced ${upstreamEventCount} stream events without advancing output for ${Math.ceil(stalledMs / 1000)}s (runaway generation loop).`,
         ))
         return true
@@ -6881,6 +7085,11 @@ export class QwenAiStreamHandler {
         && !allowBeforeTerminal
         && !isQwenAiStaleSessionError(error)
         && error.code !== 'qwen_ai_wrapper_leak'
+        // A complete cloud executor call cannot later become a local call.
+        // The bridge detaches this private source before replacement. Do not
+        // wait for the provider's Python/retrieval job to finish first.
+        && !(error.code === 'undeclared_native_tool_call'
+          && this.hasCompleteProviderLocalExecutorSubstitution())
         && error.code !== 'qwen_ai_response_ended'
         && error.code !== 'qwen_ai_upstream_busy'
       if (deferUntilTerminal) {
@@ -7394,6 +7603,18 @@ export class QwenAiStreamHandler {
         return
       }
 
+      console.info('[QwenAI] managed terminal validation', JSON.stringify({
+        requestId: this.toolCallingPlan?.diagnostics?.requestId,
+        shouldParseResponse: this.toolCallingPlan?.shouldParseResponse,
+        toolCount: this.toolCallingPlan?.allowedToolNames.size ?? 0,
+        protocol: this.toolCallingPlan?.protocol,
+        hasClientExecutor: this.toolCallingPlan?.allowedToolNames.has('exec_command'),
+        emittedToolCall,
+        failedToolResultPending: this.toolCallingPlan?.failedToolResultPending,
+        completionProof: hasManagedWorkflowCompletionMarker(this.content, this.toolCallingPlan),
+        progressStyle: isProgressStyleManagedAnswer(this.content.trim()),
+        contentLength: this.content.length,
+      }))
       if (
         !emittedToolCall
         && isDanglingManagedToolAnswer(this.content, this.toolCallingPlan)
@@ -8239,7 +8460,10 @@ export class QwenAiStreamHandler {
 
       const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
         if (resolved || semanticRecoveryInFlight) return
-        if (!sawUpstreamCompletion) {
+        if (!sawUpstreamCompletion && !(
+          error.code === 'undeclared_native_tool_call'
+          && this.hasCompleteProviderLocalExecutorSubstitution()
+        )) {
           this.pendingSemanticRecoveryError = error
           return
         }

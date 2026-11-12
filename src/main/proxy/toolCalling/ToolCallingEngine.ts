@@ -423,7 +423,7 @@ export class ToolCallingEngine {
       messages: injectPrompt(
         workflow.messages,
         renderedPrompt.content,
-        planWithWorkflow.protocol === 'qwen_hermes' || planWithWorkflow.protocol === 'qwen_native',
+        planWithWorkflow.protocol === 'qwen_hermes' || planWithWorkflow.protocol === 'qwen_native' || planWithWorkflow.protocol === 'qwen_bracket',
         renderedPrompt.documentPrompt,
       ),
       tools: undefined,
@@ -832,7 +832,7 @@ function renderPrompt(
   }
 
   const content = finishPrompt(getToolProtocol(plan.protocol).renderPrompt(promptFacingTools(plan)))
-  if (plan.protocol !== 'qwen_hermes' && plan.protocol !== 'qwen_native') return { content }
+  if (plan.protocol !== 'qwen_hermes' && plan.protocol !== 'qwen_native' && plan.protocol !== 'qwen_bracket') return { content }
 
   // Keep the complete, request-scoped tool contract in the inline control
   // message. Qwen document transport is intended for archived conversation

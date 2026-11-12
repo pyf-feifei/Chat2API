@@ -15,6 +15,7 @@ import { storeManager } from '../store/store'
 import { sessionManager } from './sessionManager'
 import { qwenAiSessionRepairService } from './qwenAiSessionRepair'
 import { mountWebAdminAssets } from '../../server/admin/assets'
+import { ModelCatalogueRefreshService } from '../providers/modelCatalogueRefresh'
 
 const SLOW_REQUEST_THRESHOLD_MS = 1500
 const BROWSER_IMPORT_MAX_CONTENT_LENGTH = 128 * 1024
@@ -46,6 +47,9 @@ export class ProxyServer {
   private activeResponses = new Set<ServerResponse>()
   private openSockets = new Set<Socket>()
   private drainWaiters = new Set<() => void>()
+  private modelCatalogueRefresh = new ModelCatalogueRefreshService(
+    () => storeManager.syncDynamicBuiltinProviderModels(),
+  )
 
   constructor() {
     this.app = new Koa()
@@ -461,6 +465,7 @@ export class ProxyServer {
 
           storeManager.addLog('info', `Proxy server started successfully, listening on ${this.host}:${this.port}`)
           qwenAiSessionRepairService.start()
+          this.modelCatalogueRefresh.start()
 
           resolve(true)
         })
@@ -472,6 +477,7 @@ export class ProxyServer {
             storeManager.addLog('error', `Server error: ${err.message}`)
           }
           qwenAiSessionRepairService.stop()
+          this.modelCatalogueRefresh.stop()
           this.server = null
           resolve(false)
         })
@@ -483,6 +489,7 @@ export class ProxyServer {
 
         this.server.on('close', () => {
           qwenAiSessionRepairService.stop()
+          this.modelCatalogueRefresh.stop()
           this.server = null
         })
       } catch (error) {
@@ -505,6 +512,7 @@ export class ProxyServer {
 
   private async stopGracefully(server: HttpServer): Promise<boolean> {
     this.draining = true
+    this.modelCatalogueRefresh.stop()
     qwenAiSessionRepairService.stop()
     storeManager.addLog('info', 'Proxy server is draining active HTTP streams before shutdown', {
       data: {

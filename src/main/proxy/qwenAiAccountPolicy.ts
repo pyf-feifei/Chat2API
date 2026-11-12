@@ -323,8 +323,9 @@ export function isQwenAiAccountFault(value: QwenAiAccountFailureClassification |
   const status = statusOf(value)
   const code = codeOf(value)
   // Account rotation is intentionally restricted to the documented classes.
-  // An explicit true from a wrapper cannot turn a 5xx/ordinary 429 into an
-  // account fault, which prevents the pool from being drained by congestion.
+  // An explicit true from a wrapper cannot turn a generic 5xx/ordinary 429
+  // into an account fault. The narrow reauthentication 503 is different:
+  // renewal and browser recovery already failed after two Unauthorized replies.
   // 402 (Payment Required) is per-account quota exhaustion: rotating off is
   // correct, and the governor's cooldown stops the pool from re-selecting
   // the dead-credit account on the next request (observed 2026-09-10: 20
@@ -339,6 +340,7 @@ export function isQwenAiAccountFault(value: QwenAiAccountFailureClassification |
     || status === 403
     || (status === 429 && code === 'QWEN_AI_CAPACITY_LIMIT')
     || (status === 429 && code === 'QWEN_AI_DAILY_QUOTA_EXHAUSTED')
+    || (status === 503 && code === 'QWEN_AI_SESSION_REAUTHENTICATION_REQUIRED')
 }
 
 /** The only inferred retry scope that is safe to use for account rotation. */
@@ -372,6 +374,7 @@ export function qwenAiAccountRetryScope(
     || status === 403
     || (status === 429 && code === 'QWEN_AI_CAPACITY_LIMIT')
     || (status === 429 && code === 'QWEN_AI_DAILY_QUOTA_EXHAUSTED')
+    || (status === 503 && code === 'QWEN_AI_SESSION_REAUTHENTICATION_REQUIRED')
     ? 'next-account'
     : undefined
 }

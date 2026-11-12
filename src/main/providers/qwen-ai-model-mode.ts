@@ -1,6 +1,6 @@
 /**
- * Client-facing mode aliases for Qwen3.8-Max. These suffixes are never sent
- * upstream: chat.qwen.ai receives the stable qwen3.8-max model id plus the
+ * Client-facing mode aliases for all Qwen models. These suffixes are never sent
+ * upstream: chat.qwen.ai receives the base model id plus the
  * corresponding feature_config flags.
  *
  * The upstream feature_config carries a three-state `thinking_mode` enum
@@ -47,6 +47,10 @@ export const QWEN_AI_38_MAX_MODE_ALIASES = [
 
 const QWEN_38_MAX = 'qwen3.8-max'
 
+function isQwenModel(value: string): boolean {
+  return /^qwen/i.test(value.trim())
+}
+
 function isQwen38Max(value: string): boolean {
   return value.toLowerCase() === QWEN_38_MAX
 }
@@ -70,7 +74,7 @@ function mode(
 }
 
 /**
- * Resolve Qwen3.8-Max aliases without changing unrelated model names.
+ * Resolve case-insensitive Qwen mode suffixes without changing other providers.
  *
  * `_TeT_AtF` is the raw form: `Te` controls `thinking_enabled` and `At`
  * controls `auto_thinking`. The three named suffixes are convenient aliases.
@@ -84,7 +88,7 @@ export function resolveQwenAiModelMode(modelName: string): QwenAiModelMode {
     return mode(model, true, true, 'Auto', false, 'floating')
   }
 
-  const shortcut = /^(qwen3\.8-max)_(fast|auto|thinking)$/i.exec(model)
+  const shortcut = /^(qwen.*?)_(fast|auto|think|thinking)$/i.exec(model)
   if (shortcut) {
     const baseModel = shortcut[1]
     switch (shortcut[2].toLowerCase()) {
@@ -97,7 +101,7 @@ export function resolveQwenAiModelMode(modelName: string): QwenAiModelMode {
     }
   }
 
-  const rawFlags = /^(qwen3\.8-max)_te([tf])_at([tf])$/i.exec(model)
+  const rawFlags = /^(qwen.*?)_te([tf])_at([tf])$/i.exec(model)
   if (rawFlags) {
     const thinking = rawFlags[2].toLowerCase() === 't'
     const auto = rawFlags[3].toLowerCase() === 't'
@@ -106,7 +110,7 @@ export function resolveQwenAiModelMode(modelName: string): QwenAiModelMode {
   }
 
   // Continue accepting the previous hyphen aliases for existing clients.
-  const legacyShortcut = /^(qwen3\.8-max)-(fast|auto|thinking)$/i.exec(model)
+  const legacyShortcut = /^(qwen.*?)-(fast|auto|think|thinking)$/i.exec(model)
   if (legacyShortcut) {
     const baseModel = legacyShortcut[1]
     switch (legacyShortcut[2].toLowerCase()) {
@@ -235,8 +239,8 @@ export function applyQwenAiEffortToModelMode(
 }
 
 /**
- * Add the stable, documented shortcuts after a live catalogue refresh.
- * A catalogue that does not contain Qwen3.8-Max is left unchanged.
+ * Add mode aliases for every Qwen catalogue model, including future releases.
+ * Keep upstream IDs and capability metadata intact; never recursively alias aliases.
  */
 export function withQwenAiModelModeAliases<TCapability>(
   catalogue: QwenAiModelCatalogueWithCapabilities<TCapability>,
@@ -250,23 +254,16 @@ export function withQwenAiModelModeAliases<TCapability>(
   const supportedModels = [...catalogue.supportedModels]
   const modelMappings = { ...catalogue.modelMappings }
 
-  const baseMapping = Object.entries(modelMappings).find(([displayName, modelId]) => (
-    isQwen38Max(displayName) || isQwen38Max(modelId)
-  ))
-  if (!baseMapping) {
-    return {
-      supportedModels,
-      modelMappings,
-      ...(catalogue.modelCapabilities ? { modelCapabilities: { ...catalogue.modelCapabilities } } : {}),
+  for (const [displayName, modelId] of Object.entries(catalogue.modelMappings)) {
+    if (!isQwenModel(displayName) && !isQwenModel(modelId)) continue
+    if (resolveQwenAiModelMode(displayName).isExplicit) continue
+    for (const suffix of ['Fast', 'Auto', 'Thinking', 'Think']) {
+      const alias = `${displayName}_${suffix}`
+      if (!supportedModels.some(model => model.toLowerCase() === alias.toLowerCase())) {
+        supportedModels.push(alias)
+      }
+      modelMappings[alias] = modelId
     }
-  }
-
-  const [, baseModelId] = baseMapping
-  for (const alias of QWEN_AI_38_MAX_MODE_ALIASES) {
-    if (!supportedModels.some(model => model.toLowerCase() === alias.toLowerCase())) {
-      supportedModels.push(alias)
-    }
-    modelMappings[alias] = baseModelId
   }
 
   return {

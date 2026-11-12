@@ -145,16 +145,15 @@ export interface ToolArgumentValidationIssues {
 export function getToolArgumentValidationIssues(
   args: unknown,
   tool?: NormalizedToolDefinition,
+  options: { normalize?: boolean } = {},
 ): ToolArgumentValidationIssues {
   if (!tool) return { missingRequired: [], unexpected: [], typeMismatches: [] }
 
   const parsed = parseArgumentCandidate(args)
   if (!parsed.ok) return { missingRequired: [], unexpected: [], typeMismatches: [] }
 
-  const normalized = normalizeArgumentsForSchema(
-    parsed.value === undefined ? {} : parsed.value,
-    tool,
-  )
+  const value = parsed.value === undefined ? {} : parsed.value
+  const normalized = options.normalize === false ? value : normalizeArgumentsForSchema(value, tool)
   const issues = collectSchemaValidationIssues(normalized, tool.parameters)
   return {
     missingRequired: issues.missingRequired,
@@ -167,8 +166,9 @@ export function getToolArgumentValidationIssues(
 export function hasToolArgumentValidationIssues(
   args: unknown,
   tool?: NormalizedToolDefinition,
+  options: { normalize?: boolean } = {},
 ): boolean {
-  const issues = getToolArgumentValidationIssues(args, tool)
+  const issues = getToolArgumentValidationIssues(args, tool, options)
   return issues.missingRequired.length > 0
     || issues.unexpected.length > 0
     || issues.typeMismatches.length > 0

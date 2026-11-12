@@ -78,6 +78,8 @@ type QwenAiRefreshError = Error & {
   unregistered?: boolean
   /** Persisted account state for an explicit, permanent credential result. */
   accountStatus?: 'inactive'
+  headers?: Record<string, string>
+  retryAfterSeconds?: number
 }
 
 type QwenAiSignInResponse = AxiosResponse<any>
@@ -164,7 +166,13 @@ function hasCookie(cookieHeader: string, name: string): boolean {
 }
 
 export function hasQwenAiSessionCookie(cookieHeader: string): boolean {
-  return hasCookie(String(cookieHeader || ''), 'token')
+  const cookies = String(cookieHeader || '')
+  if (!hasCookie(cookies, 'token')) return false
+  const payload = decodeJwtPayload(cookieValue(cookies, 'token'))
+  // An opaque legacy session may still be valid. A JWT we can inspect must
+  // not mark an expired session (or a Bearer-only access token) as ready.
+  return payload?.type !== 'access_token'
+    && !(typeof payload?.exp === 'number' && payload.exp * 1000 <= Date.now())
 }
 
 function cookieValue(cookieHeader: string, name: string): string {
@@ -242,7 +250,14 @@ export function canRefreshQwenAiAccount(account: Account): boolean {
 
 export function resolveQwenAiAuthHeaders(token: string, cookieHeader: string): Record<string, string> {
   const normalizedToken = String(token || '').trim()
-  const cookies = String(cookieHeader || '').trim()
+  // Modern access tokens authenticate only through Bearer. A stale legacy
+  // token cookie must not suppress (or override) a freshly renewed token.
+  const isAccessToken = decodeJwtPayload(normalizedToken)?.type === 'access_token'
+  const cookies = isAccessToken
+    ? String(cookieHeader || '').split(';')
+      .filter(part => part.trim().split('=', 1)[0] !== 'token')
+      .map(part => part.trim()).filter(Boolean).join('; ')
+    : String(cookieHeader || '').trim()
   const hasSessionCookie = hasQwenAiSessionCookie(cookies)
 
   return {
@@ -601,6 +616,13 @@ function createRefreshError(options: {
   error.accountFault = options.accountFault
   if (options.retryScope) error.retryScope = options.retryScope
   if (options.accountStatus) error.accountStatus = options.accountStatus
+  const gateMs = options.accountFault === false ? qwenAiRefreshRiskGateRemainingMs() : 0
+  if (gateMs > 0) {
+    error.retryAfterSeconds = Math.max(1, Math.ceil(gateMs / 1000))
+    error.headers = { 'Retry-After': String(error.retryAfterSeconds) }
+    error.retryable = true
+    error.status = 503
+  }
   return error
 }
 
@@ -872,7 +894,34 @@ export class QwenAiTokenRefresher {
       return account
     }
 
+    // A saved login / refresh token is authoritative after an explicit
+    // unauthorized payload. refreshIfNeeded treats any non-empty legacy jar
+    // as healthy, but the jar can retain a retired token cookie while the
+    // upstream session is already revoked; retrying requests without renewal
+    // only repeats the same failure.
     return this.refresh(account, signal)
+  }
+
+  /** A successful renewal is not proof the chat endpoint accepts the session. */
+  async refreshAfterRejectedRenewal(account: Account, signal?: AbortSignal): Promise<Account> {
+    const recovered = await this.recoverBrowserSession(account, signal)
+    if (recovered) return recovered
+    throw this.rejectedRenewalError()
+  }
+
+  rejectedRenewalError(): QwenAiRefreshError {
+    const error = createRefreshError({
+      message: 'Qwen AI still rejected the renewed chat session; browser reauthentication has not completed. Retry after the indicated pause.',
+      status: 503,
+      // Two explicit Unauthorized replies identify this account, not pool
+      // congestion. Exhausted browser recovery must rotate before streaming.
+      retryable: false,
+      accountFault: true,
+    })
+    error.code = 'qwen_ai_session_reauthentication_required'
+    error.retryAfterSeconds = Math.max(60, error.retryAfterSeconds ?? 0)
+    error.headers = { 'Retry-After': String(error.retryAfterSeconds) }
+    return error
   }
 
   private canRefresh(account: Account): boolean {
@@ -886,17 +935,55 @@ export class QwenAiTokenRefresher {
    * imported from browser logins and signin answers INVALID_CRED for them.
    */
   private async refresh(account: Account, signal?: AbortSignal): Promise<Account> {
-    const cookies = String(account.credentials.cookies || account.credentials.cookie || '')
-    if (usableQwenAiRefreshToken(cookies, account.credentials.token)) {
+    const persisted = storeManager.getAccountById?.(account.id, true)
+    const current = persisted?.credentials ? persisted : account
+    // Another request may already have renewed this account. Reuse its token
+    // rather than re-exchange an old snapshot (or replay a revoked cookie).
+    if (current.credentials.token !== account.credentials.token
+      && !this.isTokenExpiringSoon(current.credentials.token || '')) return current
+    const cookies = String(current.credentials.cookies || current.credentials.cookie || '')
+    if (usableQwenAiRefreshToken(cookies, current.credentials.token)) {
       try {
-        return await this.exchangeRefreshToken(account, signal)
+        return await this.exchangeRefreshToken(current, signal)
       } catch (error) {
         const refreshError = error as QwenAiRefreshError
-        const hasPassword = Boolean(account.credentials.email && account.credentials.password)
+        const hasPassword = Boolean(current.credentials.email && current.credentials.password)
+        if (refreshError.headers?.['Retry-After']) {
+          const recovered = await this.recoverBrowserSession(current, signal)
+          if (recovered) return recovered
+        }
         if (!hasPassword || refreshError.accountFault !== true) throw error
       }
     }
-    return this.signIn(account, signal)
+    try {
+      return await this.signIn(current, signal)
+    } catch (error) {
+      if ((error as QwenAiRefreshError).headers?.['Retry-After']) {
+        const recovered = await this.recoverBrowserSession(current, signal)
+        if (recovered) return recovered
+      }
+      throw error
+    }
+  }
+
+  private async recoverBrowserSession(account: Account, signal?: AbortSignal): Promise<Account | null> {
+    if (signal?.aborted) return null
+    try {
+      const recovery = await import('./qwen-risk-refresh')
+      const recovered = await recovery.noteQwenAiRiskChallenge(account, 'RGV587 auth refresh WAF')
+      // Global single-flight may have recovered a DIFFERENT account. Its
+      // identity must never replace this chat owner's credentials.
+      if (!recovered || signal?.aborted) return null
+      if (recovered.id === account.id) return recovered
+      const own = storeManager.getAccountById?.(account.id, true)
+      return own?.credentials.token !== account.credentials.token ? own ?? null : null
+    } catch (error) {
+      console.warn('[QwenAI Token Refresh] browser recovery unavailable', JSON.stringify({
+        accountId: account.id,
+        errorType: error instanceof Error ? error.name : typeof error,
+      }))
+      return null
+    }
   }
 
   /**
@@ -988,14 +1075,19 @@ export class QwenAiTokenRefresher {
         ...(rotated && rotated !== refreshToken ? [`refresh_token=${rotated}`] : []),
       ],
     )
-    return this.persistRefreshed(account, accessToken, nextCookies)
+    // Do not persist a legacy token cookie beside the new Bearer credential.
+    const authCookies = resolveQwenAiAuthHeaders(accessToken, nextCookies).Cookie || ''
+    return this.persistRefreshed(account, accessToken, authCookies)
   }
 
   private persistRefreshed(account: Account, token: string, cookies: string): Account {
     const credentials = {
       ...account.credentials,
       token,
-      ...(cookies ? { cookies } : {}),
+      cookies,
+      // The adapter supports both spellings; clear the alias as well so an
+      // empty normalized jar cannot fall back to the stale cookie field.
+      ...(Object.prototype.hasOwnProperty.call(account.credentials, 'cookie') ? { cookie: cookies } : {}),
     }
 
     noteRefreshSuccess()
@@ -1088,14 +1180,18 @@ export class QwenAiTokenRefresher {
       throw refreshError
     }
 
-    const cookies = mergeCookieHeaders(
-      account.credentials.cookies || account.credentials.cookie || '',
-      response.headers['set-cookie'],
-    )
+    const previousCookies = String(account.credentials.cookies || account.credentials.cookie || '')
+      .split(';').filter(part => part.trim().split('=', 1)[0] !== 'token').join('; ')
+    const cookies = mergeCookieHeaders(previousCookies, response.headers['set-cookie'])
+    // Signin can issue a Bearer-only access_token too. Normalize both cookie
+    // aliases, just like refresh-token exchange; a retired token= shadows a
+    // fresh Bearer token otherwise.
+    const authCookies = resolveQwenAiAuthHeaders(token, cookies).Cookie || ''
     const credentials = {
       ...account.credentials,
       token,
-      ...(cookies ? { cookies } : {}),
+      cookies: authCookies,
+      ...(Object.prototype.hasOwnProperty.call(account.credentials, 'cookie') ? { cookie: authCookies } : {}),
     }
 
     noteRefreshSuccess()

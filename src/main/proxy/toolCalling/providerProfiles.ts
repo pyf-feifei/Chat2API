@@ -2,6 +2,7 @@ import type { NormalizedToolResult, ToolProtocolId } from './types.ts'
 import { managedXmlProtocol } from './protocols/managedXml.ts'
 import { qwenHermesProtocol } from './protocols/qwenHermes.ts'
 import { qwenNativeProtocol } from './protocols/qwenNative.ts'
+import { qwenBracketProtocol } from './protocols/qwenBracket.ts'
 import { m365FencedProtocol } from './protocols/m365Fenced.ts'
 
 export interface ProviderToolProfile {
@@ -51,13 +52,14 @@ export function zaiCompletionMarkerFromEnv(): boolean {
 
 /**
  * Managed tool protocol for the qwen-ai provider. Defaults to the
- * stress-verified hermes tags; 'qwen_native' opts into the experimental
- * <function_calls> format, which the Qwen platform may intercept as its own
- * native tool-call wire format (see the qwen-ai profile comment).
+ * Hermes tags by default. 'qwen_native' uses XML function_calls; the opt-in
+ * 'qwen_bracket' uses bracket + JSON text framing to reduce provider-native
+ * routing ambiguity. Protocol choice is not a provider reliability guarantee.
  */
-export function qwenAiManagedProtocolFromEnv(): 'qwen_hermes' | 'qwen_native' {
+export function qwenAiManagedProtocolFromEnv(): 'qwen_hermes' | 'qwen_native' | 'qwen_bracket' {
   const raw = String(process.env.CHAT2API_QWEN_AI_MANAGED_PROTOCOL ?? '').trim().toLowerCase()
   if (raw === 'qwen_native') return 'qwen_native'
+  if (raw === 'qwen_bracket') return 'qwen_bracket'
   if (raw && raw !== 'qwen_hermes' && !warnedUnknownQwenAiManagedProtocol) {
     warnedUnknownQwenAiManagedProtocol = true
     console.warn(`[QwenAI] Unknown CHAT2API_QWEN_AI_MANAGED_PROTOCOL=${raw}, using "qwen_hermes"`)
@@ -175,9 +177,16 @@ export function getProviderToolProfile(providerId: string): ProviderToolProfile 
   if (providerId === 'qwen-ai') {
     return {
       providerId,
-      ...(qwenAiManagedProtocolFromEnv() === 'qwen_native'
-        ? qwenAiNativeHistoryProfile
-        : qwenAiHermesHistoryProfile),
+      ...(qwenAiManagedProtocolFromEnv() === 'qwen_bracket'
+        ? {
+            ...qwenAiHermesHistoryProfile,
+            preferredManagedProtocol: 'qwen_bracket' as const,
+            formatAssistantToolCalls: qwenBracketProtocol.formatAssistantToolCalls,
+            formatToolResult: qwenBracketProtocol.formatToolResult,
+          }
+        : qwenAiManagedProtocolFromEnv() === 'qwen_native'
+          ? qwenAiNativeHistoryProfile
+          : qwenAiHermesHistoryProfile),
     }
   }
   if (providerId === 'zai') {

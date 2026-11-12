@@ -1508,6 +1508,15 @@ export class QwenAiRequestGovernor {
     this.recentFailovers = nextFailovers
   }
 
+  clearVerifiedRiskCooldown(accountId: string): void {
+    const cooldown = this.accountCooldowns.get(accountId)
+    // Verification only supersedes a challenge verdict, never daily quota,
+    // auth failure, or a real provider capacity cooldown.
+    if (cooldown?.reason !== 'qwen_ai_content_verdict') return
+    this.accountCooldowns.delete(accountId)
+    this.pump()
+  }
+
   clearAccountCooldown(accountId: string): void {
     this.accountCooldowns.delete(accountId)
     this.accountNextAvailableAt.delete(accountId)

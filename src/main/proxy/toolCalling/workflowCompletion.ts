@@ -107,6 +107,7 @@ export function isOptionalManagedWorkflowCompletionMarker(plan?: ManagedWorkflow
 function protocolRequiresCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
   return plan?.protocol === 'qwen_hermes'
     || plan?.protocol === 'qwen_native'
+    || plan?.protocol === 'qwen_bracket'
     // m365_fenced teaches natural-language finals ("respond with no
     // fence"), which is indistinguishable from a capability-denial
     // confabulation at classification time. Observed live 2026-09-13

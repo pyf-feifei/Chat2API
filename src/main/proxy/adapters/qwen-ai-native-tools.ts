@@ -74,7 +74,7 @@ function decodeWrappedParameterValue(value: string, keyName?: string): string {
 export function normalizeNativeFunctionCallDelta(delta: Record<string, any>): NativeToolCallFragment[] {
   const fragments: NativeToolCallFragment[] = []
 
-  const addFragment = (raw: any, fallbackIndex: number) => {
+  const addFragment = (raw: any, fallbackIndex: number, providerFunctionId?: unknown) => {
     if (!isObjectValue(raw)) return
 
     const rawFunction = isObjectValue(raw.function)
@@ -84,7 +84,8 @@ export function normalizeNativeFunctionCallDelta(delta: Record<string, any>): Na
     const args = rawFunction.arguments !== undefined
       ? stableStringify(rawFunction.arguments)
       : undefined
-    const id = typeof raw.id === 'string' ? raw.id : undefined
+    const id = typeof raw.id === 'string' ? raw.id
+      : typeof providerFunctionId === 'string' ? providerFunctionId : undefined
     const rawIndex = typeof raw.index === 'number' ? raw.index : fallbackIndex
     const key = id || String(rawIndex)
 
@@ -100,11 +101,11 @@ export function normalizeNativeFunctionCallDelta(delta: Record<string, any>): Na
   }
 
   if (Array.isArray(delta.tool_calls)) {
-    delta.tool_calls.forEach(addFragment)
+    delta.tool_calls.forEach((call: unknown, index: number) => addFragment(call, index))
   }
 
   if (isObjectValue(delta.function_call)) {
-    addFragment(delta.function_call, fragments.length)
+    addFragment(delta.function_call, fragments.length, delta.function_id)
   }
 
   return fragments

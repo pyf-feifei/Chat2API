@@ -9,6 +9,17 @@ matches, fix or delete it in the same change — a stale rule is worse than none
 
 Chat2API is an Electron desktop application and a headless Koa server (Docker) that expose an OpenAI-compatible API proxy for web AI providers (DeepSeek, GLM, Kimi, MiniMax, Mimo, Microsoft 365 Copilot, Perplexity, Qwen, Qwen AI, Z.ai).
 
+## Agent Skills
+
+Pi, Codex, and Claude share the De-Armor response-calibration skill. The durable
+source is `skills/de-armor/SKILL.md`; trigger text is mirrored in
+`skills/de-armor/AGENTS.md` and `skills/de-armor/CLAUDE.md`. When the user says
+“破甲”, “说人话”, “别绕”, or asks to review or rewrite an over-hedged answer, load
+and follow the skill. “破甲” alone repairs the previous assistant answer and does
+not introduce the skill. Root-level `AGENTS.md` / `CLAUDE.md` files may mirror this
+trigger for local host discovery, but ignored copies must not be treated as the
+durable source.
+
 ## Build Commands
 
 ```bash
@@ -555,7 +566,11 @@ Each adapter decides this itself; read the adapter you are changing. The
 patterns in use are the request field (`web_search`, `reasoning_effort`) and,
 in some adapters, the model name (DeepSeek: `search`; Kimi: `think`/`r1`).
 There are no `X-Enable-Search` / `X-Enable-Thinking` headers. Qwen AI maps
-effort tiers through `src/main/providers/qwen-ai-model-mode.ts`.
+effort tiers through `src/main/providers/qwen-ai-model-mode.ts`. All Qwen model
+names/IDs support case-insensitive `_Fast`, `_Think`/`_Thinking`, `_Auto`
+suffixes; strip them before mapping upstream IDs. Fast/Think are pinned,
+Auto keeps the existing effort-driven policy. Live catalogue refresh generates
+aliases for every Qwen model, not just Qwen3.8-Max.
 
 ### Thinking Content Handling
 
@@ -590,6 +605,14 @@ re-export of `builtinProviders`, so there is nothing to keep in sync by hand.
 
 `initializeDefaultProviders()` in `store.ts` copies the built-in config into the
 persisted store at startup, so restart the app/server to see the change.
+
+Built-ins with `modelsApiEndpoint` also synchronize their live catalogue at
+startup (desktop and server). While the proxy runs, `ModelCatalogueRefreshService`
+refreshes every 5 minutes, single-flight; failures retain persisted models.
+`CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS=0` disables periodic polling.
+The proxy stops the timer on drain/close. `/v1/models` reads this persisted
+catalogue; it does not fetch upstream per request. Tests:
+`tests/server/model-catalogue-refresh.test.mjs`.
 
 ## Network Egress: Never Diagnose "Home IP Banned" Without Checking the Proxy
 
@@ -742,12 +765,25 @@ minutes**) and a `refresh_token` cookie (30 days). Measured facts:
 
 - The access token is only accepted as `Authorization: Bearer`. Sent as a
   `token=` cookie it answers `Unauthorized`, so never write it into the jar.
+  A refreshed access token must also remove any old `token=` cookie (including
+  the `cookie` alias); otherwise cookie-priority authentication shadows the
+  fresh Bearer credential. Header resolution strips it for already persisted
+  access-token accounts too. Expired JWT cookies and access-token cookies do
+  not count as ready sessions; opaque legacy cookies remain supported.
 - Renewal is `GET https://auth.qwen.ai/api/v2/auths/refresh` with
   `Cookie: refresh_token=…`. `chat.qwen.ai` answers that path with Not Found.
   `Timezone` and `x-request-origin` are required (`Invalid request header` /
   `Missing origin` without them). `CHAT2API_QWEN_AI_AUTH_BASE` overrides the host.
 - The refresh token was not rotated in testing, but a rotated one in the
   response is kept. Exchanges are serialized per account.
+- Password signin must remove the previous `token=` cookie before merging the
+  signin response cookies, even when the returned JWT is legacy (no `type`).
+  Otherwise the revoked cookie shadows the new Bearer token and create-chat
+  loops on HTTP 200 `Unauthorized` / `no chat ID returned` (2026-11-10).
+- Refresh-WAF errors carry HTTP 503 + `Retry-After`; without that hint Codex
+  consumes its remaining stream retries in seconds. Browser recovery is joined
+  before retry and must reload current credentials. A global recovery result
+  belonging to a different account must never replace this account's identity.
 - An account whose import has neither a `refresh_token` nor a working
   email/password is dead once its access token lapses. Signin answering
   `INVALID_CRED` for such accounts is the login itself, not our hashing: the
@@ -769,7 +805,26 @@ minutes**) and a `refresh_token` cookie (30 days). Measured facts:
 parked until reset) **before** the dangling-answer rule. Otherwise the short
 answer is treated as `qwen_ai_semantic_incomplete` and replayed on other
 accounts. Both response paths in `qwen-ai.ts` keep that order; a source-order
-test guards it (`tests/server/qwen-ai-daily-quota-notice.test.mjs`).
+test guards it (`tests/server/qwen-ai-daily-quota-notice.test.mjs`). Responses
+tool continuations must also classify `qwen_ai_daily_quota_exhausted` as an
+account failure with `next-account` scope: otherwise the continuation override
+silently discards the policy's rotation decision and exposes 429 to Codex.
+`tests/server/qwen-ai-forwarder-recovery.test.mjs` exercises this branch.
+Likewise, `qwen_ai_session_reauthentication_required` is a narrow account-bound
+503 after renewal and browser recovery both failed. Rotate within the request;
+generic transport/congestion 503s remain account-neutral. Keep this distinction
+in the refresh error factory, account policy, and Responses continuation override.
+
+Single-chunk context compaction must end with the same summary-only instruction
+as map/reduce compaction. Codex handoff input may end in a tool result; without
+an explicit active summary turn Qwen resumes historical `exec_command` calls
+instead of summarizing (`rejected_native_tool_call`). Preserve the bounded
+history and append the instruction; do not strip source facts to hide this.
+The native system channel must contain the summarizer role, not the source
+agent's system prompt: retain historical system messages as labelled source
+data. A trailing user instruction alone still let Codex compaction execute
+historical tools on 2026-11-11.
+Tests: `tests/server/qwen-ai-compaction-forwarder.test.mjs`.
 
 When mocking `./qwenAiRiskCircuit` in tests, provide **all** of:
 `createQwenAiRiskFingerprint`, `getQwenAiRiskCircuitEntry`,

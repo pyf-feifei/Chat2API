@@ -198,6 +198,13 @@ services:
       # Managed tool protocol for qwen-ai. Default hermes; qwen_native opts
       # into the <function_calls> wire format.
       CHAT2API_QWEN_AI_MANAGED_PROTOCOL: ${CHAT2API_QWEN_AI_MANAGED_PROTOCOL:-qwen_hermes}
+      # Optional recovery acceptance scope. A matching request + fresh reply
+      # is required; browser-default success does not prove another model works.
+      QWEN_RECOVERY_PROBE_MODEL: ${QWEN_RECOVERY_PROBE_MODEL-}
+      QWEN_RECOVERY_PROBE_MODE: ${QWEN_RECOVERY_PROBE_MODE-}
+      # Reversible transport selection; keep deployment defaults unchanged.
+      CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE: ${CHAT2API_QWEN_AI_SYSTEM_PROMPT_MODE:-native}
+      CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL: ${CHAT2API_QWEN_AI_TOOL_PROTOCOL_CHANNEL:-native}
       # This UTF-8 JSON target triggers document offload; it is not a request ceiling.
       # Set 0 to disable automatic offload. Transcript upload can be disabled
       # independently below, which keeps the complete transcript inline.
@@ -374,6 +381,9 @@ services:
       # Once semantic recovery begins, cap the full continuation chain even
       # while replacement branches keep producing incomplete progress.
       CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-840000}
+      # Bound waiting for continuation response headers separately from an
+      # accepted SSE generation; never resubmit an ambiguously accepted POST.
+      CHAT2API_QWEN_AI_CONTINUATION_HEADERS_TIMEOUT_MS: ${CHAT2API_QWEN_AI_CONTINUATION_HEADERS_TIMEOUT_MS:-60000}
       # A busy-chat admission response retries the exact same continuation
       # payload first. If that bounded retry budget is exhausted, the normal
       # account failover layer may replay the complete transcript elsewhere.
@@ -497,6 +507,9 @@ services:
       # without rebuilding the image. Production is image-only and does not
       # use this. Read-only so the container can never write the bundle.
       - ./out-server:/app/out-server:ro
+      # The Qwen browser refresher is a Python child process, not part of the
+      # JS bundle. Keep it on the same working-tree revision during local dev.
+      - ./scripts/qwen-captcha:/app/scripts/qwen-captcha:ro
 
 volumes:
   chat2api-data:

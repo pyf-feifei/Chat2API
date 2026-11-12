@@ -209,3 +209,8 @@ test-*-context.cjs
 dev-*.log
 gh_*.py
 gh_*.txt
+
+# Root diagnostic screenshots (local evidence only)
+/direct-punish.png
+/fullpage-challenge.png
+/inpage-punish.png

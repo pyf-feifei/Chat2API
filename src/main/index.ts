@@ -95,6 +95,7 @@ async function initializeApp(): Promise<void> {
 
 async function setupApp(): Promise<void> {
   await storeManager.initialize()
+  await storeManager.syncDynamicBuiltinProviderModels()
 
   // Keep the Electron development proxy separate from the Docker deployment.
   // The Docker Chat2API instance owns 8080; dev runs on 8081 by default.

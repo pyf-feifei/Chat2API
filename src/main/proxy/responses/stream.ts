@@ -395,7 +395,9 @@ export class ChatCompletionsToResponsesStream extends Transform {
     // the same circuit. Checked 2026-09-29: a per-payload risk circuit parked
     // retries for 600s that the client could not see, which presented as an
     // outage rather than a rate limit.
-    const retryAfterSeconds = retryAfterSecondsFromError(error)
+    const retryAfterSeconds = responseError.code === 'data_inspection_failed'
+      ? undefined
+      : retryAfterSecondsFromError(error)
     if (retryAfterSeconds !== undefined) {
       responseError.retry_after_seconds = retryAfterSeconds
       // A structured field alone is not enough: clients only pace the

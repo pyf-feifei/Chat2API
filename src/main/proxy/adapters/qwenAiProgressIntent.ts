@@ -62,7 +62,14 @@ export function isProgressStyleManagedAnswer(trimmedContent: string): boolean {
   const regex = managedProgressIntentRegex()
   if (!regex) return false
   const firstParagraph = trimmedContent.split('\n\n')[0]
-  return regex.test(firstParagraph)
+  if (regex.test(firstParagraph)) return true
+  // A short acknowledgement can precede the actual intent sentence. Match
+  // generic action openers at sentence boundaries too, not arbitrary words
+  // inside findings ("已执行检查" must remain a deliverable result).
+  return firstParagraph.split(/[。！？!?]\s*/u).slice(1).some(sentence => (
+    regex.test(sentence)
+    || /^(?:先|现在(?:实际)?|现在用[^。！？]{0,24}?)(?:取|获取|查看|检查|读取|执行|运行)/u.test(sentence)
+  ))
 }
 
 // Capability-denial detection: at very large contexts the model occasionally

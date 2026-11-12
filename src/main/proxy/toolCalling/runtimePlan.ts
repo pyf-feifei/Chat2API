@@ -54,6 +54,7 @@ export function buildToolCallingRuntimePlan(input: {
   // parsed call can silently miss the allowed-name allowlist.
   const toolNameAliases = profile.preferredManagedProtocol === 'qwen_hermes'
       || profile.preferredManagedProtocol === 'qwen_native'
+      || profile.preferredManagedProtocol === 'qwen_bracket'
     ? buildQwenAiToolNameAliasTable(allowedTools.map((tool) => tool.name))
     : undefined
   // The alias must be an allowed name too: the upstream model may legitimately

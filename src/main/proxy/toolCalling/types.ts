@@ -8,6 +8,7 @@ export type ToolProtocolId =
   | 'managed_xml'
   | 'qwen_hermes'
   | 'qwen_native'
+  | 'qwen_bracket'
   | 'anthropic_tool_use'
   | 'codex_responses'
   | 'm365_fenced'
