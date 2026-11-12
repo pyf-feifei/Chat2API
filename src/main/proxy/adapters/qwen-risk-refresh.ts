@@ -7,11 +7,7 @@ import { fileURLToPath } from 'url'
 import { storeManager } from '../../store/store'
 import type { Account } from '../../../shared/types'
 import { resetQwenAiRefreshFaultTracking } from './qwen-ai-token-refresh'
-import {
-  mergeRiskCookiesIntoJar,
-  riskCookiesForPeers,
-  rebindForeignIdentity,
-} from './qwen-ai-cookie-identity'
+import { rebindForeignIdentity, signedTokenSubject } from './qwen-ai-cookie-identity'
 
 // Resolve the bundled solver so the default works in every layout:
 //   dev/tsx   : this file sits at <repo>/src/main/proxy/adapters -> repo/scripts
@@ -91,92 +87,44 @@ export function parseQwenAiRiskFailureDiagnostics(stdout: string): Record<string
 
 const REFRESH_SCRIPT = process.env.QWEN_CAPTCHA_SOLVER_PATH || defaultRefreshScriptPath()
 const REFRESH_TIMEOUT_MS = 180_000
-const CHALLENGE_WINDOW_MS = 15 * 60_000
-const CHALLENGE_THRESHOLD = 1
 // A verified clearance can expire or be challenged again long before 30m.
 // Single-flight plus a short cooldown bounds browser launches without leaving
 // a newly challenged session stuck behind yesterday's successful recovery.
 const REFRESH_COOLDOWN_MS = 60_000
 
-// RGV587 (FAIL_SYS_USER_VALIDATE) is an exit-IP / browser-fingerprint verdict,
-// not an account verdict: rotating accounts behind the same flagged exit keeps
-// hitting the same challenge. Counting challenges per account can therefore
-// never reach the threshold — under "rotate on first busy" failover no single
-// account accumulates CHALLENGE_THRESHOLD hits in the window (observed live
-// 2026-09-17: 12 accounts × 2 hits each → zero refreshes). Count challenges
-// globally against the shared exit instead.
-const globalChallengeTimestamps: number[] = []
-// One refresh at a time for the whole pool — a single slider pass re-issues
-// the exit-level x5sec family that every account behind the exit can reuse.
-let globalRefreshInFlight: Promise<Account | null> | undefined
+// Serialize browser resources globally, but keep recovery results and opaque
+// cookie jars account-local. A non-JWT cookie can still identify a device or a
+// challenge; lack of a JWT subject does NOT prove it is safe to share.
+let browserTail: Promise<unknown> = Promise.resolve()
+let automaticTail: Promise<unknown> = Promise.resolve()
 let lastGlobalRefreshAt = 0
-let cooldownRefreshInFlight: Promise<Account | null> | undefined
-// Per-account in-flight guard for the manual refresh entry point
-// (refreshQwenAiRiskSession), kept separate from the pool-wide gate so a manual
-// trigger on account A and an auto trigger on account B cannot both spawn a
-// browser at once.
+const automaticInFlight = new Map<string, Promise<Account | null>>()
 const inFlight = new Map<string, Promise<Account | null>>()
 
-/**
- * Record that a request hit the RGV587 validation envelope
- * (FAIL_SYS_USER_VALIDATE + 被挤爆). After CHALLENGE_THRESHOLD hits inside
- * the window across ANY account on the shared exit, kick one background
- * risk-session refresh — a real browser passes the aliyun slider and re-issues
- * the risk cookies (x5sec family), which is the community-verified durable fix
- * for content-flagged sessions.
- */
+/** Join this account's recovery, never another account's verification result. */
 export function noteQwenAiRiskChallenge(account: Account, evidence?: string): Promise<Account | null> | undefined {
-  // bxpunish is the same aliyun (baxia) verdict family as RGV587 but arrives as
-  // a response header on a 503 busy body, not as error text — the caller folds
-  // it into the evidence string so the shared-exit counter can trip the same
-  // browser x5sec refresh. Without it, bxpunish hits never refreshed cookies.
   const envelope = /FAIL_SYS_USER_VALIDATE|RGV587|bxpunish/i.test(String(evidence ?? ''))
   if (!envelope) return
-  const now = Date.now()
-  // Global exit-level window: drop hits older than the window, then count.
-  while (globalChallengeTimestamps.length > 0 && now - globalChallengeTimestamps[0] >= CHALLENGE_WINDOW_MS) {
-    globalChallengeTimestamps.shift()
-  }
-  globalChallengeTimestamps.push(now)
-  if (globalChallengeTimestamps.length < CHALLENGE_THRESHOLD) return
-  if (globalRefreshInFlight) return globalRefreshInFlight
-  if (now - lastGlobalRefreshAt < REFRESH_COOLDOWN_MS) {
-    // A cooldown limits browser launches, not recovery eligibility. Returning
-    // undefined here made the caller mark recovery as observed forever and
-    // replay a challenged request without ever opening a browser.
-    if (!cooldownRefreshInFlight) {
-      const delayMs = REFRESH_COOLDOWN_MS - (now - lastGlobalRefreshAt)
-      cooldownRefreshInFlight = new Promise<void>(resolve => setTimeout(resolve, delayMs))
-        .then(() => {
-          cooldownRefreshInFlight = undefined
-          const latest = storeManager.getAccountById?.(account.id, true) ?? account
-          return noteQwenAiRiskChallenge(latest, evidence) ?? null
-        })
-    }
-    return cooldownRefreshInFlight
-  }
-  lastGlobalRefreshAt = now
-  globalChallengeTimestamps.length = 0
-  console.warn('[QwenAI Risk Refresh] RGV587 challenge threshold hit, refreshing risk session', JSON.stringify({
-    triggerAccountId: account.id,
-    challenges: CHALLENGE_THRESHOLD,
-    windowMs: CHALLENGE_WINDOW_MS,
-  }))
-  globalRefreshInFlight = refreshQwenAiRiskSession(account)
-    .then(result => {
-      if (result) {
-        console.info('[QwenAI Risk Refresh] risk session updated', JSON.stringify({ accountId: result.id }))
-      }
-      return result
-    })
-    .catch(error => {
-      console.error('[QwenAI Risk Refresh] failed:', error instanceof Error ? error.message : String(error))
-      return null
-    })
-    .finally(() => {
-      globalRefreshInFlight = undefined
-    })
-  return globalRefreshInFlight
+  const existing = automaticInFlight.get(account.id)
+  if (existing) return existing
+  const operation = automaticTail.then(async () => {
+    const delayMs = Math.max(0, REFRESH_COOLDOWN_MS - (Date.now() - lastGlobalRefreshAt))
+    if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs))
+    lastGlobalRefreshAt = Date.now()
+    const latest = storeManager.getAccountById?.(account.id, true) ?? account
+    console.warn('[QwenAI Risk Refresh] account-owned recovery starting', JSON.stringify({ accountId: account.id }))
+    const result = await refreshQwenAiRiskSession(latest)
+    if (result) console.info('[QwenAI Risk Refresh] risk session updated', JSON.stringify({ accountId: result.id }))
+    return result
+  }).catch(error => {
+    console.error('[QwenAI Risk Refresh] failed', JSON.stringify({
+      accountId: account.id, errorType: error instanceof Error ? error.name : typeof error,
+    }))
+    return null
+  }).finally(() => automaticInFlight.delete(account.id))
+  automaticInFlight.set(account.id, operation)
+  automaticTail = operation
+  return operation
 }
 
 /**
@@ -213,7 +161,11 @@ export async function refreshQwenAiRiskSession(
 ): Promise<Account | null> {
   const existing = inFlight.get(account.id)
   if (existing) return existing
-  const operation = doRefresh(account, options.punishUrl)
+  const operation = browserTail.then(() => {
+    const latest = storeManager.getAccountById?.(account.id, true) ?? account
+    return doRefresh(latest, options.punishUrl)
+  })
+  browserTail = operation.catch(() => undefined)
   inFlight.set(account.id, operation)
   try {
     return await operation
@@ -327,10 +279,19 @@ async function doRefresh(account: Account, punishUrl?: string): Promise<Account 
           // The browser was seeded with the stored jar, so identity cookies of
           // another user already in it come straight back; keep only this
           // account's own session in its jar.
+          const current = storeManager.getAccountById?.(account.id, true) ?? account
+          const expectedSubject = signedTokenSubject(token)
+          const currentSubject = signedTokenSubject(current.credentials.token || '')
+          if ((expectedSubject && currentSubject && currentSubject !== expectedSubject)
+            || (harvestedToken && expectedSubject && signedTokenSubject(harvestedToken) !== expectedSubject)) {
+            console.error('[QwenAI Risk Refresh] harvest belongs to a different or unrecognizable identity', JSON.stringify({ accountId: account.id }))
+            resolve(null)
+            return
+          }
           const ownCookies = rebindForeignIdentity(harvestedCookies, String(harvestedToken || token))
           const updated = storeManager.updateAccount(account.id, {
             credentials: {
-              ...account.credentials,
+              ...current.credentials,
               cookies: ownCookies,
               cookie: ownCookies,
               ...(harvestedToken ? { token: harvestedToken } : {}),
@@ -341,41 +302,8 @@ async function doRefresh(account: Account, punishUrl?: string): Promise<Account 
             resolve(null)
             return
           }
-          // The harvested x5sec family is bound to the shared exit/browser
-          // fingerprint, not to this one Qwen account. Fan it out to every
-          // other qwen-ai account so the whole pool behind the same flagged
-          // exit benefits from a single slider pass — otherwise each account
-          // would keep failing until it individually re-triggered a refresh.
-          // Only the cookies this refresh produced travel, and never the
-          // signed-in identity: copying the whole jar made all 340 accounts
-          // present one account's session (2026-09-29).
-          const riskCookies = riskCookiesForPeers(
-            cookies,
-            harvestedCookies,
-            [token, String(harvestedToken || '')],
-          )
-          let propagated = 0
-          try {
-            const peers = riskCookies.size > 0
-              ? storeManager.getAccountsByProviderId('qwen-ai', true)
-              : []
-            for (const peer of peers) {
-              if (peer.id === account.id) continue
-              const peerJar = String(peer.credentials.cookies || peer.credentials.cookie || '')
-              const merged = mergeRiskCookiesIntoJar(peerJar, riskCookies)
-              if (merged === peerJar) continue
-              storeManager.updateAccount(peer.id, {
-                credentials: {
-                  ...peer.credentials,
-                  cookies: merged,
-                  cookie: merged,
-                },
-              })
-              propagated += 1
-            }
-          } catch (propError) {
-            console.warn('[QwenAI Risk Refresh] x5sec fan-out failed:', propError instanceof Error ? propError.message : String(propError))
-          }
+          // This browser verified only this identity. Opaque device/challenge
+          // values have no proven cross-account scope, so never fan them out.
           // A fresh authenticated browser probe proves this account's auth
           // path works again; do not keep the earlier refresh-WAF gate alive.
           resetQwenAiRefreshFaultTracking()
@@ -385,8 +313,7 @@ async function doRefresh(account: Account, punishUrl?: string): Promise<Account 
             probeVerified: parsed.probe_verified === true,
             probeScope: process.env.QWEN_RECOVERY_PROBE_MODEL ? 'configured-model' : 'browser-default-model',
             probeModelVerified: parsed.probe_model_verified === true,
-            sharedCookies: Array.from(riskCookies.keys()),
-            propagatedToAccounts: propagated,
+            propagatedToAccounts: 0,
           }))
           resolve(updated)
           return

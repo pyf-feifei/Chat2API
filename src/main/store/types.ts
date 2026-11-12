@@ -373,6 +373,8 @@ export interface Account {
    * survive until then rather than for the minutes a risk cooldown lasts.
    */
   dailyQuotaExhaustedUntil?: number
+  /** Upstream-model quota deadlines; do not disable other models on the account. */
+  modelQuotaExhaustedUntil?: Record<string, number>
 }
 
 /**

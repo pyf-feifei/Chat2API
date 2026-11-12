@@ -387,6 +387,8 @@ export interface ForwardResult {
   retryable?: boolean
   /** Stable upstream classification used by provider-specific circuit breakers. */
   errorCode?: string
+  /** A model-specific quota notice must not park unrelated models. */
+  quotaScope?: 'model' | 'account'
   /** False when a protocol-level response failure should not penalize the selected account. */
   accountFault?: boolean
   /** Retry only by selecting another account before any generation request was accepted upstream. */

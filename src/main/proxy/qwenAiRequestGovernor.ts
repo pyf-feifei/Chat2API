@@ -875,6 +875,12 @@ export class QwenAiRequestGovernor {
       return result
     }
 
+    // Persistent per-model quota isolation handles this allowance. A global
+    // account cooldown would also reject the other models the notice invites.
+    if (result.errorCode === 'qwen_ai_daily_quota_exhausted' && result.quotaScope === 'model') {
+      return result
+    }
+
     // A managed-tool validation failure is produced by the local response
     // parser, not by Qwen capacity. The forwarder performs one bounded
     // recovery attempt, so opening the normal 5xx cooldown here would make

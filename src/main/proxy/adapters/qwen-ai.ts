@@ -2366,6 +2366,7 @@ export type QwenAiUpstreamError = Error & {
   retryable?: boolean
   accountFault?: boolean
   retryScope?: 'next-account'
+  quotaScope?: 'model' | 'account'
   upstreamState?: 'no_events' | 'active_without_terminal' | 'completed_without_valid_output' | 'client_disconnected'
   /** When CHAT_IN_PROGRESS carries the in-flight response id, resume-drain can consume it. */
   inFlightResponseId?: string
@@ -2679,14 +2680,19 @@ export function isQwenAiDailyQuotaNotice(text: string, reasoning = ''): boolean 
   return QWEN_AI_DAILY_QUOTA_FALLBACKS.some((re) => re.test(body))
 }
 
-function createQwenAiDailyQuotaError(): QwenAiUpstreamError {
+function createQwenAiDailyQuotaError(notice: string = ''): QwenAiUpstreamError {
+  const modelScoped = /^\s*Qwen[\w.\-]*\s*(?:今日|今天)已达上限/i.test(notice)
+    && /切换其他模型|switch.*(?:another|other).*model/i.test(notice)
   const error = createQwenAiStreamFailure(
-    'Qwen AI refused the request: this account has exhausted its daily conversation quota '
-    + '(upstream answered HTTP 200 with a quota notice). The account is parked until the '
-    + 'quota resets; retrying on the same account cannot succeed today.',
+    modelScoped
+      ? 'Qwen AI refused the request: this model has exhausted its daily quota on this account. Other models may still be available.'
+      : 'Qwen AI refused the request: this account has exhausted its daily conversation quota '
+        + '(upstream answered HTTP 200 with a quota notice). The account is parked until the '
+        + 'quota resets; retrying on the same account cannot succeed today.',
     'qwen_ai_daily_quota_exhausted',
   )
-  // 429: retryable in principle, but not on this account today.
+  error.quotaScope = modelScoped ? 'model' : 'account'
+  // 429: retryable in principle, but not for this allowance today.
   error.status = 429
   // A quota refusal is a property of the ACCOUNT's daily allowance, not a
   // credential fault and not a content risk verdict. accountFault=false keeps
@@ -4508,6 +4514,18 @@ export class QwenAiAdapter {
       error.headers = sanitizeForwardedErrorHeaders(response.headers)
       return error
     }
+    // Create-chat can answer HTTP 200 with an Aliyun challenge, too. It is
+    // neither a missing chat ID nor evidence that this account is invalid.
+    if (response.status === 200 && /aliyun_waf|baxia|captcha-frontend/i.test(body)
+      && /(?:text\/html|application\/xhtml\+xml)/i.test(contentType)) {
+      const error = new Error('Qwen AI create-chat is awaiting upstream browser verification. Try again in 60s.') as QwenAiUpstreamError
+      error.status = 503
+      error.code = 'qwen_ai_egress_waf_block'
+      error.retryable = true
+      error.accountFault = false
+      error.headers = { 'Retry-After': '60' }
+      return error
+    }
     // The WAF's second shape (measured 2026-10-14 on every flagged egress):
     // the chat call is answered HTTP 200 with a JSON "Internal error" body
     // while chat creation on a different endpoint succeeded. Fresh accounts
@@ -4871,9 +4889,20 @@ export class QwenAiAdapter {
       // generic 'no chat ID' error, spending Codex retries on different stale
       // pool accounts. Reauthenticate in-place before any client reconnect.
       if (this.isUnauthorizedPayload(response.data)) {
-        console.warn('[QwenAI] chat rejected renewed credentials; awaiting browser reauthentication', JSON.stringify({ accountId: this.account.id }))
-        this.account = await this.tokenRefresher.refreshAfterRejectedRenewal(this.account, signal)
-        response = await this.postWithRefreshRetry(url, payload, createOptions)
+        console.warn('[QwenAI] chat rejected renewed credentials; verifying account-owned recovery stages', JSON.stringify({ accountId: this.account.id }))
+        let verified = false
+        this.account = await this.tokenRefresher.refreshAfterRejectedRenewal(this.account, signal, async renewed => {
+          this.account = renewed
+          response = await this.postWithRefreshRetry(url, payload, createOptions)
+          if (this.isUnauthorizedPayload(response.data)) return false
+          if (response.status >= 400) {
+            throw await this.createInvalidStreamError(response, `chat creation returned HTTP ${response.status}`)
+          }
+          verified = Boolean(response.data?.data?.id)
+          if (!verified) throw await this.createInvalidStreamError(response, 'recovery returned no chat ID')
+          return true
+        })
+        if (!verified) response = await this.postWithRefreshRetry(url, payload, createOptions)
         if (this.isUnauthorizedPayload(response.data)) {
           throw this.tokenRefresher.rejectedRenewalError()
         }
@@ -4883,8 +4912,13 @@ export class QwenAiAdapter {
         throw await this.createInvalidStreamError(response, `chat creation returned HTTP ${response.status}`)
       }
 
+      if (!response.data?.data?.id && typeof response.data === 'string') {
+        throw await this.createInvalidStreamError(response, 'create-chat returned a non-JSON body')
+      }
       if (QWEN_AI_DEBUG_REQUEST_LOGS) {
-        console.log('[QwenAI] Create chat response:', JSON.stringify(response.data, null, 2))
+        console.log('[QwenAI] Create chat response metadata:', JSON.stringify({
+          status: response.status, hasChatId: Boolean(response.data?.data?.id),
+        }))
       }
 
       if (response.data?.data?.id) {
@@ -6773,6 +6807,11 @@ export class QwenAiStreamHandler {
       summaryText = ''
       summarySourceText = ''
       deliveredAnswerText = ''
+      // A replacement branch starts its own progress baseline. Retaining the
+      // abandoned branch's high-water kills a smaller but growing tool block.
+      lastProducedChars = 0
+      lastProducedAt = Date.now()
+      upstreamEventCount = 0
       sawUpstreamCompletion = false
       this.pendingSemanticRecoveryError = undefined
       idleRecoveryInFlight = false
@@ -7009,7 +7048,10 @@ export class QwenAiStreamHandler {
     let lastProducedChars = 0
     let lastProducedAt = Date.now()
     const producedChars = () =>
-      reasoningText.length + summaryText.length + deliveredAnswerText.length
+      // Managed tool JSON is deliberately held until its arguments validate.
+      // Counting only client-visible bytes calls a growing tool block a loop
+      // and kills legitimate large file writes before the closing delimiter.
+      reasoningText.length + summaryText.length + Math.max(deliveredAnswerText.length, this.content.length)
     const checkRunawayGeneration = (): boolean => {
       if (finalChunkSent) return true
       const produced = producedChars()
@@ -7599,7 +7641,7 @@ export class QwenAiStreamHandler {
           accountId: this.account?.id,
           notice: String(this.content).trim().slice(0, 80),
         }))
-        failStream(createQwenAiDailyQuotaError())
+        failStream(createQwenAiDailyQuotaError(this.content))
         return
       }
 
@@ -8344,7 +8386,7 @@ export class QwenAiStreamHandler {
           }))
           // Non-streaming path: rejectOnce is the local settlement hook here.
           // failStream only exists in the streaming closure.
-          rejectOnce(createQwenAiDailyQuotaError())
+          rejectOnce(createQwenAiDailyQuotaError(data.choices[0].message.content))
           return
         }
 

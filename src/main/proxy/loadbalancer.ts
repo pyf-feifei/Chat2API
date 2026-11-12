@@ -10,6 +10,7 @@ import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
 import { accountHasQwenAiWebSession } from './adapters/qwen-ai-token-refresh'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 import { qwenAiStickyRegistry } from './qwenAiStickyRegistry'
+import { hasQwenAiModelQuota } from './qwenAiQuota'
 
 const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
 
@@ -278,8 +279,11 @@ export class LoadBalancer {
         continue
       }
 
+      const quotaModel = this.mapModel(model, provider)
       const accounts = storeManager.getAccountsByProviderId(provider.id, true)
         .filter(account => this.isAccountAvailable(account))
+        .filter(account => !this.isQwenAiProvider(provider)
+          || !hasQwenAiModelQuota(account.modelQuotaExhaustedUntil, quotaModel))
         .filter(account => !excludedAccountIds.has(account.id))
         .filter(account => !this.isAccountInHardCooldown(account.id))
         .filter(account => !excludeFailed || !this.isAccountInFailure(account.id))

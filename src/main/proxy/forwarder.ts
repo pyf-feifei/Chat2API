@@ -914,13 +914,21 @@ async function studioAgentKnownUnavailable(cachePath: string): Promise<boolean> 
   }
 }
 
-function markAccountDailyQuotaExhausted(accountId: string | undefined): void {
+function markAccountDailyQuotaExhausted(accountId: string | undefined, model?: string): void {
   if (!accountId) return
   const until = Date.now() + DAILY_QUOTA_PARK_MS
   try {
-    storeManager.updateAccount(accountId, { dailyQuotaExhaustedUntil: until })
-    console.warn('[QwenAI] account parked until the daily quota resets', JSON.stringify({
+    if (model) {
+      const current = storeManager.getAccountById(accountId)
+      storeManager.updateAccount(accountId, {
+        modelQuotaExhaustedUntil: { ...current?.modelQuotaExhaustedUntil, [model]: until },
+      })
+    } else {
+      storeManager.updateAccount(accountId, { dailyQuotaExhaustedUntil: until })
+    }
+    console.warn('[QwenAI] quota allowance parked for the configured retry window', JSON.stringify({
       accountId,
+      ...(model ? { model } : {}),
       until: new Date(until).toISOString(),
     }))
   } catch (error) {
@@ -2786,7 +2794,7 @@ export class RequestForwarder {
         // the account can only refuse again until the upstream's day boundary,
         // whereas a risk cooldown lasts minutes.
         if (result.errorCode === 'qwen_ai_daily_quota_exhausted') {
-          markAccountDailyQuotaExhausted(account.id)
+          markAccountDailyQuotaExhausted(account.id, result.quotaScope === 'model' ? actualModel : undefined)
         }
         if (scheduleQwenAiBusyRetry(result)) {
           continue
@@ -6327,6 +6335,9 @@ export class RequestForwarder {
               : undefined
           : inferredErrorRetryScope,
         recoveryHint,
+        ...((error as { quotaScope?: 'model' | 'account' })?.quotaScope
+          ? { quotaScope: (error as { quotaScope?: 'model' | 'account' }).quotaScope }
+          : {}),
         // Surface the dead-in-flight structural signal so the Responses route
         // can drop the sticky chain binding instead of re-pinning every retry
         // to a permanently busy dead branch.

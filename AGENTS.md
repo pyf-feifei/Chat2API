@@ -572,6 +572,19 @@ suffixes; strip them before mapping upstream IDs. Fast/Think are pinned,
 Auto keeps the existing effort-driven policy. Live catalogue refresh generates
 aliases for every Qwen model, not just Qwen3.8-Max.
 
+### Managed stream progress is not only delivered text
+
+Qwen managed tool arguments are buffered until the tool block validates. The
+runaway watchdog must count growing guarded answer content, not just delivered
+answer text: a long tool argument had 1800 events with zero delivered bytes
+and was incorrectly cut off after 91 seconds (2026-11-12). Keep timeout/event
+thresholds for actual no-growth floods; do not disable the watchdog to hide
+this. Reset the progress high-water, clock and event count when replacing a
+provider branch: a smaller growing replacement must not inherit the abandoned
+branch's output length. `tests/server/qwen-ai-stream-failure.test.mjs` covers
+both growing buffered arguments across replacement and preservation of a
+pending invalid-tool cause.
+
 ### Thinking Content Handling
 
 In stream handler, output thinking content to `reasoning_content` field:
@@ -742,19 +755,27 @@ return 429 to Codex.
 
 ### Risk refresh must never copy identity between accounts
 
-`qwen-risk-refresh.ts` harvests a browser cookie jar and shares risk cookies
-with the pool. On 2026-09-29 it copied the **whole** jar, including `token`,
+`qwen-risk-refresh.ts` harvests a browser cookie jar for its owning account
+only. On 2026-09-29 it copied the **whole** jar, including `token`,
 `refresh_token`, `aui` and `cnaui`, onto 339 accounts. A `token` cookie takes
 priority over the Bearer JWT (`resolveQwenAiAuthHeaders`), so all 340 accounts
 ran as one user and drew verdicts continuously.
 
-- Peers only receive cookies the refresh itself changed **and** that carry no
-  identity (`src/main/proxy/adapters/qwen-ai-cookie-identity.ts`). Identity is
-  decided from the value: a signed JWT, or a value equal to a user id from
-  one. Do not replace this with a list of cookie names.
-- Health check for the pool: the number of distinct `token` cookies must equal
-  the number of accounts, and each must equal that account's own JWT.
-- Tests: `tests/server/qwen-ai-cookie-identity.test.ts`.
+- Never fan out browser cookies to peers, including opaque values that carry
+  no recognizable JWT subject. Nonidentity is not proof of cross-account scope:
+  device/challenge cookies can be opaque. On 2026-11-12 the old filter still
+  left 95 accounts sharing one `x5sec`, and all 96 sharing `isg`/`tfstk` values.
+  This proves shared state, not that it caused every upstream verdict. Do not
+  mass-clear existing jars as a presumed fix.
+- Browser recovery is globally serialized, but each account owns its promise,
+  verified reply, and cookie jar. A peer's verification must not replace or
+  satisfy this account's recovery. A harvested JWT must match the seeded JWT's
+  subject before persistence. Reload queued accounts from the store at launch.
+- Health check: compare JWT subjects across accounts and refresh tokens. Modern
+  access tokens are Bearer-only and must NOT have a matching `token=` cookie;
+  only legacy cookie-auth accounts can be checked that way.
+- Tests: `tests/server/qwen-ai-cookie-identity.test.ts` and
+  `tests/server/qwen-ai-risk-refresh-verdict.test.mjs`.
 
 ### Qwen issues two kinds of login token
 
@@ -775,7 +796,22 @@ minutes**) and a `refresh_token` cookie (30 days). Measured facts:
   `Timezone` and `x-request-origin` are required (`Invalid request header` /
   `Missing origin` without them). `CHAT2API_QWEN_AI_AUTH_BASE` overrides the host.
 - The refresh token was not rotated in testing, but a rotated one in the
-  response is kept. Exchanges are serialized per account.
+  response is kept. Refresh-token exchanges and password signins are single-flight
+  across adapter instances and background repair, not just within one adapter.
+  Adapters are constructed per request; instance-local maps do not deduplicate
+  concurrent requests. Failed flights must be released so recovery can retry.
+- Access tokens renew within three minutes of expiry, matching the web app,
+  capped at half the lifetime for unusually short tokens. Legacy JWTs retain
+  their six-hour/half-life margin. A half-life policy for 15-minute tokens
+  doubled auth traffic unnecessarily.
+- Password signin also uses `https://auth.qwen.ai/api/v2/auths/signin`, with
+  `x-request-origin: https://chat.qwen.ai` and `Timezone`. Current responses
+  carry `data.access_token` and `data.refresh_token`; retain both (legacy
+  `token` responses remain supported). On 2026-11-12 the old chat-host signin
+  issued a legacy JWT that create-chat rejected; the same account via the auth
+  host immediately passed create-chat. Do not mistake that legacy-path failure
+  for an unusable saved password or proof that browser recovery is required.
+  An HTML 405 is a WAF challenge, not a reason to send a second legacy login.
 - Password signin must remove the previous `token=` cookie before merging the
   signin response cookies, even when the returned JWT is legacy (no `type`).
   Otherwise the revoked cookie shadows the new Bearer token and create-chat
@@ -797,12 +833,41 @@ minutes**) and a `refresh_token` cookie (30 days). Measured facts:
 - Code: `usableQwenAiRefreshToken`, `hasQwenAiWebSession`,
   `canRefreshQwenAiAccount` in `qwen-ai-token-refresh.ts`. Tests:
   `tests/server/qwen-ai-refresh-token.test.mjs`.
+- Session repair must rotate past its last selected account. Restarting each
+  sweep at the head starves the tail of a 96-account pool. The default 25s
+  interval takes at least 40 minutes per sweep, longer than a 15-minute token's
+  life. Successful refresh-token-only renewals now wait 5s via
+  `CHAT2API_QWEN_AI_SESSION_REPAIR_REFRESH_TOKEN_INTERVAL_MS`; password/browser
+  recovery, non-active probes and failures retain the 25s repair interval.
+  A fallback callback tracks the actual path: a refresh-token input does not
+  prove password fallback did not run. Keep the risk gate and backoff intact.
+  A single-account three-request 5s pacing check passed at 190–280ms each on
+  2026-11-12; this is not proof that a full pool can sustain the same cadence.
+  Set the refresh-token interval to 25000 to restore conservative pacing.
+  `sessionRepair.capacity` reports a lower-bound refresh-only sweep time;
+  it excludes network latency, password recovery/backoff and is not a
+  real-world throughput proof. No automatic pool-size acceleration.
+  `tests/server/qwen-ai-session-repair.test.mjs` guards fairness and capacity.
+- The retired chat-host password signin can return `success:true` and a legacy
+  JWT that create-chat still rejects (measured 2026-11-12). Test chat acceptance after each recovery
+  stage, not just auth success. If refresh and password fail chat verification,
+  run same-account browser recovery, serialized across accounts; never substitute
+  a peer's global risk-recovery result or remove the browser fallback merely
+  because a password exists. Keep transport/cancellation failures distinct.
 
 ### Quota notices arrive as successful answers
 
 "今日对话次数已达上限" / "You've reached today's chat limit" comes back as HTTP
-200 content. It must be classified (`qwen_ai_daily_quota_exhausted`, account
-parked until reset) **before** the dangling-answer rule. Otherwise the short
+200 content. It must be classified (`qwen_ai_daily_quota_exhausted`)
+**before** the dangling-answer rule. A notice explicitly naming a Qwen model
+and inviting a switch to other models has `quotaScope: model`: persist only
+`modelQuotaExhaustedUntil[actualModel]`, never an account-wide quota marker or
+account-wide governor cooldown. On 2026-11-12 an account parked after a
+Qwen4-Max-Preview quota notice immediately returned a real Qwen3.8-Max reply
+in an isolated snapshot. Generic daily-chat notices retain account-wide
+isolation. The current 20-hour retry window is a local conservative policy,
+not a measured upstream reset time. Existing global markers lack scope and
+must not be bulk-cleared or migrated without confirmation. Otherwise the short
 answer is treated as `qwen_ai_semantic_incomplete` and replayed on other
 accounts. Both response paths in `qwen-ai.ts` keep that order; a source-order
 test guards it (`tests/server/qwen-ai-daily-quota-notice.test.mjs`). Responses
@@ -810,6 +875,8 @@ tool continuations must also classify `qwen_ai_daily_quota_exhausted` as an
 account failure with `next-account` scope: otherwise the continuation override
 silently discards the policy's rotation decision and exposes 429 to Codex.
 `tests/server/qwen-ai-forwarder-recovery.test.mjs` exercises this branch.
+Model scope is covered by `tests/server/qwen-ai-model-quota.test.mjs`, the
+quota-notice tests and governor tests.
 Likewise, `qwen_ai_session_reauthentication_required` is a narrow account-bound
 503 after renewal and browser recovery both failed. Rotate within the request;
 generic transport/congestion 503s remain account-neutral. Keep this distinction

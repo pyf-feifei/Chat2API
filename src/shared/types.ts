@@ -178,6 +178,15 @@ export interface QwenAiGovernorStatus {
     inFlightAccountId?: string
     nextRunAt?: number
     globalPauseUntil?: number
+    capacity?: {
+      shortTokenAccounts: number
+      intervalMs: number
+      refreshTokenIntervalMs: number
+      minimumSweepMs: number
+      renewalCycleMs?: number
+      sustainable: boolean
+      excludesNetworkTime: boolean
+    }
   }
   refreshFaults?: {
     rejectionStreak: number

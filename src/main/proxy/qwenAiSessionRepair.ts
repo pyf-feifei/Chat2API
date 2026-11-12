@@ -10,6 +10,7 @@ import {
 } from './adapters/qwen-ai-token-refresh'
 
 const DEFAULT_REPAIR_INTERVAL_MS = 25_000
+const DEFAULT_REFRESH_TOKEN_INTERVAL_MS = 5_000
 const DEFAULT_RESCAN_INTERVAL_MS = 60_000
 const DEFAULT_FAILURE_RETRY_MS = 5 * 60_000
 const DEFAULT_CREDENTIAL_RETRY_MS = 6 * 60 * 60_000
@@ -62,10 +63,10 @@ function isQwenAiProvider(provider: Provider): boolean {
 }
 
 /**
- * Ready means a request can authenticate now: the jar carries the session
- * cookie, or it carries a refresh token and the access token minted from it has
- * not reached its renewal point. Such an access token lives for minutes, so this
- * sweep, not the next request, is what keeps it current.
+ * Ready is local credential freshness, NOT a verified successful chat: the jar
+ * carries a usable-looking session cookie, or a refresh token plus an access
+ * token outside its renewal window. Upstream quota and content verdicts can
+ * still refuse generation. The sweep tries to keep short-lived tokens fresh.
  */
 export function isQwenAiWebSessionReady(account: Account): boolean {
   const cookies = String(account.credentials.cookies || account.credentials.cookie || '')
@@ -143,6 +144,8 @@ export class QwenAiSessionRepairService {
   private nextRunAt?: number
   private globalPauseUntil = 0
   private retryAfterByAccount = new Map<string, number>()
+  private lastSelectedAccountId?: string
+  private lastRepairWasRefreshOnly = false
 
   isEnabled(): boolean {
     return envBoolean('CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED', true)
@@ -231,14 +234,53 @@ export class QwenAiSessionRepairService {
     return { state: 'pending', ready: false, repairable: true }
   }
 
+  private getRefreshCapacity(): {
+    shortTokenAccounts: number
+    intervalMs: number
+    refreshTokenIntervalMs: number
+    minimumSweepMs: number
+    renewalCycleMs?: number
+    sustainable: boolean
+    excludesNetworkTime: boolean
+  } {
+    const intervalMs = envDuration(
+      'CHAT2API_QWEN_AI_SESSION_REPAIR_INTERVAL_MS', DEFAULT_REPAIR_INTERVAL_MS, 1_000,
+    )
+    const cycles = this.getQwenAiAccounts().flatMap(account => {
+      if (!isQwenAiWebSessionRepairable(account)) return []
+      try {
+        const payload = JSON.parse(Buffer.from(String(account.credentials.token || '').split('.')[1], 'base64url').toString('utf8'))
+        const lifetimeMs = (payload.exp - payload.iat) * 1000
+        if (payload.type !== 'access_token' || !Number.isFinite(lifetimeMs) || lifetimeMs <= 0) return []
+        return [lifetimeMs - Math.min(180_000, lifetimeMs / 2)]
+      } catch {
+        return []
+      }
+    })
+    const refreshTokenIntervalMs = envDuration(
+      'CHAT2API_QWEN_AI_SESSION_REPAIR_REFRESH_TOKEN_INTERVAL_MS', DEFAULT_REFRESH_TOKEN_INTERVAL_MS, 1_000,
+    )
+    const minimumSweepMs = cycles.length * refreshTokenIntervalMs
+    const renewalCycleMs = cycles.length ? Math.min(...cycles) : undefined
+    return {
+      shortTokenAccounts: cycles.length, intervalMs, refreshTokenIntervalMs, minimumSweepMs, renewalCycleMs,
+      sustainable: renewalCycleMs === undefined || minimumSweepMs < renewalCycleMs,
+      // A necessary bound, not a promise: actual auth latency and backoff add
+      // to this sweep. Never silently speed up to make the boolean turn green.
+      excludesNetworkTime: true,
+    }
+  }
+
   getRuntimeStatus(): {
     running: boolean
     inFlightAccountId?: string
     nextRunAt?: number
     globalPauseUntil?: number
+    capacity: ReturnType<QwenAiSessionRepairService['getRefreshCapacity']>
   } {
     return {
       running: this.running,
+      capacity: this.getRefreshCapacity(),
       inFlightAccountId: this.inFlightAccountId,
       nextRunAt: this.nextRunAt,
       globalPauseUntil: this.globalPauseUntil > Date.now() ? this.globalPauseUntil : undefined,
@@ -284,7 +326,11 @@ export class QwenAiSessionRepairService {
     }
 
     this.inFlightAccountId = candidate.id
+    this.lastRepairWasRefreshOnly = false
     const isProbe = candidate.status !== 'active'
+    let refreshOnly = !isProbe && Boolean(usableQwenAiRefreshToken(
+      String(candidate.credentials.cookies || candidate.credentials.cookie || ''), candidate.credentials.token,
+    ))
     try {
       // A probe must prove the credentials still work before the account is
       // allowed back into the pool. `repairWebSession` is a no-op for an
@@ -293,14 +339,17 @@ export class QwenAiSessionRepairService {
       // "repaired" forever while the account stayed inactive and unusable.
       const repaired = isProbe
         ? await qwenAiTokenRefresher.refreshAfterUnauthorized(candidate, signal)
-        : await qwenAiTokenRefresher.repairWebSession(candidate, signal)
+        : await qwenAiTokenRefresher.repairWebSession(candidate, signal, {
+            onCredentialRecovery: () => { refreshOnly = false },
+          })
       if (!isQwenAiWebSessionReady(repaired)) {
-        throw new Error('Qwen AI signin did not return the required session cookie')
+        throw new Error('Qwen AI renewal did not return locally fresh session credentials')
       }
       if (repaired.status !== 'active') {
         throw new Error('Qwen AI signin did not reactivate the frozen account')
       }
 
+      this.lastRepairWasRefreshOnly = refreshOnly
       this.retryAfterByAccount.delete(candidate.id)
       console.info(
         `[QwenAI Session Repair] ${isProbe ? 're-probed' : 'repaired'} account=${candidate.id}`,
@@ -391,7 +440,13 @@ export class QwenAiSessionRepairService {
       && this.getAccountStatus(account, now).state === 'probe'
       && !this.getAccountStatus(account, now).nextAttemptAt
 
-    return accounts.find(isDueActive) || accounts.find(isDueProbe)
+    // Resume after the last selection: short-lived tokens near the head can
+    // become due again before a large pool's tail has ever been visited.
+    const lastIndex = accounts.findIndex(account => account.id === this.lastSelectedAccountId)
+    const ordered = [...accounts.slice(lastIndex + 1), ...accounts.slice(0, lastIndex + 1)]
+    const selected = ordered.find(isDueActive) || ordered.find(isDueProbe)
+    if (selected) this.lastSelectedAccountId = selected.id
+    return selected
   }
 
   private getQwenAiAccounts(): Account[] {
@@ -486,7 +541,15 @@ export class QwenAiSessionRepairService {
       return
     }
 
-    this.schedule(repairIntervalMs)
+    // Password/browser recovery and all failures retain conservative pacing.
+    // Only a successful refresh-token-only exchange uses the renewal cadence;
+    // never infer the path just from the input jar (refresh may fall back).
+    const refreshTokenIntervalMs = envDuration(
+      'CHAT2API_QWEN_AI_SESSION_REPAIR_REFRESH_TOKEN_INTERVAL_MS', DEFAULT_REFRESH_TOKEN_INTERVAL_MS, 1_000,
+    )
+    this.schedule(result.status === 'repaired' && this.lastRepairWasRefreshOnly
+      ? refreshTokenIntervalMs
+      : repairIntervalMs)
   }
 }
 

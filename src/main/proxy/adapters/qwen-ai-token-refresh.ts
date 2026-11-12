@@ -4,11 +4,11 @@ import type { Account } from '../../store/types'
 import { storeManager } from '../../store/store'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
-// The web app exchanges its refresh token on the auth host, not on chat.qwen.ai
-// (which answers the same path with Not Found). Read from the frontend bundle
-// 0.3.12, 2026-09-29.
+// Both signin and refresh use the auth host in the current web app (0.3.22).
+// The retired chat-host signin can mint a legacy JWT that chat then rejects.
 const DEFAULT_QWEN_AI_AUTH_BASE = 'https://auth.qwen.ai'
 const REFRESH_THRESHOLD_MS = 6 * 60 * 60 * 1000
+const ACCESS_TOKEN_REFRESH_THRESHOLD_MS = 3 * 60 * 1000
 const DEFAULT_UNREGISTERED_STRIKES = 3
 const DEFAULT_UNREGISTERED_STRIKE_WINDOW_MS = 30 * 60 * 1000
 const DEFAULT_REJECTION_STREAK_LIMIT = 5
@@ -272,7 +272,7 @@ export function resolveQwenAiAuthHeaders(token: string, cookieHeader: string): R
 function extractSignInToken(body: unknown): string {
   if (!isObjectValue(body)) return ''
   const nestedData = isObjectValue(body.data) ? body.data : undefined
-  for (const candidate of [nestedData?.token, body.token]) {
+  for (const candidate of [nestedData?.access_token, body.access_token, nestedData?.token, body.token]) {
     if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
   }
   return ''
@@ -738,6 +738,19 @@ function createRefreshTransportError(error: unknown, signal?: AbortSignal): Qwen
   })
 }
 
+function waitForQwenAiAuthFlight(operation: Promise<Account>, signal?: AbortSignal): Promise<Account> {
+  if (!signal) return operation
+  if (signal.aborted) return Promise.reject(createRefreshTransportError(undefined, signal))
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(createRefreshTransportError(undefined, signal))
+    signal.addEventListener('abort', onAbort, { once: true })
+    void operation.then(
+      value => { signal.removeEventListener('abort', onAbort); resolve(value) },
+      error => { signal.removeEventListener('abort', onAbort); reject(error) },
+    )
+  })
+}
+
 /**
  * Evidence that the stored session no longer works, keyed by account id.
  *
@@ -747,6 +760,15 @@ function createRefreshTransportError(error: unknown, signal?: AbortSignal): Qwen
  * retired looks exactly like an egress block and is never renewed.
  */
 const lastChallengeByAccount = new Map<string, string>()
+// Auth recovery belongs to one identity, unlike shared egress risk recovery.
+// Serialize browser launches across adapter instances without lending a peer's
+// recovery result to an account whose credentials were explicitly rejected.
+let authBrowserRecoveryTail: Promise<unknown> = Promise.resolve()
+// Adapters are constructed per request; an instance-local map cannot coalesce
+// their renewals with the background repair service.
+const refreshTokenExchanges = new Map<string, Promise<Account>>()
+const passwordSignIns = new Map<string, Promise<Account>>()
+const authBrowserRecoveries = new Map<string, Promise<Account | null>>()
 
 /**
  * Why accounts are not being renewed, counted per reason.
@@ -799,33 +821,30 @@ function pendingChallenge(accountId: string | undefined): string | undefined {
 }
 
 export class QwenAiTokenRefresher {
-  private readonly refreshTokenExchanges = new Map<string, Promise<Account>>()
-
   isTokenExpiringSoon(token: string, now: number = Date.now()): boolean {
     const payload = decodeJwtPayload(token)
     if (!payload?.exp || typeof payload.exp !== 'number') {
       return true
     }
 
-    // A fixed 6h margin is larger than a 15-minute access token's whole life,
-    // which would renew it on every request. Scale the margin to the token's
-    // own lifetime when it says how long that is.
+    // Match the web app's three-minute access-token window. Half-life renewal
+    // of a 15-minute token needlessly doubled auth traffic; retain the half-life
+    // cap for unusually short tokens and the legacy JWT's six-hour policy.
     const lifetimeMs = typeof payload.iat === 'number' && payload.exp > payload.iat
       ? (payload.exp - payload.iat) * 1000
       : Infinity
-    return payload.exp * 1000 - now <= Math.min(REFRESH_THRESHOLD_MS, lifetimeMs / 2)
+    const thresholdMs = payload.type === 'access_token'
+      ? ACCESS_TOKEN_REFRESH_THRESHOLD_MS
+      : REFRESH_THRESHOLD_MS
+    return payload.exp * 1000 - now <= Math.min(thresholdMs, lifetimeMs / 2)
   }
 
 
   /**
-   * A challenge is evidence that this session is finished. Measured
-   * 2026-09-27: a pool whose upstream credentials had been retired still
-   * reported ready=339 and never refreshed, because the jar carried a
-   * `token=` cookie and the JWT was valid for another two weeks. Every request
-   * reused that dead session and came back as an aliyun WAF challenge
-   * (ff926c7f07e45e2e487a29a6197d3460), which reads as an egress block and
-   * sends the investigation after IP, TLS and browser identity. None of those
-   * were the cause; signin answered INVALID_CRED for every account checked.
+   * A challenge can require renewal even when the jar and JWT look current.
+   * It is not proof of dead credentials: retired chat-host signin also answered
+   * INVALID_CRED or minted unusable JWTs. Current auth-host signin must be used
+   * before drawing conclusions about the saved login.
    */
   private isSessionFinishedBy(evidence: string | undefined): boolean {
     const text = String(evidence ?? '')
@@ -872,7 +891,11 @@ export class QwenAiTokenRefresher {
     return this.refresh(account, signal)
   }
 
-  async repairWebSession(account: Account, signal?: AbortSignal): Promise<Account> {
+  async repairWebSession(
+    account: Account,
+    signal?: AbortSignal,
+    options?: { onCredentialRecovery?: () => void },
+  ): Promise<Account> {
     const cookies = String(account.credentials.cookies || account.credentials.cookie || '').trim()
     if (hasQwenAiSessionCookie(cookies) || !this.canRefresh(account)) {
       return account
@@ -886,7 +909,7 @@ export class QwenAiTokenRefresher {
       return account
     }
 
-    return this.refresh(account, signal)
+    return this.refresh(account, signal, options?.onCredentialRecovery)
   }
 
   async refreshAfterUnauthorized(account: Account, signal?: AbortSignal): Promise<Account> {
@@ -902,11 +925,64 @@ export class QwenAiTokenRefresher {
     return this.refresh(account, signal)
   }
 
-  /** A successful renewal is not proof the chat endpoint accepts the session. */
-  async refreshAfterRejectedRenewal(account: Account, signal?: AbortSignal): Promise<Account> {
-    const recovered = await this.recoverBrowserSession(account, signal)
-    if (recovered) return recovered
+  /** Auth success alone is not evidence the chat endpoint accepts a session. */
+  async refreshAfterRejectedRenewal(
+    account: Account,
+    signal?: AbortSignal,
+    verify?: (renewed: Account) => Promise<boolean>,
+  ): Promise<Account> {
+    const persisted = storeManager.getAccountById?.(account.id, true)
+    let current = persisted?.credentials ? persisted : account
+    const cookies = String(current.credentials.cookies || current.credentials.cookie || '')
+    const hasPassword = Boolean(current.credentials.email && current.credentials.password)
+    const check = async (stage: string, renew: () => Promise<Account | null>): Promise<boolean> => {
+      if (signal?.aborted) throw createRefreshTransportError(undefined, signal)
+      let renewed: Account | null
+      try {
+        renewed = await renew()
+      } catch (error) {
+        if (signal?.aborted || (error as QwenAiRefreshError)?.status === 499) throw error
+        // Safe stage metadata, never request payloads or raw provider bodies.
+        console.warn('[QwenAI Token Refresh] auth recovery stage failed', JSON.stringify({
+          accountId: account.id, stage, code: (error as QwenAiRefreshError)?.code,
+          status: (error as QwenAiRefreshError)?.status,
+        }))
+        return false
+      }
+      if (signal?.aborted) throw createRefreshTransportError(undefined, signal)
+      if (!renewed || renewed.id !== account.id) return false
+      current = renewed
+      // Probe errors (transport, WAF, cancellation) are not auth rejections.
+      // Propagate them rather than misreporting every failure as Unauthorized.
+      const accepted = verify ? await verify(renewed) : true
+      console.info('[QwenAI Token Refresh] auth recovery checked', JSON.stringify({
+        accountId: account.id, stage, accepted,
+      }))
+      return accepted
+    }
+
+    if (usableQwenAiRefreshToken(cookies, current.credentials.token)
+      && await check('refresh-token', () => this.exchangeRefreshToken(current, signal))) return current
+    if (hasPassword && await check('password', () => this.signIn(current, signal))) return current
+    if (await check('browser', () => this.recoverOwnBrowserSession(current, signal))) return current
     throw this.rejectedRenewalError()
+  }
+
+  private recoverOwnBrowserSession(account: Account, signal?: AbortSignal): Promise<Account | null> {
+    const existing = authBrowserRecoveries.get(account.id)
+    if (existing) return existing
+    const operation = authBrowserRecoveryTail.then(async () => {
+      if (signal?.aborted) return null
+      const recovery = await import('./qwen-risk-refresh')
+      const latest = storeManager.getAccountById?.(account.id, true) ?? account
+      return recovery.refreshQwenAiRiskSession(latest)
+    })
+    authBrowserRecoveries.set(account.id, operation)
+    authBrowserRecoveryTail = operation.catch(() => undefined)
+    void operation.finally(() => {
+      if (authBrowserRecoveries.get(account.id) === operation) authBrowserRecoveries.delete(account.id)
+    }).catch(() => undefined)
+    return operation
   }
 
   rejectedRenewalError(): QwenAiRefreshError {
@@ -919,6 +995,7 @@ export class QwenAiTokenRefresher {
       accountFault: true,
     })
     error.code = 'qwen_ai_session_reauthentication_required'
+    error.retryScope = 'next-account'
     error.retryAfterSeconds = Math.max(60, error.retryAfterSeconds ?? 0)
     error.headers = { 'Retry-After': String(error.retryAfterSeconds) }
     return error
@@ -930,11 +1007,11 @@ export class QwenAiTokenRefresher {
 
   /**
    * Renew with the refresh token when the account has one, and fall back to a
-   * password signin only when it does not or the exchange is refused. A
-   * password is not a better credential: the accounts that need this path were
-   * imported from browser logins and signin answers INVALID_CRED for them.
+   * password signin only when it does not or the exchange is refused. Preserve
+   * refresh-first behavior without assuming an old signin rejection proves
+   * that the saved password is unusable on the current auth host.
    */
-  private async refresh(account: Account, signal?: AbortSignal): Promise<Account> {
+  private async refresh(account: Account, signal?: AbortSignal, onCredentialRecovery?: () => void): Promise<Account> {
     const persisted = storeManager.getAccountById?.(account.id, true)
     const current = persisted?.credentials ? persisted : account
     // Another request may already have renewed this account. Reuse its token
@@ -949,12 +1026,14 @@ export class QwenAiTokenRefresher {
         const refreshError = error as QwenAiRefreshError
         const hasPassword = Boolean(current.credentials.email && current.credentials.password)
         if (refreshError.headers?.['Retry-After']) {
+          onCredentialRecovery?.()
           const recovered = await this.recoverBrowserSession(current, signal)
           if (recovered) return recovered
         }
         if (!hasPassword || refreshError.accountFault !== true) throw error
       }
     }
+    onCredentialRecovery?.()
     try {
       return await this.signIn(current, signal)
     } catch (error) {
@@ -992,11 +1071,12 @@ export class QwenAiTokenRefresher {
    * rotating it, every exchange after the first would be refused.
    */
   private exchangeRefreshToken(account: Account, signal?: AbortSignal): Promise<Account> {
-    const running = this.refreshTokenExchanges.get(account.id)
-    if (running) return running
+    const running = refreshTokenExchanges.get(account.id)
+    if (running) return waitForQwenAiAuthFlight(running, signal)
+    if (signal?.aborted) return Promise.reject(createRefreshTransportError(undefined, signal))
     const exchange = this.performRefreshTokenExchange(account, signal)
-      .finally(() => this.refreshTokenExchanges.delete(account.id))
-    this.refreshTokenExchanges.set(account.id, exchange)
+      .finally(() => refreshTokenExchanges.delete(account.id))
+    refreshTokenExchanges.set(account.id, exchange)
     return exchange
   }
 
@@ -1033,7 +1113,7 @@ export class QwenAiTokenRefresher {
           Referer: `${QWEN_AI_BASE}/`,
           'x-request-origin': QWEN_AI_BASE,
           source: 'web',
-          Version: '0.2.67',
+          Version: '0.3.22',
           Timezone: currentTimezoneHeader(),
           Cookie: `refresh_token=${refreshToken}`,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
@@ -1112,7 +1192,20 @@ export class QwenAiTokenRefresher {
     }
   }
 
-  private async signIn(account: Account, signal?: AbortSignal): Promise<Account> {
+  private signIn(account: Account, signal?: AbortSignal): Promise<Account> {
+    // Include the login fingerprint so editing a rejected password is not
+    // forced to join an attempt using its predecessor.
+    const key = `${account.id}:${qwenAiLoginFingerprint(account)}`
+    const running = passwordSignIns.get(key)
+    if (running) return waitForQwenAiAuthFlight(running, signal)
+    if (signal?.aborted) return Promise.reject(createRefreshTransportError(undefined, signal))
+    const operation = this.performSignIn(account, signal)
+      .finally(() => passwordSignIns.delete(key))
+    passwordSignIns.set(key, operation)
+    return operation
+  }
+
+  private async performSignIn(account: Account, signal?: AbortSignal): Promise<Account> {
     // Inside a WAF gate the refresh endpoint is answering challenge pages, not
     // credentials. Asking again only deepens the egress flag and freezes one
     // more healthy account, so fail locally without touching the network.
@@ -1141,8 +1234,9 @@ export class QwenAiTokenRefresher {
         Origin: QWEN_AI_BASE,
         Referer: `${QWEN_AI_BASE}/`,
         source: 'web',
-        Version: '0.2.67',
+        Version: '0.3.22',
         Timezone: currentTimezoneHeader(),
+        'x-request-origin': QWEN_AI_BASE,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
       },
       timeout: 15000,
@@ -1152,9 +1246,12 @@ export class QwenAiTokenRefresher {
 
     let response: QwenAiSignInResponse
     try {
-      response = await axios.post(`${QWEN_AI_BASE}/api/v2/auths/signin`, payload, requestOptions)
-      if (response.status === 404 || response.status === 405) {
-        response = await axios.post(`${QWEN_AI_BASE}/api/v1/auths/signin`, payload, requestOptions)
+      response = await axios.post(`${qwenAiAuthBase()}/api/v2/auths/signin`, payload, requestOptions)
+      // A WAF 405 is not an unsupported API version; do not send another login.
+      const challengePage = /text\/html/i.test(String(response.headers['content-type'] || ''))
+        || (typeof response.data === 'string' && /<html|<!doctype|aliyun_waf|baxia|captcha/i.test(response.data))
+      if ((response.status === 404 || response.status === 405) && !challengePage) {
+        response = await axios.post(`${qwenAiAuthBase()}/api/v1/auths/signin`, payload, requestOptions)
       }
     } catch (error) {
       throw createRefreshTransportError(error, signal)
@@ -1182,7 +1279,12 @@ export class QwenAiTokenRefresher {
 
     const previousCookies = String(account.credentials.cookies || account.credentials.cookie || '')
       .split(';').filter(part => part.trim().split('=', 1)[0] !== 'token').join('; ')
-    const cookies = mergeCookieHeaders(previousCookies, response.headers['set-cookie'])
+    const data = isObjectValue(response.data?.data) ? response.data.data : response.data
+    const rotated = typeof data?.refresh_token === 'string' ? data.refresh_token.trim() : ''
+    const cookies = mergeCookieHeaders(previousCookies, [
+      ...normalizeSetCookieHeaders(response.headers['set-cookie']),
+      ...(rotated ? [`refresh_token=${rotated}`] : []),
+    ])
     // Signin can issue a Bearer-only access_token too. Normalize both cookie
     // aliases, just like refresh-token exchange; a retired token= shadows a
     // fresh Bearer token otherwise.
