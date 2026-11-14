@@ -128,6 +128,7 @@ import {
   recordQwenAiEgressRiskVerdict,
   recordQwenAiEgressWafBlock,
 } from './qwenAiRiskCircuit'
+import { canRecoverQwenAiSession, recoverQwenAiAccountSession } from './qwenAiServiceRecovery'
 import {
   isWebshareProxyEnabled,
   isWebshareStickyActive,
@@ -1990,6 +1991,8 @@ export class RequestForwarder {
     let riskVerdictSeen = false
     let riskSessionRecovery: Promise<Account | null | undefined> | undefined
     let riskSessionRecoveryObserved = false
+    let requireVerifiedRiskRecovery = false
+    const serviceRecovery = context.qwenAiServiceRecoveryState
     const qwenAiTranscriptTransportPolicy = isQwenAiProvider
       ? qwenAiTranscriptTransportPolicyFromEnv()
       : undefined
@@ -2065,10 +2068,23 @@ export class RequestForwarder {
         if (!riskSessionRecoveryObserved) {
           riskSessionRecoveryObserved = true
           riskSessionRecovery = import('./adapters/qwen-risk-refresh')
-            .then(module => module.noteQwenAiRiskChallenge(
-              account,
-              `${result.error ?? ''} bxpunish:${bxpunishHeaderEarly ?? ''}`,
-            ))
+            .then(module => {
+              const recover = () => module.noteQwenAiRiskChallenge(
+                account,
+                `${result.error ?? ''} bxpunish:${bxpunishHeaderEarly ?? ''}`,
+              )
+              return serviceRecovery
+                ? recoverQwenAiAccountSession({
+                    accountId: account.id,
+                    state: serviceRecovery,
+                    signal: context.signal,
+                    recover,
+                    onAttempt: browserAttempt => console.info('[QwenAI] service-owned session recovery', JSON.stringify({
+                      requestId: context.requestId, accountId: account.id, browserAttempt,
+                    })),
+                  })
+                : recover()
+            })
             .catch(error => {
               console.warn('[QwenAI] risk-session recovery failed', JSON.stringify({
                 requestId: context.requestId,
@@ -2173,10 +2189,33 @@ export class RequestForwarder {
           && !context.signal?.aborted
           && observedAt + webshareDelayMs < qwenAiRequestDeadline
         if (!canEscalateVerdictToWebshare) {
+          // Reconnects skip the blind verdict ladder, not an account-owned
+          // browser recovery already in flight. Spend one existing paced slot
+          // only if verification completes; otherwise terminate without replay.
+          if (
+            (repeatFastFailActive || serviceRecovery)
+            && riskSessionRecovery
+            && (serviceRecovery
+              ? canRecoverQwenAiSession(serviceRecovery, context.signal)
+              : qwenAiVerdictPacedRetries < qwenAiVerdictPacedRetryCountFromEnv())
+            && !context.signal?.aborted
+            && observedAt < qwenAiRequestDeadline
+          ) {
+            requireVerifiedRiskRecovery = true
+            qwenAiVerdictPacedRetries += 1
+            nextRetryDelayMs = 0
+            nextRetryDelayOverrideMs = undefined
+            attempt += 1
+            console.info('[QwenAI] repeat verdict awaiting account-owned browser verification', JSON.stringify({
+              requestId: context.requestId,
+              accountId: account.id,
+            }))
+            return true
+          }
           // No other egress can retest the verdict, but time still can: keep
           // the client's stream open and probe again after a spaced wait
           // instead of refusing the turn (see qwenAiVerdictPacedRetryCountFromEnv).
-          const pacedRetryLimit = repeatFastFailActive
+          const pacedRetryLimit = repeatFastFailActive || serviceRecovery
             ? 0
             : qwenAiVerdictPacedRetryCountFromEnv()
           const pacedDelayMs = qwenAiVerdictPacedRetryDelayMs(qwenAiVerdictPacedRetries)
@@ -2380,11 +2419,21 @@ export class RequestForwarder {
           const recovery = await waitWithinQwenDeadline(riskSessionRecovery)
           riskSessionRecovery = undefined
           if (recovery === qwenDeadlineExpired) return createQwenAiRequestTimeoutResult(startTime)
-          if (recovery && recovery !== qwenClientAborted && recovery.id === account.id) {
-            // The pool-wide single-flight can belong to another account.
-            // Its browser reply does not prove this account/session recovered,
-            // even when nonidentity risk cookies were shared with peers.
+          const verifiedSameAccount = recovery && recovery !== qwenClientAborted && recovery.id === account.id
+          if (requireVerifiedRiskRecovery && !verifiedSameAccount && recovery !== qwenClientAborted) {
+            riskVerdictSeen = true
+            if (qwenAiEgressRecoveryState) qwenAiEgressRecoveryState.riskVerdictSeen = true
+            console.warn('[QwenAI] repeat verdict recovery unverified; no request replay', JSON.stringify({
+              requestId: context.requestId,
+              accountId: account.id,
+            }))
+            break
+          }
+          requireVerifiedRiskRecovery = false
+          if (verifiedSameAccount) {
+            // Verification belongs only to this account, never a peer.
             nextRetryDelayMs = 0
+            if (serviceRecovery) riskSessionRecoveryObserved = false
             qwenAiRequestGovernor.clearVerifiedRiskCooldown?.(account.id)
             if (context.qwenAiSessionBridge?.continuation) {
               // A rejected append can leave CHAT_IN_PROGRESS on the retained

@@ -194,7 +194,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
     python3-pil \
     && pip3 install --no-cache-dir --break-system-packages patchright \
-    && python3 -m patchright install chromium 2>/dev/null || true \
+    && (python3 -m patchright install chromium 2>/dev/null || true) \
+    && chromium --version && chromedriver --version \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 ENV CHROME_PATH=/usr/bin/chromium

@@ -87,15 +87,14 @@ export function createDeferredQwenAiFailoverStream(
     const result = outcome.result
     const qwenSource = result.stream as QwenAiOutputStream | undefined
     activeQwenSource = qwenSource
-    output.qwenAiEffectiveAccountId = qwenSource?.qwenAiEffectiveAccountId
-      || result.effectiveAccountId
-      || outcome.selection.account.id
-    output.qwenAiEffectiveProviderId = qwenSource?.qwenAiEffectiveProviderId
-      || result.effectiveProviderId
-      || outcome.selection.provider.id
-    output.qwenAiEffectiveActualModel = qwenSource?.qwenAiEffectiveActualModel
-      || result.effectiveActualModel
-      || outcome.selection.actualModel
+    Object.defineProperties(output, {
+      qwenAiEffectiveAccountId: { configurable: true, get: () => qwenSource?.qwenAiEffectiveAccountId
+        || result.effectiveAccountId || outcome.selection.account.id },
+      qwenAiEffectiveProviderId: { configurable: true, get: () => qwenSource?.qwenAiEffectiveProviderId
+        || result.effectiveProviderId || outcome.selection.provider.id },
+      qwenAiEffectiveActualModel: { configurable: true, get: () => qwenSource?.qwenAiEffectiveActualModel
+        || result.effectiveActualModel || outcome.selection.actualModel },
+    })
     // A deferred stream is the stream observed by the Responses route. Keep
     // the live Qwen state on that outer stream so it can be resolved after
     // the provider handler learns the real response ID.
@@ -219,7 +218,11 @@ export function createDeferredQwenAiFailoverStream(
   signal?.addEventListener('abort', onAbort, { once: true })
 
   void outcomePromise.then(outcome => {
-    if (settled) return
+    if (settled || output.destroyed) {
+      const lateSource = outcome.result.stream as (NodeJS.ReadableStream & { destroy?: () => void }) | undefined
+      lateSource?.destroy?.()
+      return
+    }
     setEffectiveSelection(outcome)
 
     if (!outcome.result.success) {
@@ -233,6 +236,12 @@ export function createDeferredQwenAiFailoverStream(
 
     source = outcome.result.stream
     const qwenSource = source as QwenAiOutputStream
+    if (qwenSource.destroyed && !qwenSource.readableEnded && !qwenSource.qwenAiFailure) {
+      fail(Object.assign(new Error('Qwen AI source closed before deferred stream attachment'), {
+        status: 502, code: 'qwen_ai_stream_incomplete', accountFault: false,
+      }))
+      return
+    }
 
     qwenSource.once(QWEN_AI_STREAM_FAILURE_EVENT, (error: Error) => fail(error, true))
     source.once('error', (error: Error) => {
@@ -240,7 +249,7 @@ export function createDeferredQwenAiFailoverStream(
         settleFailure(sourceFailure || error)
         return
       }
-      settleFailure(error)
+      fail(error)
     })
     source.once('end', () => {
       // Stream handlers attach state at terminal completion. Prefer that
@@ -262,7 +271,7 @@ export function createDeferredQwenAiFailoverStream(
           code: 'qwen_ai_stream_incomplete',
           accountFault: false,
         })
-        settleFailure(sourceFailurePending ? sourceFailure || incomplete : incomplete)
+        fail(sourceFailurePending ? sourceFailure || incomplete : incomplete)
       }
     })
     // Always attach the source before inspecting its terminal state. A Qwen

@@ -355,6 +355,8 @@ export interface ProxyContext {
   requestIntent?: 'normal' | 'context_compaction'
   /** Mutable recovery budget shared by all Qwen account attempts in this request. */
   qwenAiLogicalRecoveryState?: QwenAiLogicalRecoveryState
+  /** Bounded same-account browser recovery shared by all account branches. */
+  qwenAiServiceRecoveryState?: import('./qwenAiServiceRecovery').QwenAiServiceRecoveryState
   /** Mutable egress-IP recovery ledger shared by all Qwen account attempts. */
   qwenAiEgressRecoveryState?: QwenAiEgressRecoveryState
   /**

@@ -17,9 +17,11 @@ import { slimQwenAiReplayImages } from '../replayImageSlimming'
 import { resolveImageSlimPolicy, imageSlimModeFromEnv } from '../imageSlimPolicy'
 import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
+import { createQwenAiServiceRecoveryState } from '../qwenAiServiceRecovery'
 import {
   QwenAiAdapter,
   QWEN_AI_STREAM_FAILURE_EVENT,
+  qwenAiRequestTimeoutMsFromEnv,
   type QwenAiOutputStream,
 } from '../adapters/qwen-ai'
 import { modelMapper } from '../modelMapper'
@@ -1030,6 +1032,9 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
     }
   }
 
+  const serviceRecovery = initialProviderIsQwenAi
+    ? createQwenAiServiceRecoveryState(startedAt + qwenAiRequestTimeoutMsFromEnv())
+    : undefined
   const createProxyContext = (
     selection: AccountSelection,
     deferManagedStreamCommit = false,
@@ -1052,6 +1057,7 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
       signal: abort.controller.signal,
       requestIntent: requestIntent.intent,
       ...(qwenAiLogicalRecoveryState ? { qwenAiLogicalRecoveryState } : {}),
+      ...(serviceRecovery ? { qwenAiServiceRecoveryState: serviceRecovery } : {}),
       ...(qwenAiEgressRecoveryState ? { qwenAiEgressRecoveryState } : {}),
       ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
       ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
@@ -1598,7 +1604,11 @@ router.post('/responses', responsesLineageLockMiddleware, async (ctx: Context) =
         })
       },
     })
-    const outcome = deferManagedStreamCommit
+    // Compaction/no-tool requests also need immediate response headers and
+    // typed progress while admission, authentication and recovery are pending.
+    // Only managed tools enable full branch validation; do not turn ordinary
+    // streaming text into a buffered response merely to send heartbeats.
+    const outcome = initialProviderIsQwenAi && chatRequest.stream === true
       ? {
           selection: initialSelection,
           result: {

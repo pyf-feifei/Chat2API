@@ -67,7 +67,7 @@
 
 `scripts/qwen-captcha/refresh.py` 区分三种页面控件：Baxia 的整条右拖验证条（`nc_*` / `.btn_slide`，包含 iframe）、拼图滑块（`aliyunCaptcha-*` 和 `puzzle-captcha-*` 两种 DOM，后者的裁剪拼图需要 CSS 纵坐标偏移）、图标连线。验证交互最多尝试 3 轮。浏览器应复用该账号自己的凭据，隔离上下文；现代 `access_token` 不写入 `token=` Cookie。
 
-首次检测到验证信号即启动全局 single-flight 恢复；两次启动至少间隔 60 秒，冷却期内的新挑战会共享延迟恢复 Promise，等剩余冷却结束再认证，不再直接跳过恢复。当前请求重试前等待该恢复结束，并从 store 重新读取凭据，避免重放旧 Cookie。认证刷新被 WAF 暂停时先尝试同账号的浏览器恢复（有保存登录信息时可重新登录），失败才返回 HTTP 503 + `Retry-After`；已开始的 Responses 流将等待时间转换为 Codex 可识别的退避事件。密码重新登录会清除旧 `token=` Cookie，再合并本次登录响应，避免旧 Cookie 覆盖新 Bearer 凭据。创建会话在令牌刷新后仍返回 `Unauthorized` 时，会在同一请求内尝试浏览器重新认证再重试一次；认证仍未完成则返回 `qwen_ai_session_reauthentication_required` + HTTP 503 / `Retry-After`，而不是通用 `no chat ID returned`。
+首次检测到验证信号即启动同账号 single-flight 恢复，浏览器任务全局串行；两次启动至少间隔 60 秒，同账号冷却期内的新挑战共享延迟恢复 Promise，等剩余冷却结束再认证，不再直接跳过恢复。当前请求重试前等待该恢复结束，并从 store 重新读取凭据，避免重放旧 Cookie。认证刷新被 WAF 暂停时先尝试同账号的浏览器恢复（有保存登录信息时可重新登录），失败才返回 HTTP 503 + `Retry-After`；已开始的 Responses 流将等待时间转换为 Codex 可识别的退避事件。密码重新登录会清除旧 `token=` Cookie，再合并本次登录响应，避免旧 Cookie 覆盖新 Bearer 凭据。创建会话在令牌刷新后仍返回 `Unauthorized` 时，会在同一请求内尝试浏览器重新认证再重试一次；认证仍未完成则返回 `qwen_ai_session_reauthentication_required` + HTTP 503 / `Retry-After`，而不是通用 `no chat ID returned`。
 
 恢复成功必须满足：验证控件消失，并且同一浏览器内的新探测消息收到带随机标记的真实回复。仅拖动完成、采集到 Cookie 或已有历史回复，都不视为成功；上游认证返回 `success:false` 时立即停止，保持原凭据不变。需要年龄确认时只尝试关闭遮罩，不填写出生年份或提交账号设置。也会关闭已知的 Qwen 新版本介绍弹窗（例如 `Qwen4-Max is now in preview`）；欢迎、年龄与版本介绍可能先后出现，最多关闭 3 次，未知弹窗不自动点击。探针失败会记录布尔状态与计数（是否发送、是否仍有遮罩、认证是否被拒等），不记录页面正文、凭据或原始子进程 stderr。如果页面既未发送探针、也无活动挑战，即使没有捕获到认证拒绝响应，仍允许用已保存登录信息重新登录一次；已发送但无回复或挑战仍在时不触发该兜底。
 
@@ -128,7 +128,7 @@ CHAT2API_QWEN_AI_BUSY_STORM_COOLDOWN_MS=600000
 
 ## RGV587 风控的 Webshare 代理重试（可选）
 
-RGV587 是 IP 级风控：验证信封标记的是出口 IP，轮换账号只会让所有账号继续从同一个被标记的出口撞上风控墙。配置 Webshare 代理后，当请求被归类为 `qwen_ai_upstream_busy`（RGV587 伪装成容量 busy）且同账号 busy 重试预算（`CHAT2API_QWEN_AI_BUSY_RETRY_COUNT`，默认 0）耗尽时，代理会通过 Webshare 出口 IP 把同一请求再重试一次（每个逻辑请求最多 1 次）；平时所有流量仍走直连，只有这条恢复路径使用代理，流量消耗保持最低。
+RGV587 验证信封本身不能确定是否为 IP、账号会话或请求路径问题；先按上文做同账号、同模型对照，不把轮换账号或出口当作已验证的修复。Webshare 是可选且有界的恢复路径，不配置它不等于代理部署错误。启用后，`bxpunish`／RGV587 可触发出口重试，由 `CHAT2API_QWEN_AI_VERDICT_PROXY_EXIT_MAX` 限制尝试次数；已记录的相同请求会跳过该阶梯。普通流量默认直连，已验证恢复后可进入下述粘性模式。
 
 两条触发路径都会用代理（各最多 1 次）：busy 重试预算耗尽后的恢复重试，以及文档管线失败逃生重试（见下节）。
 
@@ -178,11 +178,15 @@ CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
 
 取值为 `0`（禁用升级，同会话预算耗尽即按 422 `qwen_ai_semantic_incomplete` 快速失败）、`1`（默认）或 `2`（上限）；其他值回退为 `1`。升级分支若再次 dangling，则快速失败并把 `retryable` 标志透传给客户端。wrapper 泄漏不适用此升级（泄漏是确定性违规，已有更紧的独立预算）。
 
+## 服务内部恢复预算
+
+Responses 请求（包括无工具的上下文压缩）在 Qwen 转发开始后立即建立 SSE，并持续发送 typed progress；恢复期间不要求客户端重连。每个逻辑请求共享浏览器验证预算，跨配额切换也不重置：`CHAT2API_QWEN_AI_SERVICE_RECOVERY_TIMEOUT_MS` 默认 300000，`CHAT2API_QWEN_AI_SERVICE_RECOVERY_BROWSER_ATTEMPTS` 默认 2（最多 4），`CHAT2API_QWEN_AI_SERVICE_RECOVERY_RETRY_DELAY_MS` 默认 60000。失败探针只按冷却重试验证，不盲目重发原长请求；仅同账号验证成功后重试原请求，且仍需实际生成通过。取消、超时、预算耗尽会结束请求，不扩大到全池轮换。已验证工具分支只交付一次，未通过的私有分支不交给客户端。普通文本流不因此整体缓冲。
+
 ## 浏览器恢复的验收范围
 
 `QWEN_RECOVERY_PROBE_MODEL` 和 `QWEN_RECOVERY_PROBE_MODE` 可指定恢复探针模型与模式，例如 `qwen4.0-max-preview`／`Fast`。脚本通过网页现有选择控件切换，并核对带本次唯一标记的实际生成请求；所选模型或模式不符、没有真实新回复时，不接受凭据写回。留空仍使用浏览器默认模型，日志标记 `probeScope: browser-default-model`，不能据此证明其他模型恢复。
 
-池内请求可能加入另一账号的浏览器 single-flight。该账号成功不代表当前账号成功；只有恢复结果 ID 与当前账号一致时，才取消本次退避和清除对应恢复冷却。状态 `active`、Cookie 收集成功、网页默认模型回复以及其他账号的成功，都不等于目标模型的当前请求可用。
+浏览器任务全局串行，同账号请求共享其自己的恢复 Promise，不以另一账号的恢复结果替代。只有恢复结果 ID 与当前账号一致时，才取消本次退避和清除对应恢复冷却。Responses 使用上节请求级服务恢复预算；其他调用方仍按原有 paced-retry 预算与请求截止时间等待已启动的同账号恢复，`CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES=0` 可关闭其 paced 重试。验证成功才重试原请求，失败、取消或超时则不重放；服务预算跨账号共享，不因重入 forwarder 重置。状态 `active`、Cookie 收集成功、网页默认模型回复以及其他账号的成功，都不等于目标模型的当前请求可用。
 
 `RGV587`／`bxpunish` 不直接证明封号、IP 封禁或内容拒绝。先核对凭据和身份，再用同账号、同模型、相近时间的短请求对照网页与 HTTP 路径。正常完成网站要求的验证后仍应复测真实生成，遵守配额与 Retry-After，不以连续轮换账号作为诊断或修复。
 
