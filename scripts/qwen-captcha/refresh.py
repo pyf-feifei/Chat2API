@@ -468,7 +468,7 @@ def send_probe(page, marker):
         # into a chat; its old locator may detach or match the new prefilled
         # composer. An observed marked chat POST proves submission either way.
         if not submitted:
-            remaining = composer.evaluate("el => 'value' in el ? el.value : el.innerText")
+            remaining = composer.evaluate("el => 'value' in el ? el.value : el.innerText", timeout=1000)
             if marker in (remaining or ''):
                 return False
         print('Verification probe sent')
@@ -885,6 +885,13 @@ def run_verification(page, wait_seconds, punish_url=''):
             verified = True
             break
         page.wait_for_timeout(800)
+    # Challenge handling deliberately yields for the server's verdict and may
+    # complete on the last polling iteration. Re-read the same marked reply
+    # once at the boundary instead of discarding a success that arrived during
+    # that final wait. This never sends another probe or extends its budget.
+    if not verified and probe_sent:
+        model_verified = not requested_model or probe_model_matches(probe_request, requested_model, requested_mode)
+        verified = model_verified and probe_reply_visible(page, marker) and not page_looks_risky(page)
     page.remove_listener('request', observe_probe_request)
     return {
         **({'probe_model': requested_model, 'probe_mode': requested_mode,
