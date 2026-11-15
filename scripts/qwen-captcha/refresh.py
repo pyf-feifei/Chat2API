@@ -339,16 +339,27 @@ def drag_bar_slider(page, frame, handle):
     page.wait_for_timeout(100)
 
 
-def reset_bar_error(page):
+def bar_error_frame(page):
     for frame in visible_frames(page):
         try:
-            link = first_visible(frame, '.errloading a')
-            if link is not None:
-                link.click(timeout=2000)
-                return True
+            if first_visible(frame, '.errloading') is not None:
+                return frame
         except Exception:
+            # A verified iframe can disappear between enumeration and lookup.
             continue
-    return False
+    return None
+
+
+def reset_bar_error(page, frame, timeout_ms):
+    # Some Baxia failures render only an icon and error text, with no refresh
+    # anchor or SDK reset control. Reload the same isolated page once instead
+    # of idling until timeout or calling undocumented challenge internals.
+    link = first_visible(frame, '.errloading a')
+    if link is not None:
+        link.click(timeout=min(2000, timeout_ms))
+        return 'widget'
+    page.reload(wait_until='domcontentloaded', timeout=timeout_ms)
+    return 'page'
 
 
 PROBE_MARKDOWN = '.qwen-markdown, [class*="markdown"]'
@@ -728,6 +739,8 @@ def solve_connect_captcha(page, max_attempts: int = 4, run_no: int = 1) -> bool:
 
 
 def page_looks_risky(page) -> bool:
+    if bar_error_frame(page) is not None:
+        return True
     if bar_slider_locator(page)[1] is not None or slider_locator(page)[1] is not None:
         return True
     for frame in visible_frames(page):
@@ -803,6 +816,7 @@ def run_verification(page, wait_seconds, punish_url=''):
     challenge_seen = False
     probe_sent = False
     overlay_dismissals = 0
+    challenge_resets = 0
     verified = False
     requested_model = normalize_probe_model(os.environ.get('QWEN_RECOVERY_PROBE_MODEL', ''))
     requested_mode = os.environ.get('QWEN_RECOVERY_PROBE_MODE', '').strip()
@@ -829,6 +843,26 @@ def run_verification(page, wait_seconds, punish_url=''):
     if punish_url:
         page.goto(punish_url, wait_until='domcontentloaded', timeout=30000)
     while time.monotonic() < deadline:
+        error_frame = bar_error_frame(page)
+        if error_frame is not None:
+            challenge_seen = True
+            # One reset per browser verification, shared with the existing
+            # deadline and three-interaction cap. Persistent errors fail closed.
+            if challenge_resets >= 1 or attempts >= max_attempts:
+                break
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            challenge_resets += 1
+            reset = reset_bar_error(page, error_frame, min(15000, remaining_ms))
+            if reset == 'page':
+                # A reload can restore an old answer; require a fresh marker
+                # and matching new network request before harvesting anything.
+                marker = 'C2A_VERIFY_' + uuid.uuid4().hex[:16]
+                probe_sent = False
+                probe_request.clear()
+            page.wait_for_timeout(min(1500, max(0, int((deadline - time.monotonic()) * 1000))))
+            continue
         frame, bar = bar_slider_locator(page)
         puzzle_frame, puzzle = slider_locator(page)
         connect_frame = next((f for f in visible_frames(page) if connect_captcha_visible(f)), None)
@@ -852,12 +886,6 @@ def run_verification(page, wait_seconds, punish_url=''):
                 print(f'Verification interaction failed ({type(error).__name__})')
             # Allow the SERVER verdict / iframe removal to arrive before retry.
             page.wait_for_timeout(3000)
-            continue
-        if reset_bar_error(page):
-            challenge_seen = True
-            if attempts >= max_attempts:
-                break
-            page.wait_for_timeout(1500)
             continue
         if punish_url and re.search(r'/punish|___tmp___', page.url, re.I):
             accepted = any(first_visible(f, '.nc_scale .btn_ok') is not None for f in visible_frames(page))
@@ -900,6 +928,7 @@ def run_verification(page, wait_seconds, punish_url=''):
         'probe_verified': verified,
         'risk_page': page_looks_risky(page),
         'challenge_attempts': attempts,
+        'challenge_resets': challenge_resets,
         'overlay_dismissals': overlay_dismissals,
         'probe_sent': probe_sent,
     }
@@ -917,6 +946,7 @@ def verification_failure_diagnostics(page, evidence):
         'probe_verified': evidence.get('probe_verified') is True,
         'risk_page': evidence.get('risk_page') is True,
         'challenge_attempts': evidence.get('challenge_attempts', 0),
+        'challenge_resets': evidence.get('challenge_resets', 0),
         'overlay_dismissals': evidence.get('overlay_dismissals', 0),
         'visible_dialogs': visible_dialogs,
         'auth_rejected': getattr(page, '_qwen_auth_state', {}).get('rejected') is True,

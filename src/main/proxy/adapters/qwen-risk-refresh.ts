@@ -76,7 +76,7 @@ export function parseQwenAiRiskFailureDiagnostics(stdout: string): Record<string
       for (const key of ['probe_sent', 'probe_verified', 'risk_page', 'auth_rejected', 'screenshot_written']) {
         if (typeof diagnostic[key] === 'boolean') safe[key] = diagnostic[key]
       }
-      for (const key of ['challenge_attempts', 'overlay_dismissals', 'visible_dialogs']) {
+      for (const key of ['challenge_attempts', 'challenge_resets', 'overlay_dismissals', 'visible_dialogs']) {
         if (Number.isSafeInteger(diagnostic[key]) && diagnostic[key] >= 0 && diagnostic[key] <= 100) safe[key] = diagnostic[key]
       }
       return safe
