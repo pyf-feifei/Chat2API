@@ -433,6 +433,20 @@ def select_probe_model(page, model, mode=''):
 
 
 def send_probe(page, marker):
+    submitted = False
+
+    def observe_submission(request):
+        nonlocal submitted
+        if request.method != 'POST' or urllib.parse.urlparse(request.url).path != '/api/v2/chat/completions':
+            return
+        try:
+            body = request.post_data_json
+            submitted = submitted or any(marker in str(message.get('content', ''))
+                                         for message in body.get('messages', []))
+        except Exception:
+            return
+
+    page.on('request', observe_submission)
     try:
         composer = first_visible(page, 'textarea, [contenteditable="true"]')
         if composer is None:
@@ -450,13 +464,19 @@ def send_probe(page, marker):
         else:
             composer.press('Enter', timeout=2000)
         page.wait_for_timeout(300)
-        remaining = composer.evaluate("el => 'value' in el ? el.value : el.innerText")
-        if marker in (remaining or ''):
-            return False
+        # Sending the first message can replace the home composer while routing
+        # into a chat; its old locator may detach or match the new prefilled
+        # composer. An observed marked chat POST proves submission either way.
+        if not submitted:
+            remaining = composer.evaluate("el => 'value' in el ? el.value : el.innerText")
+            if marker in (remaining or ''):
+                return False
         print('Verification probe sent')
         return True
     except Exception:
-        return False
+        return submitted
+    finally:
+        page.remove_listener('request', observe_submission)
 
 
 # ---------------------------------------------------------------- #
@@ -714,8 +734,22 @@ def page_looks_risky(page) -> bool:
         try:
             if connect_captcha_visible(frame):
                 return True
-            # Inspect rendered text, not SDK source / stale error strings.
-            text = frame.locator('body').inner_text(timeout=1000)
+            # Chat titles are user/history data, not the current challenge.
+            # A sidebar title containing RGV587 kept a correctly answered probe
+            # permanently "risky". Remove only known navigation containers from
+            # the text scan; live challenge widgets are checked separately.
+            text = frame.locator('body').evaluate('''body => {
+                // Collect rendered live text outside known history/navigation.
+                const nodes = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+                const parts = [];
+                while (nodes.nextNode()) {
+                    const node = nodes.currentNode, parent = node.parentElement;
+                    if (!parent || parent.closest('script, style, nav, [role="navigation"], .chat-item-title-text, .chat-item-drag-link')) continue;
+                    if (!parent.getClientRects().length || getComputedStyle(parent).visibility === 'hidden') continue;
+                    parts.push(node.textContent);
+                }
+                return parts.join(' ');
+            }''')
             if re.search(r'RGV587|FAIL_SYS_USER_VALIDATE|被挤爆|Please slide to verify|'
                          r'Please drag the slider below|请按住滑块|拖动到最右|出错了.{0,12}刷新', text, re.I):
                 return True
@@ -775,20 +809,23 @@ def run_verification(page, wait_seconds, punish_url=''):
     probe_request = {}
 
     def observe_probe_request(request):
-        if '/api/v2/chat/completions' not in request.url:
+        nonlocal probe_sent
+        if request.method != 'POST' or urllib.parse.urlparse(request.url).path != '/api/v2/chat/completions':
             return
         try:
             payload = request.post_data_json
             messages = payload.get('messages', [])
             if not any(marker in str(message.get('content', '')) for message in messages):
                 return
+            probe_sent = True
             feature = messages[-1].get('feature_config', {}) if messages else {}
             probe_request.update(model=payload.get('model', ''), thinking_mode=feature.get('thinking_mode', ''))
         except Exception:
             return
 
-    if requested_model:
-        page.on('request', observe_probe_request)
+    # Keep observing through home-to-chat navigation, not just the click. The
+    # marked POST can arrive after the replaced composer stops being usable.
+    page.on('request', observe_probe_request)
     if punish_url:
         page.goto(punish_url, wait_until='domcontentloaded', timeout=30000)
     while time.monotonic() < deadline:
@@ -841,14 +878,14 @@ def run_verification(page, wait_seconds, punish_url=''):
             if requested_model and not select_probe_model(page, requested_model, requested_mode):
                 page.wait_for_timeout(800)
                 continue
-            probe_sent = send_probe(page, marker)
+            sent = send_probe(page, marker)
+            probe_sent = probe_sent or sent
         model_verified = not requested_model or probe_model_matches(probe_request, requested_model, requested_mode)
         if probe_sent and model_verified and probe_reply_visible(page, marker) and not page_looks_risky(page):
             verified = True
             break
         page.wait_for_timeout(800)
-    if requested_model:
-        page.remove_listener('request', observe_probe_request)
+    page.remove_listener('request', observe_probe_request)
     return {
         **({'probe_model': requested_model, 'probe_mode': requested_mode,
             'probe_model_verified': probe_model_matches(probe_request, requested_model, requested_mode)} if requested_model else {}),
