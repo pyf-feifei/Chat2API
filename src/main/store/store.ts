@@ -898,7 +898,10 @@ class StoreManager {
     const { ProviderChecker } = await import('../providers/checker.ts')
     await Promise.all(dynamicProviders.map(async provider => {
       try {
-        const result = await ProviderChecker.fetchProviderModels(provider.id)
+        const result = await ProviderChecker.fetchProviderModels(
+          provider.id,
+          provider.id === 'qwen-ai' ? this.getAccountsByProviderId(provider.id, true) : [],
+        )
         if (result.supportedModels.length === 0) {
           throw new Error('provider returned an empty model catalogue')
         }

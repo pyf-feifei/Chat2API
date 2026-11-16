@@ -2,6 +2,7 @@ import axios, { AxiosError } from 'axios'
 import { getBuiltinProvider } from './builtin'
 import { parseProviderModelsResponse } from './modelSync'
 import { withQwenAiModelModeAliases } from './qwen-ai-model-mode'
+import { modelCatalogueAuthHeaders } from './modelCatalogueAuth'
 import type { Provider, ProviderCheckResult, Account, ProviderModelCapability } from '../../shared/types'
 import type { BuiltinProviderConfig } from '../store/types'
 
@@ -967,7 +968,8 @@ export class ProviderChecker {
   }
 
   static async fetchProviderModels(
-    providerId: string
+    providerId: string,
+    accounts: Pick<Account, 'status' | 'credentials'>[] = [],
   ): Promise<{
     supportedModels: string[]
     modelMappings: Record<string, string>
@@ -986,6 +988,7 @@ export class ProviderChecker {
     try {
       const headers: Record<string, string> = {
         ...(builtinConfig.modelsApiHeaders || builtinConfig.headers),
+        ...modelCatalogueAuthHeaders(providerId, accounts),
       }
 
       const response = await axios.get(builtinConfig.modelsApiEndpoint, {
@@ -1005,8 +1008,13 @@ export class ProviderChecker {
 
       return { supportedModels, modelMappings, modelCapabilities }
     } catch (error) {
-      console.error(`[ProviderChecker] Failed to fetch models for ${providerId}:`, error)
-      throw error
+      // Axios errors retain request headers (including the owning token).
+      // Never log or propagate the raw request configuration.
+      const message = axios.isAxiosError(error)
+        ? 'Model catalogue network request failed'
+        : error instanceof Error ? error.message : 'Model catalogue request failed'
+      console.error(`[ProviderChecker] Failed to fetch models for ${providerId}: ${message}`)
+      throw new Error(message)
     }
   }
 }

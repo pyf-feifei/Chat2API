@@ -13,6 +13,7 @@ import { ProviderChecker } from '../../../providers/checker'
 import { getBuiltinProvider } from '../../../providers/builtin'
 import { mergeProviderModelCapabilities, parseProviderModelsResponse } from '../../../providers/modelSync'
 import { withQwenAiModelModeAliases } from '../../../providers/qwen-ai-model-mode'
+import { modelCatalogueAuthHeaders } from '../../../providers/modelCatalogueAuth'
 import AccountManager from '../../../store/accounts'
 import { storeManager } from '../../../store/store'
 import axios from 'axios'
@@ -275,8 +276,8 @@ router.post('/:id/models/update', async (ctx: Context) => {
       return
     }
 
-    const activeAccount = AccountManager.getByProviderId(providerId, true)
-      .find(account => account.status === 'active')
+    const catalogueAccounts = AccountManager.getByProviderId(providerId, true)
+    const activeAccount = catalogueAccounts.find(account => account.status === 'active')
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -284,11 +285,15 @@ router.post('/:id/models/update', async (ctx: Context) => {
       ...modelsApiHeaders,
     }
 
-    if (activeAccount?.credentials?.token) {
-      headers.Authorization = `Bearer ${activeAccount.credentials.token}`
-    }
-    if (activeAccount?.credentials?.cookies) {
-      headers.Cookie = activeAccount.credentials.cookies
+    if (providerId === 'qwen-ai') {
+      Object.assign(headers, modelCatalogueAuthHeaders(providerId, catalogueAccounts))
+    } else {
+      if (activeAccount?.credentials?.token) {
+        headers.Authorization = `Bearer ${activeAccount.credentials.token}`
+      }
+      if (activeAccount?.credentials?.cookies) {
+        headers.Cookie = activeAccount.credentials.cookies
+      }
     }
 
     const response = await axios.get(modelsApiEndpoint, {

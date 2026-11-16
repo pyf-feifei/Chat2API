@@ -16,6 +16,8 @@
 
 `Qwen3.8-Max` 映射到 `qwen3.8-max`，无 effort 时默认 Auto；客户端明确选择 Preview 才使用该 Preview 模型。
 
+模型目录必须携带本服务器一个 active 账号的可读 Bearer 凭据：匿名接口可能 HTTP 200 但只返回旧模型子集。启动、周期刷新、桌面手动刷新和管理刷新均使用账号认证；没有可用凭据或请求失败时保留既有目录，不以匿名结果降级。2026-11-16 认证目录实测返回 `Qwen4-Max` → `qwen4-max`，模式别名随目录生成；这不等于旧 `qwen4.0-max-preview`，不会静默替换旧 Preview 请求。new-api 等聚合器从 `/v1/models` 重新获取并选择对应模型后才会更新其渠道能力。
+
 | 显示名称 | 实际模型 ID |
 | --- | --- |
 | Qwen3.8-Max | qwen3.8-max |

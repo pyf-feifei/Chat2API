@@ -431,7 +431,10 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     error?: string
   }> => {
     try {
-      const result = await ProviderChecker.fetchProviderModels(providerId)
+      const result = await ProviderChecker.fetchProviderModels(
+        providerId,
+        providerId === 'qwen-ai' ? storeManager.getAccountsByProviderId(providerId, true) : [],
+      )
       
       const provider = ProviderManager.getById(providerId)
       const mergedModelCapabilities = mergeProviderModelCapabilities(
