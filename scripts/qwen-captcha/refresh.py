@@ -409,36 +409,58 @@ def probe_model_matches(observed, model, mode):
     )
 
 
+def select_probe_option(page, trigger_selector, option_selector, target, normalize):
+    """Await asynchronous menu rendering without toggling an open menu shut."""
+    trigger = first_visible(page, trigger_selector)
+    if trigger is None:
+        return False
+    if normalize(trigger.inner_text(timeout=1000)) == target:
+        return True
+
+    def visible_option():
+        return next((item for item in page.locator(option_selector).all()
+                     if item.is_visible() and normalize(item.inner_text(timeout=1000)) == target), None)
+
+    selected = visible_option()
+    if selected is None:
+        # A prior loop may already have opened the menu. Never blindly click
+        # its toggle again while options are loading; that closes it and can
+        # alternate open/closed for the entire verification budget.
+        expanded = trigger.get_attribute('aria-expanded', timeout=1000)
+        if expanded != 'true' and first_visible(page, option_selector) is None:
+            trigger.click(timeout=2000)
+        deadline = time.monotonic() + 2
+        while selected is None and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+            selected = visible_option()
+    if selected is None:
+        return False
+    selected.click(timeout=2000)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        current = first_visible(page, trigger_selector)
+        if current is not None and normalize(current.inner_text(timeout=1000)) == target:
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
 def select_probe_model(page, model, mode=''):
     """Select existing UI options only; never silently substitute a model."""
     target = normalize_probe_model(model)
     if not target:
         return True
     try:
-        trigger = first_visible(page, '.wms-trigger__text')
-        if trigger is None:
+        if not select_probe_option(page, '.wms-trigger__text', '.wms-list__name-text', target, normalize_probe_model):
             return False
-        if normalize_probe_model(trigger.inner_text()) != target:
-            trigger.click(timeout=2000)
-            candidates = page.locator('.wms-list__name-text').all()
-            selected = next((item for item in candidates if item.is_visible()
-                             and normalize_probe_model(item.inner_text()) == target), None)
-            if selected is None:
-                return False
-            selected.click(timeout=2000)
-        if mode:
-            selector = first_visible(page, '.qwen-chat-v2-dropdown-menu-select-label')
-            if selector is None:
-                return False
-            if selector.inner_text().strip().lower() != mode.lower():
-                selector.click(timeout=2000)
-                options = page.locator('.qwen-chat-v2-dropdown-menu-item-label').all()
-                selected = next((item for item in options if item.is_visible()
-                                 and item.inner_text().strip().lower() == mode.lower()), None)
-                if selected is None:
-                    return False
-                selected.click(timeout=2000)
-        return normalize_probe_model(trigger.inner_text()) == target
+        if mode and not select_probe_option(page, '.qwen-chat-v2-dropdown-menu-select-label',
+                                             '.qwen-chat-v2-dropdown-menu-item-label', mode.lower(),
+                                             lambda value: value.strip().lower()):
+            return False
+        # Both selections must have settled before sending. Actual network
+        # model/mode plus a new marked reply remain the final recovery gate.
+        trigger = first_visible(page, '.wms-trigger__text')
+        return trigger is not None and normalize_probe_model(trigger.inner_text(timeout=1000)) == target
     except Exception:
         return False
 
