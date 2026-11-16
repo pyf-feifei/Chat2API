@@ -14,8 +14,10 @@ import {
   type QwenAiEgressRecoveryState,
 } from '../types'
 import { loadBalancer } from '../loadbalancer'
-import { requestForwarder } from '../forwarder'
-import { QwenAiAdapter } from '../adapters/qwen-ai'
+import { requestForwarder, shouldDeferQwenAiManagedStreamCommit } from '../forwarder'
+import { QwenAiAdapter, qwenAiRequestTimeoutMsFromEnv } from '../adapters/qwen-ai'
+import { createQwenAiServiceRecoveryState } from '../qwenAiServiceRecovery'
+import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { createQwenAiBusyFailoverStopRule } from '../qwenBusyFailover'
 import {
@@ -118,10 +120,11 @@ function getClientIP(ctx: Context): string {
 
 function createClientAbortSignal(ctx: Context): AbortSignal {
   const controller = new AbortController()
-  ctx.req.on('close', () => {
-    if (!ctx.res.writableEnded) {
-      controller.abort()
-    }
+  // IncomingMessage close can mean the request body was fully consumed,
+  // not that a streaming client disconnected. Observe the outgoing response.
+  ctx.req.once('aborted', () => controller.abort())
+  ctx.res.once('close', () => {
+    if (!ctx.res.writableEnded) controller.abort()
   })
   return controller.signal
 }
@@ -523,11 +526,15 @@ router.post('/messages', async (ctx: Context) => {
     stream: anthropicReq.stream,
   }))
 
-  // Egress-IP recovery must outlive a single account attempt: an aliyun verdict
-  // (FAIL_SYS_USER_VALIDATE / RGV587 / `bxpunish`) flags the exit IP, not the
-  // account, so once a request escalates to the Webshare proxy it must stay
-  // there for every later account of the SAME client request. One ledger per
-  // request, shared by all failover attempts.
+  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+  const serviceRecovery = initialProviderIsQwenAi
+    ? createQwenAiServiceRecoveryState(startTime + qwenAiRequestTimeoutMsFromEnv())
+    : undefined
+  const deferManagedStreamCommit = initialProviderIsQwenAi
+    && shouldDeferQwenAiManagedStreamCommit(openaiReq)
+
+  // A verdict alone does not identify account, payload or egress cause.
+  // Keep optional egress and browser budgets shared across this request.
   const qwenAiEgressRecoveryState: QwenAiEgressRecoveryState | undefined =
     QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
       ? {
@@ -550,13 +557,12 @@ router.post('/messages', async (ctx: Context) => {
     signal: clientSignal,
     requestIntent: requestIntent.intent,
     ...(qwenAiEgressRecoveryState ? { qwenAiEgressRecoveryState } : {}),
+    ...(serviceRecovery ? { qwenAiServiceRecoveryState: serviceRecovery } : {}),
+    ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
   })
 
-  // This route threads no Qwen recovery state, so account-neutral semantic
-  // replays were unbounded here; the content stop rule bounds them, and the
-  // busy hook reports a cross-account busy storm to the governor. Both rules
-  // only match qwen errorCodes with accountFault === false, so non-Qwen
-  // selections can never trip them — no provider check needed.
+  // Preserve content/busy stop rules independently of browser recovery.
+  // Browser success is account-local, never authority to replay on a peer.
   const busyAccountIds: string[] = []
   let busyStormCooldownMs: number | undefined
 
@@ -616,6 +622,11 @@ router.post('/messages', async (ctx: Context) => {
     if (outcomeRecorded) return
     outcomeRecorded = true
     const latency = Date.now() - startTime
+    console.info('[Anthropic] stream-delivery', JSON.stringify({
+      requestId, outcome: success ? 'completed' : 'failed',
+      elapsedMs: latency, providerId: provider.id, accountId: account.id,
+      model: actualModel, errorCode: (error as (Error & { code?: string }) | undefined)?.code,
+    }))
     if (success) {
       loadBalancer.clearAccountFailure(account.id)
       proxyStatusManager.recordRequestSuccess(latency)
@@ -639,7 +650,17 @@ router.post('/messages', async (ctx: Context) => {
   }
 
   try {
-    const outcome = await runWithAccountFailover()
+    const pendingOutcome = runWithAccountFailover()
+    const outcome = initialProviderIsQwenAi && anthropicReq.stream
+      ? {
+          selection: initialSelection,
+          result: {
+            success: true,
+            status: 200,
+            stream: createDeferredQwenAiFailoverStream(pendingOutcome, clientSignal),
+          } as import('../types').ForwardResult,
+        }
+      : await pendingOutcome
     account = outcome.selection.account
     provider = outcome.selection.provider
     actualModel = outcome.selection.actualModel
@@ -690,12 +711,22 @@ router.post('/messages', async (ctx: Context) => {
         return
       }
 
+      const effective = result.stream as import('../adapters/qwen-ai').QwenAiOutputStream
+      const applyEffectiveSelection = () => {
+        const effectiveAccount = effective.qwenAiEffectiveAccountId
+          ? storeManager.getAccountById(effective.qwenAiEffectiveAccountId) : undefined
+        const effectiveProvider = effective.qwenAiEffectiveProviderId
+          ? storeManager.getProviderById(effective.qwenAiEffectiveProviderId) : undefined
+        if (effectiveAccount) account = effectiveAccount
+        if (effectiveProvider) provider = effectiveProvider
+        actualModel = effective.qwenAiEffectiveActualModel || actualModel
+      }
       const messageId = generateMessageId()
       const transStream = createAnthropicMessagesStream(result.stream, {
         messageId,
         model: actualModel,
-        onSuccess: () => recordOutcome(true),
-        onFailure: error => recordOutcome(false, error),
+        onSuccess: () => { applyEffectiveSelection(); recordOutcome(true) },
+        onFailure: error => { applyEffectiveSelection(); recordOutcome(false, error) },
       })
 
       ctx.set('Content-Type', 'text/event-stream; charset=utf-8')

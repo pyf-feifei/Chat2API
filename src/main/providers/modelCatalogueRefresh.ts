@@ -1,6 +1,6 @@
-const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000
+const DEFAULT_REFRESH_INTERVAL_MS = 0
 
-/** Zero disables periodic refresh; startup/manual synchronization still works. */
+/** Startup/manual sync by default; a positive interval explicitly opts into polling. */
 export function modelCatalogueRefreshIntervalMsFromEnv(): number {
   const raw = process.env.CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS
   if (raw === undefined || raw.trim() === '') return DEFAULT_REFRESH_INTERVAL_MS

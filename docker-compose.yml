@@ -27,6 +27,8 @@ services:
       CHAT2API_MANAGEMENT_SECRET: ${CHAT2API_MANAGEMENT_SECRET}
       CHAT2API_STORAGE_ENCRYPTION_KEY: ${CHAT2API_STORAGE_ENCRYPTION_KEY}
       CHAT2API_LOG_LEVEL: info
+      # Sync catalogues once at startup; positive milliseconds opt into polling.
+      CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS: ${CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS:-0}
       CHAT2API_LOAD_BALANCER_DEBUG: "true"
       CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
       # Detect the protocol-level Claude/Codex context-summary turn from its

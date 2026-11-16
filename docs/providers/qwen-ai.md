@@ -10,7 +10,7 @@
 
 ## 默认模型
 
-下表是内置离线兜底列表；实际列表还会合并官网 `/api/v2/models/` 返回的模型。桌面和服务端启动时同步，代理运行期间每 5 分钟自动刷新；失败保留上次成功结果，后台刷新不阻塞对话。`CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS` 可调整间隔（毫秒，`0` 关闭定时刷新）；供应商管理中的更新模型按钮仍可手动刷新。
+下表是内置离线兜底列表；实际列表还会合并官网 `/api/v2/models/` 返回的模型。桌面和服务端启动时同步一次（包括重启或更新容器），默认不定时轮询；失败保留上次成功结果。供应商管理中的更新模型按钮可手动刷新。`CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS` 默认 `0`；只有显式设置正整数间隔（毫秒）才启用可选的定时刷新，且不会按对话请求刷新。
 
 2026-11-11 实测接口已返回 `Qwen4-Max-Preview` → `qwen4.0-max-preview`，支持 1,000,000 上下文、131,072 摘要生成长度，`think_skip.enable=false`（思考不可跳过）。动态模型及能力会进入服务模型列表，无需手写内置模型；不会把已有 `Qwen3.8-Max` 请求擅自切到 Qwen4。
 
@@ -184,13 +184,13 @@ CHAT2API_QWEN_AI_SEMANTIC_FRESH_CHAT_ESCALATIONS=1
 
 ## 服务内部恢复预算
 
-Responses 请求（包括无工具的上下文压缩）在 Qwen 转发开始后立即建立 SSE，并持续发送 typed progress；恢复期间不要求客户端重连。每个逻辑请求共享浏览器验证预算，跨配额切换也不重置：`CHAT2API_QWEN_AI_SERVICE_RECOVERY_TIMEOUT_MS` 默认 300000，`CHAT2API_QWEN_AI_SERVICE_RECOVERY_BROWSER_ATTEMPTS` 默认 2（最多 4），`CHAT2API_QWEN_AI_SERVICE_RECOVERY_RETRY_DELAY_MS` 默认 60000。失败探针只按冷却重试验证，不盲目重发原长请求；仅同账号验证成功后重试原请求，且仍需实际生成通过。取消、超时、预算耗尽会结束请求，不扩大到全池轮换。已验证工具分支只交付一次，未通过的私有分支不交给客户端。普通文本流不因此整体缓冲。
+Responses 请求（包括无工具的上下文压缩）在 Qwen 转发开始后立即建立 SSE，并持续发送 typed progress；Anthropic Messages 流式请求同样提前建立 SSE，通过原生 `message_start` / `ping` 保活，并共享下述同账号验证预算与 managed 工具分支延迟交付保护。请求体读取完成不视为客户端断开，实际响应关闭或请求取消才终止转发。恢复成功时无需客户端重连，但预算耗尽仍可能返回失败；new-api 等中间层对流内错误的透传需要单独验证。每个逻辑请求共享浏览器验证预算，跨配额切换也不重置：`CHAT2API_QWEN_AI_SERVICE_RECOVERY_TIMEOUT_MS` 默认 300000，`CHAT2API_QWEN_AI_SERVICE_RECOVERY_BROWSER_ATTEMPTS` 默认 2（最多 4），`CHAT2API_QWEN_AI_SERVICE_RECOVERY_RETRY_DELAY_MS` 默认 60000。失败探针只按冷却重试验证，不盲目重发原长请求；仅同账号验证成功后重试原请求，且仍需实际生成通过。取消、超时、预算耗尽会结束请求，不扩大到全池轮换。已验证工具分支只交付一次，未通过的私有分支不交给客户端。普通文本流不因此整体缓冲。
 
 ## 浏览器恢复的验收范围
 
 `QWEN_RECOVERY_PROBE_MODEL` 和 `QWEN_RECOVERY_PROBE_MODE` 可指定恢复探针模型与模式，例如 `qwen4.0-max-preview`／`Fast`。脚本通过网页现有选择控件切换，复用已展开菜单，并短时等待异步选项与选中标签更新，避免重复点击开关将菜单关掉；选项缺失仍失败，不替换模型。最终核对带本次唯一标记的实际生成请求；所选模型或模式不符、没有真实新回复时，不接受凭据写回。留空仍使用浏览器默认模型，日志标记 `probeScope: browser-default-model`，不能据此证明其他模型恢复。
 
-浏览器任务全局串行，同账号请求共享其自己的恢复 Promise，不以另一账号的恢复结果替代。只有恢复结果 ID 与当前账号一致时，才取消本次退避和清除对应恢复冷却。Responses 使用上节请求级服务恢复预算；其他调用方仍按原有 paced-retry 预算与请求截止时间等待已启动的同账号恢复，`CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES=0` 可关闭其 paced 重试。验证成功才重试原请求，失败、取消或超时则不重放；服务预算跨账号共享，不因重入 forwarder 重置。状态 `active`、Cookie 收集成功、网页默认模型回复以及其他账号的成功，都不等于目标模型的当前请求可用。
+浏览器任务全局串行，同账号请求共享其自己的恢复 Promise，不以另一账号的恢复结果替代。只有恢复结果 ID 与当前账号一致时，才取消本次退避和清除对应恢复冷却。Responses 和 Anthropic Messages 使用上节请求级服务恢复预算；其他调用方仍按原有 paced-retry 预算与请求截止时间等待已启动的同账号恢复，`CHAT2API_QWEN_AI_VERDICT_PACED_RETRIES=0` 可关闭其 paced 重试。验证成功才重试原请求，失败、取消或超时则不重放；服务预算跨账号共享，不因重入 forwarder 重置。状态 `active`、Cookie 收集成功、网页默认模型回复以及其他账号的成功，都不等于目标模型的当前请求可用。
 
 `RGV587`／`bxpunish` 不直接证明封号、IP 封禁或内容拒绝。先核对凭据和身份，再用同账号、同模型、相近时间的短请求对照网页与 HTTP 路径。正常完成网站要求的验证后仍应复测真实生成，遵守配额与 Retry-After，不以连续轮换账号作为诊断或修复。
 

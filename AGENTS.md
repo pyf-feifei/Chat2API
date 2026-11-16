@@ -620,9 +620,10 @@ re-export of `builtinProviders`, so there is nothing to keep in sync by hand.
 persisted store at startup, so restart the app/server to see the change.
 
 Built-ins with `modelsApiEndpoint` also synchronize their live catalogue at
-startup (desktop and server). While the proxy runs, `ModelCatalogueRefreshService`
-refreshes every 5 minutes, single-flight; failures retain persisted models.
-`CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS=0` disables periodic polling.
+startup (desktop and server), including container restarts/updates. Periodic
+polling is disabled by default (`CHAT2API_MODEL_CATALOGUE_REFRESH_INTERVAL_MS=0`);
+a positive interval explicitly opts into single-flight polling. Manual refresh
+remains available, and failures retain persisted models.
 The proxy stops the timer on drain/close. `/v1/models` reads this persisted
 catalogue; it does not fetch upstream per request. Tests:
 `tests/server/model-catalogue-refresh.test.mjs`.
